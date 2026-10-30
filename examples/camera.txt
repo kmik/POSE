@@ -1,0 +1,13 @@
+# OpenCV pinhole calibration, measured at this image resolution.
+# Replace these example values with your camera's calibration.
+width=400
+height=300
+fx=240
+fy=240
+cx=199.5
+cy=149.5
+k1=0
+k2=0
+p1=0
+p2=0
+k3=0

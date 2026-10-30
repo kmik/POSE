@@ -1,0 +1,285 @@
+package sgm;
+
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import javax.imageio.*;
+import javax.imageio.stream.ImageInputStream;
+
+/**
+ * Header-only resolution planning. Automatic disparity ranges remain estimates until rectification.
+ */
+final class ResolutionPlan {
+  static int[] originalSize(Path path) throws IOException {
+    try (ImageInputStream in = ImageIO.createImageInputStream(path.toFile())) {
+      if (in == null) throw new IOException("Cannot inspect image header: " + path);
+      Iterator<ImageReader> readers = ImageIO.getImageReaders(in);
+      if (!readers.hasNext()) throw new IOException("No image header reader for " + path);
+      ImageReader reader = readers.next();
+      try {
+        reader.setInput(in, true, true);
+        return new int[] {reader.getWidth(0), reader.getHeight(0)};
+      } finally {
+        reader.dispose();
+      }
+    }
+  }
+
+  static void write(List<Path> paths, Options o, Project project) throws IOException {
+    List<Object> images = new ArrayList<>();
+    long pixels = 0, alignmentPixels = 0, maxPixels = 0, sourceMax = 0, evidence = 0;
+    int longest = 0, shortest = 0, minimumSide = Integer.MAX_VALUE;
+    long[] sizes = new long[paths.size()];
+    for (int i = 0; i < paths.size(); i++) {
+      int[] original = originalSize(paths.get(i)),
+          processed = o.processedSize(original[0], original[1]);
+      long n = (long) processed[0] * processed[1];
+      int[] aligned = o.alignmentOptions().processedSize(original[0], original[1]);
+      alignmentPixels += (long) aligned[0] * aligned[1];
+      minimumSide = Math.min(minimumSide, Math.min(processed[0], processed[1]));
+      sizes[i] = n;
+      pixels += n;
+      sourceMax = Math.max(sourceMax, (long) original[0] * original[1]);
+      if (n > maxPixels) {
+        maxPixels = n;
+        longest = Math.max(processed[0], processed[1]);
+        shortest = Math.min(processed[0], processed[1]);
+      }
+      images.add(
+          Json.object(
+              "image_id",
+              i,
+              "filename",
+              paths.get(i).getFileName().toString(),
+              "original_size",
+              original,
+              "processed_size",
+              processed,
+              "alignment_size",
+              aligned,
+              "scale_xy",
+              new double[] {
+                processed[0] / (double) original[0], processed[1] / (double) original[1]
+              }));
+    }
+    int pairs = 0;
+    for (int i = 0; i < paths.size(); i++)
+      for (int j = i + 1; j < Math.min(paths.size(), i + o.neighbors + 1); j++) {
+        pairs++;
+        evidence += 8 * (sizes[i] + sizes[j]);
+      }
+    if (!o.pairSelection.equals("sequential")) {
+      pairs = paths.size() * (paths.size() - 1) / 2;
+      evidence = 0;
+      for (int i = 0; i < paths.size(); i++)
+        for (int j = i + 1; j < paths.size(); j++) evidence += 8 * (sizes[i] + sizes[j]);
+    }
+    if (o.rectified) {
+      pairs = 1;
+      evidence = 8 * (sizes[0] + sizes[1]);
+    }
+    long imagesNative = 5 * Math.max(pixels, alignmentPixels),
+        features = (long) paths.size() * o.features * (128 * 4 + 64),
+        decodeNative = 3 * sourceMax,
+        rectifyNative = 32 * maxPixels;
+    long residentEvidence =
+        o.diskDepth
+            ? Math.min(
+                evidence, Math.min(64 * 1048576L, Math.max(1048576L, o.memoryMb * 1048576L / 8)))
+            : evidence;
+    List<Integer> counts = new ArrayList<>(Arrays.asList(64, 128, 256, 512));
+    if (!counts.contains(o.disparities)) counts.add(o.disparities);
+    Collections.sort(counts);
+    List<Object> estimates = new ArrayList<>();
+    long budget = Math.min(o.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .65));
+    int gpuLimit = GpuSgm.disparityLimit(longest, shortest, o);
+    long gpuHost = maxPixels * (96 + 32 * ((o.census * o.census - 1 + 63) / 64));
+    if (gpuHost > budget) gpuLimit = 0;
+    for (int d : counts) {
+      Options scenario = o.copy();
+      scenario.disparities = d;
+      long sgm = CensusSgm.memoryEstimate(longest, shortest, d, o);
+      boolean gpuSelected =
+          d <= gpuLimit && (!o.compute.equals("auto") || maxPixels * d >= 1000000L);
+      estimates.add(
+          Json.object(
+              "disparities",
+              d,
+              "sgm_bytes",
+              sgm,
+              "gpu_estimated_bytes",
+              GpuSgm.memoryEstimate(longest, shortest, d, o),
+              "fits_gpu_limits",
+              d <= gpuLimit,
+              "gpu_memory_plan",
+              GpuStereo.report(longest, shortest, scenario),
+              "tiled_sgm_resident_bytes",
+              CensusSgm.tiledMemoryEstimate(longest, shortest, d, o.census, o.memoryMb),
+              "tiled_cost_volume_disk_bytes",
+              maxPixels * d * (2 + StereoCost.aggregateBytes(o)),
+              "fits_sgm_budget",
+              d <= gpuLimit
+                  || (o.tiled
+                      ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o.census, o.memoryMb)
+                          <= budget
+                      : sgm <= budget && maxPixels * d <= Integer.MAX_VALUE - 8L),
+              "potential_depth_evidence_bytes",
+              evidence,
+              "approximate_known_process_bytes",
+              (gpuSelected
+                      ? gpuHost
+                      : o.tiled
+                          ? CensusSgm.tiledMemoryEstimate(
+                              longest, shortest, d, o.census, o.memoryMb)
+                          : sgm)
+                  + residentEvidence
+                  + imagesNative
+                  + features
+                  + decodeNative
+                  + rectifyNative));
+    }
+    int limit = DisparityRange.memoryLimit(longest, shortest, o);
+    Path file = o.output.resolve("00_inputs/resolution_plan.json");
+    Files.createDirectories(file.getParent());
+    Json.write(
+        file,
+        Json.object(
+            "quality",
+            o.quality,
+            "compute",
+            o.compute,
+            "gpu_device_index",
+            o.gpuDevice,
+            "gpu_feasible_disparities",
+            gpuLimit,
+            "storage",
+            o.storage,
+            "cache_enabled",
+            o.cache,
+            "alignment_quality",
+            o.alignmentQuality,
+            "alignment_max_dimension",
+            o.alignmentMaxDimension,
+            "disk_depth",
+            o.diskDepth,
+            "tiled",
+            o.tiled,
+            "pyramid_levels",
+            o.pyramidLevels,
+            "downsample_factor",
+            o.qualityDownsample(),
+            "max_dimension_cap",
+            o.quality.equals("custom") || o.maxDimensionExplicit ? o.maxDimension : null,
+            "images",
+            images,
+            "potential_neighbor_pairs",
+            pairs,
+            "resident_processed_image_native_bytes",
+            imagesNative,
+            "largest_source_decode_native_bytes",
+            decodeNative,
+            "approximate_feature_bytes",
+            features,
+            "potential_depth_evidence_heap_bytes",
+            residentEvidence,
+            "potential_depth_evidence_total_bytes",
+            evidence,
+            "potential_depth_evidence_disk_bytes",
+            o.diskDepth ? evidence : 0,
+            "surface_consolidation",
+            o.surfaceConsolidation,
+            "surface_working_set_budget_bytes",
+            o.surfaceConsolidation.equals("normal")
+                ? Math.min(o.surfaceMemoryMb, Math.max(8, o.memoryMb / 4)) * 1048576L
+                : 0,
+            "potential_surface_input_uncompressed_bytes",
+            o.surfaceConsolidation.equals("normal")
+                ? maxPixels * pairs / ((long) o.step * o.step) * SurfaceConsolidator.RECORD_BYTES
+                : 0,
+            "surface_temporary_disk_scope",
+            "Gzip level-1 partitions of accepted candidates only; splitting may temporarily hold"
+                + " parent plus children. Actual compressed/peak bytes are recorded in"
+                + " 06_fusion/surface_consolidation.json; all work partitions removed on close.",
+            "rectification_native_estimate_bytes",
+            rectifyNative,
+            "jvm_max_heap_bytes",
+            Runtime.getRuntime().maxMemory(),
+            "sgm_budget_bytes",
+            budget,
+            "largest_pair_feasible_disparities",
+            limit,
+            "sgm_scenarios",
+            estimates,
+            "disparity_mode",
+            o.disparitiesExplicit
+                ? "explicit"
+                : "automatic; actual range determined after rectification",
+            "estimate_scope",
+            "Known buffers and potential pair evidence; approximate process RAM, not a reservation"
+                + " or guarantee. OpenCV/SIFT, bundle workspace, object overhead, image codecs and"
+                + " project compression add memory. Matching-row estimate permits vertical"
+                + " transposition. No silent quality downgrade or upsampling."));
+    System.out.printf(
+        Locale.ROOT,
+        "Quality=%s; downsample=%d; largest processed image=%dx%d; SGM budget=%.0f MiB, feasible"
+            + " disparities up to %d; potential depth evidence=%.0f MiB%n",
+        o.quality,
+        o.qualityDownsample(),
+        longest,
+        shortest,
+        budget / 1048576.,
+        limit,
+        evidence / 1048576.);
+    for (int d : counts) {
+      long sgm = CensusSgm.memoryEstimate(longest, shortest, d, o);
+      boolean gpuSelected =
+          d <= gpuLimit && (!o.compute.equals("auto") || maxPixels * d >= 1000000L);
+      long resident =
+          gpuSelected
+              ? gpuHost
+              : o.tiled
+                  ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o.census, o.memoryMb)
+                  : sgm;
+      System.out.printf(
+          Locale.ROOT,
+          "  %4d disparities: SGM resident %.0f MiB; known process components ~%.0f MiB%s%n",
+          d,
+          resident / 1048576.,
+          (resident + residentEvidence + imagesNative + features + decodeNative + rectifyNative)
+              / 1048576.,
+          resident > budget || d > gpuLimit && !o.tiled && maxPixels * d > Integer.MAX_VALUE - 8L
+              ? " [exceeds SGM budget/array limit]"
+              : "");
+      if (gpuSelected) {
+        Options scenario = o.copy();
+        scenario.disparities = d;
+        GpuStereo.Plan plan =
+            GpuStereo.plan(
+                GpuSgm.selectedDevice(o), GpuSgm.selectedGroup(o), longest, shortest, d, scenario);
+        System.out.printf(
+            Locale.ROOT,
+            "       GPU %s working set ~%.0f MiB; temporary aggregate disk ~%.0f MiB%n",
+            plan.streamed() ? "streamed" : "banked resident",
+            plan.deviceBytes() / 1048576.,
+            plan.streamed() ? maxPixels * d * StereoCost.aggregateBytes(o) / 1048576. : 0.);
+      } else if (o.tiled)
+        System.out.printf(
+            Locale.ROOT,
+            "       temporary cost/aggregate disk ~%.0f MiB%n",
+            maxPixels * d * (2 + StereoCost.aggregateBytes(o)) / 1048576.);
+    }
+    System.out.println(
+        "Estimates exclude additional native/temporary allocations; see"
+            + " 00_inputs/resolution_plan.json.");
+    if (minimumSide < o.census + 2)
+      throw new IllegalArgumentException(
+          "Selected quality leaves an image too small for the census window; choose a higher"
+              + " quality");
+    if (!o.estimateMemory && (limit < 3 || o.disparitiesExplicit && o.disparities > limit))
+      throw new IllegalArgumentException(
+          "Selected quality/resolution cannot fit the "
+              + (o.disparitiesExplicit ? o.disparities : "minimum")
+              + " disparity search in the SGM budget. Choose lower --quality/--max-dimension or"
+              + " raise --memory-mb and heap; see 00_inputs/resolution_plan.json");
+  }
+}

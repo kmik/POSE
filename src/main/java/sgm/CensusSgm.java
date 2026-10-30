@@ -1,0 +1,776 @@
+package sgm;
+
+import java.io.*;
+import java.util.*;
+
+/**
+ * Selectable costs, edge-aware Hirschmuller recurrence, 4/8 paths and LR validation. CPU primitive
+ * arrays/paging or optional OpenCL kernels; no OpenCV stereo matcher or C++ process.
+ */
+public final class CensusSgm {
+  private static final int INVALID_COST = 512;
+  private final Options options;
+
+  public CensusSgm(Options options) {
+    this.options = options;
+  }
+
+  public Result compute(byte[] left, byte[] right, int width, int height) {
+    return compute(left, right, null, null, width, height);
+  }
+
+  /** Optional interleaved BGR inputs enable the RGB-distance descriptor used by Image.h. */
+  public Result compute(
+      byte[] left, byte[] right, byte[] leftBgr, byte[] rightBgr, int width, int height) {
+    return compute(left, right, leftBgr, rightBgr, width, height, null, null);
+  }
+
+  public Result compute(
+      byte[] left,
+      byte[] right,
+      byte[] leftBgr,
+      byte[] rightBgr,
+      int width,
+      int height,
+      byte[] validLeft,
+      byte[] validRight) {
+    try {
+      return computeRecorded(
+          left, right, leftBgr, rightBgr, width, height, validLeft, validRight, null);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  Result computeRecorded(
+      byte[] left,
+      byte[] right,
+      byte[] leftBgr,
+      byte[] rightBgr,
+      int width,
+      int height,
+      byte[] validLeft,
+      byte[] validRight,
+      Observer observer)
+      throws IOException {
+    if (width < options.census + 2
+        || height < options.census + 2
+        || left.length != (long) width * height
+        || right.length != left.length)
+      throw new IllegalArgumentException("Invalid stereo image dimensions");
+    int n = left.length, d = options.disparities;
+    long cells = (long) n * d;
+    long estimate = memoryEstimate(width, height, d, options);
+    long budget =
+        Math.min(options.memoryMb * 1024 * 1024, (long) (Runtime.getRuntime().maxMemory() * .65));
+    boolean gpu = GpuSgm.use(width, height, options);
+    if (cells >= 1_000_000)
+      System.out.printf(
+          Locale.ROOT,
+          "Stereo backend: %s; %dx%d, %d disparities%n",
+          gpu ? "OpenCL GPU" : options.tiled ? "CPU (disk-paged SGM)" : "CPU (RAM SGM)",
+          width,
+          height,
+          d);
+    if (gpu && (long) n * (96 + 32 * words(options.census)) > budget)
+      throw new IllegalArgumentException(
+          "GPU host descriptors/output buffers exceed --memory-mb/heap budget");
+    if (!gpu
+        && options.tiled
+        && tiledMemoryEstimate(width, height, d, options.census, options.memoryMb) > budget)
+      throw new IllegalArgumentException(
+          "Tiled SGM rows/descriptors/output rasters exceed the memory budget; lower dense"
+              + " resolution or raise --memory-mb/heap");
+    if (!gpu && !options.tiled && (cells > Integer.MAX_VALUE - 8 || estimate > budget))
+      throw new IllegalArgumentException(
+          String.format(
+              Locale.ROOT,
+              "SGM needs approximately %.0f MiB (budget %.0f MiB). Lower"
+                  + " --max-dimension/--disparities or raise --memory-mb and heap.",
+              estimate / 1048576.0,
+              budget / 1048576.0));
+    if (!gpu && options.tiled) {
+      java.nio.file.Files.createDirectories(options.output);
+      long free = java.nio.file.Files.getFileStore(options.output).getUsableSpace();
+      if (free > 0 && cells * (2 + StereoCost.aggregateBytes(options)) + 16777216L > free)
+        throw new IllegalArgumentException(
+            "Tiled SGM needs approximately "
+                + (cells * (2 + StereoCost.aggregateBytes(options)) / 1048576)
+                + " MiB temporary disk space; only "
+                + (free / 1048576)
+                + " MiB available");
+    }
+    Stats stats = new Stats();
+    byte[] reasons = observer == null ? null : new byte[n];
+    byte[] searchBoundary = observer == null ? null : new byte[n];
+    if (reasons != null) Arrays.fill(reasons, (byte) 1);
+    long[][] a, b;
+    boolean[] texturedLeft, texturedRight;
+    if (options.censusMode.equals("color-distance")) {
+      if (leftBgr == null
+          || rightBgr == null
+          || leftBgr.length != (long) n * 3
+          || rightBgr.length != leftBgr.length)
+        throw new IllegalArgumentException("Color-distance census requires interleaved BGR inputs");
+      DescriptorSet first = colorCensus(leftBgr, width, height, options.census),
+          second = colorCensus(rightBgr, width, height, options.census);
+      a = first.bits;
+      b = second.bits;
+      texturedLeft = first.textured;
+      texturedRight = second.textured;
+    } else {
+      a = census(left, width, height, options.census);
+      b = census(right, width, height, options.census);
+      texturedLeft = textureMask(left, width, height, options.census);
+      texturedRight = textureMask(right, width, height, options.census);
+    }
+    if (validLeft != null) {
+      if (validRight == null || validLeft.length != n || validRight.length != n)
+        throw new IllegalArgumentException("Invalid stereo mask dimensions");
+      for (int i = 0; i < n; i++) {
+        texturedLeft[i] &= validLeft[i] != 0;
+        texturedRight[i] &= validRight[i] != 0;
+      }
+    }
+    float[] dl =
+        match(
+            a,
+            b,
+            left,
+            right,
+            texturedLeft,
+            texturedRight,
+            width,
+            height,
+            false,
+            stats,
+            reasons,
+            searchBoundary);
+    float[] dr =
+        match(
+            b,
+            a,
+            right,
+            left,
+            texturedRight,
+            texturedLeft,
+            width,
+            height,
+            true,
+            new Stats(),
+            null,
+            null);
+    if (observer != null) observer.searchBoundary(searchBoundary, width, height);
+    if (observer != null) {
+      observer.raster("00_left_selected", dl, width, height);
+      observer.raster("01_right_selected", dr, width, height);
+    }
+    if (options.subpixelRefinement.equals("zncc")) {
+      long refined = PhotometricRefinement.refine(dl, left, right, width, height, false, options);
+      PhotometricRefinement.refine(dr, right, left, width, height, true, options);
+      System.out.printf(
+          Locale.ROOT,
+          "Photometric subpixel refinement: %,d left disparities improved; original masks, LR and"
+              + " depth-edge checks retained%n",
+          refined);
+      if (observer != null) {
+        observer.raster("00b_left_photometric_subpixel", dl, width, height);
+        observer.raster("01b_right_photometric_subpixel", dr, width, height);
+      }
+    }
+    float[] checked = new float[n];
+    Arrays.fill(checked, Float.NaN);
+    int radius = options.census / 2;
+    for (int y = radius; y < height - radius; y++) {
+      for (int x = radius; x < width - radius; x++) {
+        int p = y * width + x;
+        if (!Float.isFinite(dl[p])) continue;
+        int xr = Math.round(x - dl[p]);
+        if (xr < radius || xr >= width - radius) {
+          if (reasons != null) reasons[p] = 4;
+          continue;
+        }
+        float other = dr[y * width + xr];
+        if (Float.isFinite(other) && Math.abs(dl[p] - other) <= options.lrThreshold)
+          checked[p] = dl[p];
+        else {
+          stats.lrRejected++;
+          if (reasons != null) reasons[p] = 4;
+        }
+      }
+    }
+    if (observer != null) observer.raster("02_left_right_validated", checked, width, height);
+    if (options.median > 1)
+      checked =
+          options.medianMode.equals("classic")
+              ? medianValid(checked, width, height, options.median)
+              : medianEdgePreserving(
+                  checked,
+                  width,
+                  height,
+                  options.median,
+                  options.medianMaxChange,
+                  left,
+                  options.medianEdgeThreshold);
+    if (observer != null) observer.raster("03_median", checked, width, height);
+    float[] correlation = observer == null ? null : new float[n],
+        lrError = observer == null ? null : new float[n];
+    if (correlation != null) {
+      Arrays.fill(correlation, Float.NaN);
+      Arrays.fill(lrError, Float.NaN);
+    }
+    // Median changes the matched coordinate, so validation must be repeated afterwards.
+    byte[] photoLeft = options.censusMode.equals("color-distance") ? leftBgr : left;
+    byte[] photoRight = options.censusMode.equals("color-distance") ? rightBgr : right;
+    int channels = options.censusMode.equals("color-distance") ? 3 : 1;
+    for (int y = 0; y < height; y++)
+      for (int x = 0; x < width; x++) {
+        int p = y * width + x;
+        float disparity = checked[p];
+        if (!Float.isFinite(disparity)) continue;
+        int xr = Math.round(x - disparity);
+        if (lrError != null && xr >= 0 && xr < width && Float.isFinite(dr[y * width + xr]))
+          lrError[p] = Math.abs(disparity - dr[y * width + xr]);
+        if (!reciprocal(dr, width, height, x, y, disparity, options.lrThreshold, radius)) {
+          checked[p] = Float.NaN;
+          stats.postMedianLrRejected++;
+          if (reasons != null) reasons[p] = 5;
+          continue;
+        }
+        double score =
+            zncc(
+                photoLeft,
+                photoRight,
+                width,
+                height,
+                x,
+                y,
+                disparity,
+                options.correlationWindow / 2,
+                channels);
+        if (correlation != null) correlation[p] = (float) score;
+        if (score < options.correlation) {
+          checked[p] = Float.NaN;
+          stats.photometricRejected++;
+          if (reasons != null) reasons[p] = 6;
+        }
+      }
+    if (observer != null) {
+      observer.raster("04_photometric", checked, width, height);
+      observer.raster("zncc", correlation, width, height);
+      observer.raster("left_right_error", lrError, width, height);
+    }
+    float[] beforeSpeckle = observer == null ? null : checked.clone();
+    stats.speckleRejected =
+        removeSpeckles(
+            checked,
+            width,
+            height,
+            options.speckleSize,
+            options.speckleRange,
+            options.speckleConnectivity);
+    for (float value : checked) if (Float.isFinite(value)) stats.valid++;
+    if (observer != null) {
+      for (int i = 0; i < n; i++)
+        if (Float.isFinite(beforeSpeckle[i]) && !Float.isFinite(checked[i])) reasons[i] = 7;
+      observer.raster("05_final_stereo", checked, width, height);
+      observer.reasons(reasons, width, height);
+    }
+    return new Result(width, height, checked, stats, correlation, lrError);
+  }
+
+  static long memoryEstimate(int width, int height, int disparities, int census) {
+    return (long) width * height * disparities * 6
+        + (long) width * disparities * 8
+        + (long) width * height * (48 + 16 * words(census));
+  }
+
+  static long memoryEstimate(int w, int h, int d, Options o) {
+    return memoryEstimate(w, h, d, o.census)
+        - (long) w * h * d * (4 - StereoCost.aggregateBytes(o));
+  }
+
+  static long tiledMemoryEstimate(
+      int width, int height, int disparities, int census, long memoryMb) {
+    long cache = Math.min(32 * 1048576L, Math.max(1048576L, memoryMb * 1048576L / 16));
+    return (long) width * height * (48 + 16 * words(census))
+        + (long) width * disparities * 8
+        + Math.max(1048576L, cache)
+        + Math.max(2097152L, cache);
+  }
+
+  private static DescriptorSet colorCensus(byte[] bgr, int w, int h, int window) {
+    int radius = window / 2;
+    long[][] bits = new long[words(window)][w * h];
+    boolean[] textured = new boolean[w * h];
+    double[] distances = new double[window * window - 1];
+    for (int y = radius; y < h - radius; y++)
+      for (int x = radius; x < w - radius; x++) {
+        int p = y * w + x, center = 3 * p, bit = 0;
+        double total = 0, maximum = 0;
+        for (int dy = -radius; dy <= radius; dy++)
+          for (int dx = -radius; dx <= radius; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            int q = 3 * ((y + dy) * w + x + dx);
+            double squared = 0;
+            for (int channel = 0; channel < 3; channel++) {
+              int difference = (bgr[q + channel] & 255) - (bgr[center + channel] & 255);
+              squared += difference * difference;
+            }
+            double distance = Math.sqrt(squared);
+            distances[bit++] = distance;
+            total += distance;
+            maximum = Math.max(maximum, distance);
+          }
+        // Legacy mean includes the zero-distance center pixel; its fixed zero bit is omitted.
+        double mean = total / (window * window);
+        textured[p] = maximum >= 4;
+        for (int k = 0; k < distances.length; k++)
+          if (distances[k] >= mean) bits[k / 64][p] |= 1L << (k % 64);
+      }
+    return new DescriptorSet(bits, textured);
+  }
+
+  private static final class DescriptorSet {
+    final long[][] bits;
+    final boolean[] textured;
+
+    DescriptorSet(long[][] bits, boolean[] textured) {
+      this.bits = bits;
+      this.textured = textured;
+    }
+  }
+
+  private float[] match(
+      long[][] a,
+      long[][] b,
+      byte[] grayA,
+      byte[] grayB,
+      boolean[] texturedA,
+      boolean[] texturedB,
+      int width,
+      int height,
+      boolean reverse,
+      Stats stats,
+      byte[] reasons,
+      byte[] searchBoundary)
+      throws IOException {
+    int count = width * height, nd = options.disparities, radius = options.census / 2;
+    float[] gpu =
+        GpuSgm.match(
+            options,
+            a,
+            b,
+            grayA,
+            grayB,
+            texturedA,
+            texturedB,
+            width,
+            height,
+            reverse,
+            stats,
+            reasons,
+            searchBoundary);
+    if (gpu != null) return gpu;
+    long budget =
+        Math.min(options.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .65));
+    if (!options.tiled
+        && ((long) count * nd > Integer.MAX_VALUE - 8
+            || memoryEstimate(width, height, nd, options) > budget))
+      throw new IllegalArgumentException(
+          "CPU fallback SGM volume exceeds memory budget; enable --tiled or reduce dense"
+              + " resolution");
+    if (options.tiled) {
+      if (tiledMemoryEstimate(width, height, nd, options.census, options.memoryMb) > budget)
+        throw new IllegalArgumentException(
+            "CPU fallback SGM rows/descriptors exceed the memory budget");
+      java.nio.file.Files.createDirectories(options.output);
+      long free = java.nio.file.Files.getFileStore(options.output).getUsableSpace();
+      if (free > 0
+          && (long) count * nd * (2 + StereoCost.aggregateBytes(options)) + 16777216L > free)
+        throw new IllegalArgumentException(
+            "CPU fallback needs more temporary disk space for its tiled volume");
+    }
+    try (PagedVolume costs =
+            new PagedVolume(
+                (long) count * nd, 2, INVALID_COST, options.tiled, options, "sgm-cost-");
+        PagedVolume aggregate =
+            new PagedVolume(
+                (long) count * nd,
+                StereoCost.aggregateBytes(options),
+                0,
+                options.tiled,
+                options,
+                "sgm-aggregate-")) {
+      for (int y = radius; y < height - radius; y++) {
+        for (int x = radius; x < width - radius; x++) {
+          int p = y * width + x;
+          long base = (long) p * nd;
+          if (!texturedA[p]) continue;
+          for (int k = 0; k < nd; k++) {
+            int disparity = options.minDisparity + k;
+            long target = (long) x + (reverse ? disparity : -(long) disparity);
+            if (target < radius || target >= width - radius) continue;
+            int q = y * width + (int) target, hamming = 0;
+            if (!texturedB[q]) continue;
+            hamming = StereoCost.value(options, a, b, grayA, grayB, p, q, width);
+            costs.set(base + k, hamming);
+          }
+        }
+      }
+      int[][] paths = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+      int p1 = StereoCost.penalty(options.p1, options), p2 = StereoCost.p2(options);
+      for (int path = 0; path < options.directions; path++) {
+        int dx = paths[path][0], dy = paths[path][1];
+        int[] previous = new int[width * nd], row = new int[width * nd];
+        int yStart = dy < 0 ? height - 1 : 0, yStep = dy < 0 ? -1 : 1;
+        int xStart = dx < 0 ? width - 1 : 0, xStep = dx < 0 ? -1 : 1;
+        for (int yi = 0, y = yStart; yi < height; yi++, y += yStep) {
+          for (int xi = 0, x = xStart; xi < width; xi++, x += xStep) {
+            int px = x - dx, py = y - dy, dest = x * nd;
+            long base = ((long) y * width + x) * nd;
+            boolean hasPrevious =
+                px >= 0 && px < width && py >= 0 && py < height && texturedA[py * width + px];
+            int[] prev = dy == 0 ? row : previous;
+            int prevBase = hasPrevious ? px * nd : 0, minPrev = Integer.MAX_VALUE;
+            if (hasPrevious)
+              for (int k = 0; k < nd; k++) minPrev = Math.min(minPrev, prev[prevBase + k]);
+            int localP2 =
+                hasPrevious
+                    ? StereoCost.pathP2(
+                        p1, p2, options.sgmEdgeScale, grayA, y * width + x, py * width + px)
+                    : p2;
+            for (int k = 0; k < nd; k++) {
+              int value = costs.get(base + k);
+              if (hasPrevious) {
+                int transition = Math.min(prev[prevBase + k], minPrev + localP2);
+                if (k > 0) transition = Math.min(transition, prev[prevBase + k - 1] + p1);
+                if (k + 1 < nd) transition = Math.min(transition, prev[prevBase + k + 1] + p1);
+                value += transition - minPrev;
+              }
+              row[dest + k] = value;
+              aggregate.set(base + k, aggregate.get(base + k) + value);
+            }
+          }
+          int[] swap = previous;
+          previous = row;
+          row = swap;
+        }
+      }
+      float[] result = new float[count];
+      Arrays.fill(result, Float.NaN);
+      for (int y = radius; y < height - radius; y++)
+        for (int x = radius; x < width - radius; x++) {
+          int pixel = y * width + x, best = -1, bestCost = Integer.MAX_VALUE;
+          long base = (long) pixel * nd;
+          for (int k = 0; k < nd; k++)
+            if (costs.get(base + k) != INVALID_COST && aggregate.get(base + k) < bestCost) {
+              best = k;
+              bestCost = aggregate.get(base + k);
+            }
+          if (best < 0) continue;
+          boolean full =
+              costs.get(base) != INVALID_COST && costs.get(base + nd - 1) != INVALID_COST;
+          if (full) {
+            stats.fullIntervalPixels++;
+            if (searchBoundary != null) searchBoundary[pixel] = 4;
+          }
+          if (best == 0 || best == nd - 1) {
+            stats.boundaryRejected++;
+            if (reasons != null) reasons[pixel] = 2;
+            if (full && best == 0) {
+              stats.lowerBoundaryRejected++;
+              if (searchBoundary != null) searchBoundary[pixel] |= 1;
+            }
+            if (full && best == nd - 1) {
+              stats.upperBoundaryRejected++;
+              if (searchBoundary != null) searchBoundary[pixel] |= 2;
+            }
+            continue;
+          }
+          int second = Integer.MAX_VALUE;
+          for (int k = 0; k < nd; k++)
+            if (Math.abs(k - best) > 1 && costs.get(base + k) != INVALID_COST)
+              second = Math.min(second, aggregate.get(base + k));
+          if (second != Integer.MAX_VALUE
+              && second - bestCost <= Math.max(1, bestCost * options.uniqueness)) {
+            stats.ambiguityRejected++;
+            if (reasons != null) reasons[pixel] = 3;
+            continue;
+          }
+          double offset = 0;
+          if (best > 0
+              && best + 1 < nd
+              && costs.get(base + best - 1) != INVALID_COST
+              && costs.get(base + best + 1) != INVALID_COST) {
+            double before = aggregate.get(base + best - 1), after = aggregate.get(base + best + 1);
+            double curvature = before + after - 2.0 * bestCost;
+            if (curvature > 0)
+              offset = Math.max(-.5, Math.min(.5, .5 * (before - after) / curvature));
+          }
+          result[pixel] = (float) (options.minDisparity + best + offset);
+          stats.selected++;
+          if (reasons != null) reasons[pixel] = 0;
+        }
+      return result;
+    }
+  }
+
+  private static int words(int window) {
+    return (window * window - 1 + 63) / 64;
+  }
+
+  private static boolean[] textureMask(byte[] input, int w, int h, int window) {
+    boolean[] mask = new boolean[w * h];
+    int r = window / 2;
+    for (int y = r; y < h - r; y++)
+      for (int x = r; x < w - r; x++) {
+        int low = 255, high = 0;
+        for (int yy = -r; yy <= r; yy++)
+          for (int xx = -r; xx <= r; xx++) {
+            int v = input[(y + yy) * w + x + xx] & 255;
+            low = Math.min(low, v);
+            high = Math.max(high, v);
+          }
+        mask[y * w + x] = high - low >= 4;
+      }
+    return mask;
+  }
+
+  static long[][] census(byte[] input, int w, int h, int window) {
+    int r = window / 2;
+    long[][] descriptors = new long[words(window)][w * h];
+    for (int y = r; y < h - r; y++)
+      for (int x = r; x < w - r; x++) {
+        int p = y * w + x, bit = 0, center = input[p] & 255;
+        for (int yy = -r; yy <= r; yy++)
+          for (int xx = -r; xx <= r; xx++) {
+            if (xx == 0 && yy == 0) continue;
+            if ((input[(y + yy) * w + x + xx] & 255) < center)
+              descriptors[bit / 64][p] |= 1L << (bit % 64);
+            bit++;
+          }
+      }
+    return descriptors;
+  }
+
+  static float[] medianValid(float[] a, int w, int h, int window) {
+    float[] out = a.clone(), values = new float[window * window];
+    int r = window / 2;
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        if (!Float.isFinite(a[y * w + x])) continue; // do not fill occlusions
+        int n = 0;
+        for (int yy = Math.max(0, y - r); yy <= Math.min(h - 1, y + r); yy++)
+          for (int xx = Math.max(0, x - r); xx <= Math.min(w - 1, x + r); xx++) {
+            float v = a[yy * w + xx];
+            if (Float.isFinite(v)) values[n++] = v;
+          }
+        Arrays.sort(values, 0, n);
+        out[y * w + x] = values[n / 2];
+      }
+    return out;
+  }
+
+  /** Ordinary median on smooth support; restrict to the center's layer at a depth discontinuity. */
+  static float[] medianEdgePreserving(
+      float[] a, int w, int h, int window, double maximumChange, byte[] gray, int edgeThreshold) {
+    float[] out = medianValid(a, w, h, window), values = new float[window * window];
+    int r = window / 2;
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        float center = a[y * w + x];
+        if (!Float.isFinite(center)) continue;
+        if (Math.abs(out[y * w + x] - center) < maximumChange) continue;
+        int n = 0;
+        for (int yy = Math.max(0, y - r); yy <= Math.min(h - 1, y + r); yy++)
+          for (int xx = Math.max(0, x - r); xx <= Math.min(w - 1, x + r); xx++) {
+            float value = a[yy * w + xx];
+            if (Float.isFinite(value)
+                && Math.abs(value - center) <= maximumChange
+                && (edgeThreshold == 0
+                    || Math.abs((gray[yy * w + xx] & 255) - (gray[y * w + x] & 255))
+                        <= edgeThreshold)) values[n++] = value;
+          }
+        if (n > 0) {
+          Arrays.sort(values, 0, n);
+          out[y * w + x] = values[n / 2];
+        }
+      }
+    return out;
+  }
+
+  /** Zero-mean normalized cross correlation at the subpixel correspondence. */
+  static boolean reciprocal(
+      float[] right, int w, int h, int x, int y, float disparity, double tolerance, int border) {
+    if (!Float.isFinite(disparity) || y < border || y >= h - border) return false;
+    int xr = Math.round(x - disparity);
+    return xr >= border
+        && xr < w - border
+        && Float.isFinite(right[y * w + xr])
+        && Math.abs(disparity - right[y * w + xr]) <= tolerance;
+  }
+
+  /** Zero-mean normalized cross correlation at the subpixel correspondence. */
+  static double zncc(
+      byte[] a, byte[] b, int w, int h, int x, int y, double disparity, int r, int channels) {
+    double target = x - disparity;
+    int bx = (int) Math.floor(target);
+    double fraction = target - bx;
+    if (x - r < 0 || x + r >= w || y - r < 0 || y + r >= h || bx - r < 0 || bx + r + 1 >= w)
+      return -1;
+    double covariance = 0, varA = 0, varB = 0;
+    int n = (2 * r + 1) * (2 * r + 1);
+    for (int channel = 0; channel < channels; channel++) {
+      double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+      for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++) {
+          int ai = ((y + dy) * w + x + dx) * channels + channel,
+              bi = ((y + dy) * w + bx + dx) * channels + channel;
+          double av = a[ai] & 255,
+              bv = (1 - fraction) * (b[bi] & 255) + fraction * (b[bi + channels] & 255);
+          sa += av;
+          sb += bv;
+          saa += av * av;
+          sbb += bv * bv;
+          sab += av * bv;
+        }
+      covariance += sab - sa * sb / n;
+      varA += saa - sa * sa / n;
+      varB += sbb - sb * sb / n;
+    }
+    if (varA < channels * n * 4 || varB < channels * n * 4) return -1;
+    return covariance / Math.sqrt(Math.max(1e-12, varA * varB));
+  }
+
+  /** Compatibility entry point for four-connected disparity components. */
+  static long removeSpeckles(float[] a, int w, int h, int minimum, double range) {
+    return removeSpeckles(a, w, h, minimum, range, 4);
+  }
+
+  static long removeSpeckles(float[] a, int w, int h, int minimum, double range, int connectivity) {
+    if (minimum <= 1) return 0;
+    boolean[] seen = new boolean[a.length];
+    int[] queue = new int[a.length];
+    long rejected = 0;
+    for (int start = 0; start < a.length; start++) {
+      if (seen[start] || !Float.isFinite(a[start])) continue;
+      int head = 0, tail = 0;
+      queue[tail++] = start;
+      seen[start] = true;
+      while (head < tail) {
+        int p = queue[head++], x = p % w, y = p / w;
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0 || connectivity == 4 && dx != 0 && dy != 0) continue;
+            int xx = x + dx, yy = y + dy;
+            if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+            int q = yy * w + xx;
+            if (seen[q] || !Float.isFinite(a[q]) || Math.abs(a[q] - a[p]) > range) continue;
+            seen[q] = true;
+            queue[tail++] = q;
+          }
+      }
+      if (tail < minimum)
+        for (int i = 0; i < tail; i++) {
+          a[queue[i]] = Float.NaN;
+          rejected++;
+        }
+    }
+    return rejected;
+  }
+
+  public static final class Stats {
+    public long lowerBoundaryRejected, fullIntervalPixels;
+    public long coarseLowerBoundaryRejected, coarseUpperBoundaryRejected, coarseFullIntervalPixels;
+    public long boundaryRejected,
+        upperBoundaryRejected,
+        ambiguityRejected,
+        selected,
+        lrRejected,
+        postMedianLrRejected,
+        photometricRejected,
+        speckleRejected,
+        valid;
+
+    double lowerPressure() {
+      return Math.max(
+          lowerBoundaryRejected / (double) Math.max(1, fullIntervalPixels),
+          coarseLowerBoundaryRejected / (double) Math.max(1, coarseFullIntervalPixels));
+    }
+
+    double upperPressure() {
+      return Math.max(
+          upperBoundaryRejected / (double) Math.max(1, fullIntervalPixels),
+          coarseUpperBoundaryRejected / (double) Math.max(1, coarseFullIntervalPixels));
+    }
+
+    boolean lowerClipped() {
+      return (lowerBoundaryRejected >= 24 || coarseLowerBoundaryRejected >= 12)
+          && lowerPressure() > .02;
+    }
+
+    boolean upperClipped() {
+      return (upperBoundaryRejected >= 24 || coarseUpperBoundaryRejected >= 12)
+          && upperPressure() > .02;
+    }
+
+    public String csv() {
+      return boundaryRejected
+          + ","
+          + upperBoundaryRejected
+          + ","
+          + ambiguityRejected
+          + ","
+          + selected
+          + ","
+          + lrRejected
+          + ","
+          + postMedianLrRejected
+          + ","
+          + photometricRejected
+          + ","
+          + speckleRejected
+          + ","
+          + valid;
+    }
+  }
+
+  public static final class Result {
+    public final int width, height;
+    public final float[] disparity;
+    public final Stats stats;
+    public final float[] correlation, leftRightError;
+
+    public Result(int width, int height, float[] disparity) {
+      this(width, height, disparity, new Stats());
+    }
+
+    public Result(int width, int height, float[] disparity, Stats stats) {
+      this(width, height, disparity, stats, null, null);
+    }
+
+    Result(
+        int width,
+        int height,
+        float[] disparity,
+        Stats stats,
+        float[] correlation,
+        float[] leftRightError) {
+      this.width = width;
+      this.height = height;
+      this.disparity = disparity;
+      this.stats = stats;
+      this.correlation = correlation;
+      this.leftRightError = leftRightError;
+    }
+  }
+
+  interface Observer {
+    void raster(String name, float[] values, int width, int height) throws IOException;
+
+    default void reasons(byte[] codes, int width, int height) throws IOException {}
+
+    default void searchBoundary(byte[] flags, int width, int height) throws IOException {}
+  }
+}

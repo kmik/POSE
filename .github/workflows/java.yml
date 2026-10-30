@@ -1,0 +1,29 @@
+name: Collinea builds and numerical checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  numerical-and-integration-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+        java: ['25']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Locate module
+        shell: bash
+        run: |
+          if [ -f sgm_java/build.sh ]; then echo 'MODULE=sgm_java' >> "$GITHUB_ENV"; else echo 'MODULE=.' >> "$GITHUB_ENV"; fi
+      - name: Linux build and tests
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: ${{ env.MODULE }}
+        run: bash build.sh
+      - name: Windows build and tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ env.MODULE }}
+        run: ./build.ps1

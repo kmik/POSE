@@ -1,0 +1,16 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>fi.lasutils</groupId><artifactId>photogrammetry</artifactId><version>0.1.0</version>
+  <name>Collinea</name>
+  <description>Java and OpenCL photogrammetry with semi-global stereo and multi-view surface fusion</description>
+  <properties><maven.compiler.release>25</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
+  <dependencies>
+    <dependency><groupId>org.openpnp</groupId><artifactId>opencv</artifactId><version>4.9.0-0</version></dependency>
+    <dependency><groupId>org.locationtech.proj4j</groupId><artifactId>proj4j</artifactId><version>1.4.3</version></dependency>
+    <dependency><groupId>org.locationtech.proj4j</groupId><artifactId>proj4j-epsg</artifactId><version>1.4.3</version></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.7.1</version><executions><execution><id>runtime</id><phase>package</phase><goals><goal>copy-dependencies</goal></goals><configuration><outputDirectory>${project.basedir}/lib</outputDirectory></configuration></execution></executions></plugin>
+  </plugins></build>
+</project>
