@@ -1,28 +1,28 @@
 # Collinea
 
-**From overlapping photographs to georeferenced point clouds.**
+Collinea reconstructs point clouds from overlapping photographs. It is written in Java, with OpenCL acceleration for dense stereo matching and depth fusion, and can run on its own or as part of [LAS.utils](https://github.com/kmik/LAS.utils).
 
-Collinea is a Java photogrammetry tool with OpenCL acceleration, semi-global stereo matching and multi-view depth fusion. Run it as a standalone command-line program or integrate it with [LAS.utils](https://github.com/kmik/LAS.utils).
-
-![Example Collinea reconstruction colored by elevation](docs/images/city-point-cloud.png)
-
-*Example reconstruction, colored by elevation. Image supplied by the maintainer.*
+![Point cloud colored by elevation](docs/images/city-point-cloud.png)
 
 ## Features
 
-- Feature matching, camera registration and joint bundle adjustment.
-- Shared focal/radial-distortion estimation when constrained by the imagery; measured camera calibration and poses can be fixed, prior-constrained or refined from initial values.
-- Census, AD-Census, Census-gradient and ZNCC stereo costs, automatic pair-specific disparity ranges and configurable filtering intensity.
-- OpenCL SGM and depth fusion, allocation banks, continuous strip streaming, exact range-proved aggregate storage and CPU fallbacks.
-- Reprojection-based depth refinement and normal-aware consolidation with distinct-camera support and resolved-layer checks.
-- LAS/PLY clouds, surface normals, roughness/planarity diagnostics and aligned point-confidence records.
-- GPS georeferencing, orientation interchange, reusable project directories and optional detailed diagnostics/caching.
+- Feature matching, camera alignment and bundle adjustment.
+- Automatic focal length and radial distortion estimation, or supplied camera calibration and poses.
+- Semi-global stereo matching with Census, AD-Census, Census-gradient and ZNCC costs.
+- Per-pair disparity range estimation and multi-view depth filtering.
+- Reprojection-based depth refinement and normal-aware surface consolidation.
+- GPS georeferencing and import/export of interior and exterior orientations.
+- LAS and PLY output, including normals, roughness, planarity and point confidence.
 
-## Requirements and build
+## Build
 
-Use a **64-bit JDK 25 or newer**, with `JAVA_HOME` set or `java`/`javac` on PATH. The build downloads OpenCV 4.9.0-0, Proj4J 1.4.3 and Proj4J EPSG 1.4.3 into `lib/`; subsequent builds reuse them. No system OpenCV, C++ compiler or CUDA toolkit is needed.
+Requirements:
 
-Windows x64 is exercised locally. Linux x64 with glibc has launch/build scripts and configured CI, but its runtime still needs validation; Alpine/musl is unsupported. GPU operation additionally needs a vendor OpenCL runtime; GPU fusion/surface kernels require FP64. CPU processing works without OpenCL.
+- **64-bit JDK 25 or later**, with `JAVA_HOME` set or `java` and `javac` on PATH.
+- Internet access for the first build, which downloads OpenCV 4.9.0-0 and Proj4J 1.4.3 into `lib/`.
+- A vendor OpenCL runtime for GPU processing. GPU depth fusion also requires double-precision support (FP64).
+
+Windows x64 is tested locally. Linux x64 with glibc has build scripts, but [Linux CI currently fails during the test suite's OpenCL discovery](https://github.com/kmik/Collinea/actions/runs/41132915982). Alpine/musl is unsupported. CPU reconstruction does not require OpenCL; the test-suite discovery failure is a separate issue.
 
 From the repository root:
 
@@ -38,9 +38,9 @@ bash build.sh
 bash photogrammetry.sh -h
 ```
 
-Both scripts compile and run the numerical/integration suite, creating fixtures under `target/`. `mvn package` compiles and copies dependencies but does not run the custom integration suite. Local `tools/jdk-25*` installations are recognized by Windows launchers and excluded from source control.
+The build scripts compile the program and run the test suite. Test files go under `target/`. `mvn package` compiles and copies dependencies without running this suite. No system OpenCV installation or CUDA toolkit is needed.
 
-## Reconstruct a project
+## Run
 
 ```powershell
 .\photogrammetry.bat `
@@ -66,55 +66,72 @@ bash photogrammetry.sh \
   --memory-mb 4096
 ```
 
-Omit calibration to attempt automatic estimation. Ambiguous geometry or insufficient focal information can prevent a reliable solution; supply measured calibration when needed. Supplied calibration/poses are **fixed by default**; choose `--intrinsics-mode prior|initial` or `--extrinsics-mode prior|initial` to refine them. See [orientation interchange](ORIENTATIONS.md).
+Without a calibration file, Collinea estimates calibration from image metadata and geometry. If the images do not constrain it well enough, supply a measured calibration. Supplied calibration and poses are fixed by default. Use `--intrinsics-mode prior` or `initial`, and `--extrinsics-mode prior` or `initial`, to refine them. The [orientation documentation](ORIENTATIONS.md) covers these modes and supported file formats.
 
-Running without arguments, or with `-h`, prints every argument and examples.
+Run with no arguments or `-h` for the complete option list.
 
-## Resolution and resources
+## Resolution and filtering
 
-| Setting | Purpose |
-| --- | --- |
-| `--quality ultra|high|medium|low` | Original dimensions divided by 1, 2, 4 or 8; never upsample |
-| Default quality: `custom` | Fit within `--max-dimension`, default 1600 on the longest side; smaller images stay smaller |
-| `--filtering mild|moderate|aggressive` | Depth filtering strength, independent of resolution |
-| `--step N` | Sample candidates every N pixels in each axis; smaller means more fusion work |
-| `--compute auto|cpu|gpu` | Stereo backend; auto chooses eligible GPU plans and retains CPU fallback |
-| `--memory-mb N` | Processing budget in MiB; launchers enlarge Java heap when necessary |
-| `--gpu-memory-mb N` | Device-memory budget in MiB; omitted defaults to 70% of reported VRAM |
-| `--gpu-sgm streamed` | Bounded GPU strips and continuous path state; temporary disk required |
-| `--sgm-aggregate auto|16|32` | Exact aggregate storage with a proved bound and automatic 32-bit fallback |
-| `--point-attributes surface|none` | Surface attributes or compact XYZ/RGB clouds |
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--quality` | `custom` | `ultra`, `high`, `medium` and `low` divide the original width and height by 1, 2, 4 and 8. `custom` uses the longest-side limit below. |
+| `--max-dimension` | `1600` | Longest-side limit in pixels for `custom` quality. If explicitly supplied, it also caps a named quality preset. Aspect ratio is preserved; images are never upsampled. |
+| `--step` | `2` | Sample one dense candidate every N pixels along each axis of the processed image. Step 2 samples about one candidate per four pixels. It does not reduce the stereo matching resolution. |
+| `--filtering` | `moderate` | `mild`, `moderate` or `aggressive` depth filtering. This changes acceptance thresholds, not image size. |
 
-Java heap, native OpenCV allocations, GPU buffers and temporary files are separate resource pools. Leave physical RAM for native processing and the operating system. Use `--estimate-memory` to inspect a workload. See [performance/storage details](PERFORMANCE_AND_ATTRIBUTES.md).
+For a 6000 × 4000 image, the default is **1600 × 1067**. `--quality high` gives **3000 × 2000**: the implicit 1600 limit does not apply to named presets. Adding `--max-dimension 2000` caps that result at **2000 × 1333**.
 
-## Project outputs
+Lowering `--step` produces more candidates for fusion, but the disparity map is calculated at the same resolution. Change `--quality` or `--max-dimension` to change that resolution.
 
-Each invocation creates `<output>/runs/<run-id>/`:
+## Memory and processing
+
+Memory arguments use **MiB**: 1024 MiB is 1 GiB.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--memory-mb` | `2048` | Processing-buffer budget, not a limit on total process RAM. An explicit value raises the command-line JVM heap if needed; a larger existing heap is retained. |
+| `PHOTOGRAMMETRY_HEAP` (environment variable) | `8g` | Initial maximum Java heap used by the launch scripts. `--memory-mb` can raise it further. |
+| `--compute` | `auto` | `auto` selects GPU stereo when suitable and falls back to CPU. `cpu` selects CPU stereo; `gpu` requires a compatible GPU plan. Fusion inherits this choice unless overridden below. |
+| `--fusion-compute` | `inherit` | Override depth fusion separately with `cpu`, `auto` or `gpu`. Auto allows CPU fallback; GPU mode requires FP64 support. |
+| `--gpu-memory-mb` | `0` (automatic) | GPU working-set budget. Automatic uses 70% of reported VRAM. Explicit values are capped at 95%; available memory and device allocation limits can reduce what fits. |
+| `--gpu-sgm` | `auto` | Auto tries a full GPU cost/aggregate volume, then disk-backed strip streaming. `resident` or `streamed` selects either method explicitly. Streaming retains path state across strips and uses temporary disk space. |
+| `--sgm-aggregate` | `auto` | Use 16-bit aggregate storage when the configured costs and penalties fit; otherwise use 32-bit. `16` rejects an unsafe configuration, while `32` forces 32-bit storage. |
+| `--point-attributes` | `surface` | Include normals and surface metrics in LAS/PLY. `none` writes compact XYZ/RGB cloud records. The confidence CSV remains available. |
+
+Native OpenCV memory is additional to the Java heap. For example, `--memory-mb 4096` requests a 4 GiB processing budget, not a 4 GiB total RAM limit. Feature extraction and bundle adjustment run on CPU. See [performance and storage details](PERFORMANCE_AND_ATTRIBUTES.md) for the remaining CPU/GPU stages and memory estimates.
+
+Use `--estimate-memory` with the input directory and intended resolution settings to inspect the plan before reconstructing a project.
+
+## Output
+
+Each run is saved under `<output>/runs/<run-id>/`:
 
 ```text
 00_inputs/       Image inventory and processing metadata
-01_calibration/  Source/processed interior orientations
-02_features/     Feature diagnostics, depending on storage profile
+01_calibration/  Source and processed interior orientations
+02_features/     Feature diagnostics
 03_matches/      Pair and track diagnostics
-04_geometry/     Final camera poses and reusable orientation model
+04_geometry/     Camera poses and orientation archive
 05_stereo/       Stereo ranges and depth/disparity diagnostics
-06_fusion/       Fusion/consolidation metrics and performance reports
-07_results/      Final LAS/PLY clouds and point-confidence.csv.gz
+06_fusion/       Fusion and consolidation reports
+07_results/      LAS/PLY clouds and point-confidence.csv.gz
 ```
 
-Interior/exterior orientation archives are saved automatically. Additional interchange formats can be exported during processing or afterward with `--export-orientations RUN_DIRECTORY`. Photos need not be reprocessed. See [project layout](PROJECT_FORMAT.md).
+The amount of diagnostic data depends on the storage profile. `--storage standard` is the default; `--storage debug` keeps detailed intermediates. Stage caching is enabled with `--cache`. Temporary depth and surface files are removed after use. Previous runs are retained.
 
-`--storage standard` avoids exhaustive intermediates; `--storage debug` keeps detailed diagnostics. Reuse caching is opt-in with `--cache`. Working depth/surface files are cleaned up after use; existing project runs are retained.
+Interior and exterior orientations are saved automatically. Additional formats can be exported during a run or afterward with `--export-orientations RUN_DIRECTORY`, without processing the photos again. See [project layout](PROJECT_FORMAT.md) and [orientation formats](ORIENTATIONS.md).
 
-## LAS.utils integration
+## LAS.utils
 
-Copy this project into `sgm_java/` at the LAS.utils repository root. Copy the wrappers from `las-utils/` into the LAS.utils root and build the module there. Its dedicated classpath avoids mixing packaged OpenCV 4.9 with LAS.utils' older jar. The default-package entry point is `photogrammetry`.
+Copy this repository into `sgm_java/` at the LAS.utils root, then copy the wrappers from `las-utils/` into that root and build the module. Collinea uses its own classpath to keep OpenCV 4.9 separate from LAS.utils' older OpenCV jar. The Java entry point is `photogrammetry`.
 
-## Accuracy and current limits
+## Limitations
 
-This tool is under active development. Estimated stereo uncertainty excludes camera/GPS errors, and local smoothness does not establish survey accuracy. GPS supplies a horizontal georeference, default EPSG:3067; EXIF altitude has an unspecified vertical datum and no geoid/N2000 correction is applied. Negative Z values can be valid.
+Automatic calibration needs sufficient overlap and camera geometry. Estimated stereo uncertainty does not include errors in calibration, camera poses or GPS.
 
-SGM streaming does not yet provide fully windowed image processing. Native-resolution large aerial blocks and camera rigs need further scaling work. LAS uses version 1.2, point format 2 with optional Extra Bytes, and a maximum of 4,294,967,295 points per file. Attribute display depends on the reader; the aligned CSV remains available.
+The default horizontal output CRS for GPS georeferencing is EPSG:3067. Heights retain EXIF GPS altitude; no geoid or N2000 conversion is applied. Negative Z values can be valid.
+
+Very large aerial images and blocks need further work on image I/O, camera groups and memory use. LAS output uses version 1.2, point format 2, with optional Extra Bytes and a maximum of 4,294,967,295 points per file. Reader support for extra attributes varies; the same attributes are available in the CSV sidecar.
 
 ## Documentation
 
@@ -123,7 +140,7 @@ SGM streaming does not yet provide fully windowed image processing. Native-resol
 - [Project artifacts](PROJECT_FORMAT.md)
 - [Storage and GPU processing](STORAGE_GPU.md)
 - [Thin structures and SGM penalties](THIN_STRUCTURES.md)
-- [Validation evidence and limitations](VALIDATION.md)
+- [Validation](VALIDATION.md)
 - [Third-party dependencies](THIRD_PARTY_NOTICES.md)
 
-Maintained by [kmik](https://github.com/kmik). No project license has been assigned yet; third-party components retain their own licenses.
+Author: [Mikko Kukkonen](https://github.com/kmik). No project license has been selected; dependencies retain their own licenses.

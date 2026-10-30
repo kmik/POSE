@@ -12,4 +12,4 @@ The OpenPnP artifact's embedded Maven metadata declares a BSD License; OpenCV 4.
 
 LAS output uses the published [ASPRS LAS specification](https://www.asprs.org/wp-content/uploads/2019/07/LAS_1_4_r15.pdf). Algorithm/background references remain in the technical documentation. Local JDKs, formatting tools, original C++ third-party libraries, downloaded reference software and generated datasets are excluded from the standalone source package.
 
-The README illustration was supplied by the maintainer and is included as a project example; no separate image license has been assigned.
+The example point-cloud image has no separate license.
