@@ -13,6 +13,7 @@ Collinea reconstructs point clouds from overlapping photographs. It is written i
 - Reprojection-based depth refinement and normal-aware surface consolidation.
 - GPS georeferencing and import/export of interior and exterior orientations.
 - LAS and PLY output, including normals, roughness, planarity and point confidence.
+- Self-contained processing reports with all parameter values, stage timings, resource measurements and a DSM overview.
 
 ## Build
 
@@ -22,7 +23,7 @@ Requirements:
 - Internet access for the first build, which downloads OpenCV 4.9.0-0, Proj4J 1.4.3 and TwelveMonkeys ImageIO 3.15.3 into `lib/`.
 - A vendor OpenCL runtime for GPU processing. GPU depth fusion also requires double-precision support (FP64).
 
-Windows x64 is tested locally on NVIDIA and AMD OpenCL devices. Linux x64 with glibc has build scripts and a CI job. Alpine/musl is unsupported. CPU reconstruction does not require OpenCL.
+Windows x64 is tested locally on NVIDIA and AMD OpenCL devices. Windows and Linux x64/glibc build-and-test jobs have passed CI. Alpine/musl is unsupported. CPU reconstruction does not require OpenCL.
 
 From the repository root:
 
@@ -102,6 +103,8 @@ Memory arguments use **MiB**: 1024 MiB is 1 GiB.
 
 Native OpenCV memory is additional to the Java heap. For example, `--memory-mb 4096` requests a 4 GiB processing budget, not a 4 GiB total RAM limit. Feature extraction and bundle adjustment run on CPU. See [performance and storage details](PERFORMANCE_AND_ATTRIBUTES.md) for the remaining CPU/GPU stages and memory estimates.
 
+Fusion depth evidence has a separate bounded CPU page cache; see [fusion and consolidation controls](FOLLOWUP_PERFORMANCE.md).
+
 Use `--estimate-memory` with the input directory and intended resolution settings to inspect the plan before reconstructing a project. See [large-image processing and measured memory use](SCALING.md) for backend selection, commands and limits.
 
 ### Image and feature storage
@@ -132,6 +135,8 @@ Each run is saved under `<output>/runs/<run-id>/`:
 
 The amount of diagnostic data depends on the storage profile. `--storage standard` is the default; `--storage debug` keeps detailed intermediates. Stage caching is enabled with `--cache`. Temporary depth and surface files are removed after use. Previous runs are retained.
 
+The default report is `07_results/processing-report.html`, with all effective processing options, supplied arguments, timings/resources and an embedded DSM preview when the coordinate frame permits it. [Report controls and regeneration](PROCESSING_REPORT.md) explain the JSON and GeoTIFF outputs.
+
 Interior and exterior orientations are saved automatically. Additional formats can be exported during a run or afterward with `--export-orientations RUN_DIRECTORY`, without processing the photos again. See [project layout](PROJECT_FORMAT.md) and [orientation formats](ORIENTATIONS.md).
 
 ## LAS.utils
@@ -148,6 +153,8 @@ Windowed source loading and bounded raster/descriptor caches reduce large-image 
 
 ## Documentation
 
+- [Processing report, complete parameter values and DSM](PROCESSING_REPORT.md)
+- [Fusion/consolidation throughput and progress](FOLLOWUP_PERFORMANCE.md)
 - [Surface processing, performance and exported attributes](PERFORMANCE_AND_ATTRIBUTES.md)
 - [Large-image processing, exact streaming and compact SGM](SCALING.md)
 - [Earlier disk-free SGM research](ESGM_RESEARCH.md)

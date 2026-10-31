@@ -62,7 +62,13 @@ final class DepthFusion implements AutoCloseable {
     }
     pagePool =
         new PagedVolume.Pool(
-            Math.min(64 * 1048576L, Math.max(1048576L, options.memoryMb * 1048576L / 8)));
+            Math.max(
+                    1,
+                    options.fusionCacheMb > 0
+                        ? options.fusionCacheMb
+                        : Math.min(512, options.memoryMb / 8))
+                * 1048576L,
+            128);
   }
 
   int addPair(int a, int b) {
@@ -164,6 +170,10 @@ final class DepthFusion implements AutoCloseable {
   boolean surfaceDisplacement(int source, double[] before, double[] after) {
     PairDepth p = pairs.get(source);
     return backProjection(p, before, after);
+  }
+
+  boolean surfaceDisplacement(int source, double[] before, double[] direction, double amount) {
+    return surfaceDisplacement(source, before, Math3.add(before, Math3.times(direction, amount)));
   }
 
   GpuSurface surfaceDevice(int capacity) {
@@ -587,6 +597,10 @@ final class DepthFusion implements AutoCloseable {
             : "Fusion backend: OpenCL GPU (FP64 depth lookup, consensus and refinement)");
   }
 
+  int pipelineCapacity() {
+    return options.fusionBatchSize;
+  }
+
   Result[] fuseBatch(int[] source, double[][] points, int count) {
     return batch(source, points, count, options.depthRefinement, true);
   }
@@ -616,10 +630,19 @@ final class DepthFusion implements AutoCloseable {
         clock = System.nanoTime();
         // Continuous sparse CPU audit detects driver/compiler disagreements before publishing a
         // batch.
-        int audits =
-            refinement ? Math.min(8, count) : Math.min(8, Math.max(1, (count + 511) / 512));
-        for (int j = 0; j < audits; j++) {
-          int i = j * (count - 1) / Math.max(1, audits - 1);
+        List<Integer> auditIndices = new ArrayList<>();
+        if (refinement) {
+          for (int base = 0; base < count; base += 4096) {
+            int n = Math.min(4096, count - base), audits = Math.min(8, n);
+            for (int j = 0; j < audits; j++)
+              auditIndices.add(base + j * (n - 1) / Math.max(1, audits - 1));
+          }
+        } else {
+          int audits = Math.min(8, Math.max(1, (count + 511) / 512));
+          for (int j = 0; j < audits; j++)
+            auditIndices.add(j * (count - 1) / Math.max(1, audits - 1));
+        }
+        for (int i : auditIndices) {
           Result cpu = fuse(source[i], points[i], refinement);
           if (!equivalent(cpu, results[i]))
             throw new IllegalStateException(
@@ -699,10 +722,20 @@ final class DepthFusion implements AutoCloseable {
         cpuCandidates,
         "numerically_guarded_cpu_candidates",
         guardedCandidates,
-        "cpu_audit_samples_per_batch",
+        "cpu_audit_samples_per_4096_candidate_block",
         8,
         "depth_cache_bytes",
         pagePool.limit,
+        "depth_page_side",
+        options.fusionPageSide,
+        "depth_page_reads",
+        pagePool.reads,
+        "depth_page_writes",
+        pagePool.writes,
+        "depth_page_evictions",
+        pagePool.evictions,
+        "depth_file_opens",
+        pagePool.fileOpens,
         "gpu_batch_nanoseconds",
         gpuNanos,
         "cpu_guard_nanoseconds",

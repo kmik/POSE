@@ -65,7 +65,13 @@ final class DenseReconstruction {
           if (!frames.get(pair.a).camera.registered || !frames.get(pair.b).camera.registered)
             continue;
           int source = fusion.addPair(pair.a, pair.b);
-          long n = pair(frames.get(pair.a), frames.get(pair.b), source, count, out);
+          long n;
+          try (WorkProgress work =
+              WorkProgress.start(
+                  "Rectify/match/triangulate pair " + pair.a + "-" + pair.b, 0, "pixels")) {
+            n = pair(frames.get(pair.a), frames.get(pair.b), source, count, out);
+            work.done();
+          }
           count += n;
           if (project != null)
             project.event(
@@ -95,7 +101,10 @@ final class DenseReconstruction {
       if (count == 0)
         throw new IOException(
             "No dense candidates; check disparity range, camera calibration, and baseline");
-      fusion.prepare(count);
+      try (WorkProgress work = WorkProgress.start("Prepare fusion evidence/backend", 0, "pixels")) {
+        fusion.prepare(count);
+        work.done();
+      }
       System.out.printf(
           Locale.ROOT, "Fusion: processing %,d candidates from stereo depth evidence%n", count);
       long fusionProgress = System.nanoTime();
@@ -104,6 +113,8 @@ final class DenseReconstruction {
       long normalNanos = 0;
       try (DataInputStream in =
               new DataInputStream(new BufferedInputStream(Files.newInputStream(candidates)));
+          WorkProgress fusionWork =
+              WorkProgress.start("Fusion candidates / normal estimation", count, "candidates");
           FusionOutput output = new FusionOutput(options, fusion, project, crs);
           FusionPipeline pipeline =
               new FusionPipeline(
@@ -114,10 +125,11 @@ final class DenseReconstruction {
                   (options.surfaceConsolidation.equals("normal")
                       || options.pointAttributes.equals("surface")))) {
         {
-          int capacity = GpuFusion.MAX_BATCH;
+          int capacity = pipeline.capacity();
           FusionPipeline.Batch batch = null;
           for (long i = 0; i < count; i++) {
             int offset = (int) (i % capacity);
+            if ((i & 4095) == 0) fusionWork.update(i);
             if (offset == 0) {
               if (batch != null) fusionOutputNanos += System.nanoTime() - outputStarted;
               batch = pipeline.next();
@@ -155,8 +167,19 @@ final class DenseReconstruction {
           }
           if (batch != null) fusionOutputNanos += System.nanoTime() - outputStarted;
         }
+        fusionWork.update(count);
+        fusionWork.done();
+        fusionWork.close();
         pipeline.close();
         normalNanos = pipeline.normalNanos();
+        System.out.printf(
+            Locale.ROOT,
+            "Fusion: 100.0%% (%,d/%,d), %,d retained, %,d rejected; candidate processing"
+                + " complete%n",
+            count,
+            count,
+            output.count(),
+            fusionRejected);
         output.finish();
         kept = output.count();
         beforeSurface = output.stagedCount();
@@ -240,7 +263,9 @@ final class DenseReconstruction {
   private long pair(
       ImageFrame a, ImageFrame b, int source, long firstCandidate, DataOutputStream out)
       throws IOException {
+    long rectificationStarted = System.nanoTime();
     try (Rectified rectified = rectify(a, b, false, source)) {
+      RunTelemetry.record("Rectification pair " + a.id + "-" + b.id, rectificationStarted);
       int w = rectified.leftGray.cols(), h = rectified.leftGray.rows();
       byte[] left = new byte[w * h], right = new byte[w * h];
       rectified.leftGray.get(0, 0, left);
@@ -344,6 +369,8 @@ final class DenseReconstruction {
                 project == null || !options.storage.equals("debug")
                     ? null
                     : project.data.directory("05_stereo/" + prefix + "/" + folder));
+        RunTelemetry.record(
+            "Stereo matching/filtering " + prefix + " attempt " + attempt, matchingStarted);
         System.out.printf(
             Locale.ROOT,
             "Stereo %s: matching/filtering complete in %.2f s; %,d valid depth pixels%n",
@@ -360,6 +387,8 @@ final class DenseReconstruction {
                 matching.disparities,
                 "max_disparity",
                 matching.minDisparity + matching.disparities - 1,
+                "matching_filtering_seconds",
+                (System.nanoTime() - matchingStarted) / 1e9,
                 "lower_boundary_rejected",
                 result.stats.lowerBoundaryRejected,
                 "upper_boundary_rejected",
@@ -534,6 +563,7 @@ final class DenseReconstruction {
           triangulationProgress = System.nanoTime();
         }
       }
+      RunTelemetry.record("Triangulation/depth evidence " + prefix, triangulationStarted);
       System.out.printf(
           Locale.ROOT,
           "Triangulating %s: complete in %.2f s; %,d candidates%n",

@@ -1,0 +1,348 @@
+{
+  "date": "2026-10-31",
+  "platform": "Windows 11; NVIDIA RTX 5070 Laptop GPU; Java 25.0.5",
+  "scope": "Local observations, not surveyed aerial accuracy or a universal speedup",
+  "fusion": {
+    "before": {
+      "synthetic": true,
+      "candidates": 131072,
+      "accepted": 130168,
+      "fusion_seconds": 2.0535539,
+      "total_seconds": 7.3271527,
+      "decision_geometry_sha256": "6c801d4e3fb6c203fb45c5fd0f9714518dc5a955e53787dca3cb9d6bc7ae6905",
+      "backend": {
+        "gpu_candidates": 131072,
+        "cpu_candidates": 0,
+        "numerically_guarded_cpu_candidates": 0,
+        "cpu_audit_samples_per_batch": 8,
+        "depth_cache_bytes": 67108864,
+        "gpu_batch_nanoseconds": 184973300,
+        "cpu_guard_nanoseconds": 1080000,
+        "cpu_audit_nanoseconds": 1841310500,
+        "cpu_batch_nanoseconds": 0,
+        "weight_math": "direct",
+        "measurement_layout": "coalesced",
+        "pipeline_enabled": true,
+        "measured_view_reprojection": true,
+        "depth_refinement_method": "reprojection",
+        "gpu_resources": {
+          "device": "NVIDIA GeForce RTX 5070 Laptop GPU",
+          "resident_evidence_bytes": 157286400,
+          "batch_capacity": 4096,
+          "preparation_seconds": 4.0277438,
+          "guard_reasons": {
+            "threshold": 0,
+            "reprojection": 0,
+            "mode_tie": 0,
+            "independent_tie": 0,
+            "weighted_median": 0,
+            "lookup": 0,
+            "uncertainty": 0
+          },
+          "opencl_profile": {
+            "device_kernel_nanoseconds": {
+              "lookup": 25147744,
+              "finish_fusion": 65343648
+            },
+            "blocking_write_nanoseconds": 58515300,
+            "blocking_read_nanoseconds": 87524600,
+            "uploaded_bytes": 160961508,
+            "downloaded_bytes": 7340032
+          }
+        }
+      },
+      "scope": "GPU fusion with all CPU audits and disk-backed evidence; quantized geometry hash at 1e-8 coordinate units and sigma 1e-10"
+    },
+    "after": {
+      "synthetic": true,
+      "candidates": 131072,
+      "accepted": 130168,
+      "fusion_seconds": 0.3646751,
+      "total_seconds": 4.1973483,
+      "decision_geometry_sha256": "6c801d4e3fb6c203fb45c5fd0f9714518dc5a955e53787dca3cb9d6bc7ae6905",
+      "backend": {
+        "gpu_candidates": 131072,
+        "cpu_candidates": 0,
+        "numerically_guarded_cpu_candidates": 0,
+        "cpu_audit_samples_per_4096_candidate_block": 8,
+        "depth_cache_bytes": 268435456,
+        "depth_page_side": 64,
+        "depth_page_reads": 0,
+        "depth_page_writes": 0,
+        "depth_page_evictions": 0,
+        "depth_file_opens": 0,
+        "gpu_batch_nanoseconds": 239917900,
+        "cpu_guard_nanoseconds": 1055300,
+        "cpu_audit_nanoseconds": 87027100,
+        "cpu_batch_nanoseconds": 0,
+        "weight_math": "direct",
+        "measurement_layout": "coalesced",
+        "pipeline_enabled": true,
+        "measured_view_reprojection": true,
+        "depth_refinement_method": "reprojection",
+        "gpu_resources": {
+          "device": "NVIDIA GeForce RTX 5070 Laptop GPU",
+          "resident_evidence_bytes": 157286400,
+          "batch_capacity": 16384,
+          "preparation_seconds": 2.9423729,
+          "guard_reasons": {
+            "threshold": 0,
+            "reprojection": 0,
+            "mode_tie": 0,
+            "independent_tie": 0,
+            "weighted_median": 0,
+            "lookup": 0,
+            "uncertainty": 0
+          },
+          "opencl_profile": {
+            "device_kernel_nanoseconds": {
+              "lookup": 24100640,
+              "finish_fusion": 60153184
+            },
+            "blocking_write_nanoseconds": 50304600,
+            "blocking_read_nanoseconds": 84990800,
+            "uploaded_bytes": 160961508,
+            "downloaded_bytes": 7340032
+          }
+        }
+      },
+      "scope": "GPU fusion with all CPU audits and disk-backed evidence; quantized geometry hash at 1e-8 coordinate units and sigma 1e-10"
+    }
+  },
+  "consolidation": {
+    "before": {
+      "input_samples": 6503432,
+      "output_samples": 893665,
+      "decision_geometry_sha256": "78eed122b547f0f57eff4b689ef7ac1ca3b38dfbefb7cc57a69f23695fefe2f7",
+      "plane_rms": 0.0008004411852905127,
+      "finish_seconds": 223.180766,
+      "total_seconds": 233.7921528,
+      "synthetic": true,
+      "scope": "Consolidation-only synthetic load; excludes images/SGM, not user city workload"
+    },
+    "after": {
+      "input_samples": 6503432,
+      "output_samples": 893665,
+      "decision_geometry_sha256": "78eed122b547f0f57eff4b689ef7ac1ca3b38dfbefb7cc57a69f23695fefe2f7",
+      "plane_rms": 0.0008004411852905127,
+      "finish_seconds": 206.5073103,
+      "total_seconds": 214.1270666,
+      "largest_sampler_gap_seconds": 1.0059731,
+      "timing_valid": true,
+      "synthetic": true,
+      "scope": "Consolidation-only synthetic load; excludes images/SGM, not user city workload"
+    },
+    "timing_note": "Sequential synthetic runs; final run used a scoped system-awake request, released afterward. Earlier candidate results varied and are not claimed as improvements.",
+    "temporary_disk_bytes_before": 207257655,
+    "temporary_disk_bytes_after": 424554962
+  },
+  "real_partition_only": {
+    "before": {
+      "source": "Read-only sample of completed real forest cloud; not the original pre-consolidation evidence",
+      "samples": 497034,
+      "finish_seconds": 3.8867138,
+      "total_seconds": 4.6943314,
+      "sha256": "bb2475ab97f1667f0c116626a81ce98e0acc6346f3be5d4a4b2ac594803dd32c",
+      "scope": "Partition routing and ordered passthrough of unreliable-normal samples; excludes neighborhood/refinement work"
+    },
+    "after": {
+      "source": "Read-only sample of completed real forest cloud; not the original pre-consolidation evidence",
+      "samples": 497034,
+      "finish_seconds": 1.9074433,
+      "total_seconds": 2.6000877,
+      "sha256": "bb2475ab97f1667f0c116626a81ce98e0acc6346f3be5d4a4b2ac594803dd32c",
+      "scope": "Partition routing and ordered passthrough of unreliable-normal samples; excludes neighborhood/refinement work"
+    }
+  },
+  "excluded_interrupted_timing": {
+    "input_samples": 6503432,
+    "output_samples": 893665,
+    "decision_geometry_sha256": "78eed122b547f0f57eff4b689ef7ac1ca3b38dfbefb7cc57a69f23695fefe2f7",
+    "plane_rms": 0.0008004411852905127,
+    "finish_seconds": 1184.6784902,
+    "total_seconds": 1192.8618746,
+    "largest_sampler_gap_seconds": 976.5609591,
+    "timing_valid": false,
+    "synthetic": true,
+    "scope": "Consolidation-only synthetic load; excludes images/SGM, not user city workload"
+  },
+  "regional_experiment": {
+    "status": "research_not_production",
+    "results": [
+      {
+        "fixture": "plane",
+        "width": 512,
+        "height": 256,
+        "disparities": 128,
+        "ordinary": {
+          "seconds": 1.9451049,
+          "metrics": {
+            "valid": 121644,
+            "eligible": 126208,
+            "coverage": 0.9638374746450304,
+            "bad_over_1_px": 0,
+            "rms_error_px": 0.10067156076099229,
+            "p95_abs_error_px": 0.21428489685058594,
+            "fence_samples": 0,
+            "fence_eligible": 0,
+            "fence_p95_error_px": null
+          },
+          "common_with_ordinary": 121644,
+          "common_difference_over_1_px": 0,
+          "mean_common_difference_px": 0.0,
+          "extra_valid": 0,
+          "lost_valid": 0,
+          "stats": "977,0,426,126613,3385,0,1584,0,121644"
+        },
+        "guarded-regional": {
+          "seconds": 32.1458167,
+          "metrics": {
+            "valid": 125645,
+            "eligible": 126208,
+            "coverage": 0.9955391100405679,
+            "bad_over_1_px": 0,
+            "rms_error_px": 0.10067184221680146,
+            "p95_abs_error_px": 0.21428489685058594,
+            "fence_samples": 0,
+            "fence_eligible": 0,
+            "fence_p95_error_px": null
+          },
+          "common_with_ordinary": 121644,
+          "common_difference_over_1_px": 0,
+          "mean_common_difference_px": 5.555809090990539e-06,
+          "extra_valid": 4003,
+          "lost_valid": 0,
+          "stats": "798,0,477,129797,3751,0,399,0,125647"
+        }
+      },
+      {
+        "fixture": "fences-and-layers",
+        "width": 512,
+        "height": 256,
+        "disparities": 128,
+        "ordinary": {
+          "seconds": 0.9325554,
+          "metrics": {
+            "valid": 104466,
+            "eligible": 117524,
+            "coverage": 0.8888907797556244,
+            "bad_over_1_px": 321,
+            "rms_error_px": 1.9390036256491674,
+            "p95_abs_error_px": 0.2241382598876953,
+            "fence_samples": 1062,
+            "fence_eligible": 5376,
+            "fence_p95_error_px": 39.07619094848633
+          },
+          "common_with_ordinary": 104864,
+          "common_difference_over_1_px": 0,
+          "mean_common_difference_px": 0.0,
+          "extra_valid": 0,
+          "lost_valid": 0,
+          "stats": "1060,23,2368,124588,10283,0,9441,0,104864"
+        },
+        "guarded-regional": {
+          "seconds": 29.9776139,
+          "metrics": {
+            "valid": 108277,
+            "eligible": 117524,
+            "coverage": 0.9213181988359824,
+            "bad_over_1_px": 335,
+            "rms_error_px": 1.9499117839126519,
+            "p95_abs_error_px": 0.2241382598876953,
+            "fence_samples": 1153,
+            "fence_eligible": 5376,
+            "fence_p95_error_px": 39.072288513183594
+          },
+          "common_with_ordinary": 104854,
+          "common_difference_over_1_px": 0,
+          "mean_common_difference_px": 2.7984239177073375e-05,
+          "extra_valid": 3846,
+          "lost_valid": 10,
+          "stats": "869,23,2391,127812,10817,0,8295,0,108700"
+        }
+      },
+      {
+        "fixture": "repeated-texture",
+        "width": 512,
+        "height": 256,
+        "disparities": 128,
+        "ordinary": {
+          "seconds": 0.9178793,
+          "metrics": {
+            "valid": 69,
+            "eligible": 117524,
+            "coverage": 0.000587114121370954,
+            "bad_over_1_px": 69,
+            "rms_error_px": 25.365108375519224,
+            "p95_abs_error_px": 51.25,
+            "fence_samples": 14,
+            "fence_eligible": 5376,
+            "fence_p95_error_px": 51.25
+          },
+          "common_with_ordinary": 69,
+          "common_difference_over_1_px": 0,
+          "mean_common_difference_px": 0.0,
+          "extra_valid": 0,
+          "lost_valid": 0,
+          "stats": "4971,4716,43589,79456,79387,0,0,0,69"
+        },
+        "guarded-regional": {
+          "seconds": 30.1393983,
+          "metrics": {
+            "valid": 9487,
+            "eligible": 117524,
+            "coverage": 0.08072393723835132,
+            "bad_over_1_px": 355,
+            "rms_error_px": 9.267514078488746,
+            "p95_abs_error_px": 0.27272796630859375,
+            "fence_samples": 2,
+            "fence_eligible": 5376,
+            "fence_p95_error_px": 51.0
+          },
+          "common_with_ordinary": 9,
+          "common_difference_over_1_px": 9,
+          "mean_common_difference_px": 11.993394003974068,
+          "extra_valid": 9501,
+          "lost_valid": 60,
+          "stats": "4568,4398,46494,80010,70290,0,210,0,9510"
+        }
+      }
+    ]
+  },
+  "real_image_replay": {
+    "images": 3,
+    "final_points": 35089,
+    "full_file_comparisons": {
+      "dense.ply": {
+        "before_sha256": "c25bcb6fa5a8eb61673825d18b712ae60474476f073c768b3f26e2abd3710946",
+        "after_sha256": "c25bcb6fa5a8eb61673825d18b712ae60474476f073c768b3f26e2abd3710946",
+        "identical": true
+      },
+      "dense.las": {
+        "before_sha256": "ce145c36df77e803aed594143e19dfc2c6d7a4c151e6b69013d73d56c505c075",
+        "after_sha256": "ce145c36df77e803aed594143e19dfc2c6d7a4c151e6b69013d73d56c505c075",
+        "identical": true
+      }
+    },
+    "parameter_fields_checked": 181,
+    "configured_and_effective_parameters": 185,
+    "peak_sampled_resident_bytes": 871784448,
+    "peak_tracked_opencl_buffer_bytes": 403200128,
+    "scope": "Fixed-camera three-image city replay; unchanged processing settings and filtering"
+  },
+  "validation": {
+    "complete_suite_checks": 2139,
+    "amd_fusion_checks": 60,
+    "amd_surface_checks": 58,
+    "amd_followup_checks": 54,
+    "new_throughput_report_checks": 198,
+    "independent_geotiff_decoder": "Pillow; Float32 samples, dimensions, scale/tiepoint, EPSG:3067, pixel-is-area and NaN nodata verified",
+    "old_run_report": "26,839,787 final points; historical missing resource peaks remain unavailable",
+    "remaining_limits": [
+      "No native-scale Vexcel field validation",
+      "Packed per-pixel disparity bands deferred after failed regional gate",
+      "Weighted medians and ordered representatives remain CPU work",
+      "Routed coordinate scratch can increase temporary disk space"
+    ]
+  }
+}

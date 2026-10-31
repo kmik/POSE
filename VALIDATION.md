@@ -1,5 +1,12 @@
 # Local validation
 
+## Fusion, consolidation and processing reports (2026-10-31)
+
+Complete Windows suite: **2,139 checks**, including **198** throughput/report checks. AMD parity: fusion **60**, surface **58**, follow-up **54** checks. The fixed-camera city replay yields a byte-identical final PLY with **35,089 points**. Exact consolidation output and merge membership are preserved for **6,503,432 samples**. Independent Pillow decoding verifies Float32 DSM values, EPSG:3067, pixel-is-area transforms and NaN nodata. Every public processing option is checked against archived effective parameters; sampled RAM and tracked OpenCL allocations are verified separately.
+
+Measurements, rejected experiments, temporary-disk tradeoffs and limits: [FOLLOWUP_PERFORMANCE.md](FOLLOWUP_PERFORMANCE.md), `research/followup/results-2026-10-31.json`. Reports from older runs do not invent missing historical memory peaks or settings.
+
+
 ## Collinea follow-up: performance and attributes (2026-10-30)
 
 Verified production release: `target/collinea-final` (134 production class files, 55 test class files), copied byte-for-byte into the normal launcher directories. Previous compiled directories are retained; `target/collinea-installed.json` records their locations. The IDE can rebuild normal output directories: a later local rebuild was observed without changes to Java source, and its installed launcher was also replayed successfully. `target/collinea-validation.json` records release and installed hashes at the final check.

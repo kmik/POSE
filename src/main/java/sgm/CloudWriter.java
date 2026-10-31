@@ -110,7 +110,8 @@ public final class CloudWriter implements AutoCloseable {
       double[] offsets = new double[3];
       for (int i = 0; i < 3; i++) offsets[i] = min[i] + (max[i] - min[i]) / 2;
       Path las = directory.resolve("dense.las.part"), ply = directory.resolve("dense.ply.part");
-      try (OutputStream lasOut = new BufferedOutputStream(Files.newOutputStream(las));
+      try (WorkProgress work = WorkProgress.start("Final LAS/PLY export", count, "points");
+          OutputStream lasOut = new BufferedOutputStream(Files.newOutputStream(las));
           OutputStream plyOut = new BufferedOutputStream(Files.newOutputStream(ply));
           DataInputStream in =
               new DataInputStream(new BufferedInputStream(Files.newInputStream(spool)))) {
@@ -159,6 +160,7 @@ public final class CloudWriter implements AutoCloseable {
                     .order(ByteOrder.LITTLE_ENDIAN);
         byte[] extra = attributes ? new byte[SurfaceAttributes.BYTES] : new byte[0];
         for (long p = 0; p < count; p++) {
+          if ((p & 8191) == 0) work.update(p);
           double x = in.readDouble(), y = in.readDouble(), z = in.readDouble();
           int r = in.readUnsignedByte(), g = in.readUnsignedByte(), b = in.readUnsignedByte();
           record.clear();
@@ -185,6 +187,7 @@ public final class CloudWriter implements AutoCloseable {
           vertex.put(extra);
           plyOut.write(vertex.array());
         }
+        work.done();
       }
       publish(las, directory.resolve("dense.las"));
       publish(ply, directory.resolve("dense.ply"));

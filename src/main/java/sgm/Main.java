@@ -28,6 +28,10 @@ public final class Main {
         return 0;
       }
       nu.pattern.OpenCV.loadLocally();
+      if (options.exportReport != null) {
+        ProcessingReport.export(options);
+        return 0;
+      }
       if (options.analyzeRun != null) {
         SurfaceDiagnostics.analyze(options);
         return 0;

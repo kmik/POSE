@@ -117,7 +117,7 @@ final class GpuFusion implements AutoCloseable {
       long fixed = evidenceBytes + 1048576L + images * 256L + endpoints * 32L;
       long perCandidate =
           24 + 4 + endpoints * 52L + images * 12L + pairs * 8L + (pairs + 1L) * 24 + 56;
-      int capacity = MAX_BATCH;
+      int capacity = options.fusionBatchSize;
       while (capacity >= 32
           && (fixed + capacity * perCandidate > budget
               || capacity * (long) endpoints * 48 > cl.device.allocation())) capacity /= 2;

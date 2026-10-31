@@ -20,6 +20,9 @@ final class Project {
   private final String[] arguments;
   private final Options options;
   private FileChannel lockChannel;
+  private RunTelemetry telemetry;
+  private final Map<String, WorkProgress> stageWork = new LinkedHashMap<>();
+  private final Map<String, Long> stageStarted = new LinkedHashMap<>();
   private FileLock lock;
   private static final String FORMAT = "msgm-java-project-v1";
   private static final String[] STAGES = {
@@ -114,6 +117,8 @@ final class Project {
               System.getProperty("os.name"),
               "native_opencv_version",
               org.opencv.core.Core.VERSION));
+      telemetry = new RunTelemetry(run, options);
+      Files.writeString(run.resolve("logs/command-help.txt"), Options.help());
       Properties effective = new Properties();
       try {
         for (java.lang.reflect.Field field : Options.class.getFields()) {
@@ -130,6 +135,7 @@ final class Project {
             writer, "Effective run options; reconstruction adds processed camera information");
       }
     } catch (IOException | RuntimeException e) {
+      if (telemetry != null) telemetry.close();
       releaseLock();
       throw e;
     }
@@ -138,9 +144,7 @@ final class Project {
   void stage(String name, String status, String detail) throws IOException {
     if (!stages.containsKey(name))
       throw new IllegalArgumentException("Unknown project stage " + name);
-    stages.put(
-        name,
-        Json.object("status", status, "updated_utc", Instant.now().toString(), "detail", detail));
+    transition(name, status, detail);
     event("stage", Json.object("stage", name, "status", status, "detail", detail));
     Json.write(run.resolve("run.json"), runDescription("running", null));
   }
@@ -210,7 +214,13 @@ final class Project {
     try {
       finishLocked(success, error);
     } finally {
-      releaseLock();
+      try {
+        if (telemetry != null) telemetry.close();
+      } finally {
+        for (WorkProgress work : stageWork.values()) work.close();
+        stageWork.clear();
+        releaseLock();
+      }
     }
   }
 
@@ -218,8 +228,12 @@ final class Project {
     IOException ioFailure = null;
     try {
       data.close();
-      organize();
-      if (success) publishAliases();
+      try (WorkProgress work =
+          WorkProgress.start("Finalize project exports and compatibility copies", 0, "files")) {
+        organize();
+        if (success) publishAliases();
+        work.done();
+      }
     } catch (IOException e) {
       ioFailure = e;
       success = false;
@@ -244,8 +258,16 @@ final class Project {
     event(
         success ? "run_complete" : "run_failed",
         Json.object("error", error == null ? null : error.toString()));
+    Json.write(run.resolve("run.json"), runDescription(status, error));
+    if (telemetry != null) telemetry.persist();
+    if (options.processingReport.equals("html"))
+      ProcessingReport.generate(options, run, run.resolve("07_results"));
+    if (telemetry != null) telemetry.close();
     writeIndex();
-    catalog();
+    try (WorkProgress work = WorkProgress.start("Catalog project artifacts", 0, "files")) {
+      catalog();
+      work.done();
+    }
     Json.write(run.resolve("run.json"), runDescription(status, error));
     if (success) marker.setProperty("latest_successful_run", id);
     persistProject(status);
@@ -261,9 +283,30 @@ final class Project {
   }
 
   private void stageFinal(String name, String state, String detail) {
-    stages.put(
-        name,
-        Json.object("status", state, "updated_utc", Instant.now().toString(), "detail", detail));
+    transition(name, state, detail);
+  }
+
+  private void transition(String name, String state, String detail) {
+    Map<String, Object> previous = stages.get(name);
+    Map<String, Object> entry = new LinkedHashMap<>(previous);
+    entry.put("status", state);
+    entry.put("updated_utc", Instant.now().toString());
+    entry.put("detail", detail);
+    if (state.equals("running")) {
+      if (!stageWork.containsKey(name)) {
+        stageStarted.put(name, System.nanoTime());
+        stageWork.put(name, WorkProgress.start("Stage " + name + " — " + detail, 0, "units"));
+        entry.put("started_utc", Instant.now().toString());
+      } else stageWork.get(name).detail(detail);
+    } else {
+      WorkProgress work = stageWork.remove(name);
+      if (work != null) {
+        if (state.equals("complete")) work.done();
+        work.close();
+        entry.put("elapsed_seconds", (System.nanoTime() - stageStarted.get(name)) / 1e9);
+      }
+    }
+    stages.put(name, entry);
   }
 
   private Object runDescription(String status, Throwable error) {
@@ -488,6 +531,10 @@ final class Project {
           "07_results/dense.las",
           "07_results/dense.ply",
           "07_results/report.txt",
+          "07_results/processing-report.html",
+          "07_results/processing-report.json",
+          "07_results/dsm.tif",
+          "logs/processing.json",
           "07_results/coordinates.json",
           "00_inputs/images.csv",
           "01_calibration/reference_interior.json",

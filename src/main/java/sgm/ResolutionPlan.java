@@ -98,7 +98,9 @@ final class ResolutionPlan {
     long residentEvidence =
         o.diskDepth
             ? Math.min(
-                evidence, Math.min(64 * 1048576L, Math.max(1048576L, o.memoryMb * 1048576L / 8)))
+                evidence,
+                Math.max(1, o.fusionCacheMb > 0 ? o.fusionCacheMb : Math.min(512, o.memoryMb / 8))
+                    * 1048576L)
             : evidence;
     List<Integer> counts = new ArrayList<>(Arrays.asList(64, 128, 256, 512));
     if (!counts.contains(o.disparities)) counts.add(o.disparities);

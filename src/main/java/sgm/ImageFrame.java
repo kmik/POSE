@@ -81,7 +81,8 @@ final class ImageFrame implements AutoCloseable {
   void loadRasters() throws IOException {
     if (!gray.empty()) return;
     Mat resized = new Mat(), loaded = new Mat();
-    try {
+    try (WorkProgress work =
+        WorkProgress.start("Decode/resize/undistort " + path.getFileName(), 0, "pixels")) {
       boolean windowed = sourceReader().equals("imageio_source_windows");
       if (windowed) {
         resized.release();
@@ -112,6 +113,7 @@ final class ImageFrame implements AutoCloseable {
         ones.release();
       }
       Imgproc.cvtColor(color, gray, Imgproc.COLOR_BGR2GRAY);
+      work.done();
     } catch (RuntimeException | IOException | Error e) {
       releaseRasters();
       throw e;

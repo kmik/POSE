@@ -209,3 +209,9 @@ Linux launch/build support remains included; Linux execution of this export work
 ## Surface attribute extensions
 
 Current LAS/PLY attributes and the appended confidence columns are documented in [PERFORMANCE_AND_ATTRIBUTES.md](PERFORMANCE_AND_ATTRIBUTES.md). `--point-attributes surface` is the default; `none` restores compact XYZ/RGB cloud records. Source-depth normals and metrics travel with final representatives; they are not a refit to the final cloud.
+
+## Processing report and resource telemetry
+
+New runs archive all effective public processing options (including null/unset values) and initial settings, monotonic task timings and sampled resources in `logs/processing.json`. `logs/request.json` retains supplied arguments; `logs/command-help.txt` captures the processing version's option descriptions. `run.json` stage records include start timestamps and elapsed seconds.
+
+`07_results/processing-report.html` is a self-contained printable report; `processing-report.json` preserves the report data, resolved camera/pair settings and provenance. Projected runs also produce bounded Float32 `dsm.tif`, `dsm.tfw`, `dsm.png` and `dsm.json`, with explicit nodata, CRS and height-reference notes. Report generation does not change cloud geometry. `--export-report RUN_DIRECTORY` regenerates these products without reconstruction; older missing measurements are labeled unavailable. See [PROCESSING_REPORT.md](PROCESSING_REPORT.md).

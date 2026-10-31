@@ -65,6 +65,7 @@ public final class SelfTest {
     checks += RegularizationSurfaceRegression.run();
     checks += SurfaceFusionRegression.run(root);
     checks += FollowupRegression.run(root);
+    checks += FollowupThroughputRegression.run(root.resolve("throughput-report"));
     checks += ScalingRegression.run(root);
     checks += EsgmProductionRegression.run(root);
     checks += ImageResourceRegression.run(root.resolve("image-resources"));

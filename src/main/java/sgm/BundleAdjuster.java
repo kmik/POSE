@@ -59,6 +59,21 @@ final class BundleAdjuster {
       int anchor,
       int scaleCamera)
       throws IOException {
+    try (WorkProgress work = WorkProgress.start("Joint bundle adjustment", 0, "iterations")) {
+      optimizeImpl(frames, tracks, iterations, huber, project, anchor, scaleCamera);
+      work.done();
+    }
+  }
+
+  private static void optimizeImpl(
+      List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks,
+      int iterations,
+      double huber,
+      Project project,
+      int anchor,
+      int scaleCamera)
+      throws IOException {
     double[] origin = frames.get(anchor).camera.center();
     double baseline = Math3.norm(Math3.sub(frames.get(scaleCamera).camera.center(), origin));
     if (!(baseline > 1e-9) || !Double.isFinite(baseline))

@@ -71,7 +71,7 @@ public final class Options {
   public String depthRefinementMethod = "reprojection", surfaceConsolidation = "normal";
   public double surfaceRadius = 2, surfaceSpacing = 1, surfaceMaxShift = 2;
   public double surfaceNormalAngle = 30;
-  public int surfaceMemoryMb = 128;
+  public int surfaceMemoryMb = 128, surfaceBatchSize = 64;
   public String surfaceValidation = "auto", pointAttributes = "surface";
   public int correlationWindow = 7, speckleSize = 50, minViews = 3;
   public String filtering = "moderate", filteringOverrides = "";
@@ -94,6 +94,12 @@ public final class Options {
   public boolean fusionPipeline = true;
   public boolean fusionMeasuredReprojection = true;
   public int outputCompression = 6;
+  public String surfacePartition = "routed", processingReport = "html", reportDsmStatistic = "max";
+  public int fusionPageSide = 64, fusionCacheMb = 0, fusionBatchSize = 16384;
+  public int reportDsmMaxDimension = 1024, reportDsmMinPoints = 1;
+  public double reportDsmResolution = 0;
+  public boolean reportLocalDsm;
+  public Path exportReport, reportOutput;
   public boolean cache, listGpus;
   public int gpuDevice;
   public long gpuMemoryMb;
@@ -119,6 +125,9 @@ public final class Options {
         key = key.substring(0, eq);
       }
       switch (key) {
+        case "--report-local-dsm":
+          o.reportLocalDsm = true;
+          continue;
         case "--legacy-fusion-reprojection":
           o.fusionMeasuredReprojection = false;
           continue;
@@ -603,6 +612,7 @@ public final class Options {
           o.disparities = Integer.parseInt(v);
           o.disparitiesExplicit = true;
           break;
+        case "--similarity-window":
         case "--ws_census":
           o.census = Integer.parseInt(v);
           break;
@@ -635,6 +645,42 @@ public final class Options {
         case "-cores":
           o.cores = Integer.parseInt(v);
           break;
+        case "--surface-batch-size":
+          o.surfaceBatchSize = Integer.parseInt(v);
+          break;
+        case "--surface-partition":
+          o.surfacePartition = v;
+          break;
+        case "--fusion-page-side":
+          o.fusionPageSide = Integer.parseInt(v);
+          break;
+        case "--fusion-cache-mb":
+          o.fusionCacheMb = Integer.parseInt(v);
+          break;
+        case "--fusion-batch-size":
+          o.fusionBatchSize = Integer.parseInt(v);
+          break;
+        case "--report":
+          o.processingReport = v;
+          break;
+        case "--export-report":
+          o.exportReport = Paths.get(v);
+          break;
+        case "--report-output":
+          o.reportOutput = Paths.get(v);
+          break;
+        case "--report-dsm-resolution":
+          o.reportDsmResolution = number(v);
+          break;
+        case "--report-dsm-max-dimension":
+          o.reportDsmMaxDimension = Integer.parseInt(v);
+          break;
+        case "--report-dsm-min-points":
+          o.reportDsmMinPoints = Integer.parseInt(v);
+          break;
+        case "--report-dsm-statistic":
+          o.reportDsmStatistic = v;
+          break;
         case "--memory-mb":
           o.memoryMb = Long.parseLong(v);
           break;
@@ -653,6 +699,29 @@ public final class Options {
     }
     o.applyFilteringPreset(explicitFiltering);
     if (o.help) return o;
+    choice(o.surfacePartition, "--surface-partition", "routed", "recursive");
+    choice(o.processingReport, "--report", "html", "none");
+    choice(o.reportDsmStatistic, "--report-dsm-statistic", "max", "mean");
+    if (o.surfaceBatchSize < 1
+        || o.surfaceBatchSize > 1024
+        || o.fusionPageSide < 16
+        || o.fusionPageSide > 512
+        || (o.fusionPageSide & (o.fusionPageSide - 1)) != 0
+        || o.fusionCacheMb < 0
+        || o.fusionBatchSize < 32
+        || o.fusionBatchSize > 65536
+        || o.reportDsmResolution < 0
+        || o.reportDsmMaxDimension < 16
+        || o.reportDsmMaxDimension > 4096
+        || o.reportDsmMinPoints < 1)
+      throw new IllegalArgumentException("Invalid fusion cache/batch or report DSM settings");
+    if (o.exportReport != null) {
+      if (!Files.isDirectory(o.exportReport)
+          || o.analyzeRun != null
+          || o.exportOrientations != null)
+        throw new IllegalArgumentException("Choose a valid standalone report run directory");
+      return o;
+    }
     if (o.analyzeRun != null) {
       if (!Files.isDirectory(o.analyzeRun)
           || o.analysisSamples < 20
@@ -1147,8 +1216,8 @@ Dense stereo / SGM:
       stable non-edge matches within +/-0.75 pixels using grayscale correlation,
       before left/right checks. Can reduce pixel-locking/ripple on textured planes;
       costs CPU time and does not repair inaccurate calibration or orientation.
-  --ws_census N
-      Census window side in pixels (default: 5; odd, 3..11). Larger windows
+  --similarity-window N, --ws_census N
+      Dense Census/ZNCC similarity window side in pixels (default: 5; odd, 3..11). Larger windows
       gather more context but can blur depth boundaries and increase memory.
   --ws_mFilter N
       Valid-disparity median window side (default: 3; odd, 1..11; 1 disables).
@@ -1188,6 +1257,23 @@ Dense stereo / SGM:
       positive). Reciprocity is checked again after median filtering.
 
 Point filtering and multi-view fusion:
+  --fusion-page-side N
+      Depth evidence page side (default: 64; powers of two, 16..512). Smaller pages
+      reduce random audit/normal lookup I/O. Exact interleaved depth/offset values.
+  --fusion-cache-mb N
+      CPU depth-page cache MiB (default: 0 = min(512, memory-mb/8), at least 1).
+      Additional to GPU evidence and native image buffers; preserves all audits.
+  --fusion-batch-size N
+      Fusion/pipeline batch ceiling (default: 16384; 32..65536); actual GPU batches
+      may shrink to fit VRAM/allocation limits. Does not change filtering rules.
+  --surface-batch-size N
+      GPU surface proposal look-ahead ceiling (default: 64; 1..1024), reduced
+      by the surface memory allowance. Ordered CPU representatives remain intact.
+      Use 64 for the previous ceiling.
+  --surface-partition routed|recursive
+      Default routed plans exact spatial splits using a small coordinate file,
+      then compresses final partitions once. Recursive retains the reference
+      repeated gzip split path. Routed may use more peak temporary disk space.
   --filtering NAME
       mild, moderate (default), aggressive: progressively stricter depth/mode,
       reprojection, correlation and speckle thresholds. Explicit overrides win
@@ -1519,6 +1605,27 @@ Additional workflow controls:
       Retain per-pair depth evidence in heap. Default project runs use paged disk
       storage, independent of --tiled, to reduce accumulated depth-map memory.
 
+Processing report:
+  --report html|none
+      Default html writes a self-contained 07_results/processing-report.html and
+      report JSON with all parameter values, supplied arguments, timings/resources.
+  --export-report RUN_DIRECTORY
+      Regenerate a report from a completed run without reconstruction. Missing
+      historical parameters/resources are labeled unavailable, never invented.
+  --report-output DIRECTORY
+      Standalone report destination (default: RUN_DIRECTORY/07_results/report).
+  --report-dsm-resolution N
+      DSM cell size in final output units (default: 0 = automatic). Positive sizes
+      exceeding the dimension cap are rejected; never silently coarsened.
+  --report-dsm-max-dimension N
+      Bound each DSM grid side (default: 1024; 16..4096). Auto resolution fits it.
+  --report-dsm-statistic max|mean
+      Surface-cell statistic (default: max); no ground classification or gap fill.
+  --report-dsm-min-points N
+      Minimum samples per DSM cell (default: 1); others remain nodata.
+  --report-local-dsm
+      Explicitly allow local XY/Z surface raster without a geographic CRS. Default
+      produces a DSM only when archived coordinates establish a projected CRS.
 Orientation import/export (supported variants and conventions in ORIENTATIONS.md):
   --orientation-input FILE_OR_DIRECTORY
       Combined interior/exterior source. Per-image intrinsics are supported;

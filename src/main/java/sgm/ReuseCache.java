@@ -38,6 +38,10 @@ final class ReuseCache {
 
   private static final String ENGINE = engine();
 
+  static String engineIdentifier() {
+    return ENGINE;
+  }
+
   private static String engine() {
     MessageDigest d = digest();
     for (Class<?> c :

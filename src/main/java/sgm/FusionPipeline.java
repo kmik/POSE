@@ -19,10 +19,15 @@ final class FusionPipeline implements AutoCloseable {
   private Future<Batch> next;
   private long remaining;
   private final boolean normals;
+  private final int capacity;
   private long normalNanos;
 
   long normalNanos() {
     return normalNanos;
+  }
+
+  int capacity() {
+    return capacity;
   }
 
   FusionPipeline(DataInputStream in, long count, DepthFusion fusion, boolean asynchronous) {
@@ -34,6 +39,7 @@ final class FusionPipeline implements AutoCloseable {
     this.in = in;
     this.fusion = fusion;
     this.normals = normals;
+    capacity = fusion.pipelineCapacity();
     remaining = count;
     worker =
         asynchronous
@@ -43,7 +49,7 @@ final class FusionPipeline implements AutoCloseable {
   }
 
   private Batch read() throws IOException {
-    int n = (int) Math.min(GpuFusion.MAX_BATCH, remaining);
+    int n = (int) Math.min(capacity, remaining);
     if (n == 0) return null;
     remaining -= n;
     double[][] p = new double[n][];

@@ -1,5 +1,7 @@
 # Large images and GPU memory
 
+The subsequent [fusion/consolidation update](FOLLOWUP_PERFORMANCE.md) adds exact routed partition preparation, evidence-cache controls and explicit progress. [Processing reports](PROCESSING_REPORT.md) include all effective options, resource measurements, stage times and a DSM.
+
 The production matcher now handles stereo volumes that exceed VRAM without requiring a full aggregate file on disk. This changes storage and scheduling; image resolution, filtering thresholds, path directions and subpixel estimates are retained.
 
 ## Backend selection

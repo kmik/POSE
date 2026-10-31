@@ -5,7 +5,7 @@ import java.io.*;
 /** Two exact 32-bit channels. Project maps share a bounded global page/file-handle pool. */
 final class DepthRaster implements AutoCloseable {
   final int length;
-  private final PagedVolume depth, offset;
+  private final PagedVolume values;
 
   DepthRaster(int n, Options o) throws IOException {
     this(n, o, null);
@@ -15,37 +15,31 @@ final class DepthRaster implements AutoCloseable {
     length = n;
     Options pages = o.copy();
     pages.output = o.output.resolve("06_fusion/storage");
-    pages.tileSize = 512;
+    pages.tileSize = o.fusionPageSide;
     pages.disparities = 1;
     pages.memoryMb = 16;
     boolean disk = o.diskDepth && (o.projectDirectory != null || o.cacheDirectory != null);
-    depth = new PagedVolume(n, 4, 0, disk, pages, "depth-", false, pool);
-    offset = new PagedVolume(n, 4, 0, disk, pages, "offset-", false, pool);
+    values = new PagedVolume(2L * n, 4, 0, disk, pages, "depth-offset-", false, pool);
   }
 
   float get(int p) {
-    return Float.intBitsToFloat(depth.get(p));
+    return Float.intBitsToFloat(values.get(2L * p));
   }
 
   int offset(int p) {
-    return offset.get(p);
+    return values.get(2L * p + 1);
   }
 
   void put(int p, float z, int packed) {
-    depth.set(p, Float.floatToRawIntBits(z));
-    offset.set(p, packed);
+    values.set(2L * p, Float.floatToRawIntBits(z));
+    values.set(2L * p + 1, packed);
   }
 
   public void close() throws IOException {
-    try {
-      depth.close();
-    } finally {
-      offset.close();
-    }
+    values.close();
   }
 
   void discard() throws IOException {
-    depth.deleteBackingFile();
-    offset.deleteBackingFile();
+    values.deleteBackingFile();
   }
 }

@@ -2,6 +2,7 @@ package sgm;
 
 import java.io.*;
 import java.nio.*;
+import java.nio.channels.*;
 import java.nio.file.*;
 import java.util.*;
 
@@ -106,7 +107,11 @@ final class SurfaceConsolidator implements AutoCloseable {
   private final DepthFusion fusion;
   private final Path directory;
   private final Tile root;
-  private DataOutputStream spool;
+  private DataOutputStream spool, coordinates;
+  private Path coordinateFile;
+  private long coordinateBytes, coordinatePasses, routedRecords;
+  private String partitionStrategy;
+  private WorkProgress partitionProgress, surfaceProgress;
   private final List<Tile> leaves = new ArrayList<>();
   private final int capacity;
   private double largestFootprint;
@@ -151,6 +156,13 @@ final class SurfaceConsolidator implements AutoCloseable {
     directory = Files.createTempDirectory(options.output, "surface-work-");
     root = new Tile(directory.resolve("accepted.bin.gz"));
     spool = output(root.path);
+    partitionStrategy = options.surfacePartition;
+    if (partitionStrategy.equals("routed")) {
+      coordinateFile = directory.resolve("coordinates.bin");
+      coordinates =
+          new DataOutputStream(
+              new BufferedOutputStream(Files.newOutputStream(coordinateFile), 1048576));
+    }
     // Includes Java object/hash-grid overhead, halo records and sort/query scratch.
     long budget = Math.min(options.surfaceMemoryMb, Math.max(8, options.memoryMb / 4)) * 1048576L;
     decodedLimit = budget / 8;
@@ -161,6 +173,10 @@ final class SurfaceConsolidator implements AutoCloseable {
     if (finished) throw new IOException("Surface input is closed");
     write(spool, p);
     root.include(p);
+    if (coordinates != null) {
+      coordinates.writeInt(0);
+      for (double value : p.point) coordinates.writeDouble(value);
+    }
     if (p.footprint > 0 && Double.isFinite(p.footprint)) {
       largestFootprint = Math.max(largestFootprint, p.footprint);
       // Deterministic reservoir, so later views also influence the typical sampling scale.
@@ -174,17 +190,32 @@ final class SurfaceConsolidator implements AutoCloseable {
   }
 
   void finish(Sink sink) throws IOException {
+    System.out.println("Surface preparation: finalizing accepted-sample spool");
     spool.close();
     spool = null;
+    if (coordinates != null) {
+      coordinates.close();
+      coordinates = null;
+      coordinateBytes = Files.size(coordinateFile);
+    }
     finished = true;
     compressedInputBytes = Files.size(root.path);
-    temporaryBytes = peakTemporaryBytes = compressedInputBytes;
+    temporaryBytes = peakTemporaryBytes = compressedInputBytes + coordinateBytes;
     if (root.count == 0) {
       report();
       return;
     }
     long clock = System.nanoTime();
-    split(root, 0);
+    try (WorkProgress work =
+        WorkProgress.start("Surface spatial partition preparation", 0, "record visits")) {
+      partitionProgress = work;
+      if (partitionStrategy.equals("routed") && root.count > capacity / 4) splitRouted();
+      else split(root, 0);
+      work.done();
+    } finally {
+      partitionProgress = null;
+    }
+    if (coordinateFile != null) Files.deleteIfExists(coordinateFile);
     splitNanos += System.nanoTime() - clock;
     Arrays.sort(footprints, 0, footprintCount);
     double typical = footprintCount == 0 ? 1 : footprints[footprintCount / 2];
@@ -204,41 +235,53 @@ final class SurfaceConsolidator implements AutoCloseable {
       System.out.println("Surface GPU neighborhoods unavailable; using CPU: " + e.getMessage());
     }
     long progress = System.nanoTime();
-    for (int index = 0; index < leaves.size(); index++) {
-      Tile owner = leaves.get(index);
-      double halo =
-          owner.queryFootprint
-              * Math.hypot(options.surfaceRadius * options.step, options.surfaceMaxShift);
-      // A normal-directed cylinder lies inside this sphere; round outwards for world-coordinate
-      // error.
-      halo =
-          Math.nextUp(
-              halo
-                  + 1e-10
-                  + 8
-                      * Math.ulp(
-                          Math.max(
-                              Math.abs(owner.min[0]),
-                              Math.max(Math.abs(owner.min[1]), Math.abs(owner.min[2])))));
-      maximumHalo = Math.max(maximumHalo, halo);
-      process(owner, halo, cellSize, sink);
-      if (System.nanoTime() - progress > 5_000_000_000L || index + 1 == leaves.size()) {
-        System.out.printf(
-            Locale.ROOT,
-            "Surface consolidation: %d/%d partitions; %,d output, %,d redundant samples combined,"
-                + " %,d positions refined%n",
-            index + 1,
-            leaves.size(),
-            emitted,
-            merged,
-            moved);
-        progress = System.nanoTime();
+    try (WorkProgress work =
+        WorkProgress.start("Surface consolidation", leaves.size(), "partitions")) {
+      surfaceProgress = work;
+      for (int index = 0; index < leaves.size(); index++) {
+        work.detail("partition " + (index + 1) + "/" + leaves.size() + "; loading halo evidence");
+        Tile owner = leaves.get(index);
+        double halo =
+            owner.queryFootprint
+                * Math.hypot(options.surfaceRadius * options.step, options.surfaceMaxShift);
+        // A normal-directed cylinder lies inside this sphere; round outwards for world-coordinate
+        // error.
+        halo =
+            Math.nextUp(
+                halo
+                    + 1e-10
+                    + 8
+                        * Math.ulp(
+                            Math.max(
+                                Math.abs(owner.min[0]),
+                                Math.max(Math.abs(owner.min[1]), Math.abs(owner.min[2])))));
+        maximumHalo = Math.max(maximumHalo, halo);
+        process(owner, halo, cellSize, sink);
+        work.update(index + 1);
+        if (System.nanoTime() - progress > 5_000_000_000L || index + 1 == leaves.size()) {
+          System.out.printf(
+              Locale.ROOT,
+              "Surface consolidation: %d/%d partitions; %,d output, %,d redundant samples combined,"
+                  + " %,d positions refined%n",
+              index + 1,
+              leaves.size(),
+              emitted,
+              merged,
+              moved);
+          progress = System.nanoTime();
+        }
       }
+      work.done();
+    } finally {
+      surfaceProgress = null;
     }
     report();
   }
 
   private void split(Tile t, int depth) throws IOException {
+    if (partitionProgress != null)
+      partitionProgress.detail(
+          "recursive gzip split depth " + depth + "; completed partitions " + leaves.size());
     if (t.count <= capacity / 4 || depth >= 28) {
       leaves.add(t);
       return;
@@ -262,8 +305,11 @@ final class SurfaceConsolidator implements AutoCloseable {
         Tile owner = record.getDouble(28 + axis * 8) < mid ? a : b;
         (owner == a ? left : right).write(raw, 0, bytes);
         owner.includeRaw(record, bytes);
+        if (partitionProgress != null && (i & 16383) == 0)
+          partitionProgress.update(routedRecords + i);
       }
     }
+    routedRecords += t.count;
     temporaryBytes += Files.size(a.path) + Files.size(b.path);
     peakTemporaryBytes = Math.max(peakTemporaryBytes, temporaryBytes);
     temporaryBytes -= Files.size(t.path);
@@ -278,6 +324,214 @@ final class SurfaceConsolidator implements AutoCloseable {
       temporaryBytes -= Files.size(b.path);
       Files.delete(b.path);
     }
+  }
+
+  private static final class SplitNode {
+    final double[]
+        min =
+            new double[] {
+              Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY
+            },
+        max =
+            new double[] {
+              Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY
+            };
+    final int depth;
+    long count;
+    int axis, left = -1, right = -1;
+    double mid;
+    Tile tile;
+
+    SplitNode(int depth) {
+      this.depth = depth;
+    }
+
+    void include(double x, double y, double z) {
+      count++;
+      min[0] = Math.min(min[0], x);
+      min[1] = Math.min(min[1], y);
+      min[2] = Math.min(min[2], z);
+      max[0] = Math.max(max[0], x);
+      max[1] = Math.max(max[1], y);
+      max[2] = Math.max(max[2], z);
+    }
+  }
+
+  /** Plan the same recursive midpoints using 28-byte coordinates, then route full records once. */
+  private void splitRouted() throws IOException {
+    List<SplitNode> nodes = new ArrayList<>();
+    SplitNode first = new SplitNode(0);
+    first.count = root.count;
+    System.arraycopy(root.min, 0, first.min, 0, 3);
+    System.arraycopy(root.max, 0, first.max, 0, 3);
+    nodes.add(first);
+    List<Integer> frontier = new ArrayList<>(List.of(0));
+    try (FileChannel file =
+        FileChannel.open(coordinateFile, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+      ByteBuffer buffer = ByteBuffer.allocate(28 * 16384).order(ByteOrder.BIG_ENDIAN);
+      while (!frontier.isEmpty()) {
+        List<Integer> next = new ArrayList<>();
+        for (int id : frontier) {
+          SplitNode n = nodes.get(id);
+          int axis = 0;
+          for (int k = 1; k < 3; k++) if (n.max[k] - n.min[k] > n.max[axis] - n.min[axis]) axis = k;
+          if (n.count <= capacity / 4 || n.depth >= 28 || n.max[axis] - n.min[axis] < 1e-10)
+            continue;
+          n.axis = axis;
+          n.mid = n.min[axis] + (n.max[axis] - n.min[axis]) * .5;
+          n.left = nodes.size();
+          nodes.add(new SplitNode(n.depth + 1));
+          n.right = nodes.size();
+          nodes.add(new SplitNode(n.depth + 1));
+          next.add(n.left);
+          next.add(n.right);
+        }
+        if (next.isEmpty()) break;
+        long planningLimit =
+            Math.max(
+                65536L,
+                Math.min(options.surfaceMemoryMb, Math.max(8, options.memoryMb / 4))
+                    * 1048576L
+                    / 8);
+        if (nodes.size() * 256L > planningLimit) {
+          partitionStrategy = "recursive_planning_budget_fallback";
+          System.out.println(
+              "Surface partition plan exceeds bounded metadata allowance; using recursive"
+                  + " reference");
+          split(root, 0);
+          return;
+        }
+        coordinatePasses++;
+        partitionProgress.detail(
+            "coordinate planning pass " + coordinatePasses + "; nodes " + nodes.size());
+        long at = 0, visits = 0, coordinateLength = file.size();
+        while (at < coordinateLength) {
+          buffer.clear();
+          buffer.limit((int) Math.min(buffer.capacity(), coordinateLength - at));
+          int wanted = buffer.limit();
+          readFully(file, buffer, at);
+          buffer.flip();
+          for (int p = 0; p < wanted; p += 28) {
+            SplitNode n = nodes.get(buffer.getInt(p));
+            if (n.left < 0) continue;
+            double x = buffer.getDouble(p + 4),
+                y = buffer.getDouble(p + 12),
+                z = buffer.getDouble(p + 20);
+            double value = n.axis == 0 ? x : n.axis == 1 ? y : z;
+            int child = value < n.mid ? n.left : n.right;
+            buffer.putInt(p, child);
+            nodes.get(child).include(x, y, z);
+          }
+          buffer.position(0);
+          writeFully(file, buffer, at);
+          at += wanted;
+          visits += wanted / 28;
+          partitionProgress.update(routedRecords + visits);
+        }
+        routedRecords += root.count;
+        frontier = next;
+      }
+    }
+    if (nodes.size() == 1) {
+      leaves.add(root);
+      return;
+    }
+    addLeaves(nodes, 0);
+    partitionProgress.detail("routing full samples once; final partitions " + leaves.size());
+    LinkedHashMap<Tile, DataOutputStream> writers = new LinkedHashMap<>(16, .75f, true);
+    Compression.GzipPool gzipPool = new Compression.GzipPool();
+    try (DataInputStream in = input(root.path);
+        FileChannel ids = FileChannel.open(coordinateFile)) {
+      if (ids.size() != Math.multiplyExact(root.count, 28L))
+        throw new IOException("Surface coordinate count disagrees");
+      ByteBuffer routing = ByteBuffer.allocate(28 * 16384).order(ByteOrder.BIG_ENDIAN);
+      routing.limit(0);
+      byte[] raw = new byte[RECORD_BYTES];
+      ByteBuffer record = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
+      for (long i = 0; i < root.count; i++) {
+        if (!routing.hasRemaining()) {
+          routing.clear();
+          routing.limit((int) Math.min(routing.capacity(), (root.count - i) * 28L));
+          readFully(ids, routing, i * 28L);
+          routing.flip();
+        }
+        int id = routing.getInt();
+        routing.position(routing.position() + 24);
+        Tile tile = nodes.get(id).tile;
+        if (tile == null) throw new IOException("Invalid final spatial partition id");
+        DataOutputStream out = writers.get(tile);
+        if (out == null) {
+          if (writers.size() >= 8) {
+            var iterator = writers.entrySet().iterator();
+            var old = iterator.next();
+            old.getValue().close();
+            iterator.remove();
+          }
+          out =
+              new DataOutputStream(
+                  gzipPool.open(Files.newOutputStream(tile.path, StandardOpenOption.APPEND)));
+          writers.put(tile, out);
+        }
+        int bytes = readRecord(in, raw);
+        out.write(raw, 0, bytes);
+        tile.includeRaw(record, bytes);
+        if ((i & 16383) == 0) {
+          partitionProgress.update(routedRecords + i);
+          if ((i & 1048575) == 0) updateTemporaryPeak();
+        }
+      }
+      if (in.read() != -1 || ids.size() != root.count * 28L)
+        throw new IOException("Surface coordinate/record counts disagree");
+    } finally {
+      IOException failure = null;
+      for (DataOutputStream out : writers.values())
+        try {
+          out.close();
+        } catch (IOException e) {
+          failure = e;
+        }
+      gzipPool.close();
+      if (failure != null) throw failure;
+    }
+    routedRecords += root.count;
+    updateTemporaryPeak();
+    Files.delete(root.path);
+    temporaryBytes = 0;
+    for (Tile tile : leaves) temporaryBytes += Files.size(tile.path);
+  }
+
+  private void addLeaves(List<SplitNode> nodes, int id) throws IOException {
+    SplitNode n = nodes.get(id);
+    if (n.count == 0) return;
+    if (n.left >= 0) {
+      addLeaves(nodes, n.left);
+      addLeaves(nodes, n.right);
+    } else {
+      n.tile = new Tile(Files.createTempFile(directory, "tile-", ".bin.gz"));
+      leaves.add(n.tile);
+    }
+  }
+
+  private void updateTemporaryPeak() throws IOException {
+    long bytes = 0;
+    try (var files = Files.list(directory)) {
+      for (Path p : files.toList()) bytes += Files.size(p);
+    }
+    peakTemporaryBytes = Math.max(peakTemporaryBytes, bytes);
+  }
+
+  private static void readFully(FileChannel file, ByteBuffer b, long offset) throws IOException {
+    while (b.hasRemaining()) {
+      int n = file.read(b, offset + b.position());
+      if (n < 0) throw new EOFException("Truncated partition coordinates");
+      if (n == 0) throw new IOException("Coordinate read made no progress");
+    }
+  }
+
+  private static void writeFully(FileChannel file, ByteBuffer b, long offset) throws IOException {
+    while (b.hasRemaining())
+      if (file.write(b, offset + b.position()) == 0)
+        throw new IOException("Coordinate write made no progress");
   }
 
   private static boolean intersects(Tile a, Tile b, double halo) {
@@ -304,6 +558,8 @@ final class SurfaceConsolidator implements AutoCloseable {
         }
       }
     loadNanos += System.nanoTime() - clock;
+    if (surfaceProgress != null)
+      surfaceProgress.detail("building grid and ordered representatives");
     // Extremely crowded/scale-degenerate neighborhoods remain unchanged rather than being
     // incompletely filtered. This is bounded-memory and explicitly reported, never silent loss.
     if (overflow) {
@@ -339,7 +595,18 @@ final class SurfaceConsolidator implements AutoCloseable {
     // Bounded look-ahead batches GPU work; emission/representative selection stays in original
     // order.
     for (int base = 0; base < owned; ) {
-      int block = fusion.surfaceBatching() ? Math.max(1, Math.min(64, capacity / 64)) : 1;
+      if (surfaceProgress != null && (base & 1023) == 0)
+        surfaceProgress.detail(
+            "neighborhood/refinement checks; "
+                + base
+                + "/"
+                + owned
+                + " owner samples; output "
+                + emitted);
+      int block =
+          fusion.surfaceBatching()
+              ? Math.max(1, Math.min(options.surfaceBatchSize, capacity / 256))
+              : 1;
       int length = Math.min(block, owned - base);
       Proposal[] proposals = new Proposal[length];
       List<Integer> sources = new ArrayList<>();
@@ -881,6 +1148,14 @@ final class SurfaceConsolidator implements AutoCloseable {
             compressedInputBytes,
             "peak_temporary_partition_bytes",
             peakTemporaryBytes,
+            "partition_strategy",
+            partitionStrategy,
+            "coordinate_scratch_bytes",
+            coordinateBytes,
+            "coordinate_passes",
+            coordinatePasses,
+            "full_record_routing_passes",
+            partitionStrategy.equals("routed") ? (coordinatePasses > 0 ? 1 : 0) : null,
             "temporary_compression_level",
             1,
             "seconds",
@@ -998,6 +1273,10 @@ final class SurfaceConsolidator implements AutoCloseable {
     if (device != null) {
       device.close();
       device = null;
+    }
+    if (coordinates != null) {
+      coordinates.close();
+      coordinates = null;
     }
     if (spool != null) {
       spool.close();

@@ -29,6 +29,15 @@ public final class SurfacePerformanceBenchmark {
     o.output = directory;
     o.memoryMb = 1024;
     o.surfaceMemoryMb = 128;
+    try {
+      Options.class
+          .getField("surfaceBatchSize")
+          .setInt(
+              o,
+              Integer.getInteger(
+                  "sgm.surface.batch", Options.class.getField("surfaceBatchSize").getInt(o)));
+    } catch (NoSuchFieldException ignored) {
+    }
     o.compute = device ? "gpu" : "cpu";
     o.fusionCompute = o.compute;
     o.gpuMemoryMb = 1500;
@@ -40,6 +49,24 @@ public final class SurfacePerformanceBenchmark {
     ByteBuffer hash = ByteBuffer.allocate(64).order(ByteOrder.LITTLE_ENDIAN);
     long[] emitted = {0};
     double[] squared = {0};
+    java.util.concurrent.atomic.AtomicLong
+        lastTick = new java.util.concurrent.atomic.AtomicLong(System.nanoTime()),
+        largestGap = new java.util.concurrent.atomic.AtomicLong();
+    var sampler =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+            r -> {
+              Thread t = new Thread(r, "benchmark-timing-check");
+              t.setDaemon(true);
+              return t;
+            });
+    sampler.scheduleWithFixedDelay(
+        () -> {
+          long now = System.nanoTime();
+          largestGap.accumulateAndGet(now - lastTick.getAndSet(now), Math::max);
+        },
+        1,
+        1,
+        java.util.concurrent.TimeUnit.SECONDS);
     long started = System.nanoTime(), finish;
     try (DepthFusion fusion = new DepthFusion(cameras, widths, heights, o)) {
       for (int pair = 0; pair < 8; pair++) {
@@ -100,10 +127,15 @@ public final class SurfacePerformanceBenchmark {
             (System.nanoTime() - finish) / 1e9,
             "total_seconds",
             (System.nanoTime() - started) / 1e9,
+            "largest_sampler_gap_seconds",
+            largestGap.get() / 1e9,
+            "timing_valid",
+            largestGap.get() < 10000000000L,
             "synthetic",
             true,
             "scope",
             "Consolidation-only synthetic load; excludes images/SGM, not user city workload"));
+    sampler.shutdownNow();
     GpuSgm.closeSession();
     System.out.println("BENCHMARK COMPLETE " + directory);
   }

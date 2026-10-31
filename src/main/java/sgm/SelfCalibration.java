@@ -190,6 +190,16 @@ final class SelfCalibration {
 
   static Calibration refine(Calibration initial, List<Path> paths, Options options, Project project)
       throws IOException {
+    try (WorkProgress work =
+        WorkProgress.start("Shared focal/distortion refinement", 0, "iterations")) {
+      Calibration result = refineImpl(initial, paths, options, project);
+      work.done();
+      return result;
+    }
+  }
+
+  static Calibration refineImpl(
+      Calibration initial, List<Path> paths, Options options, Project project) throws IOException {
     Path dir = options.output.resolve("01_calibration/refinement");
     Files.createDirectories(dir);
     options.calibrationPoses = Collections.emptyMap();

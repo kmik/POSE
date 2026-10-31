@@ -17,6 +17,16 @@ final class AutomaticCalibration {
 
   static Calibration estimate(Options o, List<Path> paths, int width, int height, Project project)
       throws IOException {
+    try (WorkProgress work =
+        WorkProgress.start("Automatic focal initialization", 0, "iterations")) {
+      Calibration result = estimateImpl(o, paths, width, height, project);
+      work.done();
+      return result;
+    }
+  }
+
+  static Calibration estimateImpl(
+      Options o, List<Path> paths, int width, int height, Project project) throws IOException {
     Core.setRNGSeed(1);
     Path dir =
         project == null

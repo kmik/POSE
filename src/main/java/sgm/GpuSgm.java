@@ -501,11 +501,16 @@ final class GpuSgm implements AutoCloseable {
       }
     }
 
+    private long allocatedBytes;
+
     MemorySegment buffer(long bytes) {
       if (bytes <= 0 || bytes > device.allocation)
         throw new IllegalArgumentException("OpenCL allocation exceeds device limit: " + bytes);
       try (Arena a = Arena.ofConfined()) {
-        return owner.buffer(bytes, MemorySegment.NULL, a, buffers);
+        MemorySegment result = owner.buffer(bytes, MemorySegment.NULL, a, buffers);
+        allocatedBytes += bytes;
+        RunTelemetry.deviceAllocated(bytes);
+        return result;
       }
     }
 
@@ -606,6 +611,8 @@ final class GpuSgm implements AutoCloseable {
       kernels.clear();
       for (MemorySegment b : buffers) release("clReleaseMemObject", b);
       buffers.clear();
+      RunTelemetry.deviceFreed(allocatedBytes);
+      allocatedBytes = 0;
       release("clReleaseProgram", program);
       program = null;
     }

@@ -64,7 +64,12 @@ final class FeatureTracks {
           o.matchingAlgorithm + " extraction on processed undistorted images");
     int[] offset = new int[frames.size() + 1];
     for (int i = 0; i < frames.size(); i++) {
-      ReuseCache.features(frames.get(i), o);
+      try (WorkProgress work =
+          WorkProgress.start(
+              "Feature extraction " + frames.get(i).path.getFileName(), 0, "keypoints")) {
+        ReuseCache.features(frames.get(i), o);
+        work.done();
+      }
       frames.get(i).captureFeatureColors();
       if (project != null) project.data.features(frames.get(i));
       DescriptorCache.retain(frames.get(i));
@@ -98,7 +103,12 @@ final class FeatureTracks {
     }
     for (int[] edge : PairSelection.select(frames, o, project)) {
       int a = edge[0], b = edge[1];
-      Pair pair = match(frames.get(a), frames.get(b), o, project);
+      Pair pair;
+      try (WorkProgress work =
+          WorkProgress.start("Match/verify pair " + a + "-" + b, 0, "matches")) {
+        pair = match(frames.get(a), frames.get(b), o, project);
+        work.done();
+      }
       if (pair.matches.size() < o.minMatches) continue;
       pairs.add(pair);
       for (Match m : pair.matches) uf.join(offset[a] + m.a, offset[b] + m.b);
