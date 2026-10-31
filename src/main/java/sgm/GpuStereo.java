@@ -9,7 +9,22 @@ import java.util.*;
 
 /** Banked resident or exact strip-streamed SGM. Path state crosses every strip boundary. */
 final class GpuStereo {
-  record Plan(boolean streamed, int rows, long bankBytes, long deviceBytes, long hostBytes) {}
+  record Plan(
+      boolean streamed,
+      int rows,
+      long bankBytes,
+      long deviceBytes,
+      long hostBytes,
+      String aggregateStorage,
+      int blockRows,
+      long aggregateBytes) {}
+
+  private static long availableRam() {
+    var bean = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+    return bean instanceof com.sun.management.OperatingSystemMXBean os
+        ? os.getFreeMemorySize()
+        : Long.MAX_VALUE;
+  }
 
   private static long bankBytes(GpuSgm.Device d, Options o) {
     return Math.min(d.allocation(), o.gpuBankMb * 1048576L) / 8 * 8;
@@ -17,11 +32,13 @@ final class GpuStereo {
 
   static Plan plan(GpuSgm.Device device, int group, int w, int h, int D, Options o) {
     int sumBytes = StereoCost.aggregateBytes(o);
+    String aggregation = o.gpuSgm.equals("esgm") ? "recompute" : o.gpuAggregate;
     long n = (long) w * h, bank = bankBytes(device, o), budget = GpuSgm.budget(device, o);
     int words = (o.census * o.census - 1 + 63) / 64;
     long input = n * (16L * words + 4), host = n * (96L + 32 * words);
     long hostBudget =
-        Math.min(o.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .65));
+        Math.min(o.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .65))
+            - o.gpuHostReserve;
     if (host > hostBudget) return null;
     if (D < 3
         || D > 4096
@@ -30,9 +47,11 @@ final class GpuStereo {
         || n * words * 8 > device.allocation()) return null;
     long fullCells = n * D, resident = input + fullCells * (2 + sumBytes) + n * 24 + 64;
     if (!o.gpuSgm.equals("streamed")
+        && !o.gpuSgm.equals("esgm")
         && resident <= budget
         && fullCells * sumBytes <= bank * 8
-        && n * 24 <= device.allocation()) return new Plan(false, h, bank, resident, host);
+        && n * 24 <= device.allocation())
+      return new Plan(false, h, bank, resident, host, "resident", h, 0);
     if (o.gpuSgm.equals("resident") || (long) w * D * 4 > device.allocation()) return null;
     for (int rows = Math.min(h, o.gpuStripRows); rows >= 1; rows /= 2) {
       long cells = (long) w * rows * D,
@@ -41,7 +60,25 @@ final class GpuStereo {
       if (bytes <= budget
           && cells * sumBytes <= bank * 8
           && (long) w * rows * 24 <= device.allocation()
-          && staging <= hostBudget) return new Plan(true, rows, bank, bytes, staging);
+          && staging <= hostBudget) {
+        long fullAggregate = fullCells * sumBytes;
+        boolean fitsRam =
+            fullAggregate <= hostBudget - staging && fullAggregate <= availableRam() / 4 * 3;
+        if (aggregation.equals("ram") && !fitsRam) continue;
+        if (aggregation.equals("disk"))
+          return new Plan(true, rows, bank, bytes, staging, "disk", h, fullAggregate);
+        if (!aggregation.equals("recompute") && fitsRam)
+          return new Plan(
+              true, rows, bank, bytes, staging + fullAggregate, "ram", h, fullAggregate);
+        long stripeBytes = (long) w * rows * D * sumBytes;
+        long stripes = (hostBudget - staging) / stripeBytes;
+        if (stripes < 1) continue;
+        int blockRows =
+            (int) Math.min(h, Math.min(Integer.MAX_VALUE / (long) rows, stripes) * rows);
+        long aggregate = (long) w * blockRows * D * sumBytes;
+        return new Plan(
+            true, rows, bank, bytes, staging + aggregate, "recompute", blockRows, aggregate);
+      }
     }
     return null;
   }
@@ -59,32 +96,72 @@ final class GpuStereo {
   static Object report(int w, int h, Options o) {
     if (o.compute.equals("cpu")) return null;
     try {
-      Plan p = plan(GpuSgm.selectedDevice(o), GpuSgm.selectedGroup(o), w, h, o.disparities, o);
-      return p == null
-          ? null
-          : Json.object(
-              "storage",
-              p.streamed ? "streamed" : "resident_banked",
-              "rows",
-              p.rows,
-              "bank_bytes",
-              p.bankBytes,
-              "estimated_device_bytes",
-              p.deviceBytes,
-              "estimated_host_bytes",
-              p.hostBytes,
-              "aggregate_bits",
-              8 * StereoCost.aggregateBytes(o),
-              "aggregate_proved_bound",
-              StereoCost.aggregateBound(o),
-              "cost_generation_passes",
-              p.streamed ? o.directions : 1,
-              "aggregate_volume_reads",
-              p.streamed ? o.directions - 1 : 0,
-              "aggregate_volume_writes",
-              p.streamed ? o.directions - 1 : 0,
-              "aggregate_disk_bytes",
-              p.streamed ? (long) StereoCost.aggregateBytes(o) * w * h * o.disparities : 0);
+      var device = GpuSgm.selectedDevice(o);
+      int group = GpuSgm.selectedGroup(o);
+      Plan p = plan(device, group, w, h, o.disparities, o);
+      if (p == null) return null;
+      boolean wanted =
+          o.gpuSgm.equals("esgm")
+              || (o.gpuSgm.equals("auto")
+                  && o.gpuAggregate.equals("auto")
+                  && p.aggregateStorage.equals("recompute"));
+      GpuCandidateStereo.CandidatePlan compact = wanted ? GpuCandidateStereo.plan(o, w, h) : null;
+      Plan verification = p;
+      long reserve = o.gpuHostReserve;
+      if (compact != null) {
+        Options exact = o.copy();
+        exact.gpuSgm = "streamed";
+        exact.gpuAggregate = "recompute";
+        exact.gpuHostReserve = 40L * w * h;
+        verification = plan(device, group, w, h, o.disparities, exact);
+        reserve = exact.gpuHostReserve;
+      }
+      int blocks = (h + verification.blockRows - 1) / verification.blockRows;
+      return Json.object(
+          "storage",
+          compact != null
+              ? "compact_with_sparse_exact_verification"
+              : p.streamed ? "streamed_" + p.aggregateStorage : "resident_banked",
+          "rows",
+          compact != null ? compact.rows() : p.rows,
+          "bank_bytes",
+          p.bankBytes,
+          "estimated_device_bytes",
+          compact != null
+              ? Math.max(compact.deviceBytes(), verification.deviceBytes)
+              : p.deviceBytes,
+          "estimated_host_bytes",
+          compact != null
+              ? Math.max(compact.hostBytes(), verification.hostBytes + reserve)
+              : p.hostBytes + reserve,
+          "host_reserve_bytes",
+          reserve,
+          "aggregate_bits",
+          8 * StereoCost.aggregateBytes(o),
+          "aggregate_proved_bound",
+          StereoCost.aggregateBound(o),
+          "cost_generation_passes",
+          compact != null ? o.directions * (2 + blocks) : p.streamed ? o.directions * blocks : 1,
+          "cost_generation_passes_are_upper_bound",
+          compact != null || p.aggregateStorage.equals("recompute"),
+          "aggregate_volume_reads",
+          p.streamed ? o.directions - 1 : 0,
+          "aggregate_volume_writes",
+          p.streamed ? o.directions - 1 : 0,
+          "aggregate_disk_bytes",
+          compact == null && p.aggregateStorage.equals("disk") ? p.aggregateBytes : 0,
+          "aggregate_ram_bytes",
+          compact != null
+              ? verification.aggregateBytes
+              : p.streamed && !p.aggregateStorage.equals("disk") ? p.aggregateBytes : 0,
+          "verification_block_rows",
+          verification.blockRows,
+          "recomputation_blocks",
+          blocks,
+          "candidates_per_path",
+          compact == null ? null : compact.pool(),
+          "candidate_device_bytes",
+          compact == null ? 0 : compact.deviceBytes());
     } catch (RuntimeException e) {
       return Json.object("unavailable", e.getMessage());
     }
@@ -104,6 +181,51 @@ final class GpuStereo {
       CensusSgm.Stats stats,
       byte[] reasons,
       byte[] boundary) {
+    Plan selected = plan(GpuSgm.selectedDevice(o), GpuSgm.selectedGroup(o), w, h, o.disparities, o);
+    boolean compact =
+        o.gpuSgm.equals("esgm")
+            || (o.gpuSgm.equals("auto")
+                && o.gpuAggregate.equals("auto")
+                && selected != null
+                && selected.aggregateStorage.equals("recompute"));
+    if (compact && GpuCandidateStereo.supported(o, w, h))
+      return GpuCandidateStereo.execute(
+          o, a, b, grayA, grayB, ta, tb, w, h, reverse, stats, reasons, boundary);
+    if (o.gpuSgm.equals("esgm"))
+      throw new IllegalArgumentException(
+          "No compact Census/16-bit GPU plan fits; use --gpu-sgm streamed for exact recomputation");
+    try {
+      return executeTargets(
+          o, a, b, grayA, grayB, ta, tb, w, h, reverse, stats, reasons, boundary, null, null, null);
+    } catch (GpuAggregate.AllocationFailure unavailable) {
+      if (!o.gpuAggregate.equals("auto")) throw unavailable;
+      Options retry = o.copy();
+      retry.gpuSgm = "streamed";
+      retry.gpuAggregate = "recompute";
+      System.out.println("Planned aggregate RAM unavailable; using exact bounded recomputation.");
+      return executeTargets(
+          retry, a, b, grayA, grayB, ta, tb, w, h, reverse, stats, reasons, boundary, null, null,
+          null);
+    }
+  }
+
+  static float[] executeTargets(
+      Options o,
+      long[][] a,
+      long[][] b,
+      byte[] grayA,
+      byte[] grayB,
+      boolean[] ta,
+      boolean[] tb,
+      int w,
+      int h,
+      boolean reverse,
+      CensusSgm.Stats stats,
+      byte[] reasons,
+      byte[] boundary,
+      int[] slots,
+      int[] targetPixels,
+      int[] candidateSummary) {
     GpuSgm.Device device = GpuSgm.selectedDevice(o);
     Plan plan = plan(device, GpuSgm.selectedGroup(o), w, h, o.disparities, o);
     if (plan == null)
@@ -147,7 +269,9 @@ final class GpuStereo {
       System.out.printf(
           Locale.ROOT,
           "GPU SGM storage: %s; %d-row working set, %.1f MiB device; cost=%s; P1/P2=%d/%d%n",
-          plan.streamed ? "streamed, continuous paths" : "resident allocation banks",
+          plan.streamed
+              ? "streamed, continuous paths, " + plan.aggregateStorage + " aggregate"
+              : "resident allocation banks",
           rows,
           plan.deviceBytes / 1048576.,
           o.matchingCost,
@@ -155,10 +279,24 @@ final class GpuStereo {
           StereoCost.p2(o));
       float[] result = new float[n];
       Arrays.fill(result, Float.NaN);
+      if (slots != null)
+        select(
+            MemorySegment.ofArray(candidateSummary),
+            0,
+            n,
+            D,
+            o,
+            result,
+            stats,
+            reasons,
+            boundary,
+            slots,
+            -1,
+            0);
       Options storage = o.copy();
       storage.tileSize = Math.max(1024, Math.min(262144, w));
       storage.disparities = 1;
-      if (plan.streamed) {
+      if (plan.aggregateStorage.equals("disk")) {
         Files.createDirectories(o.output);
         long disk = (long) sumBytes * n * D,
             available = Files.getFileStore(o.output).getUsableSpace();
@@ -170,95 +308,145 @@ final class GpuStereo {
       }
       MemorySegment host = arena.allocate(plan.streamed ? stripCells * sumBytes : 8),
           summary = arena.allocate((long) w * rows * 24);
-      try (PagedVolume aggregate =
+      try (GpuAggregate aggregate =
           plan.streamed
-              ? new PagedVolume((long) n * D, sumBytes, 0, true, storage, "gpu-sgm-aggregate-")
+              ? new GpuAggregate(
+                  slots == null
+                      ? plan.aggregateBytes
+                      : Math.min(plan.aggregateBytes, (long) targetPixels.length * D * sumBytes),
+                  plan.aggregateStorage.equals("disk"),
+                  o.output)
               : null) {
-        int[][] directions = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
-        for (int direction = 0; direction < o.directions; direction++) {
-          int dx = directions[direction][0], dy = directions[direction][1];
-          MemorySegment input = carry0, output = carry1;
-          int stripes = (h + rows - 1) / rows;
-          for (int ordinal = 0; ordinal < stripes; ordinal++) {
-            int stripe = dy < 0 ? stripes - 1 - ordinal : ordinal,
-                y0 = stripe * rows,
-                actual = Math.min(rows, h - y0);
-            if (plan.streamed || direction == 0)
-              cost(
-                  cl,
-                  costs,
-                  ga,
-                  gb,
+        int blockRows = plan.blockRows;
+        MemorySegment checkpoint = arena.allocate(8);
+        long started = System.nanoTime();
+        int pixelsPerGroup =
+            slots == null
+                ? blockRows * w
+                : (int) Math.min(n, plan.aggregateBytes / ((long) D * sumBytes));
+        int targetCount = slots == null ? n : targetPixels.length;
+        int groups = (int) (((long) targetCount + pixelsPerGroup - 1) / pixelsPerGroup);
+        for (int group = 0; group < groups; group++) {
+          int low = group * pixelsPerGroup, high = Math.min(targetCount, low + pixelsPerGroup);
+          int blockY = slots == null ? group * blockRows : (targetPixels[low] / w / rows) * rows;
+          int blockEnd =
+              slots == null
+                  ? Math.min(h, blockY + blockRows)
+                  : Math.min(h, (targetPixels[high - 1] / w / rows + 1) * rows);
+          int[][] directions = {
+            {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}
+          };
+          for (int direction = 0; direction < o.directions; direction++) {
+            int dx = directions[direction][0], dy = directions[direction][1];
+            MemorySegment input = carry0, output = carry1;
+            int stripes = (h + rows - 1) / rows;
+            int start = dy == 0 ? blockY / rows : 0;
+            int stop =
+                plan.aggregateStorage.equals("recompute")
+                    ? (dy < 0 ? stripes - blockY / rows : (blockEnd + rows - 1) / rows)
+                    : stripes;
+            if (dy == 0) stop = (blockEnd + rows - 1) / rows;
+            for (int ordinal = start; ordinal < stop; ordinal++) {
+              if (Thread.currentThread().isInterrupted())
+                throw new IllegalStateException("GPU SGM interrupted");
+              int stripe = dy < 0 ? stripes - 1 - ordinal : ordinal,
+                  y0 = stripe * rows,
+                  actual = Math.min(rows, h - y0);
+              if (plan.streamed || direction == 0)
+                cost(
+                    cl,
+                    costs,
+                    ga,
+                    gb,
+                    gma,
+                    gmb,
+                    gra,
+                    grb,
+                    cost,
+                    sum,
+                    plan.bankBytes,
+                    w,
+                    h,
+                    D,
+                    o,
+                    reverse,
+                    words,
+                    y0,
+                    actual);
+              boolean target = y0 >= blockY && y0 < blockEnd;
+              if (plan.streamed && target && direction > 0) {
+                MemorySegment data = host.asSlice(0, (long) sumBytes * w * actual * D);
+                aggregateTransfer(
+                    aggregate, data, y0, w, actual, D, sumBytes, blockY, slots, low, high, false);
+                transferBanks(cl, sum, plan.bankBytes, data, false);
+              }
+              List<Object> arguments = new ArrayList<>();
+              bankArguments(arguments, cost, sum, plan.bankBytes, sumBytes);
+              Collections.addAll(
+                  arguments,
                   gma,
-                  gmb,
                   gra,
-                  grb,
-                  cost,
-                  sum,
-                  plan.bankBytes,
                   w,
                   h,
                   D,
-                  o,
-                  reverse,
-                  words,
-                  y0,
-                  actual);
-            if (plan.streamed && direction > 0) {
-              MemorySegment data = host.asSlice(0, (long) sumBytes * w * actual * D);
-              aggregate.transfer((long) y0 * w * D, data, false);
-              transferBanks(cl, sum, plan.bankBytes, data, false);
-            }
-            List<Object> arguments = new ArrayList<>();
-            bankArguments(arguments, cost, sum, plan.bankBytes, sumBytes);
-            Collections.addAll(
-                arguments,
-                gma,
-                gra,
-                w,
-                h,
-                D,
-                dx,
-                dy,
-                StereoCost.penalty(o.p1, o),
-                StereoCost.p2(o),
-                o.sgmEdgeScale,
-                y0,
-                actual,
-                plan.streamed ? 1 : 0,
-                ordinal > 0 ? 1 : 0,
-                input,
-                output,
-                new GpuSgm.Local(4L * (2 * D + cl.group())));
-            long lines = dy == 0 ? actual : dx == 0 ? w : w + actual - 1;
-            cl.run(paths, lines * cl.group(), arguments.toArray());
-            if (plan.streamed && direction == o.directions - 1) {
-              winners(
-                  cl,
-                  winners,
-                  cost,
-                  sum,
-                  plan.bankBytes,
-                  out,
-                  summary,
-                  w,
-                  h,
-                  D,
-                  o,
+                  dx,
+                  dy,
+                  StereoCost.penalty(o.p1, o),
+                  StereoCost.p2(o),
+                  o.sgmEdgeScale,
                   y0,
                   actual,
-                  result,
-                  stats,
-                  reasons,
-                  boundary);
-            } else if (plan.streamed) {
-              MemorySegment data = host.asSlice(0, (long) sumBytes * w * actual * D);
-              transferBanks(cl, sum, plan.bankBytes, data, true);
-              aggregate.transfer((long) y0 * w * D, data, true);
+                  plan.streamed ? 1 : 0,
+                  ordinal > 0 ? 1 : 0,
+                  input,
+                  output,
+                  new GpuSgm.Local(4L * (2 * D + cl.group())));
+              long lines = dy == 0 ? actual : dx == 0 ? w : w + actual - 1;
+              cl.run(paths, lines * cl.group(), arguments.toArray());
+              if (plan.streamed && target && direction == o.directions - 1) {
+                winners(
+                    cl,
+                    winners,
+                    cost,
+                    sum,
+                    plan.bankBytes,
+                    out,
+                    summary,
+                    w,
+                    h,
+                    D,
+                    o,
+                    y0,
+                    actual,
+                    result,
+                    stats,
+                    reasons,
+                    boundary,
+                    slots,
+                    low,
+                    high);
+              } else if (plan.streamed && target) {
+                MemorySegment data = host.asSlice(0, (long) sumBytes * w * actual * D);
+                transferBanks(cl, sum, plan.bankBytes, data, true);
+                aggregateTransfer(
+                    aggregate, data, y0, w, actual, D, sumBytes, blockY, slots, low, high, true);
+              }
+              MemorySegment swap = input;
+              input = output;
+              output = swap;
             }
-            MemorySegment swap = input;
-            input = output;
-            output = swap;
+            if (plan.streamed && (long) n * D >= 1000000) {
+              cl.transfer(carry0, 0, checkpoint, true);
+              System.out.printf(
+                  Locale.ROOT,
+                  "GPU SGM %s: block %d/%d, path %d/%d complete; %.1f s%n",
+                  reverse ? "right" : "left",
+                  group + 1,
+                  groups,
+                  direction + 1,
+                  o.directions,
+                  (System.nanoTime() - started) / 1e9);
+            }
           }
         }
         if (!plan.streamed)
@@ -279,11 +467,48 @@ final class GpuStereo {
               result,
               stats,
               reasons,
-              boundary);
+              boundary,
+              null,
+              0,
+              Integer.MAX_VALUE);
       }
       return result;
     } catch (IOException e) {
       throw new UncheckedIOException(e);
+    }
+  }
+
+  private static void aggregateTransfer(
+      GpuAggregate aggregate,
+      MemorySegment data,
+      int y0,
+      int w,
+      int rows,
+      int D,
+      int bytes,
+      int blockY,
+      int[] slots,
+      int low,
+      int high,
+      boolean write)
+      throws IOException {
+    if (slots == null) {
+      aggregate.transfer((long) (y0 - blockY) * w * D * bytes, data, write);
+      return;
+    }
+    if (!write) data.fill((byte) 0);
+    int first = y0 * w, end = first + w * rows;
+    for (int p = first; p < end; ) {
+      if (slots[p] < low || slots[p] >= high) {
+        p++;
+        continue;
+      }
+      int start = p, slot = slots[p++];
+      while (p < end && slots[p] == slot + (p - start) && slots[p] < high) p++;
+      aggregate.transfer(
+          (long) (slot - low) * D * bytes,
+          data.asSlice((long) (start - first) * D * bytes, (long) (p - start) * D * bytes),
+          write);
     }
   }
 
@@ -304,14 +529,17 @@ final class GpuStereo {
       float[] result,
       CensusSgm.Stats stats,
       byte[] reasons,
-      byte[] boundary) {
+      byte[] boundary,
+      int[] slots,
+      int low,
+      int high) {
     List<Object> args = new ArrayList<>();
     bankArguments(args, cost, sum, bank, StereoCost.aggregateBytes(o));
     Collections.addAll(args, out, w, h, D, o.census / 2, y0, actual);
     cl.run(kernel, (long) w * actual, args.toArray());
     MemorySegment data = summary.asSlice(0, (long) w * actual * 24);
     cl.transfer(out, 0, data, true);
-    select(data, y0 * w, w * actual, D, o, result, stats, reasons, boundary);
+    select(data, y0 * w, w * actual, D, o, result, stats, reasons, boundary, slots, low, high);
   }
 
   private static MemorySegment upload(GpuSgm.Compute cl, MemorySegment data) {
@@ -387,7 +615,7 @@ final class GpuStereo {
     cl.run(kernel, (long) w * rows * D, args.toArray());
   }
 
-  private static void select(
+  static void select(
       MemorySegment host,
       int first,
       int count,
@@ -397,7 +625,24 @@ final class GpuStereo {
       CensusSgm.Stats stats,
       byte[] reasons,
       byte[] boundary) {
+    select(host, first, count, D, o, result, stats, reasons, boundary, null, 0, Integer.MAX_VALUE);
+  }
+
+  static void select(
+      MemorySegment host,
+      int first,
+      int count,
+      int D,
+      Options o,
+      float[] result,
+      CensusSgm.Stats stats,
+      byte[] reasons,
+      byte[] boundary,
+      int[] slots,
+      int low,
+      int high) {
     for (int j = 0; j < count; j++) {
+      if (slots != null && (slots[first + j] < low || slots[first + j] >= high)) continue;
       long base = j * 24L;
       int p = first + j,
           best = host.get(JAVA_INT, base),
@@ -441,7 +686,7 @@ final class GpuStereo {
     }
   }
 
-  private static String kernels(boolean zncc, int sumBytes) {
+  static String kernels(boolean zncc, int sumBytes) {
     return (zncc ? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#define ZNCC 1\n" : "")
         + "#pragma OPENCL FP_CONTRACT OFF\n"
         + (sumBytes == 2 ? "typedef ushort SUM;\n" : "typedef int SUM;\n")

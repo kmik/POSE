@@ -48,8 +48,8 @@ final class DenseReconstruction {
     int[] widths = new int[frames.size()], heights = new int[frames.size()];
     for (ImageFrame f : frames) {
       cameras[f.id] = f.camera;
-      widths[f.id] = f.gray.cols();
-      heights[f.id] = f.gray.rows();
+      widths[f.id] = f.width;
+      heights[f.id] = f.height;
     }
     fusion = new DepthFusion(cameras, widths, heights, options);
   }
@@ -675,7 +675,8 @@ final class DenseReconstruction {
 
   private Rectified rectify(ImageFrame a, ImageFrame b, boolean swapped, int source)
       throws IOException {
-    if (a.gray.size().width != b.gray.size().width || a.gray.size().height != b.gray.size().height)
+    RasterCache.pair(a, b);
+    if (a.width != b.width || a.height != b.height)
       throw new IllegalArgumentException(
           "Dense pairs currently require equal processed image dimensions");
     Rectified out = new Rectified(a, b);

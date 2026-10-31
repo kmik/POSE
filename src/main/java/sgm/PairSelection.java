@@ -70,14 +70,15 @@ final class PairSelection {
             result,
             "preview_scores",
             report));
-    return OverlapSelection.filter(frames,result,List.of(),o,"alignment");
+    return OverlapSelection.filter(frames, result, List.of(), o, "alignment");
   }
 
   private static long key(int a, int b) {
     return ((long) Math.min(a, b) << 32) | (Math.max(a, b) & 0xffffffffL);
   }
 
-  private static int preview(ImageFrame a, ImageFrame b, Options o) {
+  private static int preview(ImageFrame a, ImageFrame b, Options o) throws IOException {
+    DescriptorCache.pair(a, b);
     if (a.descriptors.rows() < 2 || b.descriptors.rows() < 2) return 0;
     Mat x = a.descriptors.rowRange(0, Math.min(600, a.descriptors.rows())),
         y = b.descriptors.rowRange(0, Math.min(600, b.descriptors.rows()));

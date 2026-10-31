@@ -65,6 +65,9 @@ public final class SelfTest {
     checks += RegularizationSurfaceRegression.run();
     checks += SurfaceFusionRegression.run(root);
     checks += FollowupRegression.run(root);
+    checks += ScalingRegression.run(root);
+    checks += EsgmProductionRegression.run(root);
+    checks += ImageResourceRegression.run(root.resolve("image-resources"));
     System.out.printf(
         Locale.ROOT,
         "PASS: %d checks; OpenCV %s on %s; fixtures: %s%n",

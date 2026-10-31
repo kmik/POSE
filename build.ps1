@@ -14,6 +14,16 @@ try {
             Move-Item -LiteralPath "$jar.part" -Destination $jar
         }
     }
+    foreach ($group in @('imageio','common')) {
+        $artifacts = if ($group -eq 'imageio') {@('imageio-tiff','imageio-core','imageio-metadata')} else {@('common-lang','common-io','common-image')}
+        foreach ($artifact in $artifacts) {
+            $jar = "lib/$artifact-3.15.3.jar"
+            if (-not (Test-Path -LiteralPath $jar)) {
+                Invoke-WebRequest "https://repo.maven.apache.org/maven2/com/twelvemonkeys/$group/$artifact/3.15.3/$artifact-3.15.3.jar" -OutFile "$jar.part"
+                Move-Item -LiteralPath "$jar.part" -Destination $jar
+            }
+        }
+    }
     $dependency = 'lib/*'
     $javaCompiler = 'javac'
     $javaRuntime = 'java'

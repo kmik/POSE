@@ -1,5 +1,7 @@
 # Surface processing, SGM storage and point attributes
 
+For current aggregate storage, source-window loading and bounded image/descriptor caches, see [SCALING.md](SCALING.md). The original disk-streaming and full-source-residency statements below describe the earlier implementation; surface processing and attribute definitions remain applicable.
+
 This update preserves the existing geometric acceptance rules. It changes how work is scheduled and stored, and makes the existing local surface estimates available in point-cloud exports.
 
 ## Consolidation

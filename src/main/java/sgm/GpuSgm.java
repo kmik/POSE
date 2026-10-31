@@ -77,6 +77,15 @@ final class GpuSgm implements AutoCloseable {
   }
 
   static List<Device> devices() {
+    try {
+      return enumerateDevices();
+    } catch (IllegalStateException unavailable) {
+      if (library == null) return List.of();
+      throw unavailable;
+    }
+  }
+
+  private static List<Device> enumerateDevices() {
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment platforms = arena.allocate(32 * ADDRESS.byteSize()),
           count = arena.allocate(JAVA_INT);

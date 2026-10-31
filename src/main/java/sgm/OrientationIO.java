@@ -306,8 +306,8 @@ final class OrientationIO {
                 f.camera.cx,
                 f.camera.cy,
                 new double[5],
-                f.gray.cols(),
-                f.gray.rows());
+                f.width,
+                f.height);
       else {
         Camera source = f.calibration.camera(f.sourceWidth, f.sourceHeight);
         c =

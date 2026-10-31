@@ -19,10 +19,10 @@ Collinea reconstructs point clouds from overlapping photographs. It is written i
 Requirements:
 
 - **64-bit JDK 25 or later**, with `JAVA_HOME` set or `java` and `javac` on PATH.
-- Internet access for the first build, which downloads OpenCV 4.9.0-0 and Proj4J 1.4.3 into `lib/`.
+- Internet access for the first build, which downloads OpenCV 4.9.0-0, Proj4J 1.4.3 and TwelveMonkeys ImageIO 3.15.3 into `lib/`.
 - A vendor OpenCL runtime for GPU processing. GPU depth fusion also requires double-precision support (FP64).
 
-Windows x64 is tested locally. Linux x64 with glibc has build scripts, but [Linux CI currently fails during the test suite's OpenCL discovery](https://github.com/kmik/Collinea/actions/runs/41132915982). Alpine/musl is unsupported. CPU reconstruction does not require OpenCL; the test-suite discovery failure is a separate issue.
+Windows x64 is tested locally on NVIDIA and AMD OpenCL devices. Linux x64 with glibc has build scripts and a CI job. Alpine/musl is unsupported. CPU reconstruction does not require OpenCL.
 
 From the repository root:
 
@@ -94,13 +94,26 @@ Memory arguments use **MiB**: 1024 MiB is 1 GiB.
 | `--compute` | `auto` | `auto` selects GPU stereo when suitable and falls back to CPU. `cpu` selects CPU stereo; `gpu` requires a compatible GPU plan. Fusion inherits this choice unless overridden below. |
 | `--fusion-compute` | `inherit` | Override depth fusion separately with `cpu`, `auto` or `gpu`. Auto allows CPU fallback; GPU mode requires FP64 support. |
 | `--gpu-memory-mb` | `0` (automatic) | GPU working-set budget. Automatic uses 70% of reported VRAM. Explicit values are capped at 95%; available memory and device allocation limits can reduce what fits. |
-| `--gpu-sgm` | `auto` | Auto tries a full GPU cost/aggregate volume, then disk-backed strip streaming. `resident` or `streamed` selects either method explicitly. Streaming retains path state across strips and uses temporary disk space. |
+| `--gpu-sgm` | `auto` | Auto tries resident GPU volumes, exact streaming with a RAM aggregate, then compact Census with exact verification or bounded recomputation. Paths continue across strips. `resident`, `streamed` and `esgm` select a backend explicitly. |
+| `--gpu-aggregate` | `auto` | Streamed aggregate storage: `ram`, `disk` or `recompute`. Auto avoids the full aggregate disk spool. Exact recomputation trades additional path sweeps for lower RAM. |
+| `--esgm-candidates` | `2` | Compact proposals per path, from 1 to 4. Unresolved pixels always receive exact full-range verification. |
 | `--sgm-aggregate` | `auto` | Use 16-bit aggregate storage when the configured costs and penalties fit; otherwise use 32-bit. `16` rejects an unsafe configuration, while `32` forces 32-bit storage. |
 | `--point-attributes` | `surface` | Include normals and surface metrics in LAS/PLY. `none` writes compact XYZ/RGB cloud records. The confidence CSV remains available. |
 
 Native OpenCV memory is additional to the Java heap. For example, `--memory-mb 4096` requests a 4 GiB processing budget, not a 4 GiB total RAM limit. Feature extraction and bundle adjustment run on CPU. See [performance and storage details](PERFORMANCE_AND_ATTRIBUTES.md) for the remaining CPU/GPU stages and memory estimates.
 
-Use `--estimate-memory` with the input directory and intended resolution settings to inspect the plan before reconstructing a project.
+Use `--estimate-memory` with the input directory and intended resolution settings to inspect the plan before reconstructing a project. See [large-image processing and measured memory use](SCALING.md) for backend selection, commands and limits.
+
+### Image and feature storage
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `--image-reader` | `auto` | Uses windowed decoding for sources above 64 MiB of RGB pixels and for BigTIFF. Smaller sources retain OpenCV decoding. Explicit `windowed` and `opencv` modes are available. |
+| `--image-window` | `1024` | Maximum decoded window side in pixels. Codec buffers are additional. |
+| `--image-memory-mb` | `0` (automatic) | Processed raster cache: automatic uses one quarter of `--memory-mb`, capped at 2048 MiB. The active processed source pair must fit. |
+| `--descriptor-memory-mb` | `256` | Native descriptor cache cap, also limited to one quarter of `--memory-mb`. Evicted descriptors use run-local temporary files; active matching pairs must fit. |
+
+Windowed TIFF/BigTIFF input supports grayscale and RGB sources, including 16-bit inputs converted to 8-bit sRGB for matching. It avoids a full decoded source image on the Java heap. Processed rasters, keypoints, detector scratch and stereo input buffers still need memory.
 
 ## Output
 
@@ -131,12 +144,13 @@ Automatic calibration needs sufficient overlap and camera geometry. Estimated st
 
 The default horizontal output CRS for GPS georeferencing is EPSG:3067. Heights retain EXIF GPS altitude; no geoid or N2000 conversion is applied. Negative Z values can be valid.
 
-Very large aerial images and blocks need further work on image I/O, camera groups and memory use. LAS output uses version 1.2, point format 2, with optional Extra Bytes and a maximum of 4,294,967,295 points per file. Reader support for extra attributes varies; the same attributes are available in the CSV sidecar.
+Windowed source loading and bounded raster/descriptor caches reduce large-image memory use. Full native-resolution aerial blocks still need further work on stereo input tiling, camera groups and detector memory. BigTIFF EXIF GPS/focal metadata is not currently extracted; supply calibration and orientations when needed. LAS output uses version 1.2, point format 2, with optional Extra Bytes and a maximum of 4,294,967,295 points per file. Reader support for extra attributes varies; the same attributes are available in the CSV sidecar.
 
 ## Documentation
 
 - [Surface processing, performance and exported attributes](PERFORMANCE_AND_ATTRIBUTES.md)
-- [Disk-free SGM research and benchmark results](ESGM_RESEARCH.md)
+- [Large-image processing, exact streaming and compact SGM](SCALING.md)
+- [Earlier disk-free SGM research](ESGM_RESEARCH.md)
 - [Orientation formats and conventions](ORIENTATIONS.md)
 - [Project artifacts](PROJECT_FORMAT.md)
 - [Storage and GPU processing](STORAGE_GPU.md)

@@ -49,6 +49,12 @@ final class ReuseCache {
           Geometry.class,
           FeatureTracks.class,
           ImageFrame.class,
+          WindowedImage.class,
+          BigTiffWindows.class,
+          RasterCache.class,
+          DescriptorCache.class,
+          GpuAggregate.class,
+          GpuCandidateStereo.class,
           AutomaticCalibration.class,
           SelfCalibration.class,
           BundleAdjuster.class,
@@ -125,22 +131,26 @@ final class ReuseCache {
   }
 
   static String frame(ImageFrame f) throws IOException {
-    MessageDigest d = digest();
-    byte[] row = new byte[f.gray.cols()];
-    for (int y = 0; y < f.gray.rows(); y++) {
-      f.gray.get(y, 0, row);
-      d.update(row);
-      f.validMask.get(y, 0, row);
-      d.update(row);
+    if (f.pixelFingerprint == null) {
+      f.ensureRasters();
+      MessageDigest d = digest();
+      byte[] row = new byte[f.width];
+      for (int y = 0; y < f.height; y++) {
+        f.gray.get(y, 0, row);
+        d.update(row);
+        f.validMask.get(y, 0, row);
+        d.update(row);
+      }
+      f.pixelFingerprint = HexFormat.of().formatHex(d.digest());
     }
     return key(
         f.id
             + ":"
             + f.path.getFileName()
             + ":"
-            + f.gray.cols()
+            + f.width
             + ":"
-            + f.gray.rows()
+            + f.height
             + ":"
             + f.camera.fx
             + ":"
@@ -150,7 +160,7 @@ final class ReuseCache {
             + ":"
             + f.camera.cy
             + ":"
-            + HexFormat.of().formatHex(d.digest()));
+            + f.pixelFingerprint);
   }
 
   static boolean allowed(Options o, String stage) {

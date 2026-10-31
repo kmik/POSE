@@ -34,6 +34,11 @@ final class ResolutionPlan {
       int[] original = originalSize(paths.get(i)),
           processed = o.processedSize(original[0], original[1]);
       long n = (long) processed[0] * processed[1];
+      if (!o.estimateMemory && n > Integer.MAX_VALUE / 3)
+        throw new IllegalArgumentException(
+            "Processed image exceeds the dense color-array index limit; select --quality or"
+                + " --max-dimension explicitly: "
+                + paths.get(i));
       int[] aligned = o.alignmentOptions().processedSize(original[0], original[1]);
       alignmentPixels += (long) aligned[0] * aligned[1];
       minimumSide = Math.min(minimumSide, Math.min(processed[0], processed[1]));
@@ -78,9 +83,17 @@ final class ResolutionPlan {
       pairs = 1;
       evidence = 8 * (sizes[0] + sizes[1]);
     }
-    long imagesNative = 5 * Math.max(pixels, alignmentPixels),
-        features = (long) paths.size() * o.features * (128 * 4 + 64),
-        decodeNative = 3 * sourceMax,
+    long imagesNative = Math.min(5 * Math.max(pixels, alignmentPixels), RasterCache.limit(o)),
+        features =
+            (long) paths.size() * o.features * 64
+                + Math.min(
+                    (long) paths.size() * o.features * 512,
+                    Math.min(o.descriptorMemoryMb * 1048576L, o.memoryMb * 1048576L / 4)),
+        decodeNative =
+            o.imageReader.equals("windowed")
+                    || o.imageReader.equals("auto") && 3 * sourceMax > 64L * 1048576
+                ? 32L * o.imageWindow * o.imageWindow
+                : 3 * sourceMax,
         rectifyNative = 32 * maxPixels;
     long residentEvidence =
         o.diskDepth
@@ -101,6 +114,11 @@ final class ResolutionPlan {
       long sgm = CensusSgm.memoryEstimate(longest, shortest, d, o);
       boolean gpuSelected =
           d <= gpuLimit && (!o.compute.equals("auto") || maxPixels * d >= 1000000L);
+      GpuStereo.Plan selectedPlan =
+          gpuSelected
+              ? GpuStereo.plan(
+                  GpuSgm.selectedDevice(o), GpuSgm.selectedGroup(o), longest, shortest, d, scenario)
+              : null;
       estimates.add(
           Json.object(
               "disparities",
@@ -127,7 +145,7 @@ final class ResolutionPlan {
               evidence,
               "approximate_known_process_bytes",
               (gpuSelected
-                      ? gpuHost
+                      ? selectedPlan == null ? gpuHost : selectedPlan.hostBytes()
                       : o.tiled
                           ? CensusSgm.tiledMemoryEstimate(
                               longest, shortest, d, o.census, o.memoryMb)
@@ -176,6 +194,18 @@ final class ResolutionPlan {
             pairs,
             "resident_processed_image_native_bytes",
             imagesNative,
+            "source_pair_raster_cache_limit_bytes",
+            RasterCache.limit(o),
+            "largest_pair_source_raster_bytes",
+            10 * maxPixels,
+            "largest_pair_fits_source_cache",
+            10 * maxPixels <= RasterCache.limit(o),
+            "descriptor_resident_limit_bytes",
+            Math.min(o.descriptorMemoryMb * 1048576L, o.memoryMb * 1048576L / 4),
+            "image_reader",
+            o.imageReader,
+            "image_window",
+            o.imageWindow,
             "largest_source_decode_native_bytes",
             decodeNative,
             "approximate_feature_bytes",
@@ -236,7 +266,9 @@ final class ResolutionPlan {
           d <= gpuLimit && (!o.compute.equals("auto") || maxPixels * d >= 1000000L);
       long resident =
           gpuSelected
-              ? gpuHost
+              ? GpuStereo.plan(
+                      GpuSgm.selectedDevice(o), GpuSgm.selectedGroup(o), longest, shortest, d, o)
+                  .hostBytes()
               : o.tiled
                   ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o.census, o.memoryMb)
                   : sgm;
@@ -259,9 +291,9 @@ final class ResolutionPlan {
         System.out.printf(
             Locale.ROOT,
             "       GPU %s working set ~%.0f MiB; temporary aggregate disk ~%.0f MiB%n",
-            plan.streamed() ? "streamed" : "banked resident",
+            plan.streamed() ? "streamed " + plan.aggregateStorage() : "banked resident",
             plan.deviceBytes() / 1048576.,
-            plan.streamed() ? maxPixels * d * StereoCost.aggregateBytes(o) / 1048576. : 0.);
+            plan.aggregateStorage().equals("disk") ? plan.aggregateBytes() / 1048576. : 0.);
       } else if (o.tiled)
         System.out.printf(
             Locale.ROOT,

@@ -8,6 +8,7 @@
     <dependency><groupId>org.openpnp</groupId><artifactId>opencv</artifactId><version>4.9.0-0</version></dependency>
     <dependency><groupId>org.locationtech.proj4j</groupId><artifactId>proj4j</artifactId><version>1.4.3</version></dependency>
     <dependency><groupId>org.locationtech.proj4j</groupId><artifactId>proj4j-epsg</artifactId><version>1.4.3</version></dependency>
+    <dependency><groupId>com.twelvemonkeys.imageio</groupId><artifactId>imageio-tiff</artifactId><version>3.15.3</version></dependency>
   </dependencies>
   <build><plugins>
     <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version></plugin>

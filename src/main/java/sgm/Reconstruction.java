@@ -4,7 +4,6 @@ import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 import org.opencv.core.*;
-import org.opencv.imgcodecs.Imgcodecs;
 
 final class Reconstruction implements AutoCloseable {
   private final Options options;
@@ -47,19 +46,15 @@ final class Reconstruction implements AutoCloseable {
       }
       return;
     }
-    Mat first =
-        Imgcodecs.imread(
-            paths.get(0).toString(),
-            Imgcodecs.IMREAD_GRAYSCALE | Imgcodecs.IMREAD_IGNORE_ORIENTATION);
+    int[] first = ResolutionPlan.originalSize(paths.get(0));
     Calibration calibration;
-    try {
-      if (first.empty()) throw new IOException("Cannot decode " + paths.get(0));
+    {
       calibration = ReuseCache.calibration(paths, options, null);
       if (calibration == null) {
         calibration =
             options.calibration == null && Double.isNaN(options.focal)
-                ? AutomaticCalibration.estimate(options, paths, first.cols(), first.rows(), project)
-                : Calibration.load(options, first.cols(), first.rows());
+                ? AutomaticCalibration.estimate(options, paths, first[0], first[1], project)
+                : Calibration.load(options, first[0], first[1]);
         if (options.calibration == null && !Double.isNaN(options.focal)) {
           calibration = SelfCalibration.refine(calibration, paths, options, project);
           calibration.write(
@@ -95,11 +90,10 @@ final class Reconstruction implements AutoCloseable {
               "note",
               "Fixed parameters remain exact; prior uncertainties are assumptions, not measured"
                   + " accuracy. Rejected guarded fits retain supplied calibration."));
-    } finally {
-      first.release();
     }
     Options alignment = options.alignmentOptions();
-    for (Path path : paths) frames.add(new ImageFrame(frames.size(), path, calibration, alignment));
+    for (Path path : paths)
+      frames.add(new ImageFrame(frames.size(), path, calibration, alignment, true));
     writeSettings(calibration);
     if (project != null) {
       project.data.inputs(frames, calibration);
@@ -223,13 +217,13 @@ final class Reconstruction implements AutoCloseable {
     boolean reload = false;
     for (ImageFrame frame : frames) {
       int[] size = options.processedSize(frame.sourceWidth, frame.sourceHeight);
-      if (size[0] != frame.gray.cols() || size[1] != frame.gray.rows()) reload = true;
+      if (size[0] != frame.width || size[1] != frame.height) reload = true;
     }
     if (reload) {
       List<ImageFrame> denseFrames = new ArrayList<>();
       try {
         for (ImageFrame frame : frames) {
-          ImageFrame denseFrame = new ImageFrame(frame.id, frame.path, calibration, options);
+          ImageFrame denseFrame = new ImageFrame(frame.id, frame.path, calibration, options, true);
           denseFrames.add(denseFrame);
           denseFrame.camera.rotation = frame.camera.rotation.clone();
           denseFrame.camera.translation = frame.camera.translation.clone();
@@ -387,8 +381,8 @@ final class Reconstruction implements AutoCloseable {
     for (ImageFrame frame : frames) {
       String key = "image." + frame.id + ".";
       settings.setProperty(key + "name", frame.path.getFileName().toString());
-      settings.setProperty(key + "width", String.valueOf(frame.gray.cols()));
-      settings.setProperty(key + "height", String.valueOf(frame.gray.rows()));
+      settings.setProperty(key + "width", String.valueOf(frame.width));
+      settings.setProperty(key + "height", String.valueOf(frame.height));
       settings.setProperty(key + "fx", String.valueOf(frame.camera.fx));
       settings.setProperty(key + "fy", String.valueOf(frame.camera.fy));
     }

@@ -1,5 +1,7 @@
 # Storage profiles and GPU matching
 
+The current [large-image update](SCALING.md) supersedes the disk-streaming defaults below. Auto now uses RAM-backed exact streaming, then compact proposals with exact verification or bounded recomputation. Aggregate disk storage requires an explicit request. Earlier measurements and limits below are historical.
+
 [RECONSTRUCTION_UPGRADE.md](RECONSTRUCTION_UPGRADE.md) supersedes the original single-buffer SGM limits below. Current SGM banks resident allocations and can stream exact continuous paths when needed; explicit VRAM budgets can reach 95% of device memory. Storage-profile defaults are unchanged. Streamed aggregate working files still require temporary disk space, documented in the upgrade guide.
 
 The defaults are now **standard storage**, **no stage cache**, and **automatic GPU selection**. Existing commands keep the same image resolution and filtering settings. The update does not remove data from earlier runs or earlier `cache/v2` directories.

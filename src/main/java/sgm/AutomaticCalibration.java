@@ -73,10 +73,11 @@ final class AutomaticCalibration {
               width,
               height);
       for (Path p : paths) {
-        ImageFrame f = new ImageFrame(frames.size(), p, initial, o.alignmentOptions());
+        ImageFrame f = new ImageFrame(frames.size(), p, initial, o.alignmentOptions(), true);
         frames.add(f);
         if (project != null) project.data.source(f.id, p, f.sourceWidth, f.sourceHeight, f.gps);
         f.extract(o.features);
+        DescriptorCache.retain(f);
         System.out.println(
             "Auto calibration features "
                 + frames.size()
@@ -187,6 +188,7 @@ final class AutomaticCalibration {
 
   private static Model match(ImageFrame a, ImageFrame b, Options o, Path dir) throws IOException {
     Model out = new Model(a.id, b.id);
+    DescriptorCache.pair(a, b);
     if (a.descriptors.empty() || b.descriptors.rows() < 2 || a.descriptors.rows() < 2) {
       out.reason = "missing_descriptors";
       return out;
@@ -220,7 +222,7 @@ final class AutomaticCalibration {
       }
       x.fromList(p);
       y.fromList(q);
-      double threshold = Math.min(o.reprojection, 1) / Math.hypot(a.gray.cols(), a.gray.rows());
+      double threshold = Math.min(o.reprojection, 1) / Math.hypot(a.width, a.height);
       f.release();
       f = Calib3d.findFundamentalMat(x, y, Calib3d.FM_RANSAC, threshold, .999, 5000, mask);
       if (f.empty() || f.rows() != 3) {
@@ -310,8 +312,8 @@ final class AutomaticCalibration {
   private static Point centered(ImageFrame f, Point p) {
     double d = Math.hypot(f.sourceWidth, f.sourceHeight);
     return new Point(
-        (p.x * f.sourceWidth / f.gray.cols() - (f.sourceWidth - 1) / 2.) / d,
-        (p.y * f.sourceHeight / f.gray.rows() - (f.sourceHeight - 1) / 2.) / d);
+        (p.x * f.sourceWidth / f.width - (f.sourceWidth - 1) / 2.) / d,
+        (p.y * f.sourceHeight / f.height - (f.sourceHeight - 1) / 2.) / d);
   }
 
   static double focalFromFundamental(double[] f) {

@@ -220,7 +220,7 @@ final class SelfCalibration {
     List<ImageFrame> frames = new ArrayList<>();
     try {
       for (Path path : paths.subList(0, Math.min(12, paths.size())))
-        frames.add(new ImageFrame(frames.size(), path, initial, bootstrap));
+        frames.add(new ImageFrame(frames.size(), path, initial, bootstrap, true));
       FeatureTracks features = new FeatureTracks();
       features.build(frames, bootstrap);
       if (options.poses != null) {

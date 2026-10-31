@@ -226,3 +226,11 @@ Use a new output directory or add `--overwrite` when repeating these commands. T
 - Large-flight performance, GPS accuracy, and native OpenCV behavior on other machines require further validation.
 
 See [PORTING.md](PORTING.md) for deliberate algorithm differences and remaining legacy-mode parity work.
+
+## Large-image production update: 31 October 2026
+
+The complete Windows suite passed **1,927 checks** with OpenCV 4.9.0. Exact resident/RAM/disk/recompute parity additionally passed 258 checks on each NVIDIA and AMD device; production compact matching passed 36 checks on each. Image/cache regressions passed 37 checks. A 6000 x 4000 tiled TIFF and BigTIFF were each decoded both at native size and 1600 x 1067 under a 64 MiB Java heap (native processed matrices are additional). A virtual BigTIFF fixture also tests physical pixel offsets beyond 4 GiB without creating a large gap file.
+
+A real rectified forest pair at 1978 x 2640 / 1037 hypotheses passed complete filtered-disparity and rejection-counter parity between exact RAM streaming and compact matching with mandatory exact verification. Both retained 128,905 depth pixels; canonical float-bit SHA-256 `af9cbbdd4d5f2d301d3e8d2d98d3f3825ddf44692a9a75f1d8f93b5df80ed74c`. RAM stereo/filtering took 54.93 s; compact took 104.22 s. See [SCALING.md](SCALING.md) and [machine-readable evidence](research/scaling/results-2026-10-31.json) for memory measurements and limits.
+
+These tests do not establish native-scale Vexcel reconstruction, surveyed accuracy or reduced surface noise. The Linux missing-OpenCL discovery path is corrected; its current CI result is recorded separately in repository checks.

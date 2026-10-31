@@ -30,6 +30,10 @@ public final class Options {
   public String seedPair;
   public String censusMode = "gray";
   public String matchingCost = "census", gpuSgm = "auto", sgmAggregate = "auto";
+  public String gpuAggregate = "auto", imageReader = "auto";
+  public int imageWindow = 1024, descriptorMemoryMb = 256, imageMemoryMb = 0;
+  public int esgmCandidates = 2;
+  long gpuHostReserve;
   public String subpixelRefinement = "none";
   public double censusWeight = .5;
   public int adTruncation = 30, gradientTruncation = 60, gpuStripRows = 64;
@@ -224,6 +228,24 @@ public final class Options {
           break;
         case "--gpu-sgm":
           o.gpuSgm = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gpu-aggregate":
+          o.gpuAggregate = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--esgm-candidates":
+          o.esgmCandidates = Integer.parseInt(v);
+          break;
+        case "--image-reader":
+          o.imageReader = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--image-window":
+          o.imageWindow = Integer.parseInt(v);
+          break;
+        case "--descriptor-memory-mb":
+          o.descriptorMemoryMb = Integer.parseInt(v);
+          break;
+        case "--image-memory-mb":
+          o.imageMemoryMb = Integer.parseInt(v);
           break;
         case "--gpu-strip-rows":
           o.gpuStripRows = Integer.parseInt(v);
@@ -686,7 +708,17 @@ public final class Options {
     choice(o.subpixelRefinement, "--subpixel-refinement", "none", "zncc");
     choice(o.sgmAggregate, "--sgm-aggregate", "auto", "16", "32");
     StereoCost.aggregateBytes(o);
-    choice(o.gpuSgm, "--gpu-sgm", "auto", "resident", "streamed");
+    choice(o.gpuSgm, "--gpu-sgm", "auto", "resident", "streamed", "esgm");
+    if (o.esgmCandidates < 1 || o.esgmCandidates > 4)
+      throw new IllegalArgumentException("--esgm-candidates must be 1..4");
+    choice(o.gpuAggregate, "--gpu-aggregate", "auto", "ram", "disk", "recompute");
+    choice(o.imageReader, "--image-reader", "auto", "windowed", "opencv");
+    if (o.imageWindow < 64
+        || o.imageWindow > 8192
+        || o.descriptorMemoryMb < 1
+        || o.imageMemoryMb < 0)
+      throw new IllegalArgumentException(
+          "Image window must be 64..8192; descriptor memory must be positive");
     choice(o.overlapUnknown, "--overlap-unknown", "keep", "reject");
     for (double percentage : new double[] {o.minForwardOverlap, o.minSideOverlap, o.minPairOverlap})
       if (!(percentage >= 0 && percentage <= 100))
@@ -973,6 +1005,7 @@ public final class Options {
     out.orientationSourceUnits = orientationSourceUnits;
     out.orientationNotes = orientationNotes;
     out.stereoReportDirectory = stereoReportDirectory;
+    out.gpuHostReserve = gpuHostReserve;
     try {
       for (java.lang.reflect.Field field : Options.class.getFields())
         field.set(out, field.get(this));
@@ -1309,12 +1342,49 @@ Additional workflow controls:
       bound directions*(512 + effective P2) <= 65535; otherwise signed 32-bit.
       16 requires that bound; 32 forces reference storage. Arithmetic, raw costs
       (including invalid cost 512) and continuous path state are unchanged.
-  --gpu-sgm auto|resident|streamed
-      Default auto first tries banked resident SGM, then exact strip streaming.
-      resident requires the whole cost/aggregate volume on GPU. streamed keeps
-      bounded GPU strips and continuous horizontal/vertical/diagonal path state;
-      it preserves global SGM results and needs about 4*width*height*disparities
-      temporary disk bytes for aggregate costs, removed when the pair completes.
+  --gpu-sgm auto|resident|streamed|esgm
+      Default auto tries resident GPU SGM, then exact RAM-backed streaming.
+      Beyond RAM, compact Census proposals plus mandatory exact verification
+      are used when supported; other configurations use bounded recomputation.
+      resident requires complete GPU volumes. streamed preserves ordinary SGM
+      with continuous paths. esgm explicitly selects compact grayscale Census
+      with safe 16-bit aggregates; unresolved matches are verified exactly,
+      rather than discarded. Costs, signed ranges and filters are preserved.
+  --gpu-aggregate auto|ram|disk|recompute
+      Aggregate backing for ordinary GPU streaming (default: auto).
+      auto uses native RAM if aggregate plus workspace fits --memory-mb/heap
+      planning and available system memory; otherwise it recomputes bounded
+      groups with continuous global path state. ram requires the full aggregate
+      in RAM. disk explicitly enables contiguous temporary storage (2 or 4
+      bytes*width*height*disparities); files are removed on close. recompute
+      avoids the full aggregate volume at the cost of repeated GPU work.
+      Host aggregate RAM is included in the plan, not allocated on top of it.
+  --esgm-candidates N
+      Maximum separated proposals retained per path (default: 2; 1..4).
+      Planner may reduce this to fit memory. More proposals can reduce exact
+      verification work but use more VRAM/compute. No confidence rule is relaxed.
+  --image-reader auto|windowed|opencv
+      Source decoding (default: auto). Sources above 64 MiB of RGB pixels and
+      BigTIFF use source windows; other small sources retain the OpenCV reader.
+      windowed always uses bounded source regions and global area resampling.
+      Decoding produces 8-bit sRGB via the image color model, including supported
+      16-bit grayscale/RGB TIFFs and BigTIFF. This does not implement native
+      16-bit matching. Classic TIFF windows use the JDK codec; BigTIFF maps only
+      requested compressed blocks into a bounded virtual TIFF for that decoder.
+      Reader/plugin support is required; unsupported formats fail explicitly.
+  --image-window N
+      Maximum decoded source-window side (default: 1024; 64..8192 pixels).
+      Bounds decoder output windows; codec-specific internal buffers may differ.
+  --image-memory-mb N
+      Native processed-raster LRU cap (default: 0 = min(2048, memory-mb/4) MiB).
+      At least one active pair must fit; raise this or lower resolution if needed.
+      Metadata/keypoints survive eviction; active source pairs load on demand.
+      Stereo/rectification buffers and codec scratch are additional to this cache.
+  --descriptor-memory-mb N
+      Native descriptor LRU cap (default: 256 MiB), also capped at memory-mb/4.
+      Both active descriptor sets must fit. Exact descriptor spills are run-local
+      temporary files, removed when frames close; independent of persistent --cache.
+      Feature detector scratch and retained keypoint metadata are additional.
   --gpu-bank-mb N
       Maximum size of each SGM allocation bank (default: 1024; 1..1024 MiB),
       further capped by the device allocation limit. Up to eight banks per volume.

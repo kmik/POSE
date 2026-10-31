@@ -1,5 +1,7 @@
 # Disk-free SGM investigation
 
+Historical investigation. The production implementation now uses expanded candidate pools with mandatory exact verification of unresolved outcomes; see [SCALING.md](SCALING.md). The candidate-only coverage losses and unchanged-launcher statements below describe the frozen prototypes, not the current production backend.
+
 Status: research prototypes, tested on Windows on 31 October 2026. The photogrammetry command, its defaults and its installed matcher are unchanged. These experiments are not a new `--gpu-sgm` option.
 
 The aggregate spool can be eliminated. The remaining obstacle is accepting enough reliable matches while preserving the meaning of the existing uniqueness test. The adaptive tile experiment also needs a different handling of search margins and ambiguity before it should be used by default.

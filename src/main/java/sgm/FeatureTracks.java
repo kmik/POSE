@@ -65,7 +65,9 @@ final class FeatureTracks {
     int[] offset = new int[frames.size() + 1];
     for (int i = 0; i < frames.size(); i++) {
       ReuseCache.features(frames.get(i), o);
+      frames.get(i).captureFeatureColors();
       if (project != null) project.data.features(frames.get(i));
+      DescriptorCache.retain(frames.get(i));
       offset[i + 1] = Math.addExact(offset[i], frames.get(i).keypoints.length);
       System.out.printf(
           Locale.ROOT,
@@ -137,6 +139,7 @@ final class FeatureTracks {
 
   private static Pair match(ImageFrame a, ImageFrame b, Options o, Project project)
       throws IOException {
+    DescriptorCache.pair(a, b);
     Pair out = new Pair(a.id, b.id);
     if (a.descriptors.empty() || b.descriptors.rows() < 2) {
       out.reason = "missing_descriptors";

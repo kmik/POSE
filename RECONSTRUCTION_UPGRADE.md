@@ -1,5 +1,7 @@
 # Reconstruction, memory and exchange upgrade
 
+The later [large-image update](SCALING.md) supersedes aggregate disk-storage defaults and adds source windows and bounded caches. Disk streaming remains an explicit option. Earlier measurements below are historical.
+
 The subsequent [surface-fusion update](SURFACE_FUSION.md) enables reprojection refinement and normal-aware consolidation by default. It supersedes the earlier weighted-refinement/output-order behavior described here.
 
 This implements the nine-item TODO authorized after the initial workflow/GPU work. All changes stay in `sgm_java`. Source photographs and existing completed runs are preserved. `--help` lists every CLI argument, alias, default and example; [ORIENTATIONS.md](ORIENTATIONS.md) documents camera interchange.

@@ -36,6 +36,7 @@ final class ProjectArtifacts implements AutoCloseable {
   void denseInputs(List<ImageFrame> dense) throws IOException {
     frames = dense;
     for (ImageFrame frame : dense) {
+      if (!options.storage.equals("minimal")) frame.ensureRasters();
       Path dir = directory("00_inputs/dense/" + imageId(frame.id));
       if (!options.storage.equals("minimal"))
         image(dir.resolve("undistorted_color.png"), frame.color);
@@ -48,8 +49,12 @@ final class ProjectArtifacts implements AutoCloseable {
           Json.object(
               "image_id",
               frame.id,
+              "source_reader",
+              frame.sourceReader(),
+              "source_window_side",
+              frame.sourceReader().equals("imageio_source_windows") ? options.imageWindow : null,
               "processed_size",
-              new int[] {frame.gray.cols(), frame.gray.rows()},
+              new int[] {frame.width, frame.height},
               "fx",
               frame.camera.fx,
               "fy",
@@ -127,6 +132,7 @@ final class ProjectArtifacts implements AutoCloseable {
     this.frames = frames;
     sourceCalibration = calibration;
     for (ImageFrame frame : frames) {
+      if (!options.storage.equals("minimal")) frame.ensureRasters();
       source(frame.id, frame.path, frame.sourceWidth, frame.sourceHeight, frame.gps);
       Path dir = directory("00_inputs/" + imageId(frame.id));
       if (!options.storage.equals("minimal"))
@@ -145,8 +151,12 @@ final class ProjectArtifacts implements AutoCloseable {
               frame.path.getFileName().toString(),
               "original_size",
               new int[] {frame.sourceWidth, frame.sourceHeight},
+              "source_reader",
+              frame.sourceReader(),
+              "source_window_side",
+              frame.sourceReader().equals("imageio_source_windows") ? options.imageWindow : null,
               "processed_size",
-              new int[] {frame.gray.cols(), frame.gray.rows()},
+              new int[] {frame.width, frame.height},
               "pixel_coordinates",
               "zero-based processed undistorted raster, x right, y down",
               "distortion_applied",
@@ -162,7 +172,8 @@ final class ProjectArtifacts implements AutoCloseable {
           my = new Mat();
       try {
         if (!options.rectified && options.storage.equals("debug")) {
-          Calib3d.initUndistortRectifyMap(k, d, r, k, frame.gray.size(), CvType.CV_32FC1, mx, my);
+          Calib3d.initUndistortRectifyMap(
+              k, d, r, k, new Size(frame.width, frame.height), CvType.CV_32FC1, mx, my);
           pfm(dir.resolve("undistort_source_x.pfm"), mx);
           pfm(dir.resolve("undistort_source_y.pfm"), my);
         }
@@ -235,9 +246,9 @@ final class ProjectArtifacts implements AutoCloseable {
                 + ","
                 + csv(f.path.getFileName())
                 + ","
-                + f.gray.cols()
+                + f.width
                 + ","
-                + f.gray.rows()
+                + f.height
                 + ","
                 + c.fx
                 + ","
@@ -328,6 +339,7 @@ final class ProjectArtifacts implements AutoCloseable {
                 + " float32; row index equals keypoint_id",
             "preview",
             "all keypoint centers; every coordinate is in keypoints.csv"));
+    frame.ensureRasters();
     Mat overlay = frame.color.clone();
     try {
       for (KeyPoint k : frame.keypoints)
@@ -497,6 +509,7 @@ final class ProjectArtifacts implements AutoCloseable {
 
   private static void previewMatches(
       Path path, ImageFrame a, ImageFrame b, List<int[]> matches, Scalar color) throws IOException {
+    RasterCache.pair(a, b);
     Mat canvas =
         new Mat(
             Math.max(a.color.rows(), b.color.rows()),
@@ -754,10 +767,12 @@ final class ProjectArtifacts implements AutoCloseable {
           FeatureTracks.Observation origin = t.observations.get(0);
           ImageFrame f = frames.get(origin.image);
           Point uv = f.keypoints[origin.feature].pt;
-          double[] color =
-              f.color.get(
-                  Math.max(0, Math.min(f.color.rows() - 1, (int) Math.round(uv.y))),
-                  Math.max(0, Math.min(f.color.cols() - 1, (int) Math.round(uv.x))));
+          if (f.featureColors == null) f.captureFeatureColors();
+          double[] color = {
+            f.featureColors[origin.feature * 3] & 255,
+            f.featureColors[origin.feature * 3 + 1] & 255,
+            f.featureColors[origin.feature * 3 + 2] & 255
+          };
           ply.write(
               t.point[0]
                   + " "
@@ -850,9 +865,9 @@ final class ProjectArtifacts implements AutoCloseable {
         for (double[] uv :
             new double[][] {
               {0, 0},
-              {f.gray.cols() - 1, 0},
-              {f.gray.cols() - 1, f.gray.rows() - 1},
-              {0, f.gray.rows() - 1}
+              {f.width - 1, 0},
+              {f.width - 1, f.height - 1},
+              {0, f.height - 1}
             }) {
           double[] local = {
             (uv[0] - f.camera.cx) / f.camera.fx * extent,
@@ -1057,7 +1072,7 @@ final class ProjectArtifacts implements AutoCloseable {
             "Each matching-raster pixel stores its source processed-undistorted x/y; source is not"
                 + " the original distorted photo"));
     if (alreadyRectified && options.storage.equals("debug")) {
-      int w = a.gray.cols(), h = a.gray.rows();
+      int w = a.width, h = a.height;
       float[] x = new float[w * h], y = new float[w * h];
       for (int i = 0; i < x.length; i++) {
         x[i] = i % w;
@@ -1772,7 +1787,7 @@ final class ProjectArtifacts implements AutoCloseable {
     double u = c.fx * (x * radial + 2 * d[2] * x * y + d[3] * (r2 + 2 * x * x)) + c.cx,
         v = c.fy * (y * radial + d[2] * (r2 + 2 * y * y) + 2 * d[3] * x * y) + c.cy;
     return new double[] {
-      (u + .5) * f.sourceWidth / f.gray.cols() - .5, (v + .5) * f.sourceHeight / f.gray.rows() - .5
+      (u + .5) * f.sourceWidth / f.width - .5, (v + .5) * f.sourceHeight / f.height - .5
     };
   }
 

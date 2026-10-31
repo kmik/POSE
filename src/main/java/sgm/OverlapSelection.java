@@ -33,8 +33,8 @@ final class OverlapSelection {
     int[] w = new int[c.length], h = new int[c.length];
     for (ImageFrame f : frames) {
       c[f.id] = f.camera;
-      w[f.id] = f.gray.cols();
-      h[f.id] = f.gray.rows();
+      w[f.id] = f.width;
+      h[f.id] = f.height;
     }
     List<double[]> points = new ArrayList<>();
     for (var t : tracks) if (t.point != null) points.add(t.point);

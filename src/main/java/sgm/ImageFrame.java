@@ -20,34 +20,83 @@ final class ImageFrame implements AutoCloseable {
   final Options options;
   final Calibration calibration;
 
+  final int width, height;
+  final boolean managedRasters;
+  final boolean bigTiff;
+  Path descriptorFile;
+  long descriptorBytes;
+  String pixelFingerprint;
+  byte[] featureColors;
+
   ImageFrame(int id, Path path, Calibration calibration, Options options) throws IOException {
+    this(id, path, calibration, options, false);
+  }
+
+  ImageFrame(int id, Path path, Calibration calibration, Options options, boolean managed)
+      throws IOException {
     calibration =
         options.orientationCalibrations.getOrDefault(path.getFileName().toString(), calibration);
     this.calibration = calibration;
     this.id = id;
     this.path = path;
     this.options = options;
-    Mat loaded =
-        Imgcodecs.imread(
-            path.toString(), Imgcodecs.IMREAD_COLOR | Imgcodecs.IMREAD_IGNORE_ORIENTATION);
-    if (loaded.empty()) {
-      loaded.release();
-      throw new IOException("Cannot decode " + path);
-    }
-    Mat resized = new Mat();
-    sourceWidth = loaded.cols();
-    sourceHeight = loaded.rows();
+    this.managedRasters = managed;
+    int[] size = ResolutionPlan.originalSize(path);
+    sourceWidth = size[0];
+    sourceHeight = size[1];
+    bigTiff = BigTiffWindows.isBig(path);
+    int[] processed = options.processedSize(sourceWidth, sourceHeight);
+    width = processed[0];
+    height = processed[1];
+    camera = calibration.camera(width, height);
     color = new Mat();
     gray = new Mat();
     validMask = new Mat();
+    gps = Exif.gps(path);
+    if (!managed) loadRasters();
+  }
+
+  long rasterBytes() {
+    return 5L * width * height;
+  }
+
+  String sourceReader() {
+    return options.imageReader.equals("windowed")
+            || options.imageReader.equals("auto")
+                && (bigTiff || 3L * sourceWidth * sourceHeight > 64L * 1048576)
+        ? "imageio_source_windows"
+        : "opencv_full_decode";
+  }
+
+  void ensureRasters() throws IOException {
+    RasterCache.pair(this, this);
+  }
+
+  void releaseRasters() {
+    color.release();
+    gray.release();
+    validMask.release();
+  }
+
+  void loadRasters() throws IOException {
+    if (!gray.empty()) return;
+    Mat resized = new Mat(), loaded = new Mat();
     try {
-      int[] dimensions = options.processedSize(loaded.cols(), loaded.rows());
-      int w = dimensions[0], h = dimensions[1];
-      Imgproc.resize(loaded, resized, new Size(w, h), 0, 0, Imgproc.INTER_AREA);
-      camera = calibration.camera(w, h);
+      boolean windowed = sourceReader().equals("imageio_source_windows");
+      if (windowed) {
+        resized.release();
+        resized =
+            WindowedImage.read(path, sourceWidth, sourceHeight, width, height, options.imageWindow);
+      } else {
+        loaded =
+            Imgcodecs.imread(
+                path.toString(), Imgcodecs.IMREAD_COLOR | Imgcodecs.IMREAD_IGNORE_ORIENTATION);
+        if (loaded.empty()) throw new IOException("Cannot decode " + path);
+        Imgproc.resize(loaded, resized, new Size(width, height), 0, 0, Imgproc.INTER_AREA);
+      }
       Mat k = camera.intrinsic();
       MatOfDouble d = new MatOfDouble(calibration.distortion);
-      Mat ones = new Mat(h, w, CvType.CV_8U, new Scalar(255));
+      Mat ones = new Mat(height, width, CvType.CV_8U, new Scalar(255));
       try {
         if (options.rectified) {
           resized.copyTo(color);
@@ -63,12 +112,8 @@ final class ImageFrame implements AutoCloseable {
         ones.release();
       }
       Imgproc.cvtColor(color, gray, Imgproc.COLOR_BGR2GRAY);
-      gps = Exif.gps(path);
-    } catch (RuntimeException | IOException e) {
-      color.release();
-      gray.release();
-      validMask.release();
-      descriptors.release();
+    } catch (RuntimeException | IOException | Error e) {
+      releaseRasters();
       throw e;
     } finally {
       loaded.release();
@@ -76,7 +121,27 @@ final class ImageFrame implements AutoCloseable {
     }
   }
 
+  void captureFeatureColors() throws IOException {
+    ensureRasters();
+    featureColors = new byte[keypoints.length * 3];
+    byte[] value = new byte[3];
+    for (int i = 0; i < keypoints.length; i++) {
+      Point p = keypoints[i].pt;
+      color.get(
+          Math.max(0, Math.min(height - 1, (int) Math.round(p.y))),
+          Math.max(0, Math.min(width - 1, (int) Math.round(p.x))),
+          value);
+      System.arraycopy(value, 0, featureColors, i * 3, 3);
+    }
+  }
+
   void extract(int maximum) {
+    DescriptorCache.prepare(this);
+    try {
+      ensureRasters();
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
     org.opencv.features2d.Feature2D sift = FeatureAlgorithms.detector(options, maximum);
     MatOfKeyPoint kp = new MatOfKeyPoint();
     Mat mask = new Mat();
@@ -111,8 +176,7 @@ final class ImageFrame implements AutoCloseable {
   }
 
   void inheritKeypoints(ImageFrame alignment) {
-    double sx = gray.cols() / (double) alignment.gray.cols(),
-        sy = gray.rows() / (double) alignment.gray.rows();
+    double sx = width / (double) alignment.width, sy = height / (double) alignment.height;
     keypointPixelScale = alignment.keypointPixelScale * Math.max(sx, sy);
     keypoints = new KeyPoint[alignment.keypoints.length];
     for (int i = 0; i < keypoints.length; i++) {
@@ -131,9 +195,12 @@ final class ImageFrame implements AutoCloseable {
 
   @Override
   public void close() {
-    color.release();
-    gray.release();
-    validMask.release();
-    descriptors.release();
+    RasterCache.forget(this);
+    releaseRasters();
+    try {
+      DescriptorCache.forget(this);
+    } finally {
+      descriptors.release();
+    }
   }
 }

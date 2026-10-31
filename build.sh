@@ -15,6 +15,16 @@ for artifact in proj4j proj4j-epsg; do
     mv -- "$jar.part" "$jar"
   fi
 done
+for group in imageio common; do
+  if [[ "$group" == imageio ]]; then artifacts=(imageio-tiff imageio-core imageio-metadata); else artifacts=(common-lang common-io common-image); fi
+  for artifact in "${artifacts[@]}"; do
+    jar="lib/$artifact-3.15.3.jar"
+    if [[ ! -f "$jar" ]]; then
+      curl --fail --location --retry 3 "https://repo.maven.apache.org/maven2/com/twelvemonkeys/$group/$artifact/3.15.3/$artifact-3.15.3.jar" -o "$jar.part"
+      mv -- "$jar.part" "$jar"
+    fi
+  done
+done
 dep='lib/*'
 javac_bin="${JAVA_HOME:+$JAVA_HOME/bin/}javac"
 find src/main/java -name '*.java' -print > target/sources.txt
