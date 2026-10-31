@@ -136,6 +136,7 @@ Very large aerial images and blocks need further work on image I/O, camera group
 ## Documentation
 
 - [Surface processing, performance and exported attributes](PERFORMANCE_AND_ATTRIBUTES.md)
+- [Disk-free SGM research and benchmark results](ESGM_RESEARCH.md)
 - [Orientation formats and conventions](ORIENTATIONS.md)
 - [Project artifacts](PROJECT_FORMAT.md)
 - [Storage and GPU processing](STORAGE_GPU.md)
