@@ -24,6 +24,10 @@ final class GroundClassificationRegression {
     System.out.println("PASS ground classification: " + run(root) + "; " + root);
   }
 
+  static boolean tall(double x, double y) {
+    return x > 10 && x < 50 && y > 70 && y < 110;
+  }
+
   static double terrain(double x, double y) {
     return 90 + .08 * x - .03 * y + .4 * Math.sin(x / 7) * Math.cos(y / 9);
   }
@@ -50,6 +54,12 @@ final class GroundClassificationRegression {
       boolean closed = x > 65 && x < 110 && y > 15 && y < 60;
       if (closed)
         top = Math.max(top, ground + 14 + 3 * Math.abs(Math.sin(x / 1.5) * Math.cos(y / 1.5)));
+      // Tall stand (canopy 24-27 m) with small lower crowns 10-12 m up seen through gaps: the
+      // lowest visible points, far below the canopy top, but metres above the terrain.
+      if (tall(x, y)) {
+        double gx = x - 7 * Math.floor(x / 7) - 3.5, gy = y - 7 * Math.floor(y / 7) - 3.5;
+        top = Math.hypot(gx, gy) < 1.3 ? ground + 10 + 2 * Math.abs(Math.sin(x)) : ground + 24 + 3 * Math.abs(Math.sin(x / 1.7) * Math.cos(y / 1.7));
+      }
       boolean isGround = top == Double.NEGATIVE_INFINITY;
       double z = isGround ? ground + random.nextGaussian() * .04 : top + random.nextGaussian() * .1;
       points.add(new double[] {610000 + x, 6930000 + y, z});
@@ -81,6 +91,12 @@ final class GroundClassificationRegression {
       if (classes[i] == 2 && x > 67 && x < 108 && y > 17 && y < 58) insideStand++;
     }
     check(insideStand < points.size() / 2000, "no crown depressions taken as ground inside the closed stand: " + insideStand);
+    long insideTall = 0;
+    for (int i = 0; i < points.size(); i++) {
+      double x = points.get(i)[0] - 610000, y = points.get(i)[1] - 6930000;
+      if (classes[i] == 2 && x > 12 && x < 48 && y > 72 && y < 108) insideTall++;
+    }
+    check(insideTall < points.size() / 2000, "no lower crowns taken as ground inside the tall stand: " + insideTall);
     boolean known = true;
     for (byte b : classes) known &= b == 1 || b == 2 || b == 7;
     check(known, "only classes 1, 2, 7 written");
@@ -93,8 +109,8 @@ final class GroundClassificationRegression {
     double cell = ((Number) result.get("cell_size")).doubleValue();
     var cloud = GroundClassification.read(las, root.resolve("none.bin"));
     var grid = GroundClassification.grid(cloud, cell);
-    double sum = 0, closedSum = 0;
-    int n = 0, closedN = 0;
+    double sum = 0, closedSum = 0, tallSum = 0;
+    int n = 0, closedN = 0, tallN = 0;
     for (int r = 0; r < grid.h(); r++)
       for (int c = 0; c < grid.w(); c++) {
         double x = grid.x0() + (c + .5) * cell + cloud.ox - 610000, y = grid.y1() - (r + .5) * cell + cloud.oy - 6930000;
@@ -104,6 +120,9 @@ final class GroundClassificationRegression {
         if (x > 70 && x < 105 && y > 20 && y < 55) {
           closedSum += e * e;
           closedN++;
+        } else if (x > 5 && x < 55 && y > 65 && y < 115) {
+          tallSum += e * e;
+          tallN++;
         } else {
           sum += e * e;
           n++;
@@ -111,6 +130,7 @@ final class GroundClassificationRegression {
       }
     check(Math.sqrt(sum / n) < .25, "DTM RMSE where ground is visible: " + Math.sqrt(sum / n));
     check(Math.sqrt(closedSum / closedN) < 1.5, "interpolated DTM under closed canopy: " + Math.sqrt(closedSum / closedN));
+    check(Math.sqrt(tallSum / tallN) < 1.5, "interpolated DTM under the tall stand: " + Math.sqrt(tallSum / tallN));
 
     // Free-space bound: a ray from a camera to a ground point caps the cells it crosses.
     GroundClassification.Cloud c = new GroundClassification.Cloud();

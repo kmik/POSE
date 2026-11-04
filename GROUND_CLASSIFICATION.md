@@ -17,19 +17,26 @@ otherwise `07_results/ground.json` says why it was skipped. No reference terrain
 5. **Slope envelope:** a ground cell may not stand more than slope × distance + tolerance above
    any other ground cell (two-pass chamfer). This removes crown sides at the cloud edge and
    canopy patches beside real ground.
-5b. **Canopy islands** (`--ground-gap-depth`, 4 Nov 2026). Under a closed stand the lowest
-   points of a region can be crown tops; the morphological filter and the slope envelope then
-   accept them, since nothing lower is near. The ground cells are grouped into connected patches.
-   Large, smooth patches (≥ 25 m², plane RMS ≤ max(0.25 m, tolerance)) are anchors; their coarse
-   (5 m) median surface is the terrain trend. A patch is suspect when it has no trend, lies more
-   than 30 m from an anchor, or stands more than max(1 m, 2 × tolerance) above the trend. A
-   suspect patch is kept only if it lies deep below the surrounding canopy (75th percentile of the
-   highest points within 5 m, minus its median height) – ground seen through a gap. The depth
-   limit is the Otsu split of the suspect patches' depths, clamped to 3–8 m, or the option value.
-   A shallow patch is rejected only if it also stands more than max(1 m, 2 × tolerance) above the
-   terrain interpolated from the other ground, so real ground in narrow corridors survives. The
-   rejected cells become interpolated terrain; `ground.json` → `canopy_islands` counts the
-   patches tested and rejected and their area.
+5b. **Canopy islands** (revised 4 Nov 2026). Under a closed stand the lowest points of a region
+   can be crown tops; the morphological filter and the slope envelope then accept them, since
+   nothing lower is near. The ground cells are grouped into connected patches.
+   - *Trusted ground:* patches of at least 25 m² that are smooth within 4 m tiles (median tile
+     plane RMS ≤ max(0.25 m, tolerance); a single plane over a large patch would reject real,
+     curving terrain), plus patches within 30 m of them that lie at their coarse (5 m) terrain
+     trend (within max(1 m, 2 × tolerance)).
+   - *Every other patch* is rejected as canopy when its median height above the terrain
+     interpolated from the trusted ground exceeds max(1 m, 2 × tolerance) or 0.25 m per metre of
+     distance to the trusted ground (about 14° average slope), whichever is larger. Ground seen
+     through a gap lies at the terrain level; a crown stands metres above it, however deep it is
+     below the surrounding canopy top.
+   - Rejected cells become interpolated terrain. `ground.json` → `canopy_islands`: patches
+     tested and rejected, their area and median rise. Without any trusted ground nothing is
+     rejected. `-Dsgm.islandsDebug=FILE` writes one CSV row per patch for diagnosis.
+
+   The first version (same day) kept patches lying more than a "gap depth" (3–8 m) below the
+   surrounding canopy. In tall forest the lower crowns are deeper than that, so on forest_2
+   blocks of crowns 8–12 m above the terrain stayed ground and raised the DTM there. That rule
+   and `--ground-gap-depth` were removed.
 6. **Free space:** every camera ray reached its point, so terrain cannot stand above it. Each
    cell records the heights of the rays crossing it (one entry per ray, stopping 3 cells above
    the point); the second-lowest, which needs two independent rays, caps the terrain. Candidates
@@ -68,18 +75,23 @@ are blocked.
 - **forest_tiny** end to end (`--quality low`): 71.1% ground, observed in 47% of 1.6 m cells,
   split-half median 0.13 m.
 - **Synthetic** (`GroundClassificationRegression`, SelfTest): sloped bumpy terrain, 120 conical
-  trees, a 25 m closed block: recall > 95%, precision > 98%, DTM RMSE < 0.25 m where ground is
-  visible and < 1.5 m interpolated under the closed block. Unit checks cover the ray bound (one
+  trees, a 45 m closed block with 3 m crown depressions and a 40 m tall stand (canopy 24–27 m) with
+  lower crowns 10–12 m up seen through gaps: recall > 95%, precision > 98%, DTM RMSE < 0.25 m where ground is
+  visible and < 1.5 m interpolated under both stands, no ground inside either stand. Unit checks cover the ray bound (one
   ray alone does not set it) and the slope envelope.
 
 ## Limits and next steps
 
-- Under closed canopy the DTM is interpolated (code 2, distance in `ground.json`). Closed stands
-  larger than `--ground-max-object` used to leave crown tops classified as ground; the canopy
-  island filter (5b) now removes them when they are shallow below the surrounding canopy and
-  above the terrain of the other ground (forest_8: 14.0% → 10.8% ground, the canopy-level
-  "ground" gone; forest_2: 17.8% → 15.1%). In a block without any large smooth ground
-  (no anchors) every patch is suspect and only the patches deep below the canopy are kept.
+- Under closed canopy the DTM is interpolated (code 2, distance in `ground.json`). The
+  interpolation is a push-pull pyramid with bilinear upsampling plus relaxation; until 4 Nov it
+  copied coarse cells into blocks, which left flat squares up to 16 m wide where little ground is
+  seen (forest_11, 7% observed).
+- Closed stands larger than `--ground-max-object` used to leave crown tops classified as ground.
+  With the revised canopy island filter (5b), on the same clouds: forest_2 16.0% → 14.0% ground (crown blocks
+  8–12 m above the terrain gone), forest_8 14.0% → 11.0%, forest_11 5.4% → 3.7% (before: no
+  filter for forest_8 and forest_11, the first filter version for forest_2); profiles show
+  the remaining ground at the foot of the trees. A block without any large smooth ground has no
+  trusted ground, so the filter does nothing there.
 - The DTM inherits orientation height errors (see `ORIENTATION_GPS_ADJUSTMENT.md`).
 - C2: per-pair ground labels on depth maps, voted in fusion. C3: keep the second, farther
   matching minimum in gaps.

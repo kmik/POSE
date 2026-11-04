@@ -44,8 +44,6 @@ public final class Options {
   // Sheet fusion radius for --ground-aware-fusion (0 = auto: twice the terrain cell).
   public double groundFusionRadius = 0;
   public double groundCell = 0, groundMaxSlope = 35, groundMaxObject = 30;
-  // Minimum depth of a real canopy gap for isolated ground patches (0 = auto from canopy height).
-  public double groundGapDepth = 0;
   // Ground control points: CSV (gcp_id,x,y,z[,sx,sy,sz][,type]), optional markers to import,
   // default sigmas (m) and the marker editor port.
   public Path gcp, gcpMarkers;
@@ -704,9 +702,6 @@ public final class Options {
           break;
         case "--gcp-port":
           o.gcpPort = Integer.parseInt(v);
-          break;
-        case "--ground-gap-depth":
-          o.groundGapDepth = v.equalsIgnoreCase("auto") ? 0 : number(v);
           break;
         case "--ground-max-object":
           o.groundMaxObject = number(v);
@@ -1369,8 +1364,6 @@ public final class Options {
     if (!(o.gcpSigma > 0) || !(o.gcpHeightSigma > 0))
       throw new IllegalArgumentException("--gcp-sigma and --gcp-height-sigma must be positive");
     if (o.gcpPort < 1 || o.gcpPort > 65535) throw new IllegalArgumentException("--gcp-port must be 1..65535");
-    if (o.groundGapDepth < 0 || o.groundGapDepth > 100)
-      throw new IllegalArgumentException("--ground-gap-depth must be auto or 0..100 metres");
     if (!(o.groundMaxObject >= 1 && o.groundMaxObject <= 500))
       throw new IllegalArgumentException("--ground-max-object must be 1..500 metres");
     if (o.gpsAdjustmentRounds < 1 || o.gpsAdjustmentRounds > 20)
@@ -1979,12 +1972,6 @@ Georeferencing and output coordinates:
   --ground-max-object M
       Largest non-ground object, e.g. a tree crown (default: 30 m); sets the
       largest filter window.
-  --ground-gap-depth auto|M
-      Ground patches that are isolated or stand above the terrain of the large, smooth
-      ground areas must lie at least this far below the surrounding canopy to count as
-      ground seen through a gap; otherwise they are crown depressions and the terrain
-      is interpolated there (default auto: the depth that best separates gap-seen
-      ground from crown depressions in this cloud, 3..8 m).
 
 Ground control points (the gcp step):
   --gcp FILE
