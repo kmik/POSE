@@ -115,7 +115,7 @@ final class GroundClassification {
     double slope = Math.tan(Math.toRadians(o.groundMaxSlope));
     int radius = Math.max(1, (int) Math.ceil(o.groundMaxObject / 2 / cell));
 
-    Core r = core(cloud, cameras, g, slope, radius, o.groundGapDepth);
+    Core r = core(cloud, cameras, g, slope, radius);
     // GS1: per-pair vertical offsets of the ground against the consensus; optional correction.
     Map<String, Object> pairReport = null;
     if (cloud.sidecar) {
@@ -123,7 +123,7 @@ final class GroundClassification {
       pairReport = fit.report();
       if (o.groundPairCorrection && fit.pairs() > 0) {
         writeHeights(las, cloud, PairOffsets.apply(cloud, fit));
-        r = core(cloud, cameras, g, slope, radius, o.groundGapDepth);
+        r = core(cloud, cameras, g, slope, radius);
         PairOffsets.Fit after = PairOffsets.fit(cloud, g, r);
         pairReport.put("applied", true);
         pairReport.put("after_correction", after.summary());
@@ -291,10 +291,6 @@ final class GroundClassification {
   }
 
   static Core core(Cloud cloud, double[][] cameras, Grid g, double slope, int radius) {
-    return core(cloud, cameras, g, slope, radius, 0);
-  }
-
-  static Core core(Cloud cloud, double[][] cameras, Grid g, double slope, int radius, double gapDepth) {
     Core r = new Core();
     double cell = g.cell;
     boolean[] all = new boolean[cloud.n];
@@ -326,7 +322,7 @@ final class GroundClassification {
       int k = g.index(cloud.x[i], cloud.y[i]);
       if (k >= 0 && r.usable[i] && !(cloud.z[i] <= surface[k])) surface[k] = cloud.z[i];
     }
-    Islands islands = new Islands(surface, gapDepth);
+    Islands islands = new Islands(surface);
 
     // Pass 2: final terrain, with candidates above the ray bound rejected and the bound applied.
     r.full = terrain(cloud, g, r.usable, bound, r.tolerance, slope, radius, islands);
@@ -342,8 +338,8 @@ final class GroundClassification {
       even[i] = r.usable[i] && a;
       odd[i] = r.usable[i] && !a;
     }
-    Terrain halfA = terrain(cloud, g, even, bound, r.tolerance, slope, radius, new Islands(surface, gapDepth)),
-        halfB = terrain(cloud, g, odd, bound, r.tolerance, slope, radius, new Islands(surface, gapDepth));
+    Terrain halfA = terrain(cloud, g, even, bound, r.tolerance, slope, radius, new Islands(surface)),
+        halfB = terrain(cloud, g, odd, bound, r.tolerance, slope, radius, new Islands(surface));
     r.uncertainty = new float[g.w * g.h];
     Arrays.fill(r.uncertainty, Float.NaN);
     for (int k = 0; k < r.uncertainty.length; k++)
@@ -386,12 +382,10 @@ final class GroundClassification {
    */
   static final class Islands {
     final float[] surface;
-    final double option;
     final Map<String, Object> report = new LinkedHashMap<>();
 
-    Islands(float[] surface, double option) {
+    Islands(float[] surface) {
       this.surface = surface;
-      this.option = option;
     }
 
     void filter(float[] z, boolean[] ground, Grid g, double tolerance) {
@@ -426,7 +420,8 @@ final class GroundClassification {
       double anchorArea = 0;
       for (int p = 0; p < patches.size(); p++) {
         int[] cells = patches.get(p);
-        if (cells.length * cellArea < 25 || planeRms(cells, z, g) > smooth) continue;
+        // Large and locally smooth: terrain may curve over a big patch, crowns are rough within 4 m.
+        if (cells.length * cellArea < 25 || roughness(cells, z, g) > smooth) continue;
         isAnchor[p] = true;
         anchorArea += cells.length * cellArea;
         for (int k : cells) anchor[k] = true;
@@ -454,14 +449,16 @@ final class GroundClassification {
               (float) sample(filled, coarse, g.x0 + (k % g.w + .5) * g.cell, g.y1 - (k / g.w + .5) * g.cell);
       }
       // Per patch: suspect (elevated above the anchor trend, or far from any anchor), its level,
-      // and its depth below the surrounding canopy.
+      // and (for the diagnostics) its depth below the surrounding canopy.
       float[] distance = anchorArea > 0 ? distance(anchor, g) : null;
       int margin = (int) Math.ceil(5 / g.cell);
       int count = patches.size();
       boolean[] suspect = new boolean[count];
       double[] level = new double[count], depthBelow = new double[count];
+      double[] nearestOf = new double[count], elevationOf = new double[count], overOf = new double[count];
+      Arrays.fill(overOf, Double.NaN);
       Arrays.fill(depthBelow, Double.NaN);
-      List<Double> depths = new ArrayList<>();
+
       for (int p = 0; p < count; p++) {
         if (isAnchor[p]) continue;
         int[] cells = patches.get(p);
@@ -480,6 +477,8 @@ final class GroundClassification {
           Collections.sort(above);
           elevation = quantile(above, .5);
         }
+        nearestOf[p] = nearest;
+        elevationOf[p] = elevation;
         suspect[p] = trend == null || nearest > 30 || elevation > Math.max(1, 2 * tolerance);
         if (!suspect[p]) continue;
         int r0 = Integer.MAX_VALUE, r1 = -1, c0 = Integer.MAX_VALUE, c1 = -1;
@@ -498,13 +497,12 @@ final class GroundClassification {
         if (ring.isEmpty()) continue;
         Collections.sort(ring);
         depthBelow[p] = ring.get((ring.size() - 1) * 3 / 4) - level[p];
-        depths.add(depthBelow[p]);
+
       }
-      // Gap depth: crown depressions are shallow, real gaps deep; split the suspects' depths
-      // (Otsu), bounded to 3-8 m, unless --ground-gap-depth sets it.
-      double depth = option > 0 ? option : Math.max(3, Math.min(8, otsu(depths)));
-      // Canopy stands above the terrain: a rejected patch must lie clearly above the terrain
-      // interpolated from the anchors and the unsuspected patches.
+      // Decision: ground cannot stand far above the terrain of the trusted ground (anchors and
+      // unsuspected patches) nearby. The allowed rise grows with the distance to that ground
+      // (0.25 m per metre, about 14 degrees of average slope), so terrain seen through gaps on a
+      // slope survives while crowns standing metres above the surrounding terrain do not.
       boolean[] trusted = new boolean[n];
       boolean any = false;
       for (int p = 0; p < count; p++)
@@ -513,65 +511,93 @@ final class GroundClassification {
             trusted[k] = true;
             any = true;
           }
-      float[] alternative = null;
+      float[] alternative = null, away = null;
       if (any) {
         float[] known = new float[n];
         for (int k = 0; k < n; k++) known[k] = trusted[k] ? z[k] : Float.NaN;
         alternative = fillHoles(known, g);
+        away = distance(trusted, g);
       }
+      double base = Math.max(1, 2 * tolerance), perMetre = .25;
       long tested = 0, rejected = 0;
       double rejectedArea = 0;
+      List<Double> rejectedRise = new ArrayList<>();
       for (int p = 0; p < count; p++) {
-        if (!suspect[p] || Double.isNaN(depthBelow[p])) continue;
+        if (!suspect[p] || alternative == null) continue;
         tested++;
-        if (depthBelow[p] >= depth) continue;
         int[] cells = patches.get(p);
-        if (alternative != null) {
-          List<Double> over = new ArrayList<>();
-          for (int k : cells) over.add(z[k] - (double) alternative[k]);
-          Collections.sort(over);
-          if (quantile(over, .5) <= Math.max(1, 2 * tolerance)) continue;
+        List<Double> over = new ArrayList<>(), far = new ArrayList<>();
+        for (int k : cells) {
+          over.add(z[k] - (double) alternative[k]);
+          far.add(Float.isFinite(away[k]) ? away[k] * g.cell : 1e9);
         }
+        Collections.sort(over);
+        Collections.sort(far);
+        double rise = quantile(over, .5), allowed = Math.max(base, perMetre * quantile(far, .5));
+        overOf[p] = rise;
+        if (rise <= allowed) continue;
         rejected++;
+        rejectedRise.add(rise);
         rejectedArea += cells.length * cellArea;
         for (int k : cells) ground[k] = false;
       }
+      Collections.sort(rejectedRise);
+      String debug = System.getProperty("sgm.islandsDebug");
+      if (debug != null) debugDump(Path.of(debug), patches, isAnchor, suspect, level, depthBelow, nearestOf, elevationOf, overOf, ground, z, g, perMetre);
       report.put("patches", count);
       report.put("anchor_area_m2", anchorArea);
-      report.put("gap_depth_m", depth);
-      report.put("gap_depth_source", option > 0 ? "--ground-gap-depth" : "split of the suspect patches' depths (Otsu), 3-8 m");
       report.put("patches_tested", tested);
       report.put("patches_rejected_as_canopy", rejected);
       report.put("rejected_area_m2", rejectedArea);
+      report.put("rejected_median_rise_m", rejectedRise.isEmpty() ? null : quantile(rejectedRise, .5));
+      report.put("rise_limit", String.format(Locale.ROOT, "max(%.2f m, 0.25 x distance to trusted ground)", base));
       report.put(
           "rule",
-          "A ground patch that is isolated (more than 30 m from the large smooth ground areas) or"
-              + " stands above their terrain trend is rejected as a crown depression when it lies less"
-              + " than gap_depth below the surrounding canopy (75th percentile of the highest points"
-              + " within 5 m) and also more than max(1 m, 2 x tolerance) above the terrain"
-              + " interpolated from the other ground.");
+          "Trusted ground: large patches that are smooth within 4 m tiles, and patches near them at"
+              + " their terrain trend. Every other ground patch is rejected as canopy when its median"
+              + " height above the terrain interpolated from the trusted ground exceeds max(1 m, 2 x"
+              + " tolerance) or 0.25 m per metre of distance to the trusted ground, whichever is larger.");
     }
 
-    /** Otsu threshold of a sample (the split maximising the between-class variance). */
-    static double otsu(List<Double> values) {
-      if (values.size() < 4) return 5;
-      List<Double> v = new ArrayList<>(values);
-      Collections.sort(v);
-      int n = v.size();
-      double total = 0;
-      for (double x : v) total += x;
-      double best = -1, threshold = 5, left = 0;
-      for (int i = 1; i < n; i++) {
-        left += v.get(i - 1);
-        double w0 = i / (double) n, w1 = 1 - w0;
-        double m0 = left / i, m1 = (total - left) / (n - i);
-        double between = w0 * w1 * (m0 - m1) * (m0 - m1);
-        if (between > best) {
-          best = between;
-          threshold = (v.get(i - 1) + v.get(i)) / 2;
+    private static int dumps;
+
+    /** Diagnostics (-Dsgm.islandsDebug=FILE): one row per patch; FILE-N.csv per filter call. */
+    private static void debugDump(
+        Path file, List<int[]> patches, boolean[] isAnchor, boolean[] suspect, double[] level, double[] depthBelow,
+        double[] nearest, double[] elevation, double[] over, boolean[] ground, float[] z, Grid g, double depth) {
+      try (BufferedWriter w = Files.newBufferedWriter(Path.of(file + "-" + dumps++ + ".csv"))) {
+        w.write("patch,x,y,area_m2,level,plane_rms,anchor,suspect,nearest_anchor_m,above_trend,depth_below_canopy,above_alternative,kept,rise_per_metre\n");
+        for (int p = 0; p < patches.size(); p++) {
+          int[] cells = patches.get(p);
+          double x = 0, y = 0;
+          for (int k : cells) {
+            x += g.x0 + (k % g.w + .5) * g.cell;
+            y += g.y1 - (k / g.w + .5) * g.cell;
+          }
+          w.write(String.format(Locale.ROOT, "%d,%.2f,%.2f,%.3f,%.2f,%.3f,%b,%b,%.1f,%.2f,%.2f,%.2f,%b,%.2f%n",
+              p, x / cells.length, y / cells.length, cells.length * g.cell * g.cell, level[p], planeRms(cells, z, g),
+              isAnchor[p], suspect[p], nearest[p], elevation[p], depthBelow[p], over[p], ground[cells[0]], depth));
         }
+      } catch (IOException e) {
+        System.err.println("islands debug: " + e);
       }
-      return threshold;
+    }
+
+    /**
+     * Local roughness: the median plane RMS over 4 m tiles of the patch (tiles with at least a
+     * quarter of their cells). Real terrain may curve over a large patch but is smooth locally;
+     * crown tops are not. Falls back to the whole-patch plane for small patches.
+     */
+    static double roughness(int[] cells, float[] z, Grid g) {
+      int side = Math.max(4, (int) Math.round(4 / g.cell));
+      Map<Long, List<Integer>> tiles = new HashMap<>();
+      for (int k : cells) tiles.computeIfAbsent((long) (k / g.w / side) * 1_000_003L + (k % g.w) / side, q -> new ArrayList<>()).add(k);
+      List<Double> rms = new ArrayList<>();
+      for (List<Integer> tile : tiles.values())
+        if (tile.size() >= side * side / 4) rms.add(planeRms(tile.stream().mapToInt(Integer::intValue).toArray(), z, g));
+      if (rms.isEmpty()) return planeRms(cells, z, g);
+      Collections.sort(rms);
+      return rms.get(rms.size() / 2);
     }
 
     private static double planeRms(int[] cells, float[] z, Grid g) {
@@ -818,9 +844,19 @@ final class GroundClassification {
         coarse[r * cw + c] = n == 0 ? Float.NaN : (float) (sum / n);
       }
     float[] filled = w == 1 && h == 1 ? coarse : pyramid(coarse, cw, ch);
+    // Bilinear upsampling (push-pull): copying each coarse cell into a 2x2 block would leave
+    // flat squares up to 2^levels cells wide in large interpolated areas.
     for (int r = 0; r < h; r++)
-      for (int c = 0; c < w; c++)
-        if (!Float.isFinite(out[r * w + c])) out[r * w + c] = filled[(r / 2) * cw + c / 2];
+      for (int c = 0; c < w; c++) {
+        if (Float.isFinite(out[r * w + c])) continue;
+        double fy = Math.max(0, Math.min(ch - 1, (r + .5) / 2 - .5)), fx = Math.max(0, Math.min(cw - 1, (c + .5) / 2 - .5));
+        int y0 = (int) fy, x0 = (int) fx, y1 = Math.min(ch - 1, y0 + 1), x1 = Math.min(cw - 1, x0 + 1);
+        double ty = fy - y0, tx = fx - x0;
+        out[r * w + c] =
+            (float)
+                ((1 - ty) * ((1 - tx) * filled[y0 * cw + x0] + tx * filled[y0 * cw + x1])
+                    + ty * ((1 - tx) * filled[y1 * cw + x0] + tx * filled[y1 * cw + x1]));
+      }
     return out;
   }
 

@@ -380,7 +380,7 @@ final class PdfReport implements AutoCloseable {
       rows.add(new String[] {"Split-half difference (median / p95)", length(checks.get("split_half_median_abs_difference"), units, 2) + " / " + length(checks.get("split_half_p95_abs_difference"), units, 2)});
       if (checks.get("blocked_ray_fraction") instanceof Number b) rows.add(new String[] {"Camera rays blocked by the terrain", String.format(Locale.ROOT, "%.2f%%", 100 * b.doubleValue())});
       if (!islands.isEmpty())
-        rows.add(new String[] {"Canopy patches rejected", count(islands.get("patches_rejected_as_canopy")) + " of " + count(islands.get("patches_tested")) + " tested (" + String.format(Locale.ROOT, "%.0f", number(islands.get("rejected_area_m2"))) + " m2), gap depth " + length(islands.get("gap_depth_m"), units, 1)});
+        rows.add(new String[] {"Canopy patches rejected", count(islands.get("patches_rejected_as_canopy")) + " of " + count(islands.get("patches_tested")) + " tested (" + String.format(Locale.ROOT, "%.0f", number(islands.get("rejected_area_m2"))) + " m2), median " + length(islands.get("rejected_median_rise_m"), units, 1) + " above the terrain"});
       table(new String[] {"Ground", "Value"}, new float[] {230, 277}, rows);
       paragraph("LAS classes: 2 ground, 7 low noise, 1 other. Rasters: dtm.tif, chm.tif, ground_support.tif, ground_uncertainty.tif.");
     }
@@ -395,7 +395,7 @@ final class PdfReport implements AutoCloseable {
     {{"georeference"}, {"crs", "--crs"}, {"gpsBundle", "--gps-bundle"}, {"gpsSigma", "--gps-sigma"}, {"gpsHeightSigma", "--gps-height-sigma"}, {"gpsIntrinsics", "--gps-intrinsics"}, {"gpsFocalPrior", "--gps-focal-prior"}, {"gpsTimeOffset", "--gps-time-offset"}, {"gpsLeverArm", "--gps-lever-arm"}, {"rollingShutter", "--rolling-shutter"}},
     {{"gcp"}, {"gcp", "--gcp"}, {"gcpSigma", "--gcp-sigma"}, {"gcpHeightSigma", "--gcp-height-sigma"}},
     {{"dense"}, {"denseMethod", "--dense-method"}, {"disparities", "--disparities"}, {"correlation", "--min-correlation"}, {"minViews", "--min-views"}, {"filtering", "--filtering"}, {"fusionMode", "--fusion-mode"}},
-    {{"ground"}, {"classifyGround", "--classify-ground"}, {"groundCell", "--ground-cell"}, {"groundMaxSlope", "--ground-max-slope"}, {"groundMaxObject", "--ground-max-object"}, {"groundGapDepth", "--ground-gap-depth"}, {"groundPairCorrection", "--ground-pair-correction"}, {"groundAwareFusion", "--ground-aware-fusion"}},
+    {{"ground"}, {"classifyGround", "--classify-ground"}, {"groundCell", "--ground-cell"}, {"groundMaxSlope", "--ground-max-slope"}, {"groundMaxObject", "--ground-max-object"}, {"groundPairCorrection", "--ground-pair-correction"}, {"groundAwareFusion", "--ground-aware-fusion"}},
     {{"finish"}, {"processingReport", "--report"}, {"reportDetail", "--report-detail"}, {"scale", "--scale"}, {"outputCompression", "--output-compression"}},
   };
 
