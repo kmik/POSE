@@ -81,6 +81,16 @@ final class GcpRegression {
     Path gcps = root.resolve("gcps.csv");
     Files.writeString(gcps, csv);
 
+    // 0. Without --gcp (and without ground options) the optional steps need not be named.
+    Path plain = root.resolve("n");
+    check(Main.run(concat(new String[] {"inputs"}, new String[] {"-i", images.toString(), "-o", plain.toString(), "--quality", "low", "--cores", "4"})) == 0, "inputs (no GCP project)");
+    check(Main.run(new String[] {"calibrate", "match", "align", "georeference", "-o", plain.toString()}) == 0, "steps up to georeference (no GCP project)");
+    check(Main.run(new String[] {"dense", "-o", plain.toString()}) == 0, "dense runs without the gcp step when --gcp is not given");
+    check(Main.run(new String[] {"finish", "-o", plain.toString()}) == 0, "finish runs without the ground step when no ground option is given");
+    PipelineState plainState = PipelineState.load(plain.resolve("runs").resolve(Main.latestRun(plain)));
+    check("skipped".equals(plainState.status(Pipeline.Step.GCP)) && "skipped".equals(plainState.status(Pipeline.Step.GROUND)), "optional steps recorded as skipped");
+    check(Files.isRegularFile(plain.resolve("runs").resolve(Main.latestRun(plain)).resolve("07_results/processing-report.pdf")), "report written without GCPs");
+
     // 1. Without pins the step waits, with predicted markers written.
     Path waitingProject = root.resolve("w");
     check(Main.run(concat(new String[] {"inputs"}, new String[] {"-i", images.toString(), "-o", waitingProject.toString(), "--quality", "low", "--cores", "4"})) == 0, "inputs (waiting project)");

@@ -37,6 +37,9 @@ photogrammetry gcp-edit -o PROJECT [--run ID] [--gcp-port N]  pin GCP markers in
 - Later steps reuse the arguments saved by `inputs`; options given to a later step are appended
   and override them (they are saved too). An option that changes the alignment resolution after
   `calibrate` is refused (the saved keypoints would not fit); branch from `match` instead.
+- `gcp` and `ground` are optional. Without `--gcp` (or without any ground option) you do not need
+  to name them: they are marked skipped when a later step runs, so `dense` can follow
+  `georeference` directly, as before GCPs existed.
 - A step needs all earlier steps complete (or skipped). A failed step can be run again on the
   same run. To redo a completed step, use `--branch`: the run history stays append-only.
 - `--memory-mb` saved by `inputs` also sizes the Java heap of later steps.
