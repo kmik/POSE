@@ -727,7 +727,7 @@ final class Pipeline {
     double seconds = (System.currentTimeMillis() - ((Number) state.get("started_epoch_millis")).longValue()) / 1e3;
     long sparse = features.tracks.stream().filter(t -> t.point != null).count();
     String report =
-        "mSGM Java 0.1\nImages="
+        "POSE " + PdfReport.VERSION + "\nImages="
             + frames.size()
             + "\n"
             + options.filteringSummary()

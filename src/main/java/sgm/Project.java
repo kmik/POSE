@@ -61,7 +61,7 @@ final class Project {
     root = options.output.toAbsolutePath().normalize();
     Path markerPath = root.resolve("project.properties");
     if (!Files.exists(markerPath))
-      throw new IllegalArgumentException("Not an mSGM project: " + root);
+      throw new IllegalArgumentException("Not a POSE project: " + root);
     try (Reader reader = Files.newBufferedReader(markerPath)) {
       marker.load(reader);
     }
@@ -193,7 +193,7 @@ final class Project {
         if (!options.overwrite
             && children.anyMatch(p -> !p.getFileName().toString().equals(".project.lock")))
           throw new IllegalArgumentException(
-              "Directory is not an mSGM project and is not empty; use a new directory or"
+              "Directory is not a POSE project and is not empty; use a new directory or"
                   + " --overwrite to adopt it");
       }
       marker.setProperty("format", FORMAT);
@@ -512,7 +512,7 @@ final class Project {
 
   private void persistProject(String status) throws IOException {
     try (Writer writer = Files.newBufferedWriter(root.resolve("project.properties"))) {
-      marker.store(writer, "mSGM project history; canonical artifacts are under runs/");
+      marker.store(writer, "POSE project history; canonical artifacts are under runs/");
     }
     List<String> runs = new ArrayList<>();
     Path directory = root.resolve("runs");
@@ -540,7 +540,7 @@ final class Project {
     String latest = "runs/" + id + "/";
     Files.writeString(
         root.resolve("README.md"),
-        "# mSGM photogrammetry project\n\nLatest run: ["
+        "# POSE project\n\nLatest run: ["
             + id
             + "]("
             + latest

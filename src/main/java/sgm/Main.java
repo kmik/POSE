@@ -67,7 +67,7 @@ public final class Main {
   static String latestRun(Path root) throws IOException {
     Properties marker = new Properties();
     Path file = root.resolve("project.properties");
-    if (!Files.isRegularFile(file)) throw new IllegalArgumentException("Not an mSGM project: " + root);
+    if (!Files.isRegularFile(file)) throw new IllegalArgumentException("Not a POSE project: " + root);
     try (Reader r = Files.newBufferedReader(file)) {
       marker.load(r);
     }

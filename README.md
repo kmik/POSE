@@ -1,7 +1,14 @@
-# Collinea
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/pose-logo-dark.png">
+    <img src="docs/images/pose-logo.png" alt="POSE" width="520">
+  </picture>
+</p>
 
-Collinea turns overlapping photographs into georeferenced point clouds, surface and terrain
-models. It is written in Java, uses OpenCL for dense stereo matching and depth fusion, and runs on
+# POSE
+
+**Photogrammetric Orientation and Surface Estimation.** POSE turns overlapping photographs into
+georeferenced point clouds, surface and terrain models. It is written in Java, uses OpenCL for dense stereo matching and depth fusion, and runs on
 its own or as part of [LAS.utils](https://github.com/kmik/LAS.utils).
 
 ![Point cloud colored by elevation](docs/images/city-point-cloud.png)
@@ -46,6 +53,9 @@ Windows x64 and Linux x64 (glibc) are supported. No system OpenCV or CUDA instal
 bash build.sh
 bash photogrammetry.sh -h
 ```
+
+`pose.bat` and `pose.sh` start the same program as `photogrammetry.bat` and `photogrammetry.sh`;
+the examples below use `photogrammetry`.
 
 The build scripts compile the program and run its test suite. `mvn package` only compiles and
 copies the dependencies.
@@ -205,7 +215,7 @@ See [processing report](PROCESSING_REPORT.md) and [project layout](PROJECT_FORMA
 ## LAS.utils
 
 Copy this repository into `sgm_java/` at the LAS.utils root, copy the wrappers from `las-utils/`
-into that root, and build the module. Collinea keeps its own classpath, so its OpenCV version does
+into that root, and build the module. POSE keeps its own classpath, so its OpenCV version does
 not clash with the one in LAS.utils. The Java entry point is `photogrammetry`.
 
 ## Limitations

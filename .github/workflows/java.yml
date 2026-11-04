@@ -1,4 +1,4 @@
-name: Collinea builds and numerical checks
+name: POSE builds and numerical checks
 on: [push, pull_request, workflow_dispatch]
 jobs:
   numerical-and-integration-tests:
