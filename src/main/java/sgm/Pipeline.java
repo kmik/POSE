@@ -72,6 +72,12 @@ final class Pipeline {
     for (Step prior : Step.values()) {
       if (prior == step) break;
       String status = state.status(prior);
+      if (status.equals("pending") && notRequested(prior, options)) {
+        // An optional step that was not asked for (no --gcp, no ground option) is simply skipped.
+        state.mark(prior, "skipped", prior.description);
+        state.snapshot(prior);
+        continue;
+      }
       if (!status.equals("complete") && !status.equals("skipped"))
         throw new IllegalArgumentException(
             "Step '" + step.name + "' needs '" + prior.name + "' first (status: " + status + ")");
@@ -109,11 +115,11 @@ final class Pipeline {
    * Checks a step list against a run's state before anything is opened, so a refused command
    * leaves the run untouched: steps in pipeline order, none already done, earlier ones done.
    */
-  static void check(PipelineState state, List<Step> steps) {
+  static void check(PipelineState state, List<Step> steps, Options options) {
     for (int i = 1; i < steps.size(); i++)
       if (steps.get(i).ordinal() <= steps.get(i - 1).ordinal())
         throw new IllegalArgumentException(
-            "Give the steps in pipeline order: inputs calibrate match align georeference dense ground finish");
+            "Give the steps in pipeline order: inputs calibrate match align georeference gcp dense ground finish");
     Set<Step> planned = EnumSet.copyOf(steps);
     for (Step step : steps) {
       String current = state.status(step);
@@ -123,17 +129,34 @@ final class Pipeline {
       for (Step prior : Step.values()) {
         if (prior == step) break;
         String status = state.status(prior);
-        if (!planned.contains(prior) && !status.equals("complete") && !status.equals("skipped"))
+        if (!planned.contains(prior)
+            && !status.equals("complete")
+            && !status.equals("skipped")
+            && !(status.equals("pending") && notRequested(prior, options)))
           throw new IllegalArgumentException(
               "Step '" + step.name + "' needs '" + prior.name + "' first (status: " + status + ")");
       }
     }
   }
 
-  /** First step that is neither complete nor skipped, or null. */
-  static String next(PipelineState state) {
+  /**
+   * Optional steps run only when asked for: gcp with --gcp, ground with a ground option. Pending
+   * and not asked for, they are skipped when a later step runs.
+   */
+  static boolean notRequested(Step step, Options o) {
+    if (o == null) return false;
+    return switch (step) {
+      case GCP -> o.gcp == null;
+      case GROUND -> !(o.classifyGround || o.groundPairCorrection || o.groundAwareFusion);
+      default -> false;
+    };
+  }
+
+  /** First step that is neither complete nor skipped (nor an optional step not asked for), or null. */
+  static String next(PipelineState state, Options options) {
     for (Step s : Step.values()) {
       String status = state.status(s);
+      if (status.equals("pending") && notRequested(s, options)) continue;
       if (!status.equals("complete") && !status.equals("skipped")) return s.name;
     }
     return null;

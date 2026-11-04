@@ -152,7 +152,7 @@ public final class Main {
       if (c.branch()) source = c.runId() == null ? latestRun(root) : c.runId();
       // Refuse an impossible step list before the run is opened (it must stay as it is).
       if (!chain && !c.branch() && source != null)
-        Pipeline.check(PipelineState.load(root.resolve("runs").resolve(source)), c.steps());
+        Pipeline.check(PipelineState.load(root.resolve("runs").resolve(source)), c.steps(), options);
       project = fresh ? Project.open(options, effective) : Project.attach(options, effective, source);
       Terminal.configure(options.verbose, System.out);
       capture = project.capture();
@@ -184,7 +184,7 @@ public final class Main {
             break;
           }
         }
-        next = Pipeline.next(state);
+        next = Pipeline.next(state, options);
         if (!finishing)
           System.out.println(
               next == null
@@ -248,16 +248,23 @@ public final class Main {
     }
     PipelineState state = PipelineState.load(run);
     System.out.println("Run " + id + " (" + run + ")");
+    Options options = null;
+    try {
+      options = Options.parse(continued(c));
+    } catch (RuntimeException unreadable) {
+      // Without the saved options optional steps are listed as they are.
+    }
     for (Pipeline.Step s : Pipeline.Step.values()) {
       var entry = JsonRead.object(state.steps().get(s.name));
+      boolean optional = "pending".equals(state.status(s)) && Pipeline.notRequested(s, options);
       System.out.printf(
           Locale.ROOT,
           "  %-13s %-9s %s%n",
           s.name,
           entry.get("status"),
-          entry.get("updated_utc") == null ? "" : entry.get("updated_utc"));
+          optional ? "(not requested; skipped when a later step runs)" : entry.get("updated_utc") == null ? "" : entry.get("updated_utc"));
     }
-    String next = Pipeline.next(state);
+    String next = Pipeline.next(state, options);
     System.out.println(next == null ? "All steps done." : "Next step: " + next);
     return 0;
   }

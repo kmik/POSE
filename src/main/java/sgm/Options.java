@@ -1518,8 +1518,10 @@ Pipeline steps (run one by one, or chained; the state is saved after each step):
       gcp, dense, ground, finish. 'inputs' starts a new run (needs -i); the other
       steps continue the latest run with the options saved by 'inputs'; options given
       here are added and override them. 'finish' writes the report and final files.
-      'gcp' is skipped without --gcp. Until enough markers are pinned it ends as
-      'waiting' with predicted markers: pin them with gcp-edit, then run gcp again.
+      'gcp' and 'ground' are optional: without --gcp (or without ground options) they
+      need not be named and are skipped when a later step runs. With --gcp, 'gcp' ends
+      as 'waiting' until enough markers are pinned: pin them with gcp-edit, then run
+      gcp again.
   --run ID
       Continue (or branch from) this run instead of the latest one.
   --branch
