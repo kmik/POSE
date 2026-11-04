@@ -4,7 +4,25 @@ import java.util.*;
 
 /** Fixed-camera, one-dimensional inverse-depth fit. Each measured camera contributes once. */
 final class ReprojectionDepth {
-  record Observation(Camera camera, double u, double v) {}
+  static final class Context {
+    final Camera anchor;
+    final double z;
+    final double[] center, ray;
+
+    Context(Camera anchor, double[] point, double[] center) {
+      this.anchor = anchor;
+      this.center = center;
+      z = anchor.view(point)[2];
+      ray = Math3.times(Math3.sub(point, center), 1 / z);
+    }
+  }
+
+  record Observation(
+      Camera camera, double u, double v, Context context, double[] direction, double[] offset) {
+    Observation(Camera camera, double u, double v) {
+      this(camera, u, v, null, null, null);
+    }
+  }
 
   record Fit(double depth, double relativeSigma, double before, double after) {}
 
@@ -14,13 +32,17 @@ final class ReprojectionDepth {
    * locally constant base-camera Z patch; depth edges are checked separately by fusion.
    */
   static Observation link(Camera anchor, Camera camera, double[] point, double[] evidence) {
-    double z = anchor.view(point)[2], measuredZ = anchor.view(evidence)[2];
-    double[] center = anchor.center(), ray = Math3.times(Math3.sub(point, center), 1 / z);
-    double[] d = Math3.mv(camera.rotation, ray), t = camera.view(center);
+    return link(new Context(anchor, point, anchor.center()), camera, evidence);
+  }
+
+  static Observation link(Context context, Camera camera, double[] evidence) {
+    double measuredZ = context.anchor.view(evidence)[2];
+    double[] d = Math3.mv(camera.rotation, context.ray), t = camera.view(context.center);
     double x = d[0] + t[0] * (1 / measuredZ),
         y = d[1] + t[1] * (1 / measuredZ),
         q = d[2] + t[2] * (1 / measuredZ);
-    return new Observation(camera, camera.fx * x / q + camera.cx, camera.fy * y / q + camera.cy);
+    return new Observation(
+        camera, camera.fx * x / q + camera.cx, camera.fy * y / q + camera.cy, context, d, t);
   }
 
   static Fit fit(
@@ -29,20 +51,24 @@ final class ReprojectionDepth {
       double initialDepth,
       List<Observation> observations,
       double huber) {
-    double z = anchor.view(point)[2];
-    double[] center = anchor.center();
-    double[] ray = Math3.times(Math3.sub(point, center), 1 / z);
+    return fit(new Context(anchor, point, anchor.center()), initialDepth, observations, huber);
+  }
+
+  static Fit fit(
+      Context context, double initialDepth, List<Observation> observations, double huber) {
+    double z = context.z;
     int n = observations.size();
     double[][] directions = new double[n][], offsets = new double[n][];
     for (int i = 0; i < n; i++) {
       Camera c = observations.get(i).camera;
-      directions[i] = Math3.mv(c.rotation, ray);
-      offsets[i] = c.view(center);
+      Observation o = observations.get(i);
+      directions[i] = o.context == context ? o.direction : Math3.mv(c.rotation, context.ray);
+      offsets[i] = o.context == context ? o.offset : c.view(context.center);
     }
     double rho = 1 / z;
-    double before = evaluate(rho, observations, directions, offsets, huber)[0];
+    double before = objective(rho, observations, directions, offsets, huber);
     double trial = 1 / initialDepth;
-    if (trial > 0 && evaluate(trial, observations, directions, offsets, huber)[0] < before)
+    if (trial > 0 && objective(trial, observations, directions, offsets, huber) < before)
       rho = trial;
     for (int iteration = 0; iteration < 6; iteration++) {
       double[] f = evaluate(rho, observations, directions, offsets, huber);
@@ -51,7 +77,7 @@ final class ReprojectionDepth {
       boolean improved = false;
       for (int line = 0; line < 8; line++) {
         trial = rho + step;
-        if (trial > 0 && evaluate(trial, observations, directions, offsets, huber)[0] < f[0]) {
+        if (trial > 0 && objective(trial, observations, directions, offsets, huber) < f[0]) {
           rho = trial;
           improved = true;
           break;
@@ -67,6 +93,26 @@ final class ReprojectionDepth {
             / Math.sqrt(Math.max(1e-30, end[2]))
             / rho;
     return new Fit(1 / rho, sigma, before, end[0]);
+  }
+
+  private static double objective(
+      double rho,
+      List<Observation> observations,
+      double[][] directions,
+      double[][] offsets,
+      double huber) {
+    double objective = 0;
+    for (int i = 0; i < observations.size(); i++) {
+      Observation o = observations.get(i);
+      double[] d = directions[i], t = offsets[i];
+      double x = d[0] + t[0] * rho, y = d[1] + t[1] * rho, z = d[2] + t[2] * rho;
+      if (!(z > 1e-12)) return Double.POSITIVE_INFINITY;
+      double du = o.camera.fx * x / z + o.camera.cx - o.u,
+          dv = o.camera.fy * y / z + o.camera.cy - o.v;
+      double r = Math.hypot(du, dv);
+      objective += r <= huber ? .5 * r * r : huber * (r - .5 * huber);
+    }
+    return objective;
   }
 
   private static double[] evaluate(

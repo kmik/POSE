@@ -5,6 +5,7 @@
   <description>Java and OpenCL photogrammetry with semi-global stereo and multi-view surface fusion</description>
   <properties><maven.compiler.release>25</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
   <dependencies>
+    <dependency><groupId>org.apache.pdfbox</groupId><artifactId>pdfbox</artifactId><version>3.0.8</version></dependency>
     <dependency><groupId>org.openpnp</groupId><artifactId>opencv</artifactId><version>4.9.0-0</version></dependency>
     <dependency><groupId>org.locationtech.proj4j</groupId><artifactId>proj4j</artifactId><version>1.4.3</version></dependency>
     <dependency><groupId>org.locationtech.proj4j</groupId><artifactId>proj4j-epsg</artifactId><version>1.4.3</version></dependency>

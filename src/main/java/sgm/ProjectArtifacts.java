@@ -36,11 +36,11 @@ final class ProjectArtifacts implements AutoCloseable {
   void denseInputs(List<ImageFrame> dense) throws IOException {
     frames = dense;
     for (ImageFrame frame : dense) {
-      if (!options.storage.equals("minimal")) frame.ensureRasters();
+      if ((options.diagnostics && !options.storage.equals("minimal"))) frame.ensureRasters();
       Path dir = directory("00_inputs/dense/" + imageId(frame.id));
-      if (!options.storage.equals("minimal"))
+      if ((options.diagnostics && !options.storage.equals("minimal")))
         image(dir.resolve("undistorted_color.png"), frame.color);
-      if (options.storage.equals("debug")) {
+      if ((options.diagnostics && options.storage.equals("debug"))) {
         image(dir.resolve("undistorted_gray.png"), frame.gray);
         image(dir.resolve("valid_mask.png"), frame.validMask);
       }
@@ -126,18 +126,41 @@ final class ProjectArtifacts implements AutoCloseable {
             + ","
             + csv(archived));
     Files.write(project.run.resolve("00_inputs/images.csv"), sourceRows);
+    Path acquisition = project.run.resolve("00_inputs/acquisition.json");
+    List<Object> timestamps =
+        Files.isRegularFile(acquisition)
+            ? new ArrayList<>(JsonRead.array(JsonRead.read(acquisition)))
+            : new ArrayList<>();
+    Exif.Metadata metadata = Exif.read(path);
+    timestamps.add(
+        Json.object(
+            "filename",
+            path.getFileName().toString(),
+            "capture_time_local",
+            metadata.captureTime,
+            "capture_offset",
+            metadata.captureOffset,
+            "camera_model",
+            metadata.make + "/" + metadata.model));
+    Json.write(acquisition, timestamps);
+  }
+
+  /** A later pipeline step (new process): the same in-memory context, nothing rewritten. */
+  void restore(List<ImageFrame> frames, Calibration calibration) {
+    this.frames = frames;
+    if (calibration != null) sourceCalibration = calibration;
   }
 
   void inputs(List<ImageFrame> frames, Calibration calibration) throws IOException {
     this.frames = frames;
     sourceCalibration = calibration;
     for (ImageFrame frame : frames) {
-      if (!options.storage.equals("minimal")) frame.ensureRasters();
+      if ((options.diagnostics && !options.storage.equals("minimal"))) frame.ensureRasters();
       source(frame.id, frame.path, frame.sourceWidth, frame.sourceHeight, frame.gps);
       Path dir = directory("00_inputs/" + imageId(frame.id));
-      if (!options.storage.equals("minimal"))
+      if ((options.diagnostics && !options.storage.equals("minimal")))
         image(dir.resolve("undistorted_color.png"), frame.color);
-      if (options.storage.equals("debug")) {
+      if ((options.diagnostics && options.storage.equals("debug"))) {
         image(dir.resolve("undistorted_gray.png"), frame.gray);
         image(dir.resolve("valid_mask.png"), frame.validMask);
       }
@@ -171,7 +194,7 @@ final class ProjectArtifacts implements AutoCloseable {
           mx = new Mat(),
           my = new Mat();
       try {
-        if (!options.rectified && options.storage.equals("debug")) {
+        if (!options.rectified && (options.diagnostics && options.storage.equals("debug"))) {
           Calib3d.initUndistortRectifyMap(
               k, d, r, k, new Size(frame.width, frame.height), CvType.CV_32FC1, mx, my);
           pfm(dir.resolve("undistort_source_x.pfm"), mx);
@@ -193,7 +216,7 @@ final class ProjectArtifacts implements AutoCloseable {
           StandardCopyOption.REPLACE_EXISTING);
   }
 
-  private void referenceCalibration(Calibration calibration) throws IOException {
+  void referenceCalibration(Calibration calibration) throws IOException {
     Path dir = directory("01_calibration");
     if (options.calibration != null)
       Files.copy(
@@ -263,7 +286,7 @@ final class ProjectArtifacts implements AutoCloseable {
   }
 
   void features(ImageFrame frame) throws IOException {
-    if (options.storage.equals("minimal")) return;
+    if (!options.diagnostics || options.storage.equals("minimal")) return;
     Path dir = directory("02_features/" + imageId(frame.id));
     try (BufferedWriter w = Files.newBufferedWriter(dir.resolve("keypoints.csv"))) {
       w.write(
@@ -294,7 +317,7 @@ final class ProjectArtifacts implements AutoCloseable {
                 + "\n");
       }
     }
-    if (options.storage.equals("debug")) {
+    if ((options.diagnostics && options.storage.equals("debug"))) {
       try (DataOutputStream out =
           new DataOutputStream(
               new BufferedOutputStream(Files.newOutputStream(dir.resolve("descriptors.f32"))))) {
@@ -318,7 +341,7 @@ final class ProjectArtifacts implements AutoCloseable {
         dir.resolve("features.json"),
         Json.object(
             "descriptors_exported",
-            options.storage.equals("debug"),
+            (options.diagnostics && options.storage.equals("debug")),
             "detector",
             frame.options.matchingAlgorithm,
             "native_descriptor_type",
@@ -359,7 +382,7 @@ final class ProjectArtifacts implements AutoCloseable {
       Set<Integer> ransac,
       Set<Integer> cheirality)
       throws IOException {
-    if (!options.storage.equals("debug")) {
+    if (!(options.diagnostics && options.storage.equals("debug"))) {
       compactMatches(a, b, pair, forward.size(), ransac.size(), cheirality.size());
       return;
     }
@@ -559,7 +582,7 @@ final class ProjectArtifacts implements AutoCloseable {
             + ","
             + csv(pair.reason));
     Files.write(project.run.resolve("03_matches/pairs.csv"), pairRows);
-    if (options.storage.equals("minimal")) return;
+    if (!options.diagnostics || options.storage.equals("minimal")) return;
     Path dir = directory("03_matches/" + pairId(a.id, b.id));
     try (BufferedWriter out = gzip(dir.resolve("accepted_matches.csv.gz"))) {
       out.write("query_keypoint_id,train_keypoint_id\n");
@@ -588,7 +611,7 @@ final class ProjectArtifacts implements AutoCloseable {
   void snapshot(
       String name, List<ImageFrame> frames, List<FeatureTracks.Track> tracks, String coordinates)
       throws IOException {
-    if (!options.storage.equals("debug") && !name.equals("final")) return;
+    if (!(options.diagnostics && options.storage.equals("debug")) && !name.equals("final")) return;
     Path dir = directory("04_geometry/" + name);
     interior(dir.resolve("interior.csv"), frames);
     List<Object> cameras = new ArrayList<>();
@@ -681,7 +704,7 @@ final class ProjectArtifacts implements AutoCloseable {
       int conflicts,
       int singletons)
       throws IOException {
-    if (!options.storage.equals("debug")) return;
+    if (!(options.diagnostics && options.storage.equals("debug"))) return;
     Path dir = directory("03_matches");
     Json.write(
         dir.resolve("track_build.json"),
@@ -915,6 +938,7 @@ final class ProjectArtifacts implements AutoCloseable {
       double[] tvec,
       boolean registered)
       throws IOException {
+    if (!options.diagnostics) return;
     Path dir =
         directory(
             String.format(
@@ -971,6 +995,7 @@ final class ProjectArtifacts implements AutoCloseable {
 
   void trackFilter(FeatureTracks.Track track, List<ImageFrame> frames, boolean retained)
       throws IOException {
+    if (!options.diagnostics) return;
     Path file = project.run.resolve("04_geometry/track_filter.csv");
     if (!Files.exists(file))
       Files.writeString(file, "track_id,retained,reason,maximum_reprojection_pixels\n");
@@ -1071,7 +1096,7 @@ final class ProjectArtifacts implements AutoCloseable {
             "map_convention",
             "Each matching-raster pixel stores its source processed-undistorted x/y; source is not"
                 + " the original distorted photo"));
-    if (alreadyRectified && options.storage.equals("debug")) {
+    if (alreadyRectified && (options.diagnostics && options.storage.equals("debug"))) {
       int w = a.width, h = a.height;
       float[] x = new float[w * h], y = new float[w * h];
       for (int i = 0; i < x.length; i++) {
@@ -1089,7 +1114,7 @@ final class ProjectArtifacts implements AutoCloseable {
 
   void rectificationMaps(int source, String side, Mat mx, Mat my, boolean vertical)
       throws IOException {
-    if (!options.storage.equals("debug")) return;
+    if (!(options.diagnostics && options.storage.equals("debug"))) return;
     Path dir = rasters.get(source).dir;
     Mat x = new Mat(), y = new Mat();
     try {
@@ -1108,6 +1133,36 @@ final class ProjectArtifacts implements AutoCloseable {
     }
   }
 
+  void patchmatchPair(int source, ImageFrame reference, ImageFrame other) throws IOException {
+    PairRaster raster = new PairRaster();
+    raster.width = reference.width;
+    raster.height = reference.height;
+    raster.dir =
+        directory(
+            String.format(Locale.ROOT, "05_stereo/pm_ref_%04d_src_%04d", reference.id, other.id));
+    if ((options.diagnostics && options.storage.equals("debug"))) {
+      raster.accepted = new byte[raster.width * raster.height];
+      raster.support = new float[raster.width * raster.height];
+      Arrays.fill(raster.support, Float.NaN);
+    }
+    rasters.put(source, raster);
+    Json.write(
+        raster.dir.resolve("raster.json"),
+        Json.object(
+            "method",
+            "patchmatch",
+            "reference_image_id",
+            reference.id,
+            "source_image_id",
+            other.id,
+            "width",
+            raster.width,
+            "height",
+            raster.height,
+            "pixel_frame",
+            "processed undistorted reference image; no rectification"));
+  }
+
   void rectifiedImages(
       int source,
       ImageFrame a,
@@ -1122,7 +1177,7 @@ final class ProjectArtifacts implements AutoCloseable {
     PairRaster raster = rasters.get(source);
     raster.width = left.cols();
     raster.height = left.rows();
-    if (!options.storage.equals("debug")) {
+    if (!(options.diagnostics && options.storage.equals("debug"))) {
       Json.write(
           raster.dir.resolve("raster.json"),
           Json.object(
@@ -1270,7 +1325,7 @@ final class ProjectArtifacts implements AutoCloseable {
   }
 
   void finalDisparity(int source, CensusSgm.Result result, Options effective) throws IOException {
-    if (!options.storage.equals("standard")) return;
+    if (!options.diagnostics || !options.storage.equals("standard")) return;
     Path dir = directory("05_stereo/" + rasters.get(source).dir.getFileName() + "/disparity");
     scalar(
         dir,
@@ -1357,7 +1412,7 @@ final class ProjectArtifacts implements AutoCloseable {
       double angle,
       double correlation)
       throws IOException {
-    if (!options.storage.equals("debug")) return;
+    if (!(options.diagnostics && options.storage.equals("debug"))) return;
     if (candidates == null) {
       candidates = gzip(project.run.resolve("06_fusion/candidates.csv.gz"));
       candidates.write(
@@ -1394,7 +1449,7 @@ final class ProjectArtifacts implements AutoCloseable {
 
   void decision(long candidate, int source, int pixel, int views, String status)
       throws IOException {
-    if (!options.storage.equals("debug")) return;
+    if (!(options.diagnostics && options.storage.equals("debug"))) return;
     if (decisions == null) {
       decisions = gzip(project.run.resolve("06_fusion/decisions.csv.gz"));
       decisions.write(
@@ -1469,7 +1524,7 @@ final class ProjectArtifacts implements AutoCloseable {
       int wb,
       int hb)
       throws IOException {
-    if (!options.storage.equals("debug")) return;
+    if (!(options.diagnostics && options.storage.equals("debug"))) return;
     Path dir =
         directory("06_fusion/pair_evidence/source_" + String.format(Locale.ROOT, "%04d", source));
     DepthRaster[] maps = {first, second};
@@ -1521,7 +1576,7 @@ final class ProjectArtifacts implements AutoCloseable {
 
   void fusionRefinement(long id, int source, double[] original, DepthFusion.Result result)
       throws IOException {
-    if (!options.storage.equals("debug")) return;
+    if (!(options.diagnostics && options.storage.equals("debug"))) return;
     if (refinements == null) {
       refinements = gzip(project.run.resolve("06_fusion/refinements.csv.gz"));
       refinements.write(
@@ -1582,7 +1637,7 @@ final class ProjectArtifacts implements AutoCloseable {
 
   void finishFusion() throws IOException {
     close();
-    if (!options.storage.equals("debug")) return;
+    if (!(options.diagnostics && options.storage.equals("debug"))) return;
     for (Map.Entry<Integer, PairRaster> item : rasters.entrySet()) {
       PairRaster raster = item.getValue();
       Path dir = directory("06_fusion/" + raster.dir.getFileName());
@@ -1841,76 +1896,81 @@ final class ProjectArtifacts implements AutoCloseable {
 
   static String guide() {
     return "# mSGM project run\n\n"
-        + "Storage defaults to standard: orientations, keypoints/accepted matches, final"
-        + " disparity rasters, final clouds/confidence and summaries. minimal omits"
-        + " diagnostic rasters; debug retains the complete audit described below."
-        + " Unrequested debug artifacts are not missing processing stages. Caching is opt-in"
-        + " (--cache or --resume); successful non-debug fusion removes working depth files."
-        + " GPU compute auto uses OpenCL when available and within device limits; CPU"
-        + " fallback does not change image resolution.\n\n"
-        + "[Run status](run.json) · [Stage status](stages.csv) · [Artifact index with"
-        + " SHA-256](artifacts.csv) · [Console log](logs/console.log)\n\n"
-        + "| Directory | Contents |\n"
-        + "|---|---|\n"
-        + "|00_inputs|Source inventory/hashes, optional archived originals, lossless"
-        + " processed images, undistortion maps and masks|\n"
-        + "|01_calibration|Reference and processed interior orientation; camera-calibration"
-        + " observations, automatic focal search and EXIF evidence if applicable|\n"
-        + "|02_features|All keypoints and selected descriptors; native type/metric and"
-        + " visual overlays|\n"
-        + "|03_matches|All nearest-neighbor decisions, filtering flags, accepted/rejected"
-        + " previews, relative geometry and feature-track graph|\n"
-        + "|04_geometry|Seed/registration/bundle/final orientations, sparse tracks and"
-        + " observations, reprojection errors and camera frustums|\n"
-        + "|05_stereo|Rectification images/maps/matrices, each disparity filtering stage,"
-        + " confidence and rejection maps, pair depth/angle estimates|\n"
-        + "|06_fusion|Per-candidate depth validation/refinement, normal-aware surface"
-        + " consolidation summary; debug candidates, pre-consolidation decisions/support"
-        + " maps and separate surface_decisions.csv.gz provenance|\n"
-        + "|07_results|Final RGB LAS/PLY, point-confidence.csv.gz, coordinates.json and"
-        + " report|\n"
-        + "|logs|Console, events and effective settings|\n\n"
-        + "Depth decisions and refinements describe the per-candidate stage. When"
-        + " normal-aware consolidation is enabled, the final point-confidence.csv.gz records"
-        + " published positions, source candidate IDs, normals, neighborhood"
-        + " roughness/planarity, surface shifts and merged-observation counts. Debug"
-        + " surface_decisions.csv.gz maps merged candidates to their representatives. Merged"
-        + " counts are not extra supporting-camera counts; camera support is rechecked for"
-        + " moved points.\n\n"
-        + "## Coordinates and formats\n\n"
-        + "Image/keypoint IDs are zero-based and stable within this run. Keypoint/match"
-        + " coordinates use the processed undistorted alignment raster: x right, y down,"
-        + " zero-based pixel centers. Descriptors row i refers to keypoint i. Camera"
-        + " extrinsics use X_camera=R*X_world+t, C_world=-R^T*t; camera axes x right, y"
-        + " down, z forward. Rodrigues rotations are radians. No ambiguous omega/phi/kappa"
-        + " convention is assumed. Intrinsics and distortion are explicitly separated"
-        + " between original/reference and processed/undistorted images. When dense sizes"
-        + " differ, 00_inputs/dense/ records their separate rasters and intrinsics.\n\n"
-        + "Geometry snapshots and stereo candidates use pre-output-multiplier reconstruction"
-        + " units. Final LAS/PLY apply --scale. Image-only geometry has arbitrary scale"
-        + " unless anchored by a measured baseline, supplied poses or GPS. Successful"
-        + " automatic GPS alignment uses the selected projected CRS (default EPSG:3067),"
-        + " metres, x=easting and y=northing; --scale must be 1. Earlier geometry snapshots"
-        + " retain the original reconstruction frame; the final snapshot, candidates and"
-        + " clouds use the projected frame. See 04_geometry/georeference/transform.json and"
-        + " 07_results/coordinates.json. Z retains EXIF altitude with unspecified vertical"
-        + " datum; no N2000/geoid conversion.\n\n"
-        + "PFM files are single-channel float32, little-endian, bottom-up; invalid"
-        + " disparities/depths are NaN. Rectification-map values are source"
-        + " undistorted-image pixel coordinates. If epipolar lines are vertical, matching"
-        + " rasters are transposed; pair metadata records this and how to feed original"
-        + " coordinates to Q. Descriptor .f32 uses SGMDESC1 magic (8 bytes), big-endian"
-        + " int32 row/column counts, then row-major big-endian float32. Binary descriptors"
-        + " retain exact byte values as floats; restore unsigned bytes for Hamming matching."
-        + " CSV.gz files are ordinary UTF-8 CSV compressed with gzip. Numerical exports are"
-        + " complete; match previews show at most 300 deterministic samples.\n\n"
-        + "A stage marked skipped was not executed (e.g. feature matching with fixed"
-        + " supplied poses), not silently lost. Intermediate stereo estimates are not final"
-        + " accepted cloud points; use fusion decisions and final results for acceptance."
-        + " Full SGM cost volumes and native solver workspaces are not persisted. Source"
-        + " paths refer to originals unless --copy-inputs was requested. Each invocation"
-        + " creates a new audit run; --resume and --rerun-from reuse verified stage payloads"
-        + " from the separate project cache/v3/<storage>/. Edited audit exports are not"
-        + " implicitly loaded as restart state.\n";
+               + "Detailed diagnostics are off by default. Orientations, final clouds, compact"
+               + " lossless point-confidence.bin, reports and quality summaries remain available."
+               + " --diagnostics enables optional exports and defaults storage to debug; an"
+               + " explicit --storage minimal|standard|debug bounds that export scope. The table"
+               + " below includes optional diagnostic artifacts, which may be absent in compact"
+               + " runs. Unrequested debug artifacts are not missing processing stages. Caching is"
+               + " opt-in (--cache or --resume); successful non-debug fusion removes working depth"
+               + " files. GPU compute auto uses OpenCL when available and within device limits; CPU"
+               + " fallback does not change image resolution.\n\n"
+               + "[Run status](run.json) · [Stage status](stages.csv) · [Artifact index with"
+               + " SHA-256](artifacts.csv) · [Console log](logs/console.log)\n\n"
+               + "| Directory | Contents |\n"
+               + "|---|---|\n"
+               + "|00_inputs|Source inventory/hashes, optional archived originals, lossless"
+               + " processed images, undistortion maps and masks|\n"
+               + "|01_calibration|Reference and processed interior orientation; camera-calibration"
+               + " observations, automatic focal search and EXIF evidence if applicable|\n"
+               + "|02_features|All keypoints and selected descriptors; native type/metric and"
+               + " visual overlays|\n"
+               + "|03_matches|All nearest-neighbor decisions, filtering flags, accepted/rejected"
+               + " previews, relative geometry and feature-track graph|\n"
+               + "|04_geometry|Seed/registration/bundle/final orientations, sparse tracks and"
+               + " observations, reprojection errors and camera frustums|\n"
+               + "|05_stereo|Rectification images/maps/matrices, each disparity filtering stage,"
+               + " confidence and rejection maps, pair depth/angle estimates|\n"
+               + "|06_fusion|Per-candidate depth validation/refinement, normal-aware surface"
+               + " consolidation summary; debug candidates, pre-consolidation decisions/support"
+               + " maps and separate surface_decisions.csv.gz provenance|\n"
+               + "|07_results|Final RGB LAS/PLY, point-confidence.bin, optional confidence CSV,"
+               + " coordinates.json and report|\n"
+               + "|logs|Console, events and effective settings|\n\n"
+               + "Depth decisions and refinements describe the per-candidate stage. When"
+               + " normal-aware consolidation is enabled, the final point-confidence.bin records"
+               + " published positions, source candidate IDs, normals, neighborhood"
+               + " roughness/planarity, surface shifts and merged-observation counts. Debug"
+               + " surface_decisions.csv.gz maps merged candidates to their representatives. Merged"
+               + " counts are not extra supporting-camera counts; camera support is rechecked for"
+               + " moved points. --export-confidence RUN_DIRECTORY generates the compatible CSV"
+               + " later without reconstructing. Project-root latest-files.csv references canonical"
+               + " run outputs; --compatibility-copies additionally duplicates the large"
+               + " clouds.\n\n"
+               + "## Coordinates and formats\n\n"
+               + "Image/keypoint IDs are zero-based and stable within this run. Keypoint/match"
+               + " coordinates use the processed undistorted alignment raster: x right, y down,"
+               + " zero-based pixel centers. Descriptors row i refers to keypoint i. Camera"
+               + " extrinsics use X_camera=R*X_world+t, C_world=-R^T*t; camera axes x right, y"
+               + " down, z forward. Rodrigues rotations are radians. No ambiguous omega/phi/kappa"
+               + " convention is assumed. Intrinsics and distortion are explicitly separated"
+               + " between original/reference and processed/undistorted images. When dense sizes"
+               + " differ, 00_inputs/dense/ records their separate rasters and intrinsics.\n\n"
+               + "Geometry snapshots and stereo candidates use pre-output-multiplier reconstruction"
+               + " units. Final LAS/PLY apply --scale. Image-only geometry has arbitrary scale"
+               + " unless anchored by a measured baseline, supplied poses or GPS. Successful"
+               + " automatic GPS alignment uses the selected projected CRS (default EPSG:3067),"
+               + " metres, x=easting and y=northing; --scale must be 1. Earlier geometry snapshots"
+               + " retain the original reconstruction frame; the final snapshot, candidates and"
+               + " clouds use the projected frame. See 04_geometry/georeference/transform.json and"
+               + " 07_results/coordinates.json. Z retains EXIF altitude with unspecified vertical"
+               + " datum; no N2000/geoid conversion.\n\n"
+               + "PFM files are single-channel float32, little-endian, bottom-up; invalid"
+               + " disparities/depths are NaN. Rectification-map values are source"
+               + " undistorted-image pixel coordinates. If epipolar lines are vertical, matching"
+               + " rasters are transposed; pair metadata records this and how to feed original"
+               + " coordinates to Q. Descriptor .f32 uses SGMDESC1 magic (8 bytes), big-endian"
+               + " int32 row/column counts, then row-major big-endian float32. Binary descriptors"
+               + " retain exact byte values as floats; restore unsigned bytes for Hamming matching."
+               + " CSV.gz files are ordinary UTF-8 CSV compressed with gzip. Numerical exports are"
+               + " complete; match previews show at most 300 deterministic samples.\n\n"
+               + "A stage marked skipped was not executed (e.g. feature matching with fixed"
+               + " supplied poses), not silently lost. Intermediate stereo estimates are not final"
+               + " accepted cloud points; use fusion decisions and final results for acceptance."
+               + " Full SGM cost volumes and native solver workspaces are not persisted. Source"
+               + " paths refer to originals unless --copy-inputs was requested. Each invocation"
+               + " creates a new audit run; --resume and --rerun-from reuse verified stage payloads"
+               + " from the separate project cache/v3/<storage>-<compact|diagnostics>/. Edited"
+               + " audit exports are not implicitly loaded as restart state.\n";
   }
 }

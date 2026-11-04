@@ -1,34 +1,42 @@
 # Collinea
 
-Collinea reconstructs point clouds from overlapping photographs. It is written in Java, with OpenCL acceleration for dense stereo matching and depth fusion, and can run on its own or as part of [LAS.utils](https://github.com/kmik/LAS.utils).
+Collinea turns overlapping photographs into georeferenced point clouds, surface and terrain
+models. It is written in Java, uses OpenCL for dense stereo matching and depth fusion, and runs on
+its own or as part of [LAS.utils](https://github.com/kmik/LAS.utils).
 
 ![Point cloud colored by elevation](docs/images/city-point-cloud.png)
 
-## Features
+## What it does
 
-- Feature matching, camera alignment and bundle adjustment.
-- Automatic focal length and radial distortion estimation, or supplied camera calibration and poses.
-- Semi-global stereo matching with Census, AD-Census, Census-gradient and ZNCC costs.
-- Per-pair disparity range estimation and multi-view depth filtering.
-- Reprojection-based depth refinement and normal-aware surface consolidation.
-- GPS georeferencing and import/export of interior and exterior orientations.
-- LAS and PLY output, including normals, roughness, planarity and point confidence.
-- Self-contained processing reports with all parameter values, stage timings, resource measurements and a DSM overview.
+- **Alignment:** feature matching, camera alignment and bundle adjustment, with automatic focal
+  length and lens distortion estimation, or a supplied calibration and camera poses.
+- **Georeferencing:** from image GPS, with a GPS-weighted adjustment that also estimates the lens,
+  the GPS time offset, the antenna lever arm and the rolling shutter.
+- **Ground control points:** import a GCP file, pin the points in the images in a browser editor,
+  and adjust the block onto them. Check points give an independent accuracy estimate.
+- **Dense matching:** semi-global matching (Census, AD-Census, Census-gradient, ZNCC costs) with
+  multi-view depth fusion and surface consolidation.
+- **Ground classification:** ground points, a terrain model (DTM) and a canopy height model,
+  without any reference terrain.
+- **Outputs:** LAS and PLY clouds (with normals, surface metrics and point confidence), DSM, DTM,
+  orthomosaic preview, and a PDF processing report in the style of survey software.
+- **Step-by-step processing:** run the pipeline in one go or one step at a time, change settings
+  between steps, and branch a run to try other settings.
 
 ## Build
 
-Requirements:
+You need:
 
-- **64-bit JDK 25 or later**, with `JAVA_HOME` set or `java` and `javac` on PATH.
-- Internet access for the first build, which downloads OpenCV 4.9.0-0, Proj4J 1.4.3 and TwelveMonkeys ImageIO 3.15.3 into `lib/`.
-- A vendor OpenCL runtime for GPU processing. GPU depth fusion also requires double-precision support (FP64).
+- a **64-bit JDK 25 or later** (`JAVA_HOME` set, or `java` and `javac` on PATH);
+- internet access for the first build, which downloads OpenCV, Proj4J, TwelveMonkeys ImageIO and
+  Apache PDFBox into `lib/`;
+- for GPU processing, a vendor OpenCL runtime (GPU depth fusion needs double precision, FP64).
+  Without OpenCL everything runs on the CPU.
 
-Windows x64 is tested locally on NVIDIA and AMD OpenCL devices. Windows and Linux x64/glibc build-and-test jobs have passed CI. Alpine/musl is unsupported. CPU reconstruction does not require OpenCL.
-
-From the repository root:
+Windows x64 and Linux x64 (glibc) are supported. No system OpenCV or CUDA installation is needed.
 
 ```powershell
-# Windows PowerShell
+# Windows
 .\build.bat
 .\photogrammetry.bat -h
 ```
@@ -39,130 +47,184 @@ bash build.sh
 bash photogrammetry.sh -h
 ```
 
-The build scripts compile the program and run the test suite. Test files go under `target/`. `mvn package` compiles and copies dependencies without running this suite. No system OpenCV installation or CUDA toolkit is needed.
+The build scripts compile the program and run its test suite. `mvn package` only compiles and
+copies the dependencies.
 
-## Run
+## Quick start
+
+One command runs everything:
 
 ```powershell
-.\photogrammetry.bat `
-  -i .\images `
-  -o .\projects\city `
-  --max-dimension 1600 `
-  --step 2 `
-  --filtering moderate `
-  --neighbors 5 `
-  --min-views 3 `
-  --memory-mb 4096
+.\photogrammetry.bat -i .\images -o .\projects\forest --quality medium --classify-ground
 ```
 
-```bash
-bash photogrammetry.sh \
-  -i ./images \
-  -o ./projects/city \
-  --max-dimension 1600 \
-  --step 2 \
-  --filtering moderate \
-  --neighbors 5 \
-  --min-views 3 \
-  --memory-mb 4096
+The results are in `projects\forest\runs\<run-id>\07_results\`: `dense.las`, `dense.ply`,
+`dsm.tif`, `dtm.tif` and `processing-report.pdf`.
+
+Run with no arguments or `-h` for every option.
+
+## Step by step
+
+The same pipeline can be run one step at a time. Each step saves its state, so the next step can
+run later, in a new process, or with different settings.
+
+| Step | Does |
+| --- | --- |
+| `inputs` | reads the images and starts a new run |
+| `calibrate` | camera calibration (supplied, from EXIF, or estimated) |
+| `match` | features, image pairs and tie points |
+| `align` | camera alignment and bundle adjustment |
+| `georeference` | GPS georeferencing and the GPS-weighted adjustment |
+| `gcp` | ground control points (only with `--gcp`) |
+| `dense` | dense matching and fusion: the point cloud |
+| `ground` | ground classification (only with `--classify-ground`) |
+| `finish` | report and final files |
+
+```powershell
+.\photogrammetry.bat inputs -i .\images -o .\projects\forest --quality medium
+.\photogrammetry.bat calibrate match align georeference -o .\projects\forest
+.\photogrammetry.bat dense ground finish -o .\projects\forest --min-views 2 --classify-ground
+.\photogrammetry.bat status -o .\projects\forest
 ```
 
-Without a calibration file, Collinea estimates calibration from image metadata and geometry. If the images do not constrain it well enough, supply a measured calibration. Supplied calibration and poses are fixed by default. Use `--intrinsics-mode prior` or `initial`, and `--extrinsics-mode prior` or `initial`, to refine them. The [orientation documentation](ORIENTATIONS.md) covers these modes and supported file formats.
+- Later steps reuse the options of `inputs`. Options given to a later step are added and hold for
+  the steps after it.
+- `--run ID` continues an older run instead of the latest one.
+- `--branch` starts a new run from the saved state just before the first named step, so a step
+  can be redone with other settings without touching the original run:
 
-Run with no arguments or `-h` for the complete option list.
+  ```powershell
+  .\photogrammetry.bat dense ground finish -o .\projects\forest --branch --filtering mild
+  ```
 
-## Resolution and filtering
+`examples/forest_4_steps.ps1` is a complete example with each option given at the step that uses
+it. [Pipeline steps](PIPELINE_STEPS.md) lists which step reads which option.
+
+## Ground control points
+
+1. Write the GCP coordinates to a CSV file, in the output coordinate system (`--crs`, default
+   EPSG:3067):
+
+   ```text
+   gcp_id,x,y,z,sx,sy,sz,type
+   G1,605551.06,6938380.02,89.55,0.02,0.02,0.03,control
+   G2,605569.64,6938375.92,85.33,,,,control
+   G3,605579.60,6938372.18,85.86,,,,control
+   G4,605553.10,6938371.44,88.10,,,,check
+   ```
+
+   `sx`, `sy`, `sz` are the coordinate accuracies in metres (defaults `--gcp-sigma 0.02` and
+   `--gcp-height-sigma 0.03`). `type` is `control` (used in the adjustment) or `check` (only
+   measured). The header line is optional.
+
+2. Run the steps up to `gcp`. The step projects every GCP into the images and waits for you:
+
+   ```powershell
+   .\photogrammetry.bat calibrate match align georeference gcp -o .\projects\forest --gcp .\gcps.csv
+   ```
+
+3. Open the editor, which runs in your browser:
+
+   ```powershell
+   .\photogrammetry.bat gcp-edit -o .\projects\forest
+   ```
+
+   Pick a GCP, click an image, and click the exact position of the target. The other images
+   follow the points you have pinned. `R` marks an image where the target is not visible.
+   Press **Done** when finished.
+
+4. Continue:
+
+   ```powershell
+   .\photogrammetry.bat gcp dense ground finish -o .\projects\forest
+   ```
+
+At least three control points pinned in two or more images each are needed (one is enough when
+the images have GPS). The report lists the control and check point errors and the marker
+residuals.
+
+## Ground classification
+
+`--classify-ground` marks ground points in `dense.las` (class 2 ground, 7 low noise, 1 other) and
+writes `dtm.tif` (terrain), `chm.tif` (canopy height), `ground_support.tif` (where the ground was
+seen and where it was interpolated) and `ground_uncertainty.tif`. It needs no reference terrain:
+it combines a morphological filter with the camera rays, which pass through free space and so
+cannot run below the terrain. Patches that look like ground but lie in the tree canopy are
+rejected. Details: [ground classification](GROUND_CLASSIFICATION.md).
+
+Two optional extras:
+
+- `--ground-pair-correction` aligns the ground of each stereo pair before fusion, removing small
+  height steps between pairs.
+- `--ground-aware-fusion` merges the ground points of all pairs into one smooth ground surface.
+
+## Common options
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--quality` | `custom` | `ultra`, `high`, `medium` and `low` divide the original width and height by 1, 2, 4 and 8. `custom` uses the longest-side limit below. |
-| `--max-dimension` | `1600` | Longest-side limit in pixels for `custom` quality. If explicitly supplied, it also caps a named quality preset. Aspect ratio is preserved; images are never upsampled. |
-| `--step` | `2` | Sample one dense candidate every N pixels along each axis of the processed image. Step 2 samples about one candidate per four pixels. It does not reduce the stereo matching resolution. |
-| `--filtering` | `moderate` | `mild`, `moderate` or `aggressive` depth filtering. This changes acceptance thresholds, not image size. |
+| `--quality` | `custom` | `ultra`, `high`, `medium`, `low` process the images at full, 1/2, 1/4 or 1/8 size. |
+| `--max-dimension` | `1600` | Longest image side for `custom` quality (also caps a named quality if given). |
+| `--step` | `2` | Dense sample spacing in pixels. |
+| `--filtering` | `moderate` | `mild`, `moderate` or `aggressive` depth filtering. |
+| `--min-views` | `3` | Images that must agree on a point. |
+| `--crs` | `EPSG:3067` | Output coordinate system for GPS and GCP georeferencing. |
+| `--bundle-iterations` | until converged | Bundle adjustment iterations. |
+| `--memory-mb` | `2048` | Processing buffer budget in MiB (not a total RAM limit). |
+| `--gpu-memory-mb` | automatic | GPU working-set budget in MiB (default 70% of the VRAM). |
+| `--compute` | `auto` | `auto` uses the GPU when suitable, `cpu` or `gpu` force one. |
+| `--cores` | half the CPUs | CPU threads. |
 
-For a 6000 × 4000 image, the default is **1600 × 1067**. `--quality high` gives **3000 × 2000**: the implicit 1600 limit does not apply to named presets. Adding `--max-dimension 2000` caps that result at **2000 × 1333**.
-
-Lowering `--step` produces more candidates for fusion, but the disparity map is calculated at the same resolution. Change `--quality` or `--max-dimension` to change that resolution.
-
-## Memory and processing
-
-Memory arguments use **MiB**: 1024 MiB is 1 GiB.
-
-| Option | Default | Effect |
-| --- | --- | --- |
-| `--memory-mb` | `2048` | Processing-buffer budget, not a limit on total process RAM. An explicit value raises the command-line JVM heap if needed; a larger existing heap is retained. |
-| `PHOTOGRAMMETRY_HEAP` (environment variable) | `8g` | Initial maximum Java heap used by the launch scripts. `--memory-mb` can raise it further. |
-| `--compute` | `auto` | `auto` selects GPU stereo when suitable and falls back to CPU. `cpu` selects CPU stereo; `gpu` requires a compatible GPU plan. Fusion inherits this choice unless overridden below. |
-| `--fusion-compute` | `inherit` | Override depth fusion separately with `cpu`, `auto` or `gpu`. Auto allows CPU fallback; GPU mode requires FP64 support. |
-| `--gpu-memory-mb` | `0` (automatic) | GPU working-set budget. Automatic uses 70% of reported VRAM. Explicit values are capped at 95%; available memory and device allocation limits can reduce what fits. |
-| `--gpu-sgm` | `auto` | Auto tries resident GPU volumes, exact streaming with a RAM aggregate, then compact Census with exact verification or bounded recomputation. Paths continue across strips. `resident`, `streamed` and `esgm` select a backend explicitly. |
-| `--gpu-aggregate` | `auto` | Streamed aggregate storage: `ram`, `disk` or `recompute`. Auto avoids the full aggregate disk spool. Exact recomputation trades additional path sweeps for lower RAM. |
-| `--esgm-candidates` | `2` | Compact proposals per path, from 1 to 4. Unresolved pixels always receive exact full-range verification. |
-| `--sgm-aggregate` | `auto` | Use 16-bit aggregate storage when the configured costs and penalties fit; otherwise use 32-bit. `16` rejects an unsafe configuration, while `32` forces 32-bit storage. |
-| `--point-attributes` | `surface` | Include normals and surface metrics in LAS/PLY. `none` writes compact XYZ/RGB cloud records. The confidence CSV remains available. |
-
-Native OpenCV memory is additional to the Java heap. For example, `--memory-mb 4096` requests a 4 GiB processing budget, not a 4 GiB total RAM limit. Feature extraction and bundle adjustment run on CPU. See [performance and storage details](PERFORMANCE_AND_ATTRIBUTES.md) for the remaining CPU/GPU stages and memory estimates.
-
-Fusion depth evidence has a separate bounded CPU page cache; see [fusion and consolidation controls](FOLLOWUP_PERFORMANCE.md).
-
-Use `--estimate-memory` with the input directory and intended resolution settings to inspect the plan before reconstructing a project. See [large-image processing and measured memory use](SCALING.md) for backend selection, commands and limits.
-
-### Image and feature storage
-
-| Option | Default | Effect |
-| --- | --- | --- |
-| `--image-reader` | `auto` | Uses windowed decoding for sources above 64 MiB of RGB pixels and for BigTIFF. Smaller sources retain OpenCV decoding. Explicit `windowed` and `opencv` modes are available. |
-| `--image-window` | `1024` | Maximum decoded window side in pixels. Codec buffers are additional. |
-| `--image-memory-mb` | `0` (automatic) | Processed raster cache: automatic uses one quarter of `--memory-mb`, capped at 2048 MiB. The active processed source pair must fit. |
-| `--descriptor-memory-mb` | `256` | Native descriptor cache cap, also limited to one quarter of `--memory-mb`. Evicted descriptors use run-local temporary files; active matching pairs must fit. |
-
-Windowed TIFF/BigTIFF input supports grayscale and RGB sources, including 16-bit inputs converted to 8-bit sRGB for matching. It avoids a full decoded source image on the Java heap. Processed rasters, keypoints, detector scratch and stereo input buffers still need memory.
+`--estimate-memory` shows the memory plan without processing. Large images and GPU settings:
+[scaling](SCALING.md) and [performance and attributes](PERFORMANCE_AND_ATTRIBUTES.md).
+Camera calibration and orientation files: [orientations](ORIENTATIONS.md).
 
 ## Output
 
-Each run is saved under `<output>/runs/<run-id>/`:
+Each run gets its own folder, `<project>/runs/<run-id>/`; earlier runs are kept.
 
 ```text
-00_inputs/       Image inventory and processing metadata
-01_calibration/  Source and processed interior orientations
-02_features/     Feature diagnostics
-03_matches/      Pair and track diagnostics
-04_geometry/     Camera poses and orientation archive
-05_stereo/       Stereo ranges and depth/disparity diagnostics
-06_fusion/       Fusion and consolidation reports
-07_results/      LAS/PLY clouds and point-confidence.csv.gz
+00_inputs/       image inventory
+01_calibration/  camera calibration
+02_features/     features
+03_matches/      image pairs and tie points
+04_geometry/     camera positions, georeferencing, ground control (gcp/)
+05_stereo/       stereo pairs
+06_fusion/       depth fusion
+07_results/      point clouds, DSM, DTM, report
+state/           saved step state
 ```
 
-The amount of diagnostic data depends on the storage profile. `--storage standard` is the default; `--storage debug` keeps detailed intermediates. Stage caching is enabled with `--cache`. Temporary depth and surface files are removed after use. Previous runs are retained.
-
-The default report is `07_results/processing-report.html`, with all effective processing options, supplied arguments, timings/resources and an embedded DSM preview when the coordinate frame permits it. [Report controls and regeneration](PROCESSING_REPORT.md) explain the JSON and GeoTIFF outputs.
-
-Interior and exterior orientations are saved automatically. Additional formats can be exported during a run or afterward with `--export-orientations RUN_DIRECTORY`, without processing the photos again. See [project layout](PROJECT_FORMAT.md) and [orientation formats](ORIENTATIONS.md).
+The processing report (`07_results/processing-report.pdf`, also HTML and JSON) has a summary with
+quality flags, survey data (flying altitude, ground resolution, coverage, tie points, reprojection
+error), camera calibration, camera location errors, ground control points, the elevation models
+and the processing parameters of each step. `--report-detail full` adds the detailed diagnostics.
+See [processing report](PROCESSING_REPORT.md) and [project layout](PROJECT_FORMAT.md).
 
 ## LAS.utils
 
-Copy this repository into `sgm_java/` at the LAS.utils root, then copy the wrappers from `las-utils/` into that root and build the module. Collinea uses its own classpath to keep OpenCV 4.9 separate from LAS.utils' older OpenCV jar. The Java entry point is `photogrammetry`.
+Copy this repository into `sgm_java/` at the LAS.utils root, copy the wrappers from `las-utils/`
+into that root, and build the module. Collinea keeps its own classpath, so its OpenCV version does
+not clash with the one in LAS.utils. The Java entry point is `photogrammetry`.
 
 ## Limitations
 
-Automatic calibration needs sufficient overlap and camera geometry. Estimated stereo uncertainty does not include errors in calibration, camera poses or GPS.
-
-The default horizontal output CRS for GPS georeferencing is EPSG:3067. Heights retain EXIF GPS altitude; no geoid or N2000 conversion is applied. Negative Z values can be valid.
-
-Windowed source loading and bounded raster/descriptor caches reduce large-image memory use. Full native-resolution aerial blocks still need further work on stereo input tiling, camera groups and detector memory. BigTIFF EXIF GPS/focal metadata is not currently extracted; supply calibration and orientations when needed. LAS output uses version 1.2, point format 2, with optional Extra Bytes and a maximum of 4,294,967,295 points per file. Reader support for extra attributes varies; the same attributes are available in the CSV sidecar.
+- Automatic calibration needs good overlap and camera geometry; otherwise supply a calibration.
+- With GPS only, heights follow the EXIF GPS altitude (no geoid conversion). Use GCPs for a
+  surveyed height datum.
+- Under closed canopy the terrain is interpolated from the nearest visible ground.
+- LAS output is version 1.2, point format 2, up to 4,294,967,295 points per file.
 
 ## Documentation
 
-- [Processing report, complete parameter values and DSM](PROCESSING_REPORT.md)
-- [Fusion/consolidation throughput and progress](FOLLOWUP_PERFORMANCE.md)
-- [Surface processing, performance and exported attributes](PERFORMANCE_AND_ATTRIBUTES.md)
-- [Large-image processing, exact streaming and compact SGM](SCALING.md)
-- [Earlier disk-free SGM research](ESGM_RESEARCH.md)
-- [Orientation formats and conventions](ORIENTATIONS.md)
-- [Project artifacts](PROJECT_FORMAT.md)
+- [Pipeline steps and ground control points](PIPELINE_STEPS.md)
+- [GPS-weighted adjustment](ORIENTATION_GPS_ADJUSTMENT.md)
+- [Ground classification](GROUND_CLASSIFICATION.md)
+- [Processing report](PROCESSING_REPORT.md)
+- [Orientation formats](ORIENTATIONS.md)
+- [Project layout](PROJECT_FORMAT.md)
 - [Storage and GPU processing](STORAGE_GPU.md)
-- [Thin structures and SGM penalties](THIN_STRUCTURES.md)
-- [Validation](VALIDATION.md)
+- [Large images and scaling](SCALING.md)
 - [Third-party dependencies](THIRD_PARTY_NOTICES.md)
 
-Author: [Mikko Kukkonen](https://github.com/kmik). No project license has been selected; dependencies retain their own licenses.
+Author: [Mikko Kukkonen](https://github.com/kmik). No project license has been selected;
+dependencies keep their own licenses.

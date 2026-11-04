@@ -10,6 +10,66 @@ import java.util.*;
 public final class CensusSgm {
   private static final int INVALID_COST = 512;
   private final Options options;
+  private static final ThreadLocal<Prepared> PREPARED = new ThreadLocal<>();
+  static final class Prepared {
+    final byte[] left,right,ca,cb,ma,mb;
+    final int w,h,window;
+    final String mode;
+    final long[][] a,b;
+    final boolean[] ta,tb;
+    Prepared(Options o,byte[] l,byte[] r,byte[] ca,byte[] cb,int w,int h,byte[] ma,byte[] mb,
+        long[][] a,long[][] b,boolean[] ta,boolean[] tb) {
+      left=l;right=r;this.ca=ca;this.cb=cb;this.w=w;this.h=h;this.ma=ma;this.mb=mb;
+      window=o.census;mode=o.censusMode;this.a=a;this.b=b;this.ta=ta;this.tb=tb;
+    }
+    boolean matches(Options o,byte[] l,byte[] r,byte[] ca,byte[] cb,int w,int h,byte[] ma,byte[] mb) {
+      return left==l&&right==r&&this.ca==ca&&this.cb==cb&&this.w==w&&this.h==h
+          &&this.ma==ma&&this.mb==mb&&window==o.census&&mode.equals(o.censusMode);
+    }
+  }
+  static Prepared prepare(Options o,byte[] left,byte[] right,byte[] ca,byte[] cb,int w,int h,byte[] ma,byte[] mb) {
+    int n=Math.multiplyExact(w,h);
+    try(var rows=StereoRows.open(o.cores)) {
+    long[][] a, b;
+    boolean[] texturedLeft, texturedRight;
+    if (o.censusMode.equals("color-distance")) {
+      if (ca == null
+          || cb == null
+          || ca.length != (long) n * 3
+          || cb.length != ca.length)
+        throw new IllegalArgumentException("Color-distance census requires interleaved BGR inputs");
+      DescriptorSet first = colorCensus(ca, w, h, o.census),
+          second = colorCensus(cb, w, h, o.census);
+      a = first.bits;
+      b = second.bits;
+      texturedLeft = first.textured;
+      texturedRight = second.textured;
+    } else {
+      a = census(left, w, h, o.census);
+      b = census(right, w, h, o.census);
+      texturedLeft = textureMask(left, w, h, o.census);
+      texturedRight = textureMask(right, w, h, o.census);
+    }
+    if (ma != null) {
+      if (mb == null || ma.length != n || mb.length != n)
+        throw new IllegalArgumentException("Invalid stereo mask dimensions");
+      for (int i = 0; i < n; i++) {
+        texturedLeft[i] &= ma[i] != 0;
+        texturedRight[i] &= mb[i] != 0;
+      }
+    }
+
+      return new Prepared(o,left,right,ca,cb,w,h,ma,mb,a,b,texturedLeft,texturedRight);
+    }
+  }
+  static AutoCloseablePrepared use(Prepared prepared) { return new AutoCloseablePrepared(prepared); }
+  static final class AutoCloseablePrepared implements AutoCloseable {
+    final Prepared previous=PREPARED.get();
+    AutoCloseablePrepared(Prepared p) { PREPARED.set(p); }
+    public void close() { if(previous==null)PREPARED.remove();else PREPARED.set(previous); }
+  }
+  private PointConfidence.Selection selection;
+  private PointConfidence.Selection reverseSelection;
 
   public CensusSgm(Options options) {
     this.options = options;
@@ -53,6 +113,22 @@ public final class CensusSgm {
       byte[] validRight,
       Observer observer)
       throws IOException {
+    try (var rows = StereoRows.open(options.stereoPipeline ? Math.max(1,options.cores/2) : options.cores)) {
+      return computeInternal(left, right, leftBgr, rightBgr, width, height, validLeft, validRight, observer);
+    }
+  }
+
+  Result computeInternal(
+      byte[] left,
+      byte[] right,
+      byte[] leftBgr,
+      byte[] rightBgr,
+      int width,
+      int height,
+      byte[] validLeft,
+      byte[] validRight,
+      Observer observer)
+      throws IOException {
     if (width < options.census + 2
         || height < options.census + 2
         || left.length != (long) width * height
@@ -63,25 +139,28 @@ public final class CensusSgm {
     long estimate = memoryEstimate(width, height, d, options);
     long budget =
         Math.min(options.memoryMb * 1024 * 1024, (long) (Runtime.getRuntime().maxMemory() * .65));
-    boolean gpu = GpuSgm.use(width, height, options);
+    boolean tsgm = options.pairwiseSearch.equals("tsgm");
+    boolean gpu = !tsgm && GpuSgm.use(width, height, options);
     if (cells >= 1_000_000)
       System.out.printf(
           Locale.ROOT,
           "Stereo backend: %s; %dx%d, %d disparities%n",
-          gpu ? "OpenCL GPU" : options.tiled ? "CPU (disk-paged SGM)" : "CPU (RAM SGM)",
+          tsgm
+              ? "tsgm banded"
+              : gpu ? "OpenCL GPU" : options.tiled ? "CPU (disk-paged SGM)" : "CPU (RAM SGM)",
           width,
           height,
           d);
-    if (gpu && (long) n * (96 + 32 * words(options.census)) > budget)
+    if (tsgm) {
+      // Banded volumes are planned and budgeted by BandedSgm/GpuBandedStereo.
+    } else if (gpu && (long) n * (116 + 32 * words(options.census)) > budget)
       throw new IllegalArgumentException(
           "GPU host descriptors/output buffers exceed --memory-mb/heap budget");
-    if (!gpu
-        && options.tiled
-        && tiledMemoryEstimate(width, height, d, options.census, options.memoryMb) > budget)
+    if (!tsgm && !gpu && options.tiled && tiledMemoryEstimate(width, height, d, options) > budget)
       throw new IllegalArgumentException(
           "Tiled SGM rows/descriptors/output rasters exceed the memory budget; lower dense"
               + " resolution or raise --memory-mb/heap");
-    if (!gpu && !options.tiled && (cells > Integer.MAX_VALUE - 8 || estimate > budget))
+    if (!tsgm && !gpu && !options.tiled && (cells > Integer.MAX_VALUE - 8 || estimate > budget))
       throw new IllegalArgumentException(
           String.format(
               Locale.ROOT,
@@ -89,7 +168,7 @@ public final class CensusSgm {
                   + " --max-dimension/--disparities or raise --memory-mb and heap.",
               estimate / 1048576.0,
               budget / 1048576.0));
-    if (!gpu && options.tiled) {
+    if (!tsgm && !gpu && options.tiled) {
       java.nio.file.Files.createDirectories(options.output);
       long free = java.nio.file.Files.getFileStore(options.output).getUsableSpace();
       if (free > 0 && cells * (2 + StereoCost.aggregateBytes(options)) + 16777216L > free)
@@ -104,35 +183,41 @@ public final class CensusSgm {
     byte[] reasons = observer == null ? null : new byte[n];
     byte[] searchBoundary = observer == null ? null : new byte[n];
     if (reasons != null) Arrays.fill(reasons, (byte) 1);
-    long[][] a, b;
-    boolean[] texturedLeft, texturedRight;
-    if (options.censusMode.equals("color-distance")) {
-      if (leftBgr == null
-          || rightBgr == null
-          || leftBgr.length != (long) n * 3
-          || rightBgr.length != leftBgr.length)
-        throw new IllegalArgumentException("Color-distance census requires interleaved BGR inputs");
-      DescriptorSet first = colorCensus(leftBgr, width, height, options.census),
-          second = colorCensus(rightBgr, width, height, options.census);
-      a = first.bits;
-      b = second.bits;
-      texturedLeft = first.textured;
-      texturedRight = second.textured;
-    } else {
-      a = census(left, width, height, options.census);
-      b = census(right, width, height, options.census);
-      texturedLeft = textureMask(left, width, height, options.census);
-      texturedRight = textureMask(right, width, height, options.census);
+    String size = " " + width + "x" + height + " D=" + d;
+    long clock = System.nanoTime();
+    Prepared prepared = PREPARED.get();
+    if (prepared == null || !prepared.matches(options,left,right,leftBgr,rightBgr,width,height,validLeft,validRight)) {
+      prepared = prepare(options,left,right,leftBgr,rightBgr,width,height,validLeft,validRight);
+      RunTelemetry.record("Stereo census/texture (not reused)" + size, clock);
     }
-    if (validLeft != null) {
-      if (validRight == null || validLeft.length != n || validRight.length != n)
-        throw new IllegalArgumentException("Invalid stereo mask dimensions");
-      for (int i = 0; i < n; i++) {
-        texturedLeft[i] &= validLeft[i] != 0;
-        texturedRight[i] &= validRight[i] != 0;
-      }
+    clock = System.nanoTime();
+    long[][] a=prepared.a,b=prepared.b;
+    boolean[] texturedLeft=prepared.ta,texturedRight=prepared.tb;
+    selection = new PointConfidence.Selection(n);
+    reverseSelection =
+        PointConfidence.bidirectional(options) ? new PointConfidence.Selection(n) : null;
+    TsgmSearch.Plan plan = null;
+    if (options.pairwiseSearch.equals("tsgm")) {
+      plan =
+          TsgmSearch.plan(
+              options, left, right, validLeft, validRight, texturedLeft, texturedRight, width,
+              height);
+      RunTelemetry.record("Stereo tsgm pyramid/bands" + size, clock);
+      clock = System.nanoTime();
     }
-    float[] dl =
+    float[] dl;
+    BandedSgm.Pair pair =
+        plan == null
+            ? null
+            : new BandedSgm.Pair(a, b, left, right, texturedLeft, texturedRight, width, height);
+    float[] dr;
+    try {
+    if (plan != null) {
+      BandedSgm.Outcome outcome = banded(pair, false, plan.left(), stats, reasons, searchBoundary);
+      TsgmSearch.write(options, "left", plan, outcome, (System.nanoTime() - clock) / 1e9);
+      dl = outcome.disparity();
+    } else
+      dl =
         match(
             a,
             b,
@@ -146,7 +231,18 @@ public final class CensusSgm {
             stats,
             reasons,
             searchBoundary);
-    float[] dr =
+    RunTelemetry.record(
+        "Stereo SGM left" + (plan != null ? " (banded)" : gpu ? " (GPU)" : " (CPU)") + size, clock);
+    clock = System.nanoTime();
+    if (plan != null) {
+      DisparityBands rightBands = plan.right();
+      if (options.tsgmLevels > 0)
+        TsgmSearch.includeWinners(rightBands, dl, options.minDisparity, texturedRight);
+      BandedSgm.Outcome outcome = banded(pair, true, rightBands, new Stats(), null, null);
+      TsgmSearch.write(options, "right", null, outcome, (System.nanoTime() - clock) / 1e9);
+      dr = outcome.disparity();
+    } else
+      dr =
         match(
             b,
             a,
@@ -160,6 +256,12 @@ public final class CensusSgm {
             new Stats(),
             null,
             null);
+    } finally {
+      if (pair != null) pair.close();
+    }
+    RunTelemetry.record(
+        "Stereo SGM right" + (plan != null ? " (banded)" : gpu ? " (GPU)" : " (CPU)") + size, clock);
+    clock = System.nanoTime();
     if (observer != null) observer.searchBoundary(searchBoundary, width, height);
     if (observer != null) {
       observer.raster("00_left_selected", dl, width, height);
@@ -177,11 +279,15 @@ public final class CensusSgm {
         observer.raster("00b_left_photometric_subpixel", dl, width, height);
         observer.raster("01b_right_photometric_subpixel", dr, width, height);
       }
+      RunTelemetry.record("Stereo ZNCC subpixel refinement" + size, clock);
     }
+    clock = System.nanoTime();
     float[] checked = new float[n];
     Arrays.fill(checked, Float.NaN);
     int radius = options.census / 2;
-    for (int y = radius; y < height - radius; y++) {
+    final float[] lrChecked=checked;
+    long[] lrRejected=new long[height];
+    StereoRows.rows(radius,height-radius,y -> {
       for (int x = radius; x < width - radius; x++) {
         int p = y * width + x;
         if (!Float.isFinite(dl[p])) continue;
@@ -192,13 +298,17 @@ public final class CensusSgm {
         }
         float other = dr[y * width + xr];
         if (Float.isFinite(other) && Math.abs(dl[p] - other) <= options.lrThreshold)
-          checked[p] = dl[p];
+          lrChecked[p] = dl[p];
         else {
-          stats.lrRejected++;
+          lrRejected[y]++;
           if (reasons != null) reasons[p] = 4;
         }
       }
-    }
+    });
+    for(long rejected:lrRejected)stats.lrRejected+=rejected;
+    RunTelemetry.record("Stereo left/right check" + size, clock);
+    clock = System.nanoTime();
+
     if (observer != null) observer.raster("02_left_right_validated", checked, width, height);
     if (options.median > 1)
       checked =
@@ -213,8 +323,9 @@ public final class CensusSgm {
                   left,
                   options.medianEdgeThreshold);
     if (observer != null) observer.raster("03_median", checked, width, height);
-    float[] correlation = observer == null ? null : new float[n],
-        lrError = observer == null ? null : new float[n];
+    RunTelemetry.record("Stereo median" + size, clock);
+    clock = System.nanoTime();
+    float[] correlation = new float[n], lrError = new float[n];
     if (correlation != null) {
       Arrays.fill(correlation, Float.NaN);
       Arrays.fill(lrError, Float.NaN);
@@ -223,17 +334,19 @@ public final class CensusSgm {
     byte[] photoLeft = options.censusMode.equals("color-distance") ? leftBgr : left;
     byte[] photoRight = options.censusMode.equals("color-distance") ? rightBgr : right;
     int channels = options.censusMode.equals("color-distance") ? 3 : 1;
-    for (int y = 0; y < height; y++)
+    final float[] photoChecked=checked;
+    long[] postRejected=new long[height],photoRejected=new long[height];
+    StereoRows.rows(0,height,y -> {
       for (int x = 0; x < width; x++) {
         int p = y * width + x;
-        float disparity = checked[p];
+        float disparity = photoChecked[p];
         if (!Float.isFinite(disparity)) continue;
         int xr = Math.round(x - disparity);
         if (lrError != null && xr >= 0 && xr < width && Float.isFinite(dr[y * width + xr]))
           lrError[p] = Math.abs(disparity - dr[y * width + xr]);
         if (!reciprocal(dr, width, height, x, y, disparity, options.lrThreshold, radius)) {
-          checked[p] = Float.NaN;
-          stats.postMedianLrRejected++;
+          photoChecked[p] = Float.NaN;
+          postRejected[y]++;
           if (reasons != null) reasons[p] = 5;
           continue;
         }
@@ -250,17 +363,23 @@ public final class CensusSgm {
                 channels);
         if (correlation != null) correlation[p] = (float) score;
         if (score < options.correlation) {
-          checked[p] = Float.NaN;
-          stats.photometricRejected++;
+          photoChecked[p] = Float.NaN;
+          photoRejected[y]++;
           if (reasons != null) reasons[p] = 6;
         }
       }
+    });
+    for(long rejected:postRejected)stats.postMedianLrRejected+=rejected;
+    for(long rejected:photoRejected)stats.photometricRejected+=rejected;
+    RunTelemetry.record("Stereo post-median reciprocal/ZNCC check" + size, clock);
+
     if (observer != null) {
       observer.raster("04_photometric", checked, width, height);
       observer.raster("zncc", correlation, width, height);
       observer.raster("left_right_error", lrError, width, height);
     }
     float[] beforeSpeckle = observer == null ? null : checked.clone();
+    clock = System.nanoTime();
     stats.speckleRejected =
         removeSpeckles(
             checked,
@@ -269,6 +388,7 @@ public final class CensusSgm {
             options.speckleSize,
             options.speckleRange,
             options.speckleConnectivity);
+    RunTelemetry.record("Stereo speckle removal" + size, clock);
     for (float value : checked) if (Float.isFinite(value)) stats.valid++;
     if (observer != null) {
       for (int i = 0; i < n; i++)
@@ -276,35 +396,64 @@ public final class CensusSgm {
       observer.raster("05_final_stereo", checked, width, height);
       observer.reasons(reasons, width, height);
     }
-    return new Result(width, height, checked, stats, correlation, lrError);
+    Result result = new Result(width, height, checked, stats, correlation, lrError);
+    result.costMargin = selection.margin;
+    result.costSharpness = selection.sharpness;
+    clock = System.nanoTime();
+    if (reverseSelection != null)
+      PointConfidence.reverse(
+          result,
+          left,
+          right,
+          photoLeft,
+          photoRight,
+          channels,
+          dr,
+          reverseSelection,
+          validLeft,
+          validRight,
+          options);
+    if (reverseSelection != null) RunTelemetry.record("Stereo right-image confidence" + size, clock);
+    selection = null;
+    reverseSelection = null;
+    return result;
   }
 
   static long memoryEstimate(int width, int height, int disparities, int census) {
     return (long) width * height * disparities * 6
         + (long) width * disparities * 8
-        + (long) width * height * (48 + 16 * words(census));
+        + (long) width * height * (68 + 16 * words(census));
   }
 
   static long memoryEstimate(int w, int h, int d, Options o) {
     return memoryEstimate(w, h, d, o.census)
-        - (long) w * h * d * (4 - StereoCost.aggregateBytes(o));
+        - (long) w * h * d * (4 - StereoCost.aggregateBytes(o))
+        + PointConfidence.extraHostBytes(o, (long) w * h)
+        + (o.matchingCost.equals("zncc") && !o.tiled ? ZnccCosts.workspace(w, o.census) : 0);
   }
 
   static long tiledMemoryEstimate(
       int width, int height, int disparities, int census, long memoryMb) {
     long cache = Math.min(32 * 1048576L, Math.max(1048576L, memoryMb * 1048576L / 16));
-    return (long) width * height * (48 + 16 * words(census))
+    return (long) width * height * (68 + 16 * words(census))
         + (long) width * disparities * 8
         + Math.max(1048576L, cache)
         + Math.max(2097152L, cache);
   }
 
-  private static DescriptorSet colorCensus(byte[] bgr, int w, int h, int window) {
+  static long tiledMemoryEstimate(int width, int height, int disparities, Options o) {
+    return tiledMemoryEstimate(width, height, disparities, o.census, o.memoryMb)
+        + PointConfidence.extraHostBytes(o, (long) width * height);
+  }
+
+  static DescriptorSet colorCensus(byte[] bgr, int w, int h, int window) {
     int radius = window / 2;
     long[][] bits = new long[words(window)][w * h];
     boolean[] textured = new boolean[w * h];
-    double[] distances = new double[window * window - 1];
-    for (int y = radius; y < h - radius; y++)
+    ThreadLocal<double[]> scratch = ThreadLocal.withInitial(() -> new double[window * window - 1]);
+    StereoRows.rows(radius, h - radius, y -> {
+      double[] distances = scratch.get();
+
       for (int x = radius; x < w - radius; x++) {
         int p = y * w + x, center = 3 * p, bit = 0;
         double total = 0, maximum = 0;
@@ -328,10 +477,11 @@ public final class CensusSgm {
         for (int k = 0; k < distances.length; k++)
           if (distances[k] >= mean) bits[k / 64][p] |= 1L << (k % 64);
       }
+    });
     return new DescriptorSet(bits, textured);
   }
 
-  private static final class DescriptorSet {
+  static final class DescriptorSet {
     final long[][] bits;
     final boolean[] textured;
 
@@ -339,6 +489,19 @@ public final class CensusSgm {
       this.bits = bits;
       this.textured = textured;
     }
+  }
+
+  private BandedSgm.Outcome banded(
+      BandedSgm.Pair pair,
+      boolean reverse,
+      DisparityBands bands,
+      Stats stats,
+      byte[] reasons,
+      byte[] searchBoundary) {
+    Options matching = options.copy();
+    matching.stereoSelection = reverse ? reverseSelection : selection;
+    return BandedSgm.match(
+        matching, pair, reverse, bands, options.tsgmLevels > 0, stats, reasons, searchBoundary);
   }
 
   private float[] match(
@@ -356,9 +519,11 @@ public final class CensusSgm {
       byte[] searchBoundary)
       throws IOException {
     int count = width * height, nd = options.disparities, radius = options.census / 2;
+    Options matching = options.copy();
+    matching.stereoSelection = reverse ? reverseSelection : selection;
     float[] gpu =
         GpuSgm.match(
-            options,
+            matching,
             a,
             b,
             grayA,
@@ -381,7 +546,7 @@ public final class CensusSgm {
           "CPU fallback SGM volume exceeds memory budget; enable --tiled or reduce dense"
               + " resolution");
     if (options.tiled) {
-      if (tiledMemoryEstimate(width, height, nd, options.census, options.memoryMb) > budget)
+      if (tiledMemoryEstimate(width, height, nd, options) > budget)
         throw new IllegalArgumentException(
             "CPU fallback SGM rows/descriptors exceed the memory budget");
       java.nio.file.Files.createDirectories(options.output);
@@ -402,27 +567,42 @@ public final class CensusSgm {
                 options.tiled,
                 options,
                 "sgm-aggregate-")) {
-      for (int y = radius; y < height - radius; y++) {
-        for (int x = radius; x < width - radius; x++) {
-          int p = y * width + x;
-          long base = (long) p * nd;
-          if (!texturedA[p]) continue;
-          for (int k = 0; k < nd; k++) {
-            int disparity = options.minDisparity + k;
-            long target = (long) x + (reverse ? disparity : -(long) disparity);
-            if (target < radius || target >= width - radius) continue;
-            int q = y * width + (int) target, hamming = 0;
-            if (!texturedB[q]) continue;
-            hamming = StereoCost.value(options, a, b, grayA, grayB, p, q, width);
-            costs.set(base + k, hamming);
+      if (options.matchingCost.equals("zncc") && !options.tiled)
+        ZnccCosts.fill(
+            costs,
+            grayA,
+            grayB,
+            texturedA,
+            texturedB,
+            width,
+            height,
+            options.minDisparity,
+            nd,
+            options.census,
+            reverse);
+      else
+        for (int y = radius; y < height - radius; y++) {
+          for (int x = radius; x < width - radius; x++) {
+            int p = y * width + x;
+            long base = (long) p * nd;
+            if (!texturedA[p]) continue;
+            for (int k = 0; k < nd; k++) {
+              int disparity = options.minDisparity + k;
+              long target = (long) x + (reverse ? disparity : -(long) disparity);
+              if (target < radius || target >= width - radius) continue;
+              int q = y * width + (int) target, hamming = 0;
+              if (!texturedB[q]) continue;
+              hamming = StereoCost.value(options, a, b, grayA, grayB, p, q, width);
+              costs.set(base + k, hamming);
+            }
           }
         }
-      }
       int[][] paths = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
       int p1 = StereoCost.penalty(options.p1, options), p2 = StereoCost.p2(options);
       for (int path = 0; path < options.directions; path++) {
         int dx = paths[path][0], dy = paths[path][1];
         int[] previous = new int[width * nd], row = new int[width * nd];
+        int[] previousMin = new int[width], rowMin = new int[width];
         int yStart = dy < 0 ? height - 1 : 0, yStep = dy < 0 ? -1 : 1;
         int xStart = dx < 0 ? width - 1 : 0, xStep = dx < 0 ? -1 : 1;
         for (int yi = 0, y = yStart; yi < height; yi++, y += yStep) {
@@ -432,9 +612,9 @@ public final class CensusSgm {
             boolean hasPrevious =
                 px >= 0 && px < width && py >= 0 && py < height && texturedA[py * width + px];
             int[] prev = dy == 0 ? row : previous;
-            int prevBase = hasPrevious ? px * nd : 0, minPrev = Integer.MAX_VALUE;
-            if (hasPrevious)
-              for (int k = 0; k < nd; k++) minPrev = Math.min(minPrev, prev[prevBase + k]);
+            int prevBase = hasPrevious ? px * nd : 0;
+            int minPrev = hasPrevious ? (dy == 0 ? rowMin : previousMin)[px] : Integer.MAX_VALUE;
+            int currentMin = Integer.MAX_VALUE;
             int localP2 =
                 hasPrevious
                     ? StereoCost.pathP2(
@@ -449,12 +629,15 @@ public final class CensusSgm {
                 value += transition - minPrev;
               }
               row[dest + k] = value;
+              currentMin = Math.min(currentMin, value);
               aggregate.set(base + k, aggregate.get(base + k) + value);
             }
+            rowMin[x] = currentMin;
           }
           int[] swap = previous;
           previous = row;
           row = swap;
+          swap = previousMin; previousMin = rowMin; rowMin = swap;
         }
       }
       float[] result = new float[count];
@@ -504,11 +687,16 @@ public final class CensusSgm {
               && costs.get(base + best - 1) != INVALID_COST
               && costs.get(base + best + 1) != INVALID_COST) {
             double before = aggregate.get(base + best - 1), after = aggregate.get(base + best + 1);
-            double curvature = before + after - 2.0 * bestCost;
-            if (curvature > 0)
-              offset = Math.max(-.5, Math.min(.5, .5 * (before - after) / curvature));
+            offset = StereoCost.subpixel(options, before, bestCost, after);
           }
           result[pixel] = (float) (options.minDisparity + best + offset);
+          if (matching.stereoSelection != null) {
+            double before =
+                costs.get(base + best - 1) != INVALID_COST ? aggregate.get(base + best - 1) : -1;
+            double after =
+                costs.get(base + best + 1) != INVALID_COST ? aggregate.get(base + best + 1) : -1;
+            matching.stereoSelection.put(pixel, bestCost, second, before, after);
+          }
           stats.selected++;
           if (reasons != null) reasons[pixel] = 0;
         }
@@ -520,10 +708,11 @@ public final class CensusSgm {
     return (window * window - 1 + 63) / 64;
   }
 
-  private static boolean[] textureMask(byte[] input, int w, int h, int window) {
+  static boolean[] textureMask(byte[] input, int w, int h, int window) {
     boolean[] mask = new boolean[w * h];
     int r = window / 2;
-    for (int y = r; y < h - r; y++)
+    StereoRows.rows(r, h - r, y -> {
+
       for (int x = r; x < w - r; x++) {
         int low = 255, high = 0;
         for (int yy = -r; yy <= r; yy++)
@@ -534,13 +723,15 @@ public final class CensusSgm {
           }
         mask[y * w + x] = high - low >= 4;
       }
+    });
     return mask;
   }
 
   static long[][] census(byte[] input, int w, int h, int window) {
     int r = window / 2;
     long[][] descriptors = new long[words(window)][w * h];
-    for (int y = r; y < h - r; y++)
+    StereoRows.rows(r, h - r, y -> {
+
       for (int x = r; x < w - r; x++) {
         int p = y * w + x, bit = 0, center = input[p] & 255;
         for (int yy = -r; yy <= r; yy++)
@@ -551,13 +742,17 @@ public final class CensusSgm {
             bit++;
           }
       }
+    });
     return descriptors;
   }
 
   static float[] medianValid(float[] a, int w, int h, int window) {
-    float[] out = a.clone(), values = new float[window * window];
+    float[] out = a.clone();
+    ThreadLocal<float[]> scratch = ThreadLocal.withInitial(() -> new float[window * window]);
     int r = window / 2;
-    for (int y = 0; y < h; y++)
+    StereoRows.rows(0, h, y -> {
+      float[] values = scratch.get();
+
       for (int x = 0; x < w; x++) {
         if (!Float.isFinite(a[y * w + x])) continue; // do not fill occlusions
         int n = 0;
@@ -569,15 +764,19 @@ public final class CensusSgm {
         Arrays.sort(values, 0, n);
         out[y * w + x] = values[n / 2];
       }
+    });
     return out;
   }
 
   /** Ordinary median on smooth support; restrict to the center's layer at a depth discontinuity. */
   static float[] medianEdgePreserving(
       float[] a, int w, int h, int window, double maximumChange, byte[] gray, int edgeThreshold) {
-    float[] out = medianValid(a, w, h, window), values = new float[window * window];
+    float[] out = medianValid(a, w, h, window);
+    ThreadLocal<float[]> scratch = ThreadLocal.withInitial(() -> new float[window * window]);
     int r = window / 2;
-    for (int y = 0; y < h; y++)
+    StereoRows.rows(0, h, y -> {
+      float[] values = scratch.get();
+
       for (int x = 0; x < w; x++) {
         float center = a[y * w + x];
         if (!Float.isFinite(center)) continue;
@@ -597,6 +796,7 @@ public final class CensusSgm {
           out[y * w + x] = values[n / 2];
         }
       }
+    });
     return out;
   }
 
@@ -741,6 +941,8 @@ public final class CensusSgm {
     public final float[] disparity;
     public final Stats stats;
     public final float[] correlation, leftRightError;
+    public float[] confidence, costMargin, costSharpness;
+    public float[] rightConfidence;
 
     public Result(int width, int height, float[] disparity) {
       this(width, height, disparity, new Stats());

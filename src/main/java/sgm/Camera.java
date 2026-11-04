@@ -5,9 +5,15 @@ import org.opencv.core.*;
 final class Camera {
   double[] rotation = Math3.identity(), translation = {0, 0, 0};
   boolean registered, fixed;
+  // T1 --camera-screening exclude: registered, but left out of dense matching.
+  boolean denseExcluded;
   double fx, fy, cx, cy;
   Camera reference;
   double positionSigma = 10, rotationSigma = Math.toRadians(10);
+  // Separate sigma for the world z (height) of the position prior; NaN = positionSigma.
+  double heightSigma = Double.NaN;
+  // World velocity (units per second) at exposure; rolling-shutter and GPS timing models only.
+  double[] velocity;
 
   Camera(double fx, double fy, double cx, double cy) {
     this.fx = fx;
@@ -26,6 +32,10 @@ final class Camera {
 
   double[] project(double[] p) {
     double[] q = view(p);
+    return projectView(q);
+  }
+
+  double[] projectView(double[] q) {
     if (q[2] <= 1e-8) return null;
     return new double[] {fx * q[0] / q[2] + cx, fy * q[1] / q[2] + cy};
   }
@@ -52,6 +62,9 @@ final class Camera {
     c.reference = reference;
     c.positionSigma = positionSigma;
     c.rotationSigma = rotationSigma;
+    c.heightSigma = heightSigma;
+    c.denseExcluded = denseExcluded;
+    c.velocity = velocity;
     return c;
   }
 }

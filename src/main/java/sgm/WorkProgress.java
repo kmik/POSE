@@ -30,6 +30,7 @@ final class WorkProgress implements AutoCloseable {
     this.units = units;
     System.out.println(label + ": starting" + (total > 0 ? " (" + total + " " + units + ")" : ""));
     if (owner != null) owner.started(this, label, started);
+    Terminal.started(this);
     heartbeat =
         CLOCK.scheduleWithFixedDelay(
             () -> {
@@ -41,6 +42,30 @@ final class WorkProgress implements AutoCloseable {
             5,
             5,
             TimeUnit.SECONDS);
+  }
+
+  String label() {
+    return label;
+  }
+
+  String units() {
+    return units;
+  }
+
+  long total() {
+    return total;
+  }
+
+  long count() {
+    return count;
+  }
+
+  String detailText() {
+    return detail;
+  }
+
+  long startedNanos() {
+    return started;
   }
 
   void update(long count) {
@@ -88,6 +113,7 @@ final class WorkProgress implements AutoCloseable {
     heartbeat.cancel(false);
     if (complete && total > 0) count = total;
     print(complete ? "complete" : "stopped before completion");
+    Terminal.finished(this);
     if (owner != null) owner.finished(this, label, started, complete);
   }
 }

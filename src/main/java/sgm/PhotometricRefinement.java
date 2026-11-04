@@ -5,9 +5,10 @@ final class PhotometricRefinement {
   static long refine(
       float[] disparity, byte[] a, byte[] b, int w, int h, boolean reverse, Options o) {
     float[] original = disparity.clone();
-    long changed = 0;
+    long[] changed = new long[h];
     int r = o.correlationWindow / 2;
-    for (int y = r; y < h - r; y++)
+    StereoRows.rows(r, h - r, y -> {
+
       for (int x = r; x < w - r; x++) {
         int p = y * w + x;
         double d = original[p];
@@ -54,9 +55,12 @@ final class PhotometricRefinement {
             && best > initial + .002
             && Math.abs(chosen - d) <= .75) {
           disparity[p] = (float) chosen;
-          changed++;
+          changed[y]++;
         }
       }
-    return changed;
+    });
+    long total = 0;
+    for (long value : changed) total += value;
+    return total;
   }
 }

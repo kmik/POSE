@@ -47,7 +47,8 @@ final class ReuseCache {
     for (Class<?> c :
         new Class<?>[] {
           Options.class,
-          Reconstruction.class,
+          Pipeline.class,
+          PipelineState.class,
           Camera.class,
           DisparityRange.class,
           Geometry.class,
@@ -55,6 +56,12 @@ final class ReuseCache {
           ImageFrame.class,
           WindowedImage.class,
           BigTiffWindows.class,
+          ImageFusion.class,
+          TsgmSearch.class,
+          BandedSgm.class,
+          GpuBandedStereo.class,
+          DisparityBands.class,
+          PairMatching.class,
           RasterCache.class,
           DescriptorCache.class,
           GpuAggregate.class,
@@ -62,14 +69,30 @@ final class ReuseCache {
           AutomaticCalibration.class,
           SelfCalibration.class,
           BundleAdjuster.class,
+          SharedCalibration.class,
+          CalibrationDiagnostics.class,
+          PointConfidence.class,
+          PointRecords.class,
+          SmallMatrices.class,
+          TwoViewConfidence.class,
           FeatureAlgorithms.class,
           PairSelection.class,
+          DensePairSelection.class,
+          CameraEmission.class,
+          CameraEvidence.class,
+          MemorySafety.class,
+          WindowedRasters.class,
+          WindowedStereo.class,
+          StereoRows.class,
+          FusionScope.class,
+          IncrementalFusion.class,
           SparseCleanup.class,
           DenseReconstruction.class,
           CensusSgm.class,
           GpuSgm.class,
           GpuStereo.class,
           StereoCost.class,
+          ZnccCosts.class,
           PhotometricRefinement.class,
           OverlapSelection.class,
           OrientationIO.class,
@@ -80,6 +103,8 @@ final class ReuseCache {
           GpuFusion.class,
           GpuSurface.class,
           DenseMatcher.class,
+          PatchMatch.class,
+          PatchMatchReconstruction.class,
           DepthFusion.class,
           ReprojectionDepth.class,
           SurfaceGeometry.class,
@@ -135,18 +160,7 @@ final class ReuseCache {
   }
 
   static String frame(ImageFrame f) throws IOException {
-    if (f.pixelFingerprint == null) {
-      f.ensureRasters();
-      MessageDigest d = digest();
-      byte[] row = new byte[f.width];
-      for (int y = 0; y < f.height; y++) {
-        f.gray.get(y, 0, row);
-        d.update(row);
-        f.validMask.get(y, 0, row);
-        d.update(row);
-      }
-      f.pixelFingerprint = HexFormat.of().formatHex(d.digest());
-    }
+    fingerprint(f);
     return key(
         f.id
             + ":"
@@ -165,6 +179,21 @@ final class ReuseCache {
             + f.camera.cy
             + ":"
             + f.pixelFingerprint);
+  }
+
+  private static void fingerprint(ImageFrame f) throws IOException {
+    if (f.pixelFingerprint == null) {
+      f.ensureRasters();
+      MessageDigest d = digest();
+      byte[] row = new byte[f.width];
+      for (int y = 0; y < f.height; y++) {
+        f.gray.get(y, 0, row);
+        d.update(row);
+        f.validMask.get(y, 0, row);
+        d.update(row);
+      }
+      f.pixelFingerprint = HexFormat.of().formatHex(d.digest());
+    }
   }
 
   static boolean allowed(Options o, String stage) {
@@ -296,7 +325,25 @@ final class ReuseCache {
   }
 
   static boolean features(ImageFrame f, Options o) throws IOException {
-    String key = key(frame(f) + featureSettings(o));
+    if (o.cacheDirectory == null) {
+      if (o.runFeatureDirectory != null) {
+        Options shared = o.copy();
+        shared.cacheDirectory = o.runFeatureDirectory;
+        shared.runFeatureDirectory = null;
+        shared.resume = true;
+        shared.rerunFrom = "none";
+        boolean hit = features(f, shared);
+        if (hit) o.runFeatureHits.incrementAndGet();
+        return hit;
+      }
+      f.extract(o.features);
+      return false;
+    }
+    // Detection/description depends on the actual raster, not the focal guess, camera ID or
+    // filename. Full pixel/mask hashing still prevents reuse after distortion or resize changes.
+    // Matching/geometry continue to use frame(), which includes camera intrinsics and identity.
+    fingerprint(f);
+    String key = key(f.width + ":" + f.height + ":" + f.pixelFingerprint + featureSettings(o));
     boolean reused =
         read(
             o,
@@ -422,6 +469,7 @@ final class ReuseCache {
 
   static boolean matches(List<ImageFrame> frames, FeatureTracks features, Options o, boolean save)
       throws IOException {
+    if (o.cacheDirectory == null) return false;
     String key = matchesKey(frames, o);
     Path artifacts = o.output.resolve("03_matches");
     if (!save)
@@ -504,6 +552,11 @@ final class ReuseCache {
       CensusSgm.Observer observer,
       Path artifacts)
       throws IOException {
+    if (o.cacheDirectory == null) {
+      CensusSgm.Result result = DenseMatcher.compute(o, a, b, ca, cb, w, h, ma, mb, observer);
+      PointConfidence.stereo(result, a, b, o);
+      return result;
+    }
     String key =
         key(
             w
@@ -517,9 +570,20 @@ final class ReuseCache {
                     mb,
                     o.censusMode.equals("color-distance") ? ca : null,
                     o.censusMode.equals("color-distance") ? cb : null)
+                + ":bidirectional="
+                + PointConfidence.bidirectional(o)
                 + settings(
                     o,
                     "minDisparity",
+                    "compute",
+                    "gpuSgm",
+                    "gpuAggregate",
+                    "gpuDevice",
+                    "memoryMb",
+                    "gpuMemoryMb",
+                    "gpuBankMb",
+                    "gpuStripRows",
+                    "esgmCandidates",
                     "disparities",
                     "census",
                     "censusMode",
@@ -546,7 +610,18 @@ final class ReuseCache {
                     "pyramidLevels",
                     "pyramidRadius",
                     "tileSize",
-                    "tileOverlap"));
+                    "tileOverlap")
+                // Appended only for tsgm so existing full-search cache keys are unchanged.
+                + (o.pairwiseSearch.equals("full")
+                    ? ""
+                    : ":search="
+                        + o.pairwiseSearch
+                        + ":levels="
+                        + o.tsgmLevels
+                        + ":margin="
+                        + o.tsgmMargin
+                        + ":seeds="
+                        + (o.tsgmSeeds == null ? 0 : Arrays.hashCode(o.tsgmSeeds))));
     CensusSgm.Result[] holder = new CensusSgm.Result[1];
     if (read(
         o,
@@ -566,8 +641,13 @@ final class ReuseCache {
           holder[0] =
               new CensusSgm.Result(
                   w, h, floats(in, w * h), stats, floats(in, w * h), floats(in, w * h));
+          holder[0].confidence = floats(in, w * h);
+          holder[0].costMargin = floats(in, w * h);
+          holder[0].costSharpness = floats(in, w * h);
+          if (PointConfidence.bidirectional(o)) holder[0].rightConfidence = floats(in, w * h);
         })) return holder[0];
     CensusSgm.Result r = DenseMatcher.compute(o, a, b, ca, cb, w, h, ma, mb, observer);
+    PointConfidence.stereo(r, a, b, o);
     write(
         o,
         "stereo",
@@ -585,8 +665,106 @@ final class ReuseCache {
           floats(out, r.disparity);
           floats(out, r.correlation);
           floats(out, r.leftRightError);
+          floats(out, r.confidence);
+          floats(out, r.costMargin);
+          floats(out, r.costSharpness);
+          if (PointConfidence.bidirectional(o)) floats(out, r.rightConfidence);
         });
     return r;
+  }
+
+  static PatchMatch.Map patchmatch(Options o, PatchMatch.Scene scene, PatchMatch.Map previous)
+      throws IOException {
+    if (o.cacheDirectory == null) return PatchMatch.compute(scene, o, previous);
+    MessageDigest hash = digest();
+    hash.update(scene.pixels());
+    hash.update(scene.masks());
+    java.nio.ByteBuffer data = java.nio.ByteBuffer.allocate(scene.cameras().length * 4);
+    for (float x : scene.cameras()) data.putFloat(x);
+    hash.update(data.array());
+    if (scene.geometry() != null) {
+      java.nio.ByteBuffer block = java.nio.ByteBuffer.allocate(65536);
+      for (float x : scene.geometry()) {
+        if (block.remaining() < 4) {
+          hash.update(block.array(), 0, block.position());
+          block.clear();
+        }
+        block.putFloat(x);
+      }
+      hash.update(block.array(), 0, block.position());
+    }
+    if (previous != null) {
+      java.nio.ByteBuffer block = java.nio.ByteBuffer.allocate(65536);
+      for (float x : previous.data()) {
+        if (block.remaining() < 4) {
+          hash.update(block.array(), 0, block.position());
+          block.clear();
+        }
+        block.putFloat(x);
+      }
+      hash.update(block.array(), 0, block.position());
+    }
+    String key =
+        key(
+            "patchmatch:"
+                + PatchMatch.MODEL
+                + ":"
+                + scene.edgeSigma()
+                + ":"
+                + scene.geometricRelative()
+                + ":"
+                + (scene.geometry() == null ? "photo" : "geometric")
+                + ":"
+                + scene.width()
+                + ":"
+                + scene.height()
+                + ":"
+                + scene.minimum()
+                + ":"
+                + scene.maximum()
+                + ":"
+                + (previous == null ? "none" : previous.width() + "x" + previous.height())
+                + ":"
+                + HexFormat.of().formatHex(hash.digest())
+                + settings(
+                    o,
+                    "denseMethod",
+                    "compute",
+                    "gpuDevice",
+                    "patchmatchIterations",
+                    "patchmatchViews",
+                    "patchmatchLevels",
+                    "patchmatchEdgeSigma",
+                    "correlation",
+                    "fusionRelative"));
+    PatchMatch.Map[] cached = new PatchMatch.Map[1];
+    if (read(
+        o,
+        "stereo",
+        key,
+        null,
+        in -> {
+          String producer = in.readUTF();
+          float[] pixels =
+              floats(in, Math.multiplyExact(Math.multiplyExact(scene.width(), scene.height()), 8));
+          cached[0] =
+              new PatchMatch.Map(
+                  scene.width(),
+                  scene.height(),
+                  pixels,
+                  Json.object("backend", "cache", "producer_backend", producer));
+        })) return cached[0];
+    PatchMatch.Map result = PatchMatch.compute(scene, o, previous);
+    write(
+        o,
+        "stereo",
+        key,
+        null,
+        out -> {
+          out.writeUTF(Json.string(result.backend()));
+          floats(out, result.data());
+        });
+    return result;
   }
 
   private static final String[] STAT_NAMES = {
@@ -637,7 +815,12 @@ final class ReuseCache {
                     "trackMinAngle",
                     "extrinsicsMode",
                     "positionSigma",
-                    "rotationSigma"));
+                    "rotationSigma",
+                    "intrinsicsMode",
+                    "refineIntrinsics",
+                    "selfCalibration",
+                    "focalSigma",
+                    "radialSigma"));
     if (o.poses != null) b.append(hash(o.poses));
     for (var e : o.calibrationPoses.entrySet())
       b.append(e.getKey())
@@ -647,6 +830,7 @@ final class ReuseCache {
   }
 
   static Calibration calibration(List<Path> paths, Options o, Calibration save) throws IOException {
+    if (o.cacheDirectory == null) return save;
     StringBuilder b =
         new StringBuilder(
             settings(
@@ -654,6 +838,7 @@ final class ReuseCache {
                 "focal",
                 "sensorWidth",
                 "selfCalibration",
+                "calibrationPipeline",
                 "matchingAlgorithm",
                 "descriptorMatcher",
                 "features",
@@ -746,6 +931,7 @@ final class ReuseCache {
   static boolean geometry(
       List<ImageFrame> frames, FeatureTracks features, Options o, String key, boolean save)
       throws IOException {
+    if (o.cacheDirectory == null) return false;
     Path artifacts = o.output.resolve("04_geometry");
     if (!save)
       return read(
@@ -760,6 +946,15 @@ final class ReuseCache {
               f.camera.fixed = in.readBoolean();
               f.camera.rotation = vector(in);
               f.camera.translation = vector(in);
+              f.applyCalibration(
+                  new Calibration(
+                      in.readDouble(),
+                      in.readDouble(),
+                      in.readDouble(),
+                      in.readDouble(),
+                      vector(in),
+                      in.readInt(),
+                      in.readInt()));
             }
             int a = in.readInt(), b = in.readInt();
             features.seed = null;
@@ -786,6 +981,14 @@ final class ReuseCache {
             out.writeBoolean(f.camera.fixed);
             vector(out, f.camera.rotation);
             vector(out, f.camera.translation);
+            Calibration c = f.calibration;
+            out.writeDouble(c.fx);
+            out.writeDouble(c.fy);
+            out.writeDouble(c.cx);
+            out.writeDouble(c.cy);
+            vector(out, c.distortion);
+            out.writeInt(c.width);
+            out.writeInt(c.height);
           }
           out.writeInt(features.seed == null ? -1 : features.seed.a);
           out.writeInt(features.seed == null ? -1 : features.seed.b);

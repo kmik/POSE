@@ -19,6 +19,117 @@ final class PagedVolume implements AutoCloseable {
   }
 
   static final class Pool {
+    final java.util.concurrent.atomic.LongAdder bulkReadBytes =
+        new java.util.concurrent.atomic.LongAdder();
+    final java.util.concurrent.atomic.LongAdder bulkReadCalls =
+        new java.util.concurrent.atomic.LongAdder();
+    final java.util.concurrent.atomic.LongAdder frozenReads =
+        new java.util.concurrent.atomic.LongAdder();
+    final java.util.concurrent.atomic.LongAdder frozenEvictions =
+        new java.util.concurrent.atomic.LongAdder();
+    private long readerLimit;
+    private int pinnedFiles;
+    long pinnedFileOpens;
+    int peakPinnedFiles;
+    private final List<ReadCache> allocatedReaders =
+        new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    synchronized FileChannel pin(Path path) throws IOException {
+      if (pinnedFiles >= 512) return null;
+      FileChannel file = FileChannel.open(path, StandardOpenOption.READ);
+      pinnedFiles++;
+      pinnedFileOpens++;
+      peakPinnedFiles = Math.max(peakPinnedFiles, pinnedFiles);
+      return file;
+    }
+
+    synchronized void unpin(FileChannel file) throws IOException {
+      if (file != null) {
+        file.close();
+        pinnedFiles--;
+      }
+    }
+
+    synchronized void readShared(PagedVolume volume, ByteBuffer buffer, long offset)
+        throws IOException {
+      read(channel(volume), buffer, offset);
+    }
+
+    void closeReaders() {
+      for (ReadCache cache : allocatedReaders) {
+        cache.pages.clear();
+        cache.lastPage = null;
+        cache.lastVolume = null;
+        cache.used = 0;
+      }
+      allocatedReaders.clear();
+      readers.remove();
+    }
+
+    private final ThreadLocal<ReadCache> readers = ThreadLocal.withInitial(() -> new ReadCache());
+
+    void readerCount(int n) {
+      readerLimit = Math.max(4096, limit / Math.max(1, n));
+    }
+
+    void releaseReader() {
+      ReadCache cache = readers.get();
+      cache.pages.clear();
+      cache.lastPage = null;
+      cache.lastVolume = null;
+      cache.used = 0;
+      allocatedReaders.remove(cache);
+      readers.remove();
+    }
+
+    private record ReadKey(PagedVolume volume, long block) {}
+
+    private final class ReadCache {
+      ReadCache() {
+        allocatedReaders.add(this);
+      }
+
+      final LinkedHashMap<ReadKey, ByteBuffer> pages = new LinkedHashMap<>(16, .75f, true);
+      long used;
+      PagedVolume lastVolume;
+      long lastBlock = -1;
+      ByteBuffer lastPage;
+
+      ByteBuffer get(PagedVolume volume, long block) throws IOException {
+        if (lastVolume == volume && lastBlock == block) return lastPage;
+        ReadKey key = new ReadKey(volume, block);
+        ByteBuffer page = pages.get(key);
+        if (page == null) {
+          page = ByteBuffer.allocate(volume.cells * volume.bytes).order(ByteOrder.LITTLE_ENDIAN);
+          if (volume.initial != 0)
+            for (int i = 0; i < volume.cells; i++) {
+              if (volume.bytes == 2) page.putShort(i * volume.bytes, (short) volume.initial);
+              else page.putInt(i * volume.bytes, volume.initial);
+            }
+          if (volume.initialized.get(Math.toIntExact(block))) {
+            if (volume.frozenFile != null)
+              read(volume.frozenFile, page, block * volume.cells * volume.bytes);
+            else readShared(volume, page, block * volume.cells * volume.bytes);
+            frozenReads.increment();
+          }
+          page.clear();
+          pages.put(key, page);
+          used += page.capacity();
+          while (used > readerLimit && pages.size() > 1) {
+            var it = pages.entrySet().iterator();
+            var old = it.next();
+            used -= old.getValue().capacity();
+            it.remove();
+            frozenEvictions.increment();
+          }
+        }
+        lastVolume = volume;
+        lastBlock = block;
+        lastPage = page;
+        return page;
+      }
+    }
+
     private record Owner(PagedVolume volume, long block) {}
 
     final long limit;
@@ -102,6 +213,9 @@ final class PagedVolume implements AutoCloseable {
   private long lastIndex = -1;
   private Page last;
   private boolean closed;
+  private int[] frozenInts;
+  private FileChannel frozenFile;
+  private boolean frozen;
 
   PagedVolume(long count, int bytes, int initial, boolean disk, Options o, String name)
       throws IOException {
@@ -129,7 +243,9 @@ final class PagedVolume implements AutoCloseable {
     this.initial = initial;
     this.temporary = temporary;
     this.pool = pool;
-    cells = Math.max(1024, Math.min(262144, o.tileSize * Math.max(1, o.disparities)));
+    cells =
+        Math.max(
+            pool == null ? 1024 : 256, Math.min(262144, o.tileSize * Math.max(1, o.disparities)));
     capacity =
         Math.max(
             2,
@@ -138,10 +254,18 @@ final class PagedVolume implements AutoCloseable {
     if (disk) {
       Files.createDirectories(o.output);
       path = Files.createTempFile(o.output, name, ".tiles");
-      file =
-          temporary
-              ? FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)
-              : null;
+      if (temporary) {
+        try {
+          file = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        } catch (IOException failure) {
+          try {
+            Files.deleteIfExists(path);
+          } catch (IOException cleanup) {
+            failure.addSuppressed(cleanup);
+          }
+          throw failure;
+        }
+      } else file = null;
       ints = null;
       shorts = null;
     } else {
@@ -158,11 +282,69 @@ final class PagedVolume implements AutoCloseable {
   }
 
   int get(long index) {
+    if (frozenInts != null) return frozenInts[Math.toIntExact(index)];
     if (ints != null) return ints[(int) index];
     if (shorts != null) return shorts[(int) index] & 65535;
+    if (frozen) {
+      if (index < 0 || index >= count) throw new IndexOutOfBoundsException();
+      try {
+        ByteBuffer b = pool.readers.get().get(this, index / cells);
+        int at = (int) (index % cells) * bytes;
+        return bytes == 2 ? b.getShort(at) & 65535 : b.getInt(at);
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
     Page p = page(index);
     int at = (int) (index % cells) * bytes;
     return bytes == 2 ? p.bytes.getShort(at) & 65535 : p.bytes.getInt(at);
+  }
+
+  int existing(long index) {
+    if (index < 0 || index >= count) throw new IndexOutOfBoundsException();
+    if (ints != null || shorts != null || frozenInts != null || frozen) return get(index);
+    return initialized.get(Math.toIntExact(index / cells)) ? get(index) : initial;
+  }
+
+  /** Finish all writes before exposing immutable evidence to concurrent fusion readers. */
+  boolean resident() {
+    return ints != null || shorts != null || frozenInts != null;
+  }
+
+  void freeze(boolean resident) throws IOException {
+    if (frozen) return;
+    if (ints != null || shorts != null) {
+      frozen = true;
+      return;
+    }
+    if (pool == null) throw new IOException("Read-only evidence requires a bounded pool");
+    for (var entry : pages.entrySet()) flush(entry.getKey(), entry.getValue());
+    pool.releaseFile(this);
+    frozenFile = pool.pin(path);
+    if (resident) {
+      frozenInts = new int[Math.toIntExact(count)];
+      if (initial != 0) Arrays.fill(frozenInts, initial);
+      ByteBuffer buffer = ByteBuffer.allocate(cells * bytes).order(ByteOrder.LITTLE_ENDIAN);
+      for (int block = initialized.nextSetBit(0);
+          block >= 0;
+          block = initialized.nextSetBit(block + 1)) {
+        buffer.clear();
+        if (frozenFile != null) read(frozenFile, buffer, (long) block * cells * bytes);
+        else pool.readShared(this, buffer, (long) block * cells * bytes);
+        pool.frozenReads.increment();
+        int size = (int) Math.min(cells, count - (long) block * cells);
+        for (int i = 0; i < size; i++)
+          frozenInts[block * cells + i] =
+              bytes == 2 ? buffer.getShort(i * bytes) & 65535 : buffer.getInt(i * bytes);
+      }
+      pool.unpin(frozenFile);
+      frozenFile = null;
+    }
+    for (Page p : pages.values()) pool.drop(p);
+    pages.clear();
+    last = null;
+    lastIndex = -1;
+    frozen = true;
   }
 
   /** Contiguous exact transfers for streamed GPU aggregation; no per-cell paging or boxing. */
@@ -170,6 +352,75 @@ final class PagedVolume implements AutoCloseable {
     if (data.byteSize() % bytes != 0 || index < 0 || index + data.byteSize() / bytes > count)
       throw new IllegalArgumentException("Invalid bulk volume transfer");
     long remaining = data.byteSize() / bytes, offset = 0;
+    if (frozen || frozenInts != null) {
+      if (write) throw new IllegalStateException("Evidence is read-only");
+      if (frozenInts != null) {
+        if (bytes == 4)
+          java.lang.foreign.MemorySegment.copy(
+              java.lang.foreign.MemorySegment.ofArray(frozenInts),
+              index * 4,
+              data,
+              0,
+              data.byteSize());
+        else
+          for (long i = 0; i < remaining; i++)
+            data.set(
+                java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(
+                    ByteOrder.LITTLE_ENDIAN),
+                i * 2,
+                (short) frozenInts[Math.toIntExact(index + i)]);
+        return;
+      }
+      if (ints != null || shorts != null) {
+        var array =
+            ints != null
+                ? java.lang.foreign.MemorySegment.ofArray(ints)
+                : java.lang.foreign.MemorySegment.ofArray(shorts);
+        java.lang.foreign.MemorySegment.copy(array, index * bytes, data, 0, data.byteSize());
+        return;
+      }
+      data.fill((byte) 0);
+      if (initial != 0)
+        for (long i = 0; i < remaining; i++) {
+          if (bytes == 4)
+            data.set(
+                java.lang.foreign.ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN),
+                i * 4,
+                initial);
+          else
+            data.set(
+                java.lang.foreign.ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(
+                    ByteOrder.LITTLE_ENDIAN),
+                i * 2,
+                (short) initial);
+        }
+      try {
+        while (remaining > 0) {
+          int block = Math.toIntExact(index / cells);
+          boolean present = initialized.get(block);
+          long end =
+              (long) (present ? initialized.nextClearBit(block) : initialized.nextSetBit(block))
+                  * cells;
+          if (end < 0) end = count;
+          long n = Math.min(remaining, Math.max(1, end - index));
+          if (present) {
+            ByteBuffer buffer = data.asSlice(offset, n * bytes).asByteBuffer();
+            if (frozenFile != null) read(frozenFile, buffer, index * bytes);
+            else pool.readShared(this, buffer, index * bytes);
+            if (buffer.hasRemaining())
+              throw new EOFException("Truncated immutable evidence window");
+            pool.bulkReadBytes.add(n * bytes);
+            pool.bulkReadCalls.increment();
+          }
+          index += n;
+          remaining -= n;
+          offset += n * bytes;
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+      return;
+    }
     if (ints != null || shorts != null) {
       var array =
           ints != null
@@ -198,6 +449,7 @@ final class PagedVolume implements AutoCloseable {
   }
 
   void set(long index, int value) {
+    if (frozen || frozenInts != null) throw new IllegalStateException("Evidence is read-only");
     if (ints != null) {
       ints[(int) index] = value;
       return;
@@ -286,6 +538,7 @@ final class PagedVolume implements AutoCloseable {
     while (b.hasRemaining()) {
       int n = file.read(b, at + b.position());
       if (n < 0) break;
+      if (n == 0) throw new IOException("Volume read made no progress");
     }
   }
 
@@ -314,6 +567,8 @@ final class PagedVolume implements AutoCloseable {
       }
     } finally {
       try {
+        if (frozenFile != null) pool.unpin(frozenFile);
+        frozenInts = null;
         if (pool != null) pool.releaseFile(this);
         if (file != null) file.close();
         if (path != null && temporary) Files.deleteIfExists(path);

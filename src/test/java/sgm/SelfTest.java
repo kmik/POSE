@@ -45,10 +45,23 @@ public final class SelfTest {
     checks += NoiseRegression.run(root);
     checks += ProjectRegression.run(root);
     checks += GeoCalibrationRegression.run(root);
+    checks += GpsAdjustmentRegression.run(root.resolve("gps-adjustment"));
+    checks += GroundClassificationRegression.run(root.resolve("ground"));
+    checks += GroundStuffRegression.run(root.resolve("ground-stuff"));
+    checks += GcpRegression.run(root.resolve("gcp"));
+    checks += ReciprocalMatchingRegression.run();
     checks += SelfCalibrationRegression.run(root);
     checks += LayeringRegression.run();
     checks += FilteringPresetRegression.run(root);
     checks += BundleQualityRegression.run(root);
+    checks += BundleSchurRegression.run(root);
+    checks += SharedCalibrationRegression.run(root);
+    checks += ConfidencePatchMatchRegression.run(root);
+    checks += PatchMatchValidityRegression.run(root);
+    checks += HybridSgmRegression.run(root);
+    checks += ExactReuseRegression.run(root.resolve("exact-reuse"));
+    checks += TwoViewConfidenceRegression.run(root.resolve("two-view-confidence"));
+    checks += PdfReportRegression.run(root.resolve("pdf-report"));
     checks += WorkflowRegression.run(root);
     checks += StorageGpuRegression.run(root);
     checks += DepthIoRegression.run(root);
@@ -69,6 +82,7 @@ public final class SelfTest {
     checks += ScalingRegression.run(root);
     checks += EsgmProductionRegression.run(root);
     checks += ImageResourceRegression.run(root.resolve("image-resources"));
+    checks += PreDenseSpeedRegression.run(root.resolve("pre-dense-speed"));
     System.out.printf(
         Locale.ROOT,
         "PASS: %d checks; OpenCV %s on %s; fixtures: %s%n",

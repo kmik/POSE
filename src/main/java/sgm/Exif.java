@@ -34,7 +34,31 @@ final class Exif {
   static final class Metadata {
     Gps gps;
     double focalMm = Double.NaN, focal35Mm = Double.NaN;
-    String make = "", model = "";
+    String make = "", model = "", captureTime = "", captureOffset = "", captureSubSec = "";
+    // DJI XMP (drone-dji): aircraft velocity north/east/down in m/s; focal length in source pixels.
+    double speedNorth = Double.NaN, speedEast = Double.NaN, speedDown = Double.NaN;
+    double calibratedFocal = Double.NaN, relativeAltitude = Double.NaN;
+
+    /** Capture time in seconds (local clock, arbitrary epoch), or NaN. */
+    double captureSeconds() {
+      java.util.regex.Matcher m =
+          java.util.regex.Pattern.compile("(\\d{4}):(\\d\\d):(\\d\\d) (\\d\\d):(\\d\\d):(\\d\\d)")
+              .matcher(captureTime);
+      if (!m.find()) return Double.NaN;
+      long days =
+          java.time.LocalDate.of(
+                  Integer.parseInt(m.group(1)),
+                  Integer.parseInt(m.group(2)),
+                  Integer.parseInt(m.group(3)))
+              .toEpochDay();
+      double seconds =
+          days * 86400.
+              + Integer.parseInt(m.group(4)) * 3600
+              + Integer.parseInt(m.group(5)) * 60
+              + Integer.parseInt(m.group(6));
+      String sub = captureSubSec.replaceAll("[^0-9]", "");
+      return sub.isEmpty() ? seconds : seconds + Double.parseDouble("0." + sub);
+    }
   }
 
   static Gps gps(Path path) throws IOException {
@@ -46,6 +70,8 @@ final class Exif {
       int signature = file.readUnsignedShort();
       if (signature == 0x4949 || signature == 0x4d4d) return tiff(new Tiff(file));
       if (signature != 0xffd8) return new Metadata();
+      Metadata found = null;
+      String xmp = null;
       while (true) {
         int b;
         do {
@@ -55,24 +81,49 @@ final class Exif {
         do {
           marker = file.readUnsignedByte();
         } while (marker == 255);
-        if (marker == 0xda || marker == 0xd9) return new Metadata();
+        if (marker == 0xda || marker == 0xd9) break;
         if (marker == 0x01 || marker >= 0xd0 && marker <= 0xd7) continue;
         int length = file.readUnsignedShort() - 2;
-        if (length < 0) return new Metadata();
+        if (length < 0) break;
         byte[] segment = new byte[length];
         file.readFully(segment);
         if (marker == 0xe1
+            && found == null
             && length > 14
             && segment[0] == 'E'
             && segment[1] == 'x'
             && segment[2] == 'i'
             && segment[3] == 'f'
             && segment[4] == 0
-            && segment[5] == 0) return tiff(new Tiff(Arrays.copyOfRange(segment, 6, length)));
+            && segment[5] == 0) found = tiff(new Tiff(Arrays.copyOfRange(segment, 6, length)));
+        else if (marker == 0xe1 && xmp == null && length > 29) {
+          String text = new String(segment, StandardCharsets.ISO_8859_1);
+          if (text.startsWith("http://ns.adobe.com/xap/1.0/")) xmp = text;
+        }
+        // Both blocks precede the image data; stop scanning once both are known.
+        if (found != null && xmp != null) break;
       }
+      Metadata m = found == null ? new Metadata() : found;
+      if (xmp != null) {
+        m.speedNorth = xmpNumber(xmp, "FlightXSpeed");
+        m.speedEast = xmpNumber(xmp, "FlightYSpeed");
+        m.speedDown = xmpNumber(xmp, "FlightZSpeed");
+        m.calibratedFocal = xmpNumber(xmp, "CalibratedFocalLength");
+        m.relativeAltitude = xmpNumber(xmp, "RelativeAltitude");
+      }
+      return m;
     } catch (EOFException | IllegalArgumentException | IndexOutOfBoundsException e) {
       return new Metadata();
     }
+  }
+
+  /** A numeric drone-dji XMP attribute (attribute or element form), or NaN. */
+  static double xmpNumber(String xmp, String name) {
+    java.util.regex.Matcher m =
+        java.util.regex.Pattern.compile(
+                "drone-dji:" + name + "\\s*(?:=\\s*\"|>)\\s*([+-]?[0-9]*\\.?[0-9]+(?:[eE][+-]?\\d+)?)")
+            .matcher(xmp);
+    return m.find() ? Double.parseDouble(m.group(1)) : Double.NaN;
   }
 
   private static Metadata tiff(Tiff t) throws IOException {
@@ -87,6 +138,9 @@ final class Exif {
     Entry exif = root.get(0x8769), gps = root.get(0x8825);
     if (exif != null) {
       Map<Integer, Entry> e = t.ifd(t.integer(exif));
+      m.captureTime = t.text(e.get(0x9003));
+      m.captureOffset = t.text(e.get(0x9011));
+      m.captureSubSec = t.text(e.get(0x9291));
       Entry focal = e.get(0x920a), equiv = e.get(0xa405);
       if (focal != null && focal.type == 5) m.focalMm = t.rational(focal.offset);
       if (equiv != null) {

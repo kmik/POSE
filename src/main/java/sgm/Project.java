@@ -16,9 +16,16 @@ final class Project {
   final ProjectArtifacts data;
   private final Properties marker = new Properties();
   private final Map<String, Map<String, Object>> stages = new LinkedHashMap<>();
-  private final Instant started = Instant.now();
-  private final String[] arguments;
+  private Instant started = Instant.now();
+  private String[] arguments;
+  // True when this process continues a run started by an earlier pipeline step.
+  private final boolean attached;
   private final Options options;
+
+  private record VerifiedHash(
+      long bytes, java.nio.file.attribute.FileTime modified, Object fileKey, String hash) {}
+
+  private final Map<Path, VerifiedHash> artifactHashes = new HashMap<>();
   private FileChannel lockChannel;
   private RunTelemetry telemetry;
   private final Map<String, WorkProgress> stageWork = new LinkedHashMap<>();
@@ -40,7 +47,132 @@ final class Project {
     return new Project(options, args);
   }
 
+  /**
+   * Continues an existing run (a later pipeline step in a new process): same run directory and
+   * id, stage history and start time from run.json, logs appended, telemetry merged.
+   */
+  static Project attach(Options options, String[] args, String runId) throws IOException {
+    return new Project(options, args, runId);
+  }
+
+  private Project(Options options, String[] args, String runId) throws IOException {
+    attached = true;
+    this.options = options;
+    root = options.output.toAbsolutePath().normalize();
+    Path markerPath = root.resolve("project.properties");
+    if (!Files.exists(markerPath))
+      throw new IllegalArgumentException("Not an mSGM project: " + root);
+    try (Reader reader = Files.newBufferedReader(markerPath)) {
+      marker.load(reader);
+    }
+    if (!FORMAT.equals(marker.getProperty("format")))
+      throw new IOException("Unrecognized project.properties in " + root);
+    id = runId;
+    run = root.resolve("runs").resolve(id);
+    if (!Files.isRegularFile(run.resolve("run.json")))
+      throw new IllegalArgumentException("No run " + id + " in " + root);
+    lockChannel =
+        FileChannel.open(
+            root.resolve(".project.lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+    try {
+      lock = lockChannel.tryLock();
+      if (lock == null)
+        throw new IOException("Another photogrammetry process is using this project");
+    } catch (IOException | OverlappingFileLockException e) {
+      lockChannel.close();
+      throw new IOException("Cannot lock project: another process may be using it", e);
+    }
+    try {
+      Map<String, Object> previous = JsonRead.object(JsonRead.read(run.resolve("run.json")));
+      started = Instant.parse(String.valueOf(previous.get("started_utc")));
+      List<String> original = new ArrayList<>();
+      if (previous.get("arguments") instanceof List<?> list)
+        for (Object a : list) original.add(String.valueOf(a));
+      arguments = original.toArray(String[]::new);
+      Map<String, Object> saved = JsonRead.object(previous.get("stages"));
+      for (String stage : STAGES) {
+        Files.createDirectories(run.resolve(stage));
+        Object entry = saved.get(stage);
+        stages.put(
+            stage,
+            entry == null
+                ? Json.object("status", "pending")
+                : new LinkedHashMap<>(JsonRead.object(entry)));
+      }
+      data = new ProjectArtifacts(this, options);
+      options.output = run;
+      options.projectDirectory = root;
+      options.cacheDirectory =
+          options.cache
+              ? root.resolve("cache/v3")
+                  .resolve(options.storage + (options.diagnostics ? "-diagnostics" : "-compact"))
+              : null;
+      if (options.cacheDirectory == null)
+        options.runFeatureDirectory = Files.createTempDirectory(run, ".feature-reuse-");
+      marker.setProperty("latest_run", id);
+      persistProject("running");
+      Json.write(run.resolve("run.json"), runDescription("running", null));
+      event("step_started", Json.object("arguments", args, "project", root.toString()));
+      telemetry = new RunTelemetry(run, options);
+      telemetry.continueFrom(
+          run.resolve("logs/processing.json"), Duration.between(started, Instant.now()).toMillis() / 1e3);
+    } catch (IOException | RuntimeException e) {
+      if (telemetry != null) telemetry.close();
+      releaseLock();
+      throw e;
+    }
+  }
+
+  /**
+   * Ends a pipeline step without finalizing the run: closes artifact writers, records status,
+   * merges telemetry and releases the project lock. The last step calls {@link #finish} instead.
+   */
+  void suspend(boolean success, Throwable error, String nextStep) throws IOException {
+    try {
+      try {
+        data.close();
+      } finally {
+        cleanupRunFeatures();
+      }
+      String status = success ? "incomplete" : "failed";
+      for (String name : STAGES)
+        if (!success && "running".equals(stages.get(name).get("status")))
+          stageFinal(name, "failed", error == null ? "Step failed" : error.toString());
+      if (error != null) {
+        StringWriter stack = new StringWriter();
+        error.printStackTrace(new PrintWriter(stack));
+        Files.writeString(run.resolve("logs/error.txt"), stack.toString());
+      }
+      event(
+          success ? "step_complete" : "step_failed",
+          Json.object("error", error == null ? null : error.toString(), "next_step", nextStep));
+      Map<String, Object> description = JsonRead.object(runDescription(status, error));
+      description.put("next_step", nextStep);
+      Json.write(run.resolve("run.json"), description);
+      if (telemetry != null) telemetry.persist();
+      persistProject(status);
+    } finally {
+      try {
+        if (telemetry != null) telemetry.close();
+      } finally {
+        for (WorkProgress work : stageWork.values()) work.close();
+        stageWork.clear();
+        releaseLock();
+      }
+    }
+  }
+
+  /** Copies stage history (status, detail, timings) from a run this run branched from. */
+  void importStages(Map<String, Object> source, Collection<String> names) throws IOException {
+    for (String name : names) {
+      Object entry = source.get(name);
+      if (entry != null && stages.containsKey(name)) stages.put(name, new LinkedHashMap<>(JsonRead.object(entry)));
+    }
+    Json.write(run.resolve("run.json"), runDescription("running", null));
+  }
+
   private Project(Options options, String[] args) throws IOException {
+    attached = false;
     this.options = options;
     this.arguments = args.clone();
     root = options.output.toAbsolutePath().normalize();
@@ -95,7 +227,12 @@ final class Project {
       options.output = run;
       options.projectDirectory = root;
       options.cacheDirectory =
-          options.cache ? root.resolve("cache/v3").resolve(options.storage) : null;
+          options.cache
+              ? root.resolve("cache/v3")
+                  .resolve(options.storage + (options.diagnostics ? "-diagnostics" : "-compact"))
+              : null;
+      if (options.cacheDirectory == null)
+        options.runFeatureDirectory = Files.createTempDirectory(run, ".feature-reuse-");
       if (newProject) archiveReservedRootFiles();
       if (newProject || !Files.exists(root.resolve("latest-files.csv")))
         Files.writeString(
@@ -145,6 +282,7 @@ final class Project {
     if (!stages.containsKey(name))
       throw new IllegalArgumentException("Unknown project stage " + name);
     transition(name, status, detail);
+    Terminal.stage(name, status, detail);
     event("stage", Json.object("stage", name, "status", status, "detail", detail));
     Json.write(run.resolve("run.json"), runDescription("running", null));
   }
@@ -207,7 +345,7 @@ final class Project {
   }
 
   LogCapture capture() throws IOException {
-    return new LogCapture(run.resolve("logs/console.log"));
+    return new LogCapture(run.resolve("logs/console.log"), attached);
   }
 
   void finish(boolean success, Throwable error) throws IOException {
@@ -227,7 +365,11 @@ final class Project {
   private void finishLocked(boolean success, Throwable error) throws IOException {
     IOException ioFailure = null;
     try {
-      data.close();
+      try {
+        data.close();
+      } finally {
+        cleanupRunFeatures();
+      }
       try (WorkProgress work =
           WorkProgress.start("Finalize project exports and compatibility copies", 0, "files")) {
         organize();
@@ -260,8 +402,27 @@ final class Project {
         Json.object("error", error == null ? null : error.toString()));
     Json.write(run.resolve("run.json"), runDescription(status, error));
     if (telemetry != null) telemetry.persist();
-    if (options.processingReport.equals("html"))
-      ProcessingReport.generate(options, run, run.resolve("07_results"));
+    if (!options.processingReport.equals("none"))
+      try (WorkProgress work = WorkProgress.start("Generate final processing report", 0, "files")) {
+        ProcessingReport.generate(options, run, run.resolve("07_results"));
+        work.done();
+        Json.write(
+            run.resolve("07_results/report-status.json"),
+            Json.object("status", "complete", "format", options.processingReport));
+      } catch (IOException | RuntimeException | LinkageError reportFailure) {
+        System.err.println(
+            "Processing report failed; reconstruction status retained: "
+                + reportFailure.getMessage());
+        Json.write(
+            run.resolve("07_results/report-status.json"),
+            Json.object(
+                "status",
+                "failed",
+                "reason",
+                reportFailure.toString(),
+                "reconstruction_status",
+                status));
+      }
     if (telemetry != null) telemetry.close();
     writeIndex();
     try (WorkProgress work = WorkProgress.start("Catalog project artifacts", 0, "files")) {
@@ -284,6 +445,7 @@ final class Project {
 
   private void stageFinal(String name, String state, String detail) {
     transition(name, state, detail);
+    Terminal.stage(name, state, detail);
   }
 
   private void transition(String name, String state, String detail) {
@@ -304,6 +466,13 @@ final class Project {
         if (state.equals("complete")) work.done();
         work.close();
         entry.put("elapsed_seconds", (System.nanoTime() - stageStarted.get(name)) / 1e9);
+      } else if (entry.get("started_utc") != null && !"skipped".equals(state)) {
+        // Stage started by an earlier pipeline step (another process).
+        entry.put(
+            "elapsed_seconds",
+            Duration.between(Instant.parse(String.valueOf(entry.get("started_utc"))), Instant.now())
+                    .toMillis()
+                / 1e3);
       }
     }
     stages.put(name, entry);
@@ -458,6 +627,33 @@ final class Project {
               || name.equals("run-settings.properties")
               || name.startsWith("pair_") && (name.endsWith(".pfm") || name.endsWith(".png"))))
             continue;
+          if (!options.compatibilityCopies
+              && (name.equals("dense.las") || name.equals("dense.ply"))) {
+            Path oldCopy = root.resolve(name);
+            if (Files.isRegularFile(oldCopy)) {
+              Path retired = run.resolve("00_inputs/retired_compatibility_copies").normalize();
+              if (!retired.toAbsolutePath().startsWith(run.toAbsolutePath().normalize()))
+                throw new IOException("Compatibility archive escapes run");
+              Files.createDirectories(retired);
+              try {
+                Files.move(oldCopy, retired.resolve(name));
+              } catch (IOException e) {
+                System.err.println(
+                    "Previous root "
+                        + name
+                        + " could not be archived; use latest-files.csv for the new cloud: "
+                        + e.getMessage());
+              }
+            }
+            aliases.put(
+                name,
+                Arrays.asList(
+                    name,
+                    id,
+                    "runs/" + id + "/" + run.relativize(source).toString().replace('\\', '/'),
+                    artifactHash(source)));
+            continue;
+          }
           Path temporary = Files.createTempFile(root, ".publish-", ".part");
           try {
             Files.copy(source, temporary, StandardCopyOption.REPLACE_EXISTING);
@@ -468,7 +664,7 @@ final class Project {
                     name,
                     id,
                     "runs/" + id + "/" + run.relativize(source).toString().replace('\\', '/'),
-                    sha256(source)));
+                    artifactHash(source)));
           } finally {
             Files.deleteIfExists(temporary);
           }
@@ -503,7 +699,12 @@ final class Project {
       for (Path file : files) {
         String relative = run.relativize(file).toString().replace('\\', '/');
         writer.write(
-            ProjectArtifacts.csv(relative) + "," + Files.size(file) + "," + sha256(file) + "\n");
+            ProjectArtifacts.csv(relative)
+                + ","
+                + Files.size(file)
+                + ","
+                + artifactHash(file)
+                + "\n");
       }
     }
   }
@@ -524,6 +725,47 @@ final class Project {
     }
   }
 
+  private String artifactHash(Path file) throws IOException {
+    String name = file.getFileName().toString();
+    // Only closed cloud outputs are reused. Telemetry/log files can still change at this point.
+    if (!name.equals("dense.las") && !name.equals("dense.ply")) return sha256(file);
+    Path key = file.toAbsolutePath().normalize();
+    var a = Files.readAttributes(key, java.nio.file.attribute.BasicFileAttributes.class);
+    var old = artifactHashes.get(key);
+    if (old != null
+        && old.bytes == a.size()
+        && old.modified.equals(a.lastModifiedTime())
+        && Objects.equals(old.fileKey, a.fileKey())) return old.hash;
+    String hash = sha256(key);
+    var after = Files.readAttributes(key, java.nio.file.attribute.BasicFileAttributes.class);
+    if (a.size() != after.size()
+        || !a.lastModifiedTime().equals(after.lastModifiedTime())
+        || !Objects.equals(a.fileKey(), after.fileKey()))
+      throw new IOException("Artifact changed during hashing: " + key);
+    artifactHashes.put(key, new VerifiedHash(a.size(), a.lastModifiedTime(), a.fileKey(), hash));
+    return hash;
+  }
+
+  private void cleanupRunFeatures() throws IOException {
+    Path folder = options.runFeatureDirectory;
+    if (folder == null || !Files.exists(folder)) return;
+    Path actual = folder.toRealPath(), allowed = run.toRealPath();
+    if (actual.equals(allowed) || !actual.startsWith(allowed))
+      throw new IOException("Feature scratch escapes run directory");
+    Json.write(
+        run.resolve("02_features/reuse.json"),
+        Json.object(
+            "in_run_feature_hits",
+            options.runFeatureHits.get(),
+            "scope",
+            "Only identical processed pixels/masks, dimensions and detector settings; no persistent"
+                + " cache enabled. Changed distortion/resolution invalidates reuse."));
+    try (var files = Files.walk(actual)) {
+      for (Path p : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(p);
+    }
+    options.runFeatureDirectory = null;
+  }
+
   private void writeIndex() throws IOException {
     StringBuilder links = new StringBuilder("\n## Quick links\n\n");
     for (String relative :
@@ -532,6 +774,7 @@ final class Project {
           "07_results/dense.ply",
           "07_results/report.txt",
           "07_results/processing-report.html",
+          "07_results/processing-report.pdf",
           "07_results/processing-report.json",
           "07_results/dsm.tif",
           "logs/processing.json",
@@ -576,9 +819,17 @@ final class Project {
     private final PrintStream out, err;
 
     LogCapture(Path path) throws IOException {
-      file = new BufferedOutputStream(Files.newOutputStream(path));
-      out = new PrintStream(new Tee(originalOut, file), true, StandardCharsets.UTF_8);
-      err = new PrintStream(new Tee(originalErr, file), true, StandardCharsets.UTF_8);
+      this(path, false);
+    }
+
+    LogCapture(Path path, boolean append) throws IOException {
+      file =
+          new BufferedOutputStream(
+              append
+                  ? Files.newOutputStream(path, StandardOpenOption.CREATE, StandardOpenOption.APPEND)
+                  : Files.newOutputStream(path));
+      out = new PrintStream(new Tee(Terminal.sink(originalOut, false), file), true, StandardCharsets.UTF_8);
+      err = new PrintStream(new Tee(Terminal.sink(originalErr, true), file), true, StandardCharsets.UTF_8);
       System.setOut(out);
       System.setErr(err);
     }

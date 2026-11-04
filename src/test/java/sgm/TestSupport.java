@@ -10,12 +10,16 @@ import java.util.*;
 final class TestSupport {
   static Options options() {
     Options o = new Options();
+    o.diagnostics = true;
+    o.compatibilityCopies = true;
     o.compute = "cpu";
     o.pointAttributes = "none";
     o.storage = "debug";
     o.cache = true;
     o.depthRefinementMethod = "weighted";
     o.surfaceConsolidation = "none";
+    // Fixed 8-iteration bundle budget, as these regressions were frozen with.
+    o.bundleIterationsExplicit = true;
     return o;
   }
 
@@ -24,6 +28,8 @@ final class TestSupport {
     List<String> args =
         new ArrayList<>(
             List.of(
+                "--diagnostics",
+                "--compatibility-copies",
                 "--point-attributes",
                 "none",
                 "--storage",
@@ -34,7 +40,9 @@ final class TestSupport {
                 "--depth-refinement",
                 "weighted",
                 "--surface-consolidation",
-                "none"));
+                "none",
+                "--bundle-iterations",
+                "8"));
     args.addAll(Arrays.asList(arguments));
     return Main.run(args.toArray(String[]::new));
   }

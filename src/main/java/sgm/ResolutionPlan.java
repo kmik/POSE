@@ -34,7 +34,8 @@ final class ResolutionPlan {
       int[] original = originalSize(paths.get(i)),
           processed = o.processedSize(original[0], original[1]);
       long n = (long) processed[0] * processed[1];
-      if (!o.estimateMemory && n > Integer.MAX_VALUE / 3)
+      if (!o.estimateMemory
+          && n > (o.windowedMode.equals("off") ? Integer.MAX_VALUE / 3 : Integer.MAX_VALUE - 8L))
         throw new IllegalArgumentException(
             "Processed image exceeds the dense color-array index limit; select --quality or"
                 + " --max-dimension explicitly: "
@@ -102,13 +103,113 @@ final class ResolutionPlan {
                 Math.max(1, o.fusionCacheMb > 0 ? o.fusionCacheMb : Math.min(512, o.memoryMb / 8))
                     * 1048576L)
             : evidence;
+    if (o.denseMethod.equals("patchmatch")) {
+      long atlas = maxPixels * Math.min(paths.size(), o.patchmatchViews + 1L);
+      long deviceBytes = 2 * atlas + 64 * maxPixels, hostBytes = 4 * atlas + 160 * maxPixels;
+      Json.write(
+          o.output.resolve("00_inputs/resolution_plan.json"),
+          Json.object(
+              "dense_method",
+              "patchmatch",
+              "experimental",
+              true,
+              "compute",
+              o.compute,
+              "images",
+              images,
+              "maximum_source_views",
+              o.patchmatchViews,
+              "coarse_to_fine_levels",
+              o.patchmatchLevels,
+              "estimated_device_working_bytes",
+              deviceBytes,
+              "estimated_host_working_bytes",
+              hostBytes,
+              "stored_depth_normal_evidence_bytes",
+              32 * pixels,
+              "potential_pair_evidence_bytes",
+              evidence,
+              "source_raster_cache_limit_bytes",
+              RasterCache.limit(o),
+              "source_decode_native_bytes",
+              decodeNative,
+              "confidence_threshold",
+              o.confidenceThreshold,
+              "sgm_cost_volume_bytes",
+              0,
+              "scope",
+              "Conservative camera-atlas/plane buffers; excludes codec/native raster caches, fusion"
+                  + " and JVM overhead. Actual source graph, allocation/device and depth bounds"
+                  + " checked before estimation."));
+      System.out.printf(
+          Locale.ROOT,
+          "PatchMatch plan: up to %d source views; %.0f MiB device, %.0f MiB host buffers; no"
+              + " disparity cost volume%n",
+          o.patchmatchViews,
+          deviceBytes / 1048576.,
+          hostBytes / 1048576.);
+      return;
+    }
     List<Integer> counts = new ArrayList<>(Arrays.asList(64, 128, 256, 512));
     if (!counts.contains(o.disparities)) counts.add(o.disparities);
     Collections.sort(counts);
     List<Object> estimates = new ArrayList<>();
     long budget = Math.min(o.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .65));
+    if (WindowedStereo.shouldUse(longest, shortest, o)) {
+      int limit = WindowedStereo.limit(longest, shortest, o);
+      List<Object> scenarios = new ArrayList<>();
+      for (int d : counts)
+        scenarios.add(
+            Json.object(
+                "disparities",
+                d,
+                "host_minimum_strip_bytes",
+                WindowedStereo.hostEstimate(longest, d, 1, o),
+                "aggregate_disk_bytes",
+                maxPixels * d * StereoCost.aggregateBytes(o),
+                "raster_temporary_disk_estimate_bytes",
+                maxPixels * 112,
+                "fits_minimum_strip",
+                d <= limit));
+      Json.write(
+          o.output.resolve("00_inputs/resolution_plan.json"),
+          Json.object(
+              "dense_method",
+              "sgm",
+              "windowed_mode",
+              o.windowedMode,
+              "effective_windowed",
+              true,
+              "images",
+              images,
+              "processing_budget_bytes",
+              budget,
+              "scenarios",
+              scenarios,
+              "feasible_disparity_limit",
+              limit,
+              "potential_pair_evidence_bytes",
+              evidence,
+              "scope",
+              "Conservative header-only window/carry estimate; actual rectified width, range,"
+                  + " device, native staging, safe heap/commit and temporary disk checked at"
+                  + " execution"));
+      System.out.printf(
+          Locale.ROOT,
+          "Windowed stereo plan: largest image %dx%d; minimum-strip disparity limit %d; pair"
+              + " evidence %.0f MiB remains separately paged%n",
+          longest,
+          shortest,
+          limit,
+          evidence / 1048576.);
+      if (!o.estimateMemory && (limit < 3 || o.disparitiesExplicit && o.disparities > limit))
+        throw new IllegalArgumentException(
+            "Windowed stereo minimum strip/carry cannot fit requested search; see"
+                + " resolution_plan.json");
+      return;
+    }
     int gpuLimit = GpuSgm.disparityLimit(longest, shortest, o);
-    long gpuHost = maxPixels * (96 + 32 * ((o.census * o.census - 1 + 63) / 64));
+    long gpuHost = maxPixels * (116 + 32 * ((o.census * o.census - 1 + 63) / 64));
     if (gpuHost > budget) gpuLimit = 0;
     for (int d : counts) {
       Options scenario = o.copy();
@@ -134,24 +235,20 @@ final class ResolutionPlan {
               "gpu_memory_plan",
               GpuStereo.report(longest, shortest, scenario),
               "tiled_sgm_resident_bytes",
-              CensusSgm.tiledMemoryEstimate(longest, shortest, d, o.census, o.memoryMb),
+              CensusSgm.tiledMemoryEstimate(longest, shortest, d, o),
               "tiled_cost_volume_disk_bytes",
               maxPixels * d * (2 + StereoCost.aggregateBytes(o)),
               "fits_sgm_budget",
               d <= gpuLimit
                   || (o.tiled
-                      ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o.census, o.memoryMb)
-                          <= budget
+                      ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o) <= budget
                       : sgm <= budget && maxPixels * d <= Integer.MAX_VALUE - 8L),
               "potential_depth_evidence_bytes",
               evidence,
               "approximate_known_process_bytes",
               (gpuSelected
                       ? selectedPlan == null ? gpuHost : selectedPlan.hostBytes()
-                      : o.tiled
-                          ? CensusSgm.tiledMemoryEstimate(
-                              longest, shortest, d, o.census, o.memoryMb)
-                          : sgm)
+                      : o.tiled ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o) : sgm)
                   + residentEvidence
                   + imagesNative
                   + features
@@ -226,7 +323,10 @@ final class ResolutionPlan {
                 : 0,
             "potential_surface_input_uncompressed_bytes",
             o.surfaceConsolidation.equals("normal")
-                ? maxPixels * pairs / ((long) o.step * o.step) * SurfaceConsolidator.RECORD_BYTES
+                ? maxPixels
+                    * pairs
+                    / ((long) o.step * o.step)
+                    * (SurfaceConsolidator.RECORD_BYTES + (paths.size() + 7L) / 8)
                 : 0,
             "surface_temporary_disk_scope",
             "Gzip level-1 partitions of accepted candidates only; splitting may temporarily hold"
@@ -271,9 +371,7 @@ final class ResolutionPlan {
               ? GpuStereo.plan(
                       GpuSgm.selectedDevice(o), GpuSgm.selectedGroup(o), longest, shortest, d, o)
                   .hostBytes()
-              : o.tiled
-                  ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o.census, o.memoryMb)
-                  : sgm;
+              : o.tiled ? CensusSgm.tiledMemoryEstimate(longest, shortest, d, o) : sgm;
       System.out.printf(
           Locale.ROOT,
           "  %4d disparities: SGM resident %.0f MiB; known process components ~%.0f MiB%s%n",

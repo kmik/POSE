@@ -442,7 +442,7 @@ final class WorkflowRegression {
             .contains("Reused stereo cache"),
         "Candidate sampling change preserves stereo compatibility");
     Path payload;
-    try (var files = Files.walk(project.resolve("cache/v3/debug/stereo"))) {
+    try (var files = Files.walk(project.resolve("cache/v3/debug-diagnostics/stereo"))) {
       payload =
           files
               .filter(p -> p.getFileName().toString().equals("payload.bin"))

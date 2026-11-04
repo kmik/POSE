@@ -8,14 +8,20 @@ import java.util.*;
 
 /** Disk-partitioned, normal-directed robust fusion. It makes no terrain or axis assumption. */
 final class SurfaceConsolidator implements AutoCloseable {
-  static final int RECORD_BYTES = 148;
+  static final int RECORD_BYTES = 172;
 
   static final class Sample {
     long id;
     int source, pixel, rgb, views, pairs, merged = 1;
     double[] point, normal;
     SurfaceAttributes attributes = SurfaceAttributes.missing(false);
+    BitSet supportingCameras = new BitSet();
     double sigma, shift, footprint, normalSigma, surfaceShift;
+    double matchingConfidence = Double.NaN,
+        costMargin = Double.NaN,
+        costSharpness = Double.NaN,
+        photometric = Double.NaN,
+        lrError = Double.NaN;
 
     Sample(
         long id,
@@ -31,7 +37,13 @@ final class SurfaceConsolidator implements AutoCloseable {
       point = r.point;
       views = r.views;
       pairs = r.independentPairs;
+      if (r.supportingCameras != null) supportingCameras = (BitSet) r.supportingCameras.clone();
       sigma = r.relativeSigma;
+      matchingConfidence = r.matchingConfidence;
+      costMargin = r.costMargin;
+      costSharpness = r.costSharpness;
+      photometric = r.photometric;
+      lrError = r.lrError;
       shift = r.shift;
       normal = s.normal();
       footprint = s.footprint();
@@ -66,7 +78,8 @@ final class SurfaceConsolidator implements AutoCloseable {
 
     void include(Sample p) {
       count++;
-      uncompressedBytes += 108 + p.attributes.storageBytes();
+      uncompressedBytes +=
+          132 + ((p.supportingCameras.length() + 7) / 8) + p.attributes.storageBytes();
       if (p.normal != null && Double.isFinite(p.footprint))
         queryFootprint = Math.max(queryFootprint, p.footprint);
       for (int k = 0; k < 3; k++) {
@@ -114,6 +127,7 @@ final class SurfaceConsolidator implements AutoCloseable {
   private WorkProgress partitionProgress, surfaceProgress;
   private final List<Tile> leaves = new ArrayList<>();
   private final int capacity;
+  private final int maxRecordBytes;
   private double largestFootprint;
   private final double[] footprints = new double[8192];
   private int footprintCount;
@@ -151,6 +165,7 @@ final class SurfaceConsolidator implements AutoCloseable {
   SurfaceConsolidator(Options options, DepthFusion fusion) throws IOException {
     this.options = options;
     this.fusion = fusion;
+    maxRecordBytes = RECORD_BYTES + (fusion.cameraCount() + 7) / 8;
     pairWeights = new double[Math.max(1, fusion.pairCount())];
     pairSeen = new int[pairWeights.length];
     directory = Files.createTempDirectory(options.output, "surface-work-");
@@ -166,7 +181,11 @@ final class SurfaceConsolidator implements AutoCloseable {
     // Includes Java object/hash-grid overhead, halo records and sort/query scratch.
     long budget = Math.min(options.surfaceMemoryMb, Math.max(8, options.memoryMb / 4)) * 1048576L;
     decodedLimit = budget / 8;
-    capacity = (int) Math.min(Integer.MAX_VALUE / 4, Math.max(256, budget / 768));
+    capacity =
+        (int)
+            Math.min(
+                Integer.MAX_VALUE / 4,
+                Math.max(256, budget / (768 + (fusion.cameraCount() + 7L) / 8)));
   }
 
   void add(Sample p) throws IOException {
@@ -298,7 +317,7 @@ final class SurfaceConsolidator implements AutoCloseable {
     try (DataInputStream in = input(t.path);
         DataOutputStream left = output(a.path);
         DataOutputStream right = output(b.path)) {
-      byte[] raw = new byte[RECORD_BYTES];
+      byte[] raw = new byte[maxRecordBytes];
       ByteBuffer record = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
       for (long i = 0; i < t.count; i++) {
         int bytes = readRecord(in, raw);
@@ -446,7 +465,7 @@ final class SurfaceConsolidator implements AutoCloseable {
         throw new IOException("Surface coordinate count disagrees");
       ByteBuffer routing = ByteBuffer.allocate(28 * 16384).order(ByteOrder.BIG_ENDIAN);
       routing.limit(0);
-      byte[] raw = new byte[RECORD_BYTES];
+      byte[] raw = new byte[maxRecordBytes];
       ByteBuffer record = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
       for (long i = 0; i < root.count; i++) {
         if (!routing.hasRemaining()) {
@@ -702,6 +721,8 @@ final class SurfaceConsolidator implements AutoCloseable {
           p.surfaceShift = Math.abs(q.delta);
           p.views = check.views;
           p.pairs = check.independentPairs;
+          if (check.supportingCameras != null)
+            p.supportingCameras = (BitSet) check.supportingCameras.clone();
           p.sigma = Math.max(p.sigma, check.relativeSigma);
           moved++;
           maxShift = Math.max(maxShift, p.surfaceShift);
@@ -1038,7 +1059,7 @@ final class SurfaceConsolidator implements AutoCloseable {
 
   private boolean load(Tile t, Tile owner, double halo, List<Sample> points) throws IOException {
     try (DataInputStream in = cachedInput(t)) {
-      byte[] raw = new byte[RECORD_BYTES];
+      byte[] raw = new byte[maxRecordBytes];
       ByteBuffer record = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
       for (long i = 0; i < t.count; i++) {
         int bytes = readRecord(in, raw);
@@ -1065,13 +1086,17 @@ final class SurfaceConsolidator implements AutoCloseable {
 
   /** Preserve full floating-point records while routing; deserialize only retained query data. */
   private static int readRecord(DataInputStream in, byte[] raw) throws IOException {
-    in.readFully(raw, 0, 109);
-    int status = raw[108] & 255;
+    in.readFully(raw, 0, 132);
+    int supportBytes = ByteBuffer.wrap(raw).getInt(128);
+    if (supportBytes < 0 || supportBytes > raw.length - 170)
+      throw new IOException("Invalid camera support length");
+    in.readFully(raw, 132, supportBytes + 1);
+    int status = raw[132 + supportBytes] & 255;
     if (status == 0) {
-      in.readFully(raw, 109, 37);
-      return 146;
+      in.readFully(raw, 133 + supportBytes, 37);
+      return 170 + supportBytes;
     }
-    if (status == 1 || status == 2) return 109;
+    if (status == 1 || status == 2) return 133 + supportBytes;
     throw new IOException("Invalid surface record status");
   }
 
@@ -1236,6 +1261,14 @@ final class SurfaceConsolidator implements AutoCloseable {
     out.writeDouble(p.footprint);
     out.writeDouble(p.normalSigma);
     for (int k = 0; k < 3; k++) out.writeDouble(p.normal == null ? Double.NaN : p.normal[k]);
+    out.writeFloat((float) p.matchingConfidence);
+    out.writeFloat((float) p.costMargin);
+    out.writeFloat((float) p.costSharpness);
+    out.writeFloat((float) p.photometric);
+    out.writeFloat((float) p.lrError);
+    byte[] support = p.supportingCameras.toByteArray();
+    out.writeInt(support.length);
+    out.write(support);
     p.attributes.write(out);
   }
 
@@ -1254,6 +1287,17 @@ final class SurfaceConsolidator implements AutoCloseable {
     p.normalSigma = in.readDouble();
     p.normal = new double[] {in.readDouble(), in.readDouble(), in.readDouble()};
     if (!Double.isFinite(p.normal[0])) p.normal = null;
+    p.matchingConfidence = in.readFloat();
+    p.costMargin = in.readFloat();
+    p.costSharpness = in.readFloat();
+    p.photometric = in.readFloat();
+    p.lrError = in.readFloat();
+    int supportBytes = in.readInt();
+    if (supportBytes < 0 || supportBytes > 1048576)
+      throw new IOException("Invalid camera support length");
+    byte[] support = new byte[supportBytes];
+    in.readFully(support);
+    p.supportingCameras = BitSet.valueOf(support);
     p.attributes = SurfaceAttributes.read(in);
     return p;
   }

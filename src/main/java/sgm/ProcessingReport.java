@@ -5,7 +5,7 @@ import java.nio.file.*;
 import java.time.*;
 import java.util.*;
 
-/** Self-contained printable HTML with complete archived parameters and bounded DSM products. */
+/** PDF and self-contained HTML/JSON with archived parameters, measurements and bounded maps. */
 final class ProcessingReport {
   @SuppressWarnings("unchecked")
   static Map<String, Object> object(Object o) {
@@ -21,6 +21,8 @@ final class ProcessingReport {
   }
 
   static void export(Options o) throws IOException {
+    if (o.processingReport.equals("none"))
+      throw new IllegalArgumentException("--export-report requires --report pdf or html");
     Path run = o.exportReport.toAbsolutePath().normalize();
     Map<String, Object> state = map(run.resolve("run.json"));
     if (state.isEmpty() || "running".equals(state.get("status")))
@@ -85,7 +87,14 @@ final class ProcessingReport {
     for (String relative :
         List.of(
             "06_fusion/backend.json",
+            "06_fusion/confidence.json",
+            "06_fusion/two_view_confidence.json",
+            "05_stereo/patchmatch.json",
+            "04_geometry/bundle/shared_calibration.json",
             "06_fusion/output_profile.json",
+            "06_fusion/camera_emission.json",
+            "05_stereo/dense_pair_selection.json",
+            "07_results/confidence-export.json",
             "06_fusion/surface_consolidation.json",
             "06_fusion/fusion.json",
             "00_inputs/resolution_plan.json",
@@ -93,6 +102,8 @@ final class ProcessingReport {
             "04_geometry/registration.json",
             "04_geometry/bundle/solver.json")) {
       Object value = read(run.resolve(relative));
+      if (relative.endsWith("two_view_confidence.json")
+          && !Boolean.TRUE.equals(object(value).get("enabled"))) continue;
       if (value != null) profiles.put(relative, value);
     }
     Map<String, Object> camera = map(run.resolve("04_geometry/orientation_model.json"));
@@ -154,9 +165,51 @@ final class ProcessingReport {
             pairParameters,
             "dsm",
             dsm);
+    Path screening = run.resolve("04_geometry/camera_screening.json");
+    if (Files.isRegularFile(screening)) data.put("camera_screening", read(screening));
+    Path ground = run.resolve("07_results/ground.json");
+    if (Files.isRegularFile(ground)) data.put("ground", read(ground));
+    Map<String, Object> maps;
+    try {
+      maps = ReportMaps.create(run, out, o, dsm, coordinate, parameters);
+    } catch (IOException | IllegalArgumentException unavailable) {
+      maps = Json.object("status", "unavailable", "orthomosaic_note", unavailable.getMessage());
+    }
+    data.put("maps", maps);
+    try {
+      data.put("survey", ReportSurvey.collect(run, coordinate, maps, dsm));
+    } catch (IOException | RuntimeException unavailable) {
+      System.err.println("Report survey data unavailable: " + unavailable.getMessage());
+    }
+    if (current != null) {
+      current.persist();
+      telemetry = map(run.resolve("logs/processing.json"));
+      data.put("telemetry", telemetry);
+    }
+    for (Object item : stages) {
+      var stage = object(item);
+      stage.put(
+          "sampled_resources",
+          ResourceTimeline.stageUsage(telemetry, String.valueOf(stage.get("stage"))));
+    }
+    data.put(
+        "measurement_cutoff",
+        current == null
+            ? "Archived processing telemetry; report regeneration does not replace original"
+                + " measurements."
+            : "Resources sampled through report-map generation, before document formatting. Final"
+                + " logs also include report generation.");
+    ResourceTimeline.create(telemetry, out.resolve("resource-timeline.png"));
     Json.write(out.resolve("processing-report.json"), data);
     Files.writeString(out.resolve("processing-report.html"), html(data, overview, out));
-    System.out.println("Processing report complete: " + out.resolve("processing-report.html"));
+    if (o.processingReport.equals("pdf")) PdfReport.generate(data, out, o.reportDetail);
+    else Files.deleteIfExists(out.resolve("processing-report.pdf"));
+    System.out.println(
+        "Processing report complete: "
+            + out.resolve(
+                o.processingReport.equals("pdf")
+                    ? "processing-report.pdf"
+                    : "processing-report.html"));
   }
 
   private static Double archivedDuration(Map<String, Object> report) {
@@ -245,6 +298,27 @@ final class ProcessingReport {
     card(b, "Peak tracked OpenCL buffers", memory(t.get("peak_tracked_opencl_buffer_bytes")));
     card(b, "Final surface samples", surface.getOrDefault("output_samples", "Unavailable"));
     b.append("</div>");
+    Map<String, Object> maps = object(d.get("maps"));
+    for (var figure :
+        List.of(
+            new String[] {"orthomosaic.png", "Orthomosaic overview", "orthomosaic_note"},
+            new String[] {"camera-map.png", "Camera locations and acquisition", "camera_note"},
+            new String[] {"overlap.png", "Geometric image overlap", "overlap_note"},
+            new String[] {
+              "resource-timeline.png", "Measured resource timeline", "timeline_scope"
+            })) {
+      Path image = out.resolve(figure[0]);
+      if (!Files.isRegularFile(image)) continue;
+      b.append("<h2>")
+          .append(esc(figure[1]))
+          .append("</h2><figure><img alt=\"")
+          .append(esc(figure[1]))
+          .append("\" src=\"data:image/png;base64,")
+          .append(Base64.getEncoder().encodeToString(Files.readAllBytes(image)))
+          .append("\"><figcaption>")
+          .append(esc(figure[2].equals("timeline_scope") ? t.get(figure[2]) : maps.get(figure[2])))
+          .append("</figcaption></figure>");
+    }
     b.append("<h2>Digital surface model</h2>");
     Map<String, Object> dsm = object(d.get("dsm"));
     if ("complete".equals(dsm.get("status"))) {

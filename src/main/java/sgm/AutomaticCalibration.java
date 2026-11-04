@@ -5,15 +5,15 @@ import java.nio.file.*;
 import java.util.*;
 import org.opencv.calib3d.Calib3d;
 import org.opencv.core.*;
-import org.opencv.features2d.DescriptorMatcher;
 
 /** Shared-focal self calibration from uncalibrated epipolar geometry, with EXIF fallback. */
 final class AutomaticCalibration {
   static final double LOW = .12, HIGH = 4;
   static final String ASSUMPTIONS =
-      "Shared fixed-focus camera, square pixels, zero skew, centered principal point. Guarded joint"
-          + " f,k1,k2 refinement follows focal initialization; p1,p2,k3 stay zero. Rejected"
-          + " refinement retains initial focal and zero distortion; see refinement/result.json.";
+      "Bootstrap: shared fixed-focus camera, square pixels, zero skew, centered principal point."
+          + " Guarded joint f,k1,k2 refinement follows focal initialization; p1,p2,k3 stay zero."
+          + " Rejected refinement retains initial focal and zero distortion; see"
+          + " refinement/result.json.";
 
   static Calibration estimate(Options o, List<Path> paths, int width, int height, Project project)
       throws IOException {
@@ -68,8 +68,31 @@ final class AutomaticCalibration {
             "EXIF indicates changing focal lengths. Separate cameras/zoom settings or supply an"
                 + " appropriate shared calibration.");
     Json.write(dir.resolve("exif_intrinsics.json"), metadata);
+    if (o.calibrationPipeline.equals("joint") && o.selfCalibration && Double.isFinite(prior)) {
+      double f = prior * Math.hypot(width, height);
+      Calibration initial =
+          new Calibration(f, f, (width - 1) / 2., (height - 1) / 2., new double[5], width, height);
+      Json.write(
+          dir.resolve("self_calibration.json"),
+          Json.object(
+              "status",
+              "initialized",
+              "method",
+              "exif_joint_alignment",
+              "focal_pixels",
+              f,
+              "note",
+              "EXIF initialization only. Shared alignment refinement retains held-out/physical"
+                  + " guards; inspect 04_geometry/bundle/shared_calibration.json."));
+      System.out.printf(
+          Locale.ROOT,
+          "Experimental joint calibration: EXIF f=%.3f; shared intrinsics will be fitted in the"
+              + " main track graph%n",
+          f);
+      return initial;
+    }
     List<Model> models = new ArrayList<>();
-    List<ImageFrame> frames = new ArrayList<>();
+    List<ImageFrame> frames = new ArrayList<>(), preloaded = new ArrayList<>();
     List<Object> pairReports = new ArrayList<>();
     double diagonal = Math.hypot(width, height);
     try {
@@ -82,28 +105,79 @@ final class AutomaticCalibration {
               new double[5],
               width,
               height);
-      for (Path p : paths) {
-        ImageFrame f = new ImageFrame(frames.size(), p, initial, o.alignmentOptions(), true);
-        frames.add(f);
-        if (project != null) project.data.source(f.id, p, f.sourceWidth, f.sourceHeight, f.gps);
-        f.extract(o.features);
-        DescriptorCache.retain(f);
-        System.out.println(
-            "Auto calibration features "
-                + frames.size()
-                + "/"
-                + paths.size()
-                + ": "
-                + f.keypoints.length);
-      }
-      for (int a = 0; a < frames.size(); a++)
-        for (int b = a + 1; b < Math.min(frames.size(), a + o.neighbors + 1); b++) {
-          Model m = match(frames.get(a), frames.get(b), o, dir);
-          pairReports.add(m.report());
-          if (m.accepted) models.add(m);
+      try (WorkProgress extraction =
+          WorkProgress.start("Focal bootstrap features", paths.size(), "images")) {
+        int chunk = Math.max(1, o.cores);
+        for (Path p : paths) {
+          extraction.detail(p.getFileName().toString());
+          if (frames.size() % chunk == 0 && chunk > 1) {
+            // Decode the next chunk's rasters in parallel (identical pixels). Extraction, cache
+            // reuse and output below stay serial and in the original order.
+            List<ImageFrame> next = new ArrayList<>();
+            for (Path q : paths.subList(frames.size(), Math.min(paths.size(), frames.size() + chunk)))
+              next.add(new ImageFrame(frames.size() + next.size(), q, initial, o.alignmentOptions(), true));
+            preloaded.addAll(next);
+            long preloadStarted = System.nanoTime();
+            int decoded = RasterCache.preload(next, chunk);
+            if (decoded > 0)
+              RunTelemetry.record(
+                  "Parallel calibration image preload (" + decoded + ")", preloadStarted);
+          }
+          ImageFrame f =
+              frames.size() < preloaded.size()
+                  ? preloaded.get(frames.size())
+                  : new ImageFrame(frames.size(), p, initial, o.alignmentOptions(), true);
+          frames.add(f);
+          if (project != null) project.data.source(f.id, p, f.sourceWidth, f.sourceHeight, f.gps);
+          ReuseCache.features(f, f.options);
+          DescriptorCache.retain(f);
+          extraction.update(frames.size());
+          System.out.println(
+              "Auto calibration features "
+                  + frames.size()
+                  + "/"
+                  + paths.size()
+                  + ": "
+                  + f.keypoints.length);
         }
+        extraction.done();
+      }
+      List<int[]> edges = new ArrayList<>();
+      for (int a = 0; a < frames.size(); a++)
+        for (int b = a + 1; b < Math.min(frames.size(), a + o.neighbors + 1); b++)
+          edges.add(new int[] {a, b});
+      try (WorkProgress pairs =
+          WorkProgress.start("Focal bootstrap pairs", edges.size(), "pairs")) {
+        long[] completed = {0};
+        PairMatching.ordered(
+            edges,
+            PairMatching.threads(o),
+            edge -> {
+              try (WorkProgress pair =
+                  WorkProgress.start(
+                      "Focal bootstrap pair " + edge[0] + "-" + edge[1], 0, "matches")) {
+                Model m = match(frames.get(edge[0]), frames.get(edge[1]), o, dir, pair);
+                pair.done();
+                return m;
+              }
+            },
+            (edge, m) -> {
+              pairs.detail("pair " + edge[0] + "-" + edge[1]);
+              pairReports.add(m.report());
+              if (m.accepted) models.add(m);
+              pairs.update(++completed[0]);
+              // Pairs are consumed in order and all later pairs use larger IDs: once the last pair
+              // starting at this frame is consumed, release its bounded caches immediately.
+              int a = edge[0];
+              boolean last =
+                  completed[0] == edges.size() || edges.get((int) completed[0])[0] != a;
+              if (last) frames.get(a).close();
+            });
+        pairs.done();
+      }
     } finally {
       for (ImageFrame f : frames) f.close();
+      for (ImageFrame f : preloaded) f.close();
     }
     Json.write(dir.resolve("self_calibration_pairs.json"), pairReports);
     double ratio = Double.NaN;
@@ -196,26 +270,36 @@ final class AutomaticCalibration {
     return result;
   }
 
-  private static Model match(ImageFrame a, ImageFrame b, Options o, Path dir) throws IOException {
+  private static Model match(ImageFrame a, ImageFrame b, Options o, Path dir, WorkProgress work)
+      throws IOException {
     Model out = new Model(a.id, b.id);
-    DescriptorCache.pair(a, b);
+    long started = System.nanoTime();
+    work.detail("loading descriptors");
+    DescriptorCache.acquire(a, b);
+    try {
+      return matchResident(a, b, o, dir, work, out, started);
+    } finally {
+      DescriptorCache.release(a, b);
+    }
+  }
+
+  private static Model matchResident(
+      ImageFrame a, ImageFrame b, Options o, Path dir, WorkProgress work, Model out, long started)
+      throws IOException {
     if (a.descriptors.empty() || b.descriptors.rows() < 2 || a.descriptors.rows() < 2) {
       out.reason = "missing_descriptors";
       return out;
     }
-    DescriptorMatcher matcher = FeatureAlgorithms.matcher(o, a.descriptors);
-    List<MatOfDMatch> fw = new ArrayList<>(), bw = new ArrayList<>();
+    List<MatOfDMatch> fw = new ArrayList<>();
     MatOfPoint2f x = new MatOfPoint2f(), y = new MatOfPoint2f();
     Mat f = new Mat(), mask = new Mat(), h = new Mat(), hMask = new Mat();
     try {
-      matcher.knnMatch(a.descriptors, b.descriptors, fw, 2);
-      matcher.knnMatch(b.descriptors, a.descriptors, bw, 2);
       Map<Integer, Integer> reverse = new HashMap<>();
-      for (MatOfDMatch row : bw) {
-        DMatch[] v = row.toArray();
-        if (v.length >= 2 && v[0].distance < o.ratio * v[1].distance)
-          reverse.put(v[0].queryIdx, v[0].trainIdx);
-      }
+      out.forwardQueries = a.descriptors.rows();
+      out.reverseQueries =
+          PairMatching.reciprocal(o, a, b, fw, reverse, work::detail, true, null);
+      out.fullReverseQueries = b.descriptors.rows();
+      work.detail("fundamental/homography RANSAC and focal constraint");
       List<Point> p = new ArrayList<>(), q = new ArrayList<>();
       for (MatOfDMatch row : fw) {
         DMatch[] v = row.toArray();
@@ -245,25 +329,30 @@ final class AutomaticCalibration {
       mask.get(0, 0, flags);
       Path pair = dir.resolve(ProjectArtifacts.pairId(a.id, b.id));
       Files.createDirectories(pair);
-      try (BufferedWriter w = Files.newBufferedWriter(pair.resolve("uncalibrated_matches.csv"))) {
-        w.write(
-            "a_centered_x_over_diagonal,a_centered_y_over_diagonal,b_centered_x_over_diagonal,b_centered_y_over_diagonal,fundamental_inlier\n");
+      try (BufferedWriter w =
+          o.diagnostics
+              ? Files.newBufferedWriter(pair.resolve("uncalibrated_matches.csv"))
+              : null) {
+        if (w != null)
+          w.write(
+              "a_centered_x_over_diagonal,a_centered_y_over_diagonal,b_centered_x_over_diagonal,b_centered_y_over_diagonal,fundamental_inlier\n");
         for (int i = 0; i < p.size(); i++) {
           if (flags[i] != 0) {
             ip.add(p.get(i));
             iq.add(q.get(i));
           }
-          w.write(
-              p.get(i).x
-                  + ","
-                  + p.get(i).y
-                  + ","
-                  + q.get(i).x
-                  + ","
-                  + q.get(i).y
-                  + ","
-                  + (flags[i] != 0)
-                  + "\n");
+          if (w != null)
+            w.write(
+                p.get(i).x
+                    + ","
+                    + p.get(i).y
+                    + ","
+                    + q.get(i).x
+                    + ","
+                    + q.get(i).y
+                    + ","
+                    + (flags[i] != 0)
+                    + "\n");
         }
       }
       if (out.inliers < Math.max(24, o.minMatches)) {
@@ -297,19 +386,20 @@ final class AutomaticCalibration {
               && out.curvature > Math.max(1e-6, out.score * .25)
               && out.score < .0025;
       out.reason = out.accepted ? "accepted" : "planar_or_weak_focal_constraint";
+      out.seconds = (System.nanoTime() - started) / 1e9;
       Json.write(pair.resolve("fundamental.json"), out.report());
-      try (BufferedWriter w = Files.newBufferedWriter(pair.resolve("focal_search.csv"))) {
-        w.write("focal_over_diagonal,essential_singular_value_error\n");
-        for (int i = 0; i <= 100; i++) {
-          double r = LOW * Math.pow(HIGH / LOW, i / 100.);
-          w.write(r + "," + essentialError(out.fundamental, r) + "\n");
+      if (o.diagnostics)
+        try (BufferedWriter w = Files.newBufferedWriter(pair.resolve("focal_search.csv"))) {
+          w.write("focal_over_diagonal,essential_singular_value_error\n");
+          for (int i = 0; i <= 100; i++) {
+            double r = LOW * Math.pow(HIGH / LOW, i / 100.);
+            w.write(r + "," + essentialError(out.fundamental, r) + "\n");
+          }
         }
-      }
       return out;
     } finally {
+      out.seconds = (System.nanoTime() - started) / 1e9;
       for (Mat m : fw) m.release();
-      for (Mat m : bw) m.release();
-      matcher.clear();
       x.release();
       y.release();
       f.release();
@@ -392,6 +482,8 @@ final class AutomaticCalibration {
   private static final class Model {
     final int a, b;
     int matches, inliers;
+    int forwardQueries, reverseQueries, fullReverseQueries;
+    double seconds;
     boolean accepted;
     double focal, score, curvature, homographyFraction;
     double[] fundamental;
@@ -425,7 +517,15 @@ final class AutomaticCalibration {
           "accepted",
           accepted,
           "reason",
-          reason);
+          reason,
+          "forward_knn_queries",
+          forwardQueries,
+          "reverse_knn_queries",
+          reverseQueries,
+          "full_reverse_knn_queries",
+          fullReverseQueries,
+          "elapsed_seconds",
+          seconds);
     }
   }
 }

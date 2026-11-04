@@ -26,14 +26,15 @@ final class GpuCandidateStereo {
     long n = (long) w * h, bank = Math.min(device.allocation(), o.gpuBankMb * 1048576L) / 8 * 8;
     if (D < 3
         || D > 4096
-        || (2L * D + GpuSgm.selectedGroup(o)) * 4 > device.localMemory()
+        || (2L * D + GpuSgm.selectedGroup(o) + 2) * 4 > device.localMemory()
         || bank < 8) return null;
     for (int pool = o.esgmCandidates; pool >= 1; pool--)
       for (int rows = Math.min(h, o.gpuStripRows); rows >= 1; rows /= 2) {
         long input = n * (16L * ((o.census * o.census - 1 + 63) / 64) + 6),
             c = (long) o.directions * pool;
         long bytes = input + n * c * 8 + 2L * w * rows * D + 8L * w * D + 24L * w * rows + 64;
-        long host = n * 168 + ((long) w * rows * (4L * D + 24));
+        long host =
+            n * 188 + ((long) w * rows * (4L * D + 24)) + PointConfidence.extraHostBytes(o, n);
         if (bytes <= GpuSgm.budget(device, o)
             && host <= hostBudget(o)
             && 6 * n * c <= device.allocation()
@@ -102,6 +103,10 @@ final class GpuCandidateStereo {
                   || second - (double) value <= margin
                   || lower - value > margin);
       if (!trusted) slots[p] = unresolved++;
+      // A certified winner need not have an exactly known runner-up. Bound omitted competitors
+      // conservatively rather than interpreting their absence from the pool as confidence.
+      if (trusted && o.stereoSelection != null)
+        candidates.summary[at + 2] = Math.min(second, (int) lower);
     }
     System.out.printf(
         Locale.ROOT,
@@ -228,7 +233,7 @@ final class GpuCandidateStereo {
         || costBytes > bank * 8
         || 4L * w * d > device.allocation())
       throw new IllegalArgumentException("Prototype single-allocation/bank limit exceeded");
-    if ((2L * d + GpuSgm.selectedGroup(o)) * 4 > device.localMemory())
+    if ((2L * d + GpuSgm.selectedGroup(o) + 2) * 4 > device.localMemory())
       throw new IllegalArgumentException("Prototype path state exceeds local memory");
     try (Arena arena = Arena.ofConfined();
         GpuSgm.Compute cl = new GpuSgm.Compute(o, source())) {
@@ -279,7 +284,9 @@ final class GpuCandidateStereo {
                 0,
                 1000,
                 o.adTruncation,
-                o.gradientTruncation);
+                o.gradientTruncation,
+                0,
+                0);
             cl.run(costKernel, (long) w * actual * d, args.toArray());
             args.clear();
             banks(args, costs, dummy, bank);
@@ -299,9 +306,10 @@ final class GpuCandidateStereo {
                 actual,
                 1,
                 ordinal > 0 ? 1 : 0,
+                0,
                 incoming,
                 outgoing,
-                new GpuSgm.Local(4L * (2 * d + cl.group())),
+                new GpuSgm.Local(4L * (2 * d + cl.group() + 2)),
                 candidates,
                 sums,
                 outside,
@@ -365,6 +373,7 @@ final class GpuCandidateStereo {
       MemorySegment bh = arena.allocate(2L * n);
       cl.transfer(outside, 0, bh, true);
       MemorySegment.copy(bh, 0, MemorySegment.ofArray(bounds), 0, 2L * n);
+      RunTelemetry.gpuProfile("Compact SGM " + w + "x" + h + " D=" + d, cl.profile());
       return new Result(
           summary, bounds, hc, hs, bytes, (System.nanoTime() - started) / 1e9, cl.profile());
     }
@@ -400,14 +409,22 @@ final class GpuCandidateStereo {
 
   private static String source() {
     String source = GpuStereo.kernels(false, 2);
-    source = replace(source, "cw(i,CB,value,CV);sw(i,SB,0,SV);", "cw(i,CB,value,CV);");
+    source =
+        replace(
+            source,
+            "cw(i,CB,value,CV);if(clearSum)sw(i+(ulong)sumY*w*D,SB,0,SV);",
+            "cw(i,CB,value,CV);");
     source =
         replace(
             source,
             "__local int *state) {",
             "__local int *state, __global ushort *candidate, __global ushort *compact, __global"
                 + " ushort *outside, int C, int direction, int phase, int pool) {");
-    source = replace(source, "next[k]=v;sw(at,SB,sr(at,SB,SV)+v,SV);", "next[k]=v;");
+    source =
+        replace(
+            source,
+            "next[k]=v;mine=min(mine,v);swk(sbase,k,SB,srk(sbase,k,SB,SV)+v,SV);",
+            "next[k]=v;mine=min(mine,v);");
     source =
         replace(
             source,

@@ -40,7 +40,9 @@ final class ScalingRegression {
       }
       check(rejected, "Aggregate bounds checked");
     }
-    int w = 160, h = 47, n = w * h;
+    // Leave room for retained confidence arrays inside the deliberately tiny 1 MiB budget.
+    // The non-multiple-of-seven height still exercises strip/block carry boundaries.
+    int w = 160, h = 41, n = w * h;
     byte[] a = new byte[n], b = new byte[n], ma = new byte[n], mb = new byte[n];
     new Random(219).nextBytes(a);
     Arrays.fill(ma, (byte) 255);

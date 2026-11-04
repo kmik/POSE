@@ -111,8 +111,14 @@ final class GpuSurface implements AutoCloseable {
   }
 
   public void close() {
+    if (!telemetryClosed) {
+      RunTelemetry.gpuProfile("Surface geometry", cl.profile());
+      telemetryClosed = true;
+    }
     cl.close();
   }
+
+  private boolean telemetryClosed;
 
   private static final String SOURCE =
       """

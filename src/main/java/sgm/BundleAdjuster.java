@@ -3,9 +3,9 @@ package sgm;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
-import org.opencv.core.Point;
+import org.opencv.core.*;
 
-/** Joint robust LM with point elimination and a matrix-free, preconditioned Schur solve. */
+/** Joint robust LM with point elimination and bounded direct / matrix-free Schur solves. */
 final class BundleAdjuster {
   private BundleAdjuster() {}
 
@@ -60,19 +60,44 @@ final class BundleAdjuster {
       int scaleCamera)
       throws IOException {
     try (WorkProgress work = WorkProgress.start("Joint bundle adjustment", 0, "iterations")) {
-      optimizeImpl(frames, tracks, iterations, huber, project, anchor, scaleCamera);
+      boolean fixedPoses =
+          frames.get(0).options.alignmentCalibration
+              && frames.get(0).options.poses != null
+              && frames.get(0).options.extrinsicsMode.equals("fixed");
+      if (!fixedPoses)
+        optimizeImpl(frames, tracks, iterations, huber, project, anchor, scaleCamera, null);
+      SharedCalibration.refine(frames, tracks, iterations, huber, project, anchor, scaleCamera);
       work.done();
     }
   }
 
-  private static void optimizeImpl(
+  static void optimizeImpl(
       List<ImageFrame> frames,
       List<FeatureTracks.Track> tracks,
       int iterations,
       double huber,
       Project project,
       int anchor,
-      int scaleCamera)
+      int scaleCamera,
+      SharedCalibration lens)
+      throws IOException {
+    String label = lens == null ? "poses/points" : "shared " + String.join(",", lens.parameters());
+    try (WorkProgress work = WorkProgress.start("Bundle fit " + label, 0, "iterations")) {
+      optimizeFit(frames, tracks, iterations, huber, project, anchor, scaleCamera, lens, work);
+      work.done();
+    }
+  }
+
+  private static void optimizeFit(
+      List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks,
+      int iterations,
+      double huber,
+      Project project,
+      int anchor,
+      int scaleCamera,
+      SharedCalibration lens,
+      WorkProgress work)
       throws IOException {
     double[] origin = frames.get(anchor).camera.center();
     double baseline = Math3.norm(Math3.sub(frames.get(scaleCamera).camera.center(), origin));
@@ -82,33 +107,40 @@ final class BundleAdjuster {
     int[] index = new int[frames.size()];
     Arrays.fill(index, -1);
     int count = 0;
+    // Camera position priors (GPS) or known track positions (GCPs) fix the world frame.
     boolean absolutePriors =
-        frames.stream().anyMatch(f -> f.camera.registered && f.camera.reference != null);
+        frames.stream().anyMatch(f -> f.camera.registered && f.camera.reference != null)
+            || tracks.stream().anyMatch(t -> t.prior != null && t.point != null);
     for (ImageFrame f : frames) {
       if (f.camera.registered) {
-        f.camera.fixed = !absolutePriors && f.id == anchor;
+        f.camera.fixed = lens != null && lens.fixedPoses || !absolutePriors && f.id == anchor;
         if (!f.camera.fixed) index[f.id] = count++;
       }
     }
-    double before = error(frames, tracks, huber), lambda = 1e-3;
+    double before = error(frames, tracks, huber, lens), lambda = 1e-3;
     Path diagnostics = null;
     if (project != null) {
       Path dir = project.data.directory("04_geometry/bundle");
       diagnostics = dir.resolve("linear_solver.csv");
       Files.writeString(
           diagnostics,
-          "iteration,trial,lambda,pcg_iterations,relative_linear_residual,objective_before,objective_trial,accepted\n");
+          "iteration,trial,lambda,pcg_iterations,relative_linear_residual,objective_before,objective_trial,accepted,linear_method\n");
       Json.write(
           dir.resolve("solver.json"),
           Json.object(
               "solver",
-              "joint Levenberg-Marquardt; matrix-free Schur complement; block-Jacobi PCG",
+              "joint Levenberg-Marquardt; bounded direct Schur Cholesky; matrix-free block-Jacobi"
+                  + " PCG fallback",
               "requested_iterations",
               iterations,
+              "iteration_mode",
+              frames.get(0).options.bundleIterationsExplicit
+                  ? "fixed budget (--bundle-iterations)"
+                  : "until two successive gains < 1e-6 relative, at most " + AUTO_LIMIT,
               "huber_pixels",
               huber,
               "intrinsics_fixed",
-              true,
+              lens == null,
               "anchor_image_id",
               anchor,
               "scale_image_id",
@@ -131,22 +163,52 @@ final class BundleAdjuster {
               "note",
               "All triangulated tracks and registered observations participate. Huber weights are"
                   + " recomputed each outer iteration; existing post-bundle track rejection follows"
-                  + " this solve. Workspace scales with observations and cameras, not camera count"
-                  + " squared."));
+                  + " this solve. Direct assembly is restricted to at most 768 reduced variables"
+                  + " and a bounded workspace; larger blocks retain matrix-free PCG."));
       project.data.bundle(0, before, before, frames, tracks);
     }
-    for (int iteration = 0; iteration < iterations; iteration++) {
+    // Without --bundle-iterations: iterate until two successive accepted iterations each gain
+    // less than CONVERGED (relative), capped at AUTO_LIMIT.
+    boolean converge = !frames.get(0).options.bundleIterationsExplicit;
+    int limit = converge ? Math.max(iterations, AUTO_LIMIT) : iterations, small = 0;
+    for (int iteration = 0; iteration < limit; iteration++) {
       boolean accepted = false;
       double after = before;
       Linear system = null;
       for (int trial = 0; trial < 8; trial++) {
-        system = linearize(frames, tracks, index, count, huber, lambda);
+        work.detail(
+            "iteration "
+                + (iteration + 1)
+                + ", trial "
+                + (trial + 1)
+                + "; linearizing "
+                + count
+                + " cameras");
+        system = linearize(frames, tracks, index, count, huber, lambda, lens);
+        work.detail(
+            "iteration "
+                + (iteration + 1)
+                + ", trial "
+                + (trial + 1)
+                + "; solving "
+                + system.points.size()
+                + " point blocks");
         Result result = system.solve();
+        work.detail(
+            "iteration "
+                + (iteration + 1)
+                + "; "
+                + (result == null
+                    ? "linear solve failed"
+                    : result.method + ", residual " + result.relative)
+                + "; checking objective");
         Camera[] old = new Camera[frames.size()];
         for (ImageFrame f : frames) old[f.id] = f.camera.copy();
         List<double[]> oldPoints = new ArrayList<>(system.points.size());
         for (Block p : system.points) oldPoints.add(p.track.point);
+        double[] oldLens = lens == null ? null : lens.values.clone();
         if (result != null) {
+          if (lens != null) lens.move(result.x, count * 6);
           for (ImageFrame f : frames)
             if (index[f.id] >= 0) move(f.camera, result.x, index[f.id] * 6);
           for (Block p : system.points) {
@@ -155,6 +217,10 @@ final class BundleAdjuster {
               for (int k = 0; k < 3; k++)
                 for (int j = 0; j < 6; j++)
                   rhs[k] -= e.cross[j * 3 + k] * result.x[e.camera * 6 + j];
+            if (lens != null)
+              for (int k = 0; k < 3; k++)
+                for (int j = 0; j < SharedCalibration.SIZE; j++)
+                  rhs[k] -= p.lensCross[j * 3 + k] * result.x[count * 6 + j];
             p.track.point = Math3.add(p.track.point, mv(p.inverse, rhs, 3));
           }
           double newLength = Math3.norm(Math3.sub(frames.get(scaleCamera).camera.center(), origin));
@@ -169,7 +235,10 @@ final class BundleAdjuster {
             for (Block p : system.points)
               p.track.point =
                   Math3.add(origin, Math3.times(Math3.sub(p.track.point, origin), factor));
-            after = error(frames, tracks, huber);
+            after =
+                lens != null && !lens.physical()
+                    ? Double.POSITIVE_INFINITY
+                    : error(frames, tracks, huber, lens);
           } else after = Double.POSITIVE_INFINITY;
           accepted = Double.isFinite(after) && after < before;
         } else after = Double.POSITIVE_INFINITY;
@@ -191,12 +260,15 @@ final class BundleAdjuster {
                   + after
                   + ","
                   + accepted
+                  + ","
+                  + (result == null ? "failed" : result.method)
                   + "\n",
               StandardOpenOption.APPEND);
         if (accepted) {
           lambda = Math.max(1e-10, lambda / 3);
           break;
         }
+        if (lens != null) lens.values = oldLens;
         for (ImageFrame f : frames) {
           f.camera.rotation = old[f.id].rotation;
           f.camera.translation = old[f.id].translation;
@@ -218,38 +290,137 @@ final class BundleAdjuster {
           after,
           count,
           system.points.size());
-      if (before - after < 1e-7 * Math.max(1, before)) break;
+      work.update(iteration + 1);
+      if (converge) {
+        small = before - after < CONVERGED * Math.max(1, before) ? small + 1 : 0;
+        if (small >= 2) {
+          System.out.printf(
+              Locale.ROOT, "Bundle converged after %d iterations.%n", iteration + 1);
+          break;
+        }
+        if (iteration + 1 == limit)
+          System.out.printf(
+              Locale.ROOT,
+              "Bundle: iteration limit %d reached while still improving; stopping.%n",
+              limit);
+      } else if (before - after < 1e-7 * Math.max(1, before)) break;
       before = after;
     }
   }
 
+  static final int AUTO_LIMIT = 100;
+  static final double CONVERGED = 1e-6;
+
   static double error(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, double huber) {
-    double total = 0;
+    return error(frames, tracks, huber, null);
+  }
+
+  /** Robust reprojection objective plus camera and shared-parameter priors. */
+  static double objective(
+      List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks,
+      double huber,
+      SharedCalibration lens) {
+    return error(frames, tracks, huber, lens);
+  }
+
+  private static double error(
+      List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks,
+      double huber,
+      SharedCalibration lens) {
+    double total = lens == null ? 0 : lens.priorCost();
     for (FeatureTracks.Track t : tracks)
       if (t.point != null)
         for (FeatureTracks.Observation o : t.observations) {
           ImageFrame f = frames.get(o.image);
           if (!f.camera.registered) continue;
-          double[] uv = f.camera.project(t.point);
-          Point observed = f.keypoints[o.feature].pt;
+          Point observed =
+              lens == null ? f.keypoints[o.feature].pt : lens.observed[f.id][o.feature];
+          double[] uv =
+              lens == null ? f.camera.project(t.point) : lens.project(f, t.point, observed.y);
           if (uv == null || !Double.isFinite(uv[0]) || !Double.isFinite(uv[1]))
             return Double.POSITIVE_INFINITY;
           double e = Math.hypot(uv[0] - observed.x, uv[1] - observed.y);
           total += e <= huber ? .5 * e * e : huber * (e - .5 * huber);
         }
-    for (ImageFrame f : frames) if (f.camera.registered) total += priorCost(f.camera);
+    boolean antenna = lens != null && lens.antennaModel();
+    for (ImageFrame f : frames)
+      if (f.camera.registered)
+        total += antenna ? antennaPriorCost(f.camera, lens) : priorCost(f.camera);
+    for (FeatureTracks.Track t : tracks)
+      if (t.point != null && t.prior != null)
+        for (int k = 0; k < 3; k++) total += .5 * Math.pow((t.point[k] - t.prior[k]) / t.priorSigma[k], 2);
     return total;
+  }
+
+  /** Camera prior whose position term compares the GPS antenna (C + R^T L + V dt) to the fix. */
+  static double antennaPriorCost(Camera c, SharedCalibration lens) {
+    if (c.reference == null) return 0;
+    double[] position = Math3.sub(lens.antenna(c), c.reference.center()), sigma = positionSigmas(c);
+    double rotation =
+        Math3.norm(
+            Math3.rotationVector(Math3.mul(c.rotation, Math3.transpose(c.reference.rotation))));
+    double cost = rotation * rotation / (c.rotationSigma * c.rotationSigma);
+    for (int axis = 0; axis < 3; axis++) cost += Math.pow(position[axis] / sigma[axis], 2);
+    return .5 * cost;
+  }
+
+  /**
+   * Normal-equation terms of the antenna prior. Under the left pose update (R <- exp(w) R, t <-
+   * exp(w) t + d): dC/dd = -R^T, dC/dw = 0 and d(R^T L)/dw = R^T [L]x; d/d dt = V, d/dL = R^T.
+   */
+  private static void antennaPriorNormal(Camera c, int ci, Linear s, SharedCalibration lens) {
+    if (c.reference == null) return;
+    int n = SharedCalibration.SIZE, time = SharedCalibration.TIME, lever = SharedCalibration.LEVER;
+    double[] residual = Math3.sub(lens.antenna(c), c.reference.center()), sigma = positionSigmas(c);
+    double[] rt = Math3.transpose(c.rotation);
+    double lx = lens.values[lever], ly = lens.values[lever + 1], lz = lens.values[lever + 2];
+    double[] cross = {0, -lz, ly, lz, 0, -lx, -ly, lx, 0};
+    for (int axis = 0; axis < 3; axis++) {
+      double[] jc = new double[6], jl = new double[n];
+      for (int col = 0; col < 3; col++)
+        for (int k = 0; k < 3; k++) jc[col] += rt[axis * 3 + k] * cross[k * 3 + col];
+      for (int k = 0; k < 3; k++) jc[3 + k] = -c.rotation[k * 3 + axis];
+      if (lens.active[time]) jl[time] = c.velocity == null ? 0 : c.velocity[axis];
+      for (int k = 0; k < 3; k++) if (lens.active[lever + k]) jl[lever + k] = rt[axis * 3 + k];
+      double r = residual[axis] / sigma[axis];
+      for (int i = 0; i < 6; i++) jc[i] /= sigma[axis];
+      for (int j = 0; j < n; j++) jl[j] /= sigma[axis];
+      for (int j = 0; j < n; j++) {
+        s.lensRhs[j] -= jl[j] * r;
+        for (int k = 0; k < n; k++) s.lensNormal[j * n + k] += jl[j] * jl[k];
+      }
+      if (ci < 0) continue;
+      for (int i = 0; i < 6; i++) {
+        s.cameraRhs[ci][i] -= jc[i] * r;
+        for (int k = 0; k < 6; k++) s.cameraNormal[ci][i * 6 + k] += jc[i] * jc[k];
+        for (int j = 0; j < n; j++) s.coupling[ci][i * n + j] += jc[i] * jl[j];
+      }
+    }
+    if (ci >= 0) {
+      // Rotation term only (the position term above replaces the plain one).
+      Camera rotationOnly = c.copy();
+      rotationOnly.positionSigma = rotationOnly.heightSigma = Double.POSITIVE_INFINITY;
+      priorNormal(rotationOnly, s.cameraNormal[ci], s.cameraRhs[ci]);
+    }
   }
 
   static double priorCost(Camera c) {
     if (c.reference == null) return 0;
-    double position = Math3.norm(Math3.sub(c.center(), c.reference.center())),
-        rotation =
-            Math3.norm(
-                Math3.rotationVector(Math3.mul(c.rotation, Math3.transpose(c.reference.rotation))));
-    return .5
-        * (position * position / (c.positionSigma * c.positionSigma)
-            + rotation * rotation / (c.rotationSigma * c.rotationSigma));
+    double[] position = Math3.sub(c.center(), c.reference.center()), sigma = positionSigmas(c);
+    double rotation =
+        Math3.norm(
+            Math3.rotationVector(Math3.mul(c.rotation, Math3.transpose(c.reference.rotation))));
+    double cost = rotation * rotation / (c.rotationSigma * c.rotationSigma);
+    for (int axis = 0; axis < 3; axis++) cost += Math.pow(position[axis] / sigma[axis], 2);
+    return .5 * cost;
+  }
+
+  /** Per-axis world sigma of the camera-centre prior (z may differ, e.g. barometric heights). */
+  private static double[] positionSigmas(Camera c) {
+    double z = Double.isFinite(c.heightSigma) ? c.heightSigma : c.positionSigma;
+    return new double[] {c.positionSigma, c.positionSigma, z};
   }
 
   static void priorNormal(Camera c, double[] a, double[] b) {
@@ -258,9 +429,10 @@ final class BundleAdjuster {
         rotation =
             Math3.rotationVector(Math3.mul(c.rotation, Math3.transpose(c.reference.rotation)));
     double[][] jp = new double[3][6], jr = new double[3][6];
+    double[] sigma = positionSigmas(c);
     double eps = 1e-6;
     for (int axis = 0; axis < 3; axis++) {
-      for (int k = 0; k < 3; k++) jp[axis][k + 3] = -c.rotation[k * 3 + axis] / c.positionSigma;
+      for (int k = 0; k < 3; k++) jp[axis][k + 3] = -c.rotation[k * 3 + axis] / sigma[axis];
       double[] w = new double[3];
       w[axis] = eps;
       double[] r =
@@ -272,7 +444,7 @@ final class BundleAdjuster {
     for (int i = 0; i < 6; i++)
       for (int axis = 0; axis < 3; axis++) {
         b[i] -=
-            jp[axis][i] * position[axis] / c.positionSigma
+            jp[axis][i] * position[axis] / sigma[axis]
                 + jr[axis][i] * rotation[axis] / c.rotationSigma;
         for (int j = 0; j < 6; j++)
           a[i * 6 + j] += jp[axis][i] * jp[axis][j] + jr[axis][i] * jr[axis][j];
@@ -299,6 +471,7 @@ final class BundleAdjuster {
     final FeatureTracks.Track track;
     final double[] normal = new double[9], b = new double[3];
     double[] inverse;
+    final double[] lensCross = new double[SharedCalibration.SIZE * 3];
     final List<Edge> edges = new ArrayList<>();
 
     Block(FeatureTracks.Track track) {
@@ -306,7 +479,7 @@ final class BundleAdjuster {
     }
   }
 
-  private record Result(double[] x, int iterations, double relative) {}
+  private record Result(double[] x, int iterations, double relative, String method) {}
 
   private static Linear linearize(
       List<ImageFrame> frames,
@@ -314,8 +487,9 @@ final class BundleAdjuster {
       int[] index,
       int count,
       double huber,
-      double lambda) {
-    Linear s = new Linear(count);
+      double lambda,
+      SharedCalibration lens) {
+    Linear s = new Linear(count, lens != null, frames.get(0).options.memoryMb * 1048576L);
     for (FeatureTracks.Track t : tracks)
       if (t.point != null) {
         Block block = new Block(t);
@@ -323,18 +497,21 @@ final class BundleAdjuster {
           ImageFrame f = frames.get(o.image);
           Camera c = f.camera;
           if (!c.registered) continue;
-          double[] q = c.view(t.point);
+          Point obs = lens == null ? f.keypoints[o.feature].pt : lens.observed[f.id][o.feature];
+          // With rolling shutter, q is the camera-frame point at the row's exposure time. It moves
+          // with pose updates exactly like the plain view, so the pose Jacobian below is unchanged.
+          double[] q = lens == null ? c.view(t.point) : lens.view(f, t.point, obs.y);
           if (q[2] <= 1e-8) continue;
-          Point obs = f.keypoints[o.feature].pt;
-          double[] residual = {
-            c.fx * q[0] / q[2] + c.cx - obs.x, c.fy * q[1] / q[2] + c.cy - obs.y
-          };
+          double[] uv = lens == null ? c.projectView(q) : lens.project(f, t.point, obs.y);
+          double[] residual = {uv[0] - obs.x, uv[1] - obs.y};
           double weight =
               Math.min(1, huber / Math.max(1e-12, Math.hypot(residual[0], residual[1])));
           double[][] jq = {
             {c.fx / q[2], 0, -c.fx * q[0] / (q[2] * q[2])},
             {0, c.fy / q[2], -c.fy * q[1] / (q[2] * q[2])}
           };
+          if (lens != null) jq = lens.spatialJacobian(f, t.point, obs.y);
+          double[][] jl = lens == null ? null : lens.lensJacobian(f, t.point, obs.y);
           double[][] jp = new double[2][3], jc = new double[2][6];
           for (int row = 0; row < 2; row++) {
             for (int j = 0; j < 3; j++)
@@ -346,6 +523,17 @@ final class BundleAdjuster {
           }
           accumulate(block.normal, block.b, jp, residual, weight);
           int ci = index[o.image];
+          if (lens != null) {
+            accumulate(s.lensNormal, s.lensRhs, jl, residual, weight);
+            for (int j = 0; j < SharedCalibration.SIZE; j++) {
+              for (int k = 0; k < 3; k++)
+                block.lensCross[j * 3 + k] += weight * (jl[0][j] * jp[0][k] + jl[1][j] * jp[1][k]);
+              if (ci >= 0)
+                for (int k = 0; k < 6; k++)
+                  s.coupling[ci][k * SharedCalibration.SIZE + j] +=
+                      weight * (jc[0][k] * jl[0][j] + jc[1][k] * jl[1][j]);
+            }
+          }
           if (ci < 0) continue;
           accumulate(s.cameraNormal[ci], s.cameraRhs[ci], jc, residual, weight);
           Edge e = new Edge(ci);
@@ -354,16 +542,73 @@ final class BundleAdjuster {
               e.cross[j * 3 + k] = weight * (jc[0][j] * jp[0][k] + jc[1][j] * jp[1][k]);
           block.edges.add(e);
         }
+        if (t.prior != null)
+          // Known position (GCP): r = (X - prior) / sigma, J = I / sigma.
+          for (int k = 0; k < 3; k++) {
+            double w = 1 / (t.priorSigma[k] * t.priorSigma[k]);
+            block.normal[k * 3 + k] += w;
+            block.b[k] -= w * (t.point[k] - t.prior[k]);
+          }
         damp(block.normal, 3, lambda);
         block.inverse = inverse(block.normal, 3);
         if (block.inverse == null) throw new IllegalStateException("Singular damped point block");
         s.points.add(block);
       }
+    boolean antenna = lens != null && lens.antennaModel();
     for (ImageFrame f : frames)
-      if (index[f.id] >= 0)
+      if (antenna && f.camera.registered) antennaPriorNormal(f.camera, index[f.id], s, lens);
+      else if (index[f.id] >= 0)
         priorNormal(f.camera, s.cameraNormal[index[f.id]], s.cameraRhs[index[f.id]]);
+    if (lens != null) {
+      lens.priorNormal(s.lensNormal, s.lensRhs);
+      damp(s.lensNormal, SharedCalibration.SIZE, lambda);
+    }
     for (int i = 0; i < count; i++) damp(s.cameraNormal[i], 6, lambda);
     return s;
+  }
+
+  /**
+   * Marginal lens uncertainty includes nuisance poses and structure through Schur solves. Tiny
+   * damping regularizes the scale gauge; these are conditional local diagnostics.
+   */
+  static double[] calibrationUncertainty(
+      List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks,
+      double huber,
+      SharedCalibration lens,
+      double noise) {
+    double[][] covariance = calibrationCovariance(frames, tracks, huber, lens, noise);
+    if (covariance == null) return null;
+    double[] sigma = new double[SharedCalibration.SIZE];
+    for (int k = 0; k < sigma.length; k++) sigma[k] = Math.sqrt(covariance[k][k]);
+    return sigma;
+  }
+
+  static double[][] calibrationCovariance(
+      List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks,
+      double huber,
+      SharedCalibration lens,
+      double noise) {
+    int[] index = new int[frames.size()];
+    Arrays.fill(index, -1);
+    int count = 0;
+    for (ImageFrame f : frames) if (f.camera.registered && !f.camera.fixed) index[f.id] = count++;
+    Linear system = linearize(frames, tracks, index, count, huber, 1e-10, lens);
+    double[][] covariance = new double[SharedCalibration.SIZE][SharedCalibration.SIZE];
+    for (int k = 0; k < SharedCalibration.SIZE; k++)
+      if (lens.active[k]) {
+        double[] rhs = new double[count * 6 + SharedCalibration.SIZE];
+        rhs[count * 6 + k] = 1;
+        Result fit = system.solve(rhs);
+        if (fit == null || fit.relative > 1e-3 || !(fit.x[count * 6 + k] > 0)) return null;
+        for (int j = 0; j < SharedCalibration.SIZE; j++)
+          if (lens.active[j]) covariance[j][k] = noise * noise * fit.x[count * 6 + j];
+      }
+    for (int j = 0; j < SharedCalibration.SIZE; j++)
+      for (int k = j + 1; k < SharedCalibration.SIZE; k++)
+        covariance[j][k] = covariance[k][j] = (covariance[j][k] + covariance[k][j]) * .5;
+    return covariance;
   }
 
   private static void accumulate(double[] a, double[] b, double[][] j, double[] r, double w) {
@@ -379,6 +624,8 @@ final class BundleAdjuster {
   }
 
   private static double[] inverse(double[] a, int n) {
+    double[] factored = SmallMatrices.inverse(a, n);
+    if (factored != null) return factored;
     double[][] matrix = new double[n][n];
     for (int i = 0; i < n; i++) System.arraycopy(a, i * n, matrix[i], 0, n);
     double[] out = new double[n * n];
@@ -408,11 +655,104 @@ final class BundleAdjuster {
     final double[][] cameraNormal, cameraRhs;
     final List<Block> points = new ArrayList<>();
     final int count;
+    final boolean shared;
+    final double[] lensNormal = new double[SharedCalibration.SIZE * SharedCalibration.SIZE],
+        lensRhs = new double[SharedCalibration.SIZE];
+    final double[][] coupling;
+    final long workspaceBudget;
+    double[] reduced;
 
-    Linear(int n) {
+    Linear(int n, boolean shared, long memoryBudget) {
+      workspaceBudget = Math.min(32L * 1048576, memoryBudget / 16);
+      this.shared = shared;
+      coupling = new double[n][6 * SharedCalibration.SIZE];
       count = n;
       cameraNormal = new double[n][36];
       cameraRhs = new double[n][6];
+    }
+
+    /** Assemble only the small camera/lens system; points are still eliminated analytically. */
+    private double[] reducedMatrix(int n) {
+      if (reduced != null) return reduced;
+      double[] h = new double[n * n];
+      for (int c = 0; c < count; c++)
+        for (int j = 0; j < 6; j++)
+          for (int k = 0; k < 6; k++) h[(c * 6 + j) * n + c * 6 + k] = cameraNormal[c][j * 6 + k];
+      if (shared) {
+        int off = count * 6;
+        for (int j = 0; j < SharedCalibration.SIZE; j++)
+          for (int k = 0; k < SharedCalibration.SIZE; k++)
+            h[(off + j) * n + off + k] = lensNormal[j * SharedCalibration.SIZE + k];
+        for (int c = 0; c < count; c++)
+          for (int j = 0; j < 6; j++)
+            for (int k = 0; k < SharedCalibration.SIZE; k++)
+              h[(c * 6 + j) * n + off + k] =
+                  h[(off + k) * n + c * 6 + j] = coupling[c][j * SharedCalibration.SIZE + k];
+      }
+      for (Block b : points) {
+        if (shared) subtractRows(h, n, b, b.lensCross, count * 6, SharedCalibration.SIZE);
+        for (Edge e : b.edges) subtractRows(h, n, b, e.cross, e.camera * 6, 6);
+      }
+      // The mathematical Schur matrix is symmetric. Remove only round-off asymmetry.
+      for (int i = 0; i < n; i++)
+        for (int j = 0; j < i; j++)
+          h[i * n + j] = h[j * n + i] = .5 * (h[i * n + j] + h[j * n + i]);
+      return reduced = h;
+    }
+
+    private void subtractRows(double[] h, int n, Block b, double[] left, int offset, int rows) {
+      for (int j = 0; j < rows; j++) {
+        double v0 = 0, v1 = 0, v2 = 0;
+        for (int k = 0; k < 3; k++) {
+          v0 += left[j * 3 + k] * b.inverse[k * 3];
+          v1 += left[j * 3 + k] * b.inverse[k * 3 + 1];
+          v2 += left[j * 3 + k] * b.inverse[k * 3 + 2];
+        }
+        int row = (offset + j) * n;
+        if (shared)
+          for (int k = 0; k < SharedCalibration.SIZE; k++)
+            h[row + count * 6 + k] -=
+                v0 * b.lensCross[k * 3] + v1 * b.lensCross[k * 3 + 1] + v2 * b.lensCross[k * 3 + 2];
+        for (Edge e : b.edges)
+          for (int k = 0; k < 6; k++)
+            h[row + e.camera * 6 + k] -=
+                v0 * e.cross[k * 3] + v1 * e.cross[k * 3 + 1] + v2 * e.cross[k * 3 + 2];
+      }
+    }
+
+    private Result direct(double[] rhs) {
+      int n = rhs.length;
+      // Includes Java matrix, scaled matrix, native matrix/factor and temporary solve space.
+      if (n == 0 || n > 768 || 4L * n * n * Double.BYTES > workspaceBudget) return null;
+      double[] h = reducedMatrix(n),
+          scaled = new double[h.length],
+          scale = new double[n],
+          b = new double[n];
+      for (int i = 0; i < n; i++) {
+        if (!(h[i * n + i] > 0) || !Double.isFinite(h[i * n + i])) return null;
+        scale[i] = Math.sqrt(h[i * n + i]);
+        b[i] = rhs[i] / scale[i];
+      }
+      for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) scaled[i * n + j] = h[i * n + j] / scale[i] / scale[j];
+      Mat a = Math3.mat(scaled, n, n), y = Math3.mat(b, n, 1), solution = new Mat();
+      try {
+        if (!Core.solve(a, y, solution, Core.DECOMP_CHOLESKY)) return null;
+        double[] x = Math3.array(solution);
+        for (int i = 0; i < n; i++) x[i] /= scale[i];
+        // Certify against the original matrix-free operator, not the assembled matrix itself.
+        double[] residual = product(x);
+        for (int i = 0; i < n; i++) residual[i] -= rhs[i];
+        double norm = Math.sqrt(dot(rhs, rhs));
+        double relative = Math.sqrt(dot(residual, residual)) / Math.max(1e-15, norm);
+        return Double.isFinite(relative) && relative < 1e-6
+            ? new Result(x, 0, relative, "direct_schur_cholesky")
+            : null;
+      } finally {
+        a.release();
+        y.release();
+        solution.release();
+      }
     }
 
     double[] product(double[] x) {
@@ -420,12 +760,33 @@ final class BundleAdjuster {
       for (int i = 0; i < count; i++)
         for (int j = 0; j < 6; j++)
           for (int k = 0; k < 6; k++) out[i * 6 + j] += cameraNormal[i][j * 6 + k] * x[i * 6 + k];
+      if (shared) {
+        int off = count * 6;
+        for (int j = 0; j < SharedCalibration.SIZE; j++)
+          for (int k = 0; k < SharedCalibration.SIZE; k++)
+            out[off + j] += lensNormal[j * SharedCalibration.SIZE + k] * x[off + k];
+        for (int c = 0; c < count; c++)
+          for (int j = 0; j < 6; j++)
+            for (int k = 0; k < SharedCalibration.SIZE; k++) {
+              out[c * 6 + j] += coupling[c][j * SharedCalibration.SIZE + k] * x[off + k];
+              out[off + k] += coupling[c][j * SharedCalibration.SIZE + k] * x[c * 6 + j];
+            }
+      }
+      double[] v = new double[3], u = new double[3];
       for (Block b : points) {
-        double[] v = new double[3];
+        Arrays.fill(v, 0);
+        if (shared)
+          for (int k = 0; k < 3; k++)
+            for (int j = 0; j < SharedCalibration.SIZE; j++)
+              v[k] += b.lensCross[j * 3 + k] * x[count * 6 + j];
         for (Edge e : b.edges)
           for (int k = 0; k < 3; k++)
             for (int j = 0; j < 6; j++) v[k] += e.cross[j * 3 + k] * x[e.camera * 6 + j];
-        double[] u = mv(b.inverse, v, 3);
+        Arrays.fill(u, 0);
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) u[i] += b.inverse[i * 3 + j] * v[j];
+        if (shared)
+          for (int j = 0; j < SharedCalibration.SIZE; j++)
+            for (int k = 0; k < 3; k++) out[count * 6 + j] -= b.lensCross[j * 3 + k] * u[k];
         for (Edge e : b.edges)
           for (int j = 0; j < 6; j++)
             for (int k = 0; k < 3; k++) out[e.camera * 6 + j] -= e.cross[j * 3 + k] * u[k];
@@ -434,15 +795,30 @@ final class BundleAdjuster {
     }
 
     Result solve() {
-      int n = count * 6;
+      return solve(null);
+    }
+
+    Result solve(double[] suppliedRhs) {
+      int n = count * 6 + (shared ? SharedCalibration.SIZE : 0);
       double[] rhs = new double[n];
       double[][] diag = new double[count][];
+      double[] lensDiag = lensNormal.clone();
+      if (shared) System.arraycopy(lensRhs, 0, rhs, count * 6, SharedCalibration.SIZE);
       for (int c = 0; c < count; c++) {
         System.arraycopy(cameraRhs[c], 0, rhs, c * 6, 6);
         diag[c] = cameraNormal[c].clone();
       }
       for (Block b : points) {
         double[] v = mv(b.inverse, b.b, 3);
+        if (shared)
+          for (int j = 0; j < SharedCalibration.SIZE; j++) {
+            for (int k = 0; k < 3; k++) rhs[count * 6 + j] -= b.lensCross[j * 3 + k] * v[k];
+            for (int l = 0; l < SharedCalibration.SIZE; l++)
+              for (int k = 0; k < 3; k++)
+                for (int m = 0; m < 3; m++)
+                  lensDiag[j * SharedCalibration.SIZE + l] -=
+                      b.lensCross[j * 3 + k] * b.inverse[k * 3 + m] * b.lensCross[l * 3 + m];
+          }
         for (Edge e : b.edges)
           for (int j = 0; j < 6; j++) {
             for (int k = 0; k < 3; k++) rhs[e.camera * 6 + j] -= e.cross[j * 3 + k] * v[k];
@@ -453,13 +829,22 @@ final class BundleAdjuster {
                       e.cross[j * 3 + k] * b.inverse[k * 3 + m] * e.cross[l * 3 + m];
           }
       }
+      double[] solveRhs = suppliedRhs == null ? rhs : suppliedRhs;
+      Result direct = direct(solveRhs);
+      if (direct != null) return direct;
       for (int c = 0; c < count; c++) {
         diag[c] = inverse(diag[c], 6);
         if (diag[c] == null) return null;
       }
-      double[] x = new double[n], r = rhs.clone(), z = precondition(diag, r), p = z.clone();
+      double[] lensInverse = shared ? inverse(lensDiag, SharedCalibration.SIZE) : null;
+      if (shared && lensInverse == null) return null;
+      if (suppliedRhs != null) rhs = suppliedRhs.clone();
+      double[] x = new double[n],
+          r = rhs.clone(),
+          z = precondition(diag, lensInverse, r),
+          p = z.clone();
       double norm = Math.sqrt(dot(rhs, rhs));
-      if (norm < 1e-15) return new Result(x, 0, 0);
+      if (norm < 1e-15) return new Result(x, 0, 0, "matrix_free_pcg");
       double rz = dot(r, z), relative = 1;
       int limit = Math.min(500, Math.max(30, n * 2));
       for (int iter = 0; iter < limit; iter++) {
@@ -473,21 +858,25 @@ final class BundleAdjuster {
         }
         relative = Math.sqrt(dot(r, r)) / norm;
         if (!Double.isFinite(relative)) return null;
-        if (relative < 1e-6) return new Result(x, iter + 1, relative);
-        z = precondition(diag, r);
+        if (relative < 1e-6) return new Result(x, iter + 1, relative, "matrix_free_pcg");
+        z = precondition(diag, lensInverse, r);
         double next = dot(r, z), beta = next / rz;
         for (int i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
         rz = next;
       }
       // An inexact step is still checked against the full robust objective before acceptance.
-      return new Result(x, limit, relative);
+      return new Result(x, limit, relative, "matrix_free_pcg");
     }
 
-    private double[] precondition(double[][] inverse, double[] r) {
+    private double[] precondition(double[][] inverse, double[] lensInverse, double[] r) {
       double[] z = new double[r.length];
       for (int c = 0; c < count; c++)
         for (int j = 0; j < 6; j++)
           for (int k = 0; k < 6; k++) z[c * 6 + j] += inverse[c][j * 6 + k] * r[c * 6 + k];
+      if (shared)
+        for (int j = 0; j < SharedCalibration.SIZE; j++)
+          for (int k = 0; k < SharedCalibration.SIZE; k++)
+            z[count * 6 + j] += lensInverse[j * SharedCalibration.SIZE + k] * r[count * 6 + k];
       return z;
     }
   }

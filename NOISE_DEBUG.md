@@ -23,7 +23,7 @@ These coordinates are in arbitrary seed-camera units, not metres or elevation. Z
 
 The sparse reprojection p95 values are 1.056, 0.709, and 1.104 pixels for the three images. The camera CSV in the original run and in the first corrected run is byte-identical (SHA-256 checked). This isolates the major failure to dense matching/fusion rather than a changed camera solution. LAS binary round-trip checks also pass; the extreme values were real reconstructed coordinates, not an export scaling error. The physical camera calibration has not been independently surveyed.
 
-The before/after comparison (generated locally at `output/noise-debug/before-after.png`; omitted from the source package) uses identical plotting windows in both columns and reports points outside each window. Full-range numeric statistics are in the original diagnostics (generated locally at `output/noise-debug/before/statistics.txt`; omitted from the source package) and the final diagnostics (generated locally at `output/example-test-fixed/diagnostics/statistics.txt`; omitted from the source package); the comparison does not silently hide outliers by deleting them from the measurements.
+The [before/after comparison](output/noise-debug/before-after.png) uses identical plotting windows in both columns and reports points outside each window. Full-range numeric statistics are in [the original diagnostics](output/noise-debug/before/statistics.txt) and [the final diagnostics](output/example-test-fixed/diagnostics/statistics.txt); the comparison does not silently hide outliers by deleting them from the measurements.
 
 ## Root causes and fixes
 
@@ -79,7 +79,7 @@ During debugging, before adding the final extra bilinear-mask pixel, I held the 
 | Corrected stereo checks, `--min-views 2` | 80,209 | **68.123** |
 | Same stereo checks, independent `--min-views 3` | 56,074 | **16.651** |
 
-The two-view ablation diagnostics (generated locally at `output/noise-debug/ablation-two-view/diagnostics/statistics.txt`; omitted from the source package) demonstrate why simply adding a stereo filter was insufficient. The final wider-range reconstruction recovers more valid canopy coverage while retaining the independent-view rule. No point count alone was used as a quality criterion.
+The [two-view ablation diagnostics](output/noise-debug/ablation-two-view/diagnostics/statistics.txt) demonstrate why simply adding a stereo filter was insufficient. The final wider-range reconstruction recovers more valid canopy coverage while retaining the independent-view rule. No point count alone was used as a quality criterion.
 
 ### Known-depth false-surface regression
 
@@ -126,7 +126,7 @@ From the original C++ repository root, in PowerShell:
 
 `--overwrite` here replaces only the newly generated corrected run's filenames. The original `example-test` directory is separate.
 
-Open the corrected LAS (generated locally at `output/example-test-fixed/dense.las`; omitted from the source package) or PLY (generated locally at `output/example-test-fixed/dense.ply`; omitted from the source package). Inspect `report.txt`, `geometry-quality.csv`, `stereo-quality.csv`, `fusion-quality.txt`, and `run-settings.properties` beside them for the effective settings and rejection counts.
+Open [the corrected LAS](output/example-test-fixed/dense.las) or [PLY](output/example-test-fixed/dense.ply). Inspect `report.txt`, `geometry-quality.csv`, `stereo-quality.csv`, `fusion-quality.txt`, and `run-settings.properties` beside them for the effective settings and rejection counts.
 
 The final run had 83,889 sampled candidates, of which independent fusion rejected 21,653, leaving 62,236 exported points. Parallax rejection is counted before export sampling and therefore has a different denominator. Stereo-quality counters likewise refer to full disparity pixels, not sampled cloud points.
 

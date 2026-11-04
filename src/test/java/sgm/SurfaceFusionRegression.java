@@ -478,7 +478,7 @@ final class SurfaceFusionRegression {
       }
       check(failed, "Output failure is propagated rather than publishing partial surface results");
       Path broken = Files.createDirectories(o.output.resolve("broken output"));
-      Files.createDirectories(broken.resolve("07_results/point-confidence.csv.gz"));
+      Files.createDirectories(broken.resolve("07_results/point-confidence.bin"));
       Options bad = o.copy();
       bad.output = broken;
       boolean rejected = false;
@@ -538,6 +538,7 @@ final class SurfaceFusionRegression {
                   "1",
                   "--storage",
                   "debug",
+                  "--diagnostics",
                   "--surface-memory-mb",
                   "8"));
       if (version == 1) args.add("--no-fusion-pipeline");
@@ -613,7 +614,8 @@ final class SurfaceFusionRegression {
                   "--depth-refinement",
                   "weighted",
                   "--voxel",
-                  ".15"
+                  ".15",
+                  "--diagnostics"
                 })
             == 0,
         "Voxel thinning remains usable without surface consolidation");

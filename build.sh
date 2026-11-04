@@ -26,6 +26,17 @@ for group in imageio common; do
   done
 done
 dep='lib/*'
+for artifact in pdfbox pdfbox-io fontbox; do
+  jar="lib/$artifact-3.0.8.jar"
+  if [[ ! -f "$jar" ]]; then
+    curl --fail --location --retry 3 "https://repo.maven.apache.org/maven2/org/apache/pdfbox/$artifact/3.0.8/$artifact-3.0.8.jar" -o "$jar.part"
+    mv -- "$jar.part" "$jar"
+  fi
+done
+if [[ ! -f lib/commons-logging-1.4.0.jar ]]; then
+  curl --fail --location --retry 3 'https://repo.maven.apache.org/maven2/commons-logging/commons-logging/1.4.0/commons-logging-1.4.0.jar' -o lib/commons-logging-1.4.0.jar.part
+  mv -- lib/commons-logging-1.4.0.jar.part lib/commons-logging-1.4.0.jar
+fi
 javac_bin="${JAVA_HOME:+$JAVA_HOME/bin/}javac"
 find src/main/java -name '*.java' -print > target/sources.txt
 "$javac_bin" --release 25 -encoding UTF-8 -cp "$dep" -d target/classes @target/sources.txt

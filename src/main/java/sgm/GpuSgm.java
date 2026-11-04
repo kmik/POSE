@@ -22,31 +22,59 @@ final class GpuSgm implements AutoCloseable {
   private static final ThreadLocal<GpuSgm> SESSION = new ThreadLocal<>();
   private static final ThreadLocal<Set<String>> WARNED = ThreadLocal.withInitial(HashSet::new);
   private static SymbolLookup library;
-  private static final Map<String, MethodHandle> FUNCTIONS = new HashMap<>();
+  private static final Map<String, MethodHandle> FUNCTIONS = new java.util.concurrent.ConcurrentHashMap<>();
   final Device device;
   private MemorySegment context, queue;
+  private final LinkedHashMap<String, MemorySegment> programs = new LinkedHashMap<>(8, .75f, true);
+  private long programBuilds, programHits;
   private final int group;
 
-  private static synchronized Object invoke(
+  // Initialization is serialized; native calls (including blocking transfers) are not.
+  private static synchronized MethodHandle function(
+      String name, MemoryLayout result, MemoryLayout[] parameters) {
+    if (library == null) {
+      String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
+      if (ADDRESS.byteSize() != 8)
+        throw new IllegalStateException("OpenCL backend requires a 64-bit JVM");
+      library = SymbolLookup.libraryLookup(
+          os.contains("win") ? "OpenCL.dll" : "libOpenCL.so.1", Arena.global());
+    }
+    return FUNCTIONS.computeIfAbsent(name, key -> Linker.nativeLinker().downcallHandle(
+        library.find(key).orElseThrow(), FunctionDescriptor.of(result, parameters)));
+  }
+
+  private static Object invoke(
       String name, MemoryLayout result, MemoryLayout[] parameters, Object... arguments) {
     try {
-      if (library == null) {
-        String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
-        if (ADDRESS.byteSize() != 8)
-          throw new IllegalStateException("OpenCL backend requires a 64-bit JVM");
-        library =
-            SymbolLookup.libraryLookup(
-                os.contains("win") ? "OpenCL.dll" : "libOpenCL.so.1", Arena.global());
-      }
       MethodHandle f = FUNCTIONS.get(name);
-      if (f == null) {
-        f =
-            Linker.nativeLinker()
-                .downcallHandle(
-                    library.find(name).orElseThrow(), FunctionDescriptor.of(result, parameters));
-        FUNCTIONS.put(name, f);
-      }
-      return f.invokeWithArguments(arguments);
+      if (f == null) f = function(name, result, parameters);
+      return switch (name) {
+        case "clGetDeviceInfo" -> (int) f.invokeExact((MemorySegment) arguments[0], (int) arguments[1], (long) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4]);
+        case "clGetPlatformIDs" -> (int) f.invokeExact((int) arguments[0], (MemorySegment) arguments[1], (MemorySegment) arguments[2]);
+        case "clGetDeviceIDs" -> (int) f.invokeExact((MemorySegment) arguments[0], (long) arguments[1], (int) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4]);
+        case "clCreateContext" -> (MemorySegment) f.invokeExact((MemorySegment) arguments[0], (int) arguments[1], (MemorySegment) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4], (MemorySegment) arguments[5]);
+        case "clCreateCommandQueue" -> (MemorySegment) f.invokeExact((MemorySegment) arguments[0], (MemorySegment) arguments[1], (long) arguments[2], (MemorySegment) arguments[3]);
+        case "clCreateBuffer" -> (MemorySegment) f.invokeExact((MemorySegment) arguments[0], (long) arguments[1], (long) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4]);
+        case "clSetKernelArg" -> (int) f.invokeExact((MemorySegment) arguments[0], (int) arguments[1], (long) arguments[2], (MemorySegment) arguments[3]);
+        case "clEnqueueNDRangeKernel" -> (int) f.invokeExact((MemorySegment) arguments[0], (MemorySegment) arguments[1], (int) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4], (MemorySegment) arguments[5], (int) arguments[6], (MemorySegment) arguments[7], (MemorySegment) arguments[8]);
+        case "clCreateProgramWithSource" -> (MemorySegment) f.invokeExact((MemorySegment) arguments[0], (int) arguments[1], (MemorySegment) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4]);
+        case "clBuildProgram" -> (int) f.invokeExact((MemorySegment) arguments[0], (int) arguments[1], (MemorySegment) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4], (MemorySegment) arguments[5]);
+        case "clGetProgramBuildInfo" -> (int) f.invokeExact((MemorySegment) arguments[0], (MemorySegment) arguments[1], (int) arguments[2], (long) arguments[3], (MemorySegment) arguments[4], (MemorySegment) arguments[5]);
+        case "clCreateKernel" -> (MemorySegment) f.invokeExact((MemorySegment) arguments[0], (MemorySegment) arguments[1], (MemorySegment) arguments[2]);
+        case "clGetKernelWorkGroupInfo" -> (int) f.invokeExact((MemorySegment) arguments[0], (MemorySegment) arguments[1], (int) arguments[2], (long) arguments[3], (MemorySegment) arguments[4], (MemorySegment) arguments[5]);
+        case "clGetEventProfilingInfo" -> (int) f.invokeExact((MemorySegment) arguments[0], (int) arguments[1], (long) arguments[2], (MemorySegment) arguments[3], (MemorySegment) arguments[4]);
+        case "clFinish" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clReleaseEvent" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clReleaseKernel" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clReleaseProgram" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clReleaseCommandQueue" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clReleaseContext" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clReleaseMemObject" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clRetainProgram" -> (int) f.invokeExact((MemorySegment) arguments[0]);
+        case "clEnqueueReadBuffer" -> (int) f.invokeExact((MemorySegment) arguments[0], (MemorySegment) arguments[1], (int) arguments[2], (long) arguments[3], (long) arguments[4], (MemorySegment) arguments[5], (int) arguments[6], (MemorySegment) arguments[7], (MemorySegment) arguments[8]);
+        case "clEnqueueWriteBuffer" -> (int) f.invokeExact((MemorySegment) arguments[0], (MemorySegment) arguments[1], (int) arguments[2], (long) arguments[3], (long) arguments[4], (MemorySegment) arguments[5], (int) arguments[6], (MemorySegment) arguments[7], (MemorySegment) arguments[8]);
+        default -> throw new IllegalArgumentException("Unknown OpenCL binding " + name);
+      };
     } catch (Throwable e) {
       if (e instanceof VirtualMachineError error) throw error;
       throw new IllegalStateException("OpenCL " + name + ": " + e.getMessage(), e);
@@ -172,10 +200,9 @@ final class GpuSgm implements AutoCloseable {
     current = new GpuSgm(devices.get(o.gpuDevice), o.gpuDevice);
     SESSION.set(current);
     System.out.println(
-        "GPU SGM: "
+        "OpenCL compute device: "
             + current.device.name
-            + "; OpenCL integer costs and global "
-            + "4/8-path aggregation; CPU selection/filtering");
+            + "; actual stereo/fusion method is reported by each stage");
     return current;
   }
 
@@ -332,6 +359,10 @@ final class GpuSgm implements AutoCloseable {
         size = 8;
         value = a.allocate(ADDRESS);
         value.set(ADDRESS, 0, segment);
+      } else if (values[i] instanceof Float scalar) {
+        size = 4;
+        value = a.allocate(JAVA_FLOAT);
+        value.set(JAVA_FLOAT, 0, scalar);
       } else {
         size = 4;
         value = a.allocate(JAVA_INT);
@@ -384,9 +415,35 @@ final class GpuSgm implements AutoCloseable {
       invoke(function, JAVA_INT, new MemoryLayout[] {ADDRESS}, object);
   }
 
-  public void close() {
+  public synchronized void close() {
+    for (MemorySegment p : programs.values()) release("clReleaseProgram", p);
+    programs.clear();
     release("clReleaseCommandQueue", queue);
     release("clReleaseContext", context);
+  }
+
+  private synchronized MemorySegment cachedProgram(String source) {
+    MemorySegment p = programs.get(source);
+    if (p != null) {
+      check((int) invoke("clRetainProgram", JAVA_INT, new MemoryLayout[] {ADDRESS}, p),
+          "Retain cached OpenCL program");
+      programHits++;
+    }
+    return p;
+  }
+
+  private synchronized void cacheProgram(String source, MemorySegment program) {
+    check((int) invoke("clRetainProgram", JAVA_INT, new MemoryLayout[] {ADDRESS}, program),
+        "Retain OpenCL program cache");
+    MemorySegment old = programs.put(source, program);
+    if (old != null) release("clReleaseProgram", old);
+    programBuilds++;
+    while (programs.size() > 8) {
+      var first = programs.entrySet().iterator();
+      var entry = first.next();
+      release("clReleaseProgram", entry.getValue());
+      first.remove();
+    }
   }
 
   static void closeSession() {
@@ -414,11 +471,20 @@ final class GpuSgm implements AutoCloseable {
     private final List<Event> events = new ArrayList<>();
     private final Map<String, Long> deviceNanos = new LinkedHashMap<>();
     private long writeNanos, readNanos, writeBytes, readBytes;
+    private long argumentsSet, argumentsReused;
+    private final Map<MemorySegment, Object[]> argumentValues = new HashMap<>();
+    private final Arena argumentArena;
+    private final MemorySegment argumentScratch;
+    private boolean closed;
 
     Compute(Options options, String source) {
       owner = session(options);
       device = owner.device;
+      argumentArena = Arena.ofShared();
+      argumentScratch = argumentArena.allocate(8, 8);
       try (Arena arena = Arena.ofConfined()) {
+        program = owner.cachedProgram(source);
+        if (program != null) return;
         MemorySegment err = arena.allocate(JAVA_INT), sources = arena.allocate(ADDRESS);
         sources.set(ADDRESS, 0, arena.allocateFrom(source));
         program =
@@ -460,6 +526,7 @@ final class GpuSgm implements AutoCloseable {
           throw new IllegalStateException(
               "OpenCL kernel build failed (fusion/ZNCC require FP64): " + log.getString(0));
         }
+        owner.cacheProgram(source, program);
       } catch (RuntimeException e) {
         close();
         throw e;
@@ -548,11 +615,36 @@ final class GpuSgm implements AutoCloseable {
 
     synchronized void run(MemorySegment kernel, long count, Object... arguments) {
       try (Arena a = Arena.ofConfined()) {
-        owner.args(kernel, a, arguments);
+        Object[] previous = argumentValues.get(kernel);
+        if (previous == null || previous.length != arguments.length) {
+          previous = new Object[arguments.length];
+          argumentValues.put(kernel, previous);
+        }
+        for (int i = 0; i < arguments.length; i++) {
+          Object value = arguments[i];
+          if (sameArgument(previous[i], value)) { argumentsReused++; continue; }
+          long size;
+          MemorySegment data = argumentScratch;
+          if (value instanceof Local local) { size = local.bytes; data = MemorySegment.NULL; }
+          else if (value instanceof MemorySegment address) { size = 8; data.set(ADDRESS, 0, address); }
+          else if (value instanceof Float scalar) { size = 4; data.set(JAVA_FLOAT, 0, scalar); }
+          else { size = 4; data.set(JAVA_INT, 0, (Integer) value); }
+          check((int) invoke("clSetKernelArg", JAVA_INT,
+              new MemoryLayout[] {ADDRESS, JAVA_INT, JAVA_LONG, ADDRESS}, kernel, i, size, data),
+              "Kernel argument");
+          previous[i] = value;
+          argumentsSet++;
+        }
         MemorySegment event = a.allocate(ADDRESS);
         owner.launch(kernel, count, a, event);
         events.add(new Event(event.get(ADDRESS, 0), kernelNames.get(kernel)));
       }
+    }
+
+    static boolean sameArgument(Object previous, Object value) {
+      if (previous instanceof Float a && value instanceof Float b)
+        return Float.floatToRawIntBits(a) == Float.floatToRawIntBits(b);
+      return Objects.equals(previous, value);
     }
 
     private void collect() {
@@ -591,6 +683,10 @@ final class GpuSgm implements AutoCloseable {
 
     synchronized Object profile() {
       return Json.object(
+          "program_builds_in_session", owner.programBuilds,
+          "program_cache_hits_in_session", owner.programHits,
+          "kernel_arguments_set", argumentsSet,
+          "kernel_arguments_reused", argumentsReused,
           "device_kernel_nanoseconds",
           new LinkedHashMap<>(deviceNanos),
           "blocking_write_nanoseconds",
@@ -603,7 +699,19 @@ final class GpuSgm implements AutoCloseable {
           readBytes);
     }
 
+    synchronized void releaseBuffers() {
+      invoke("clFinish", JAVA_INT, new MemoryLayout[] {ADDRESS}, owner.queue);
+      collect();
+      for (MemorySegment b : buffers) release("clReleaseMemObject", b);
+      buffers.clear();
+      argumentValues.clear(); // cl_mem addresses can be reused after release.
+      RunTelemetry.deviceFreed(allocatedBytes);
+      allocatedBytes = 0;
+    }
+
     public synchronized void close() {
+      if (closed) return;
+      closed = true;
       if (owner != null && owner.queue != null)
         invoke("clFinish", JAVA_INT, new MemoryLayout[] {ADDRESS}, owner.queue);
       collect();
@@ -615,6 +723,7 @@ final class GpuSgm implements AutoCloseable {
       allocatedBytes = 0;
       release("clReleaseProgram", program);
       program = null;
+      argumentArena.close();
     }
   }
 

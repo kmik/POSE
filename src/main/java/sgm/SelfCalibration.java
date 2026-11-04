@@ -129,6 +129,14 @@ final class SelfCalibration {
           "intrinsics_mode",
           fitted.controls == null ? "automatic" : fitted.controls.intrinsicsMode,
           "selected_parameters",
+          fitted.controls == null
+              ? "f,k1,k2"
+              : String.join(
+                  ",",
+                  Arrays.stream(fitted.controls.refineIntrinsics.split(","))
+                      .filter(p -> Set.of("f", "k1", "k2").contains(p))
+                      .toList()),
+          "requested_alignment_parameters",
           fitted.controls == null ? "f,k1,k2" : fitted.controls.refineIntrinsics,
           "prior_lens_log_f_k1_k2",
           fitted.priorLens,
@@ -287,7 +295,10 @@ final class SelfCalibration {
       Result result = optimize(data, 50);
       Json.write(dir.resolve("result.json"), result.report());
       evidence(
-          dir, result.evaluatedBaseline == null ? data : result.evaluatedBaseline, result.fitted);
+          dir,
+          result.evaluatedBaseline == null ? data : result.evaluatedBaseline,
+          result.fitted,
+          options.diagnostics);
       if (!result.accepted) {
         System.out.println("Self-calibration retained initial intrinsics: " + result.reason);
         return initial;
@@ -454,44 +465,46 @@ final class SelfCalibration {
     return result;
   }
 
-  private static void evidence(Path dir, Data before, Data after) throws IOException {
-    try (BufferedWriter w = Files.newBufferedWriter(dir.resolve("observations.csv"))) {
-      w.write(
-          "track_id,held_out,image_id,observed_x,observed_y,initial_projected_x,initial_projected_y,refined_projected_x,refined_projected_y,initial_world_x,initial_world_y,initial_world_z,refined_world_x,refined_world_y,refined_world_z\n");
-      for (int i = 0; i < before.samples.size(); i++) {
-        Sample a = before.samples.get(i), b = after.samples.get(i);
-        for (Seen ob : a.seen) {
-          double[] p = project(before, ob.view, a.point), q = project(after, ob.view, b.point);
-          w.write(
-              a.id
-                  + ","
-                  + a.validation
-                  + ","
-                  + ob.view
-                  + ","
-                  + ob.u
-                  + ","
-                  + ob.v
-                  + ","
-                  + (p == null ? "," : p[0] + "," + p[1])
-                  + ","
-                  + (q == null ? "," : q[0] + "," + q[1])
-                  + ","
-                  + a.point[0]
-                  + ","
-                  + a.point[1]
-                  + ","
-                  + a.point[2]
-                  + ","
-                  + b.point[0]
-                  + ","
-                  + b.point[1]
-                  + ","
-                  + b.point[2]
-                  + "\n");
+  private static void evidence(Path dir, Data before, Data after, boolean detailed)
+      throws IOException {
+    if (detailed)
+      try (BufferedWriter w = Files.newBufferedWriter(dir.resolve("observations.csv"))) {
+        w.write(
+            "track_id,held_out,image_id,observed_x,observed_y,initial_projected_x,initial_projected_y,refined_projected_x,refined_projected_y,initial_world_x,initial_world_y,initial_world_z,refined_world_x,refined_world_y,refined_world_z\n");
+        for (int i = 0; i < before.samples.size(); i++) {
+          Sample a = before.samples.get(i), b = after.samples.get(i);
+          for (Seen ob : a.seen) {
+            double[] p = project(before, ob.view, a.point), q = project(after, ob.view, b.point);
+            w.write(
+                a.id
+                    + ","
+                    + a.validation
+                    + ","
+                    + ob.view
+                    + ","
+                    + ob.u
+                    + ","
+                    + ob.v
+                    + ","
+                    + (p == null ? "," : p[0] + "," + p[1])
+                    + ","
+                    + (q == null ? "," : q[0] + "," + q[1])
+                    + ","
+                    + a.point[0]
+                    + ","
+                    + a.point[1]
+                    + ","
+                    + a.point[2]
+                    + ","
+                    + b.point[0]
+                    + ","
+                    + b.point[1]
+                    + ","
+                    + b.point[2]
+                    + "\n");
+          }
         }
       }
-    }
     List<Object> poses = new ArrayList<>();
     for (int i = 0; i < after.views.size(); i++) {
       View view = after.views.get(i);
