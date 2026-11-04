@@ -55,7 +55,7 @@ final class Georeference {
               + supplied.name
               + "; metre coordinates, no GPS similarity applied; vertical datum unspecified");
     }
-    List<double[]> source = new ArrayList<>(), target = new ArrayList<>();
+    List<double[]> source = new ArrayList<>(), target = new ArrayList<>(), views = new ArrayList<>();
     List<Integer> ids = new ArrayList<>();
     Crs crs = o.noGps ? null : new Crs(o.crs);
     List<Object> inventory = new ArrayList<>();
@@ -80,6 +80,8 @@ final class Georeference {
       if (!o.noGps && g != null && g.usable() && f.camera.registered) {
         source.add(f.camera.center());
         target.add(crs.project(g));
+        // Viewing direction (camera z axis) in the reconstruction frame: third row of R.
+        views.add(Arrays.copyOfRange(f.camera.rotation, 6, 9));
         ids.add(f.id);
       }
     }
@@ -90,9 +92,14 @@ final class Georeference {
             ? "GPS alignment disabled by --no-gps"
             : "GPS alignment needs at least 3 registered images with WGS84 latitude, longitude and"
                 + " altitude";
+    String method = "similarity";
     if (source.size() >= 3) {
       try {
-        transform = robustFit(source, target, o.gpsThreshold);
+        if (collinear(target)) {
+          // One straight flight line: GPS cannot fix the roll about the line; the cameras can.
+          transform = lineFit(source, target, views, o.gpsThreshold);
+          method = "single_line_with_downward_view";
+        } else transform = robustFit(source, target, o.gpsThreshold);
       } catch (IllegalArgumentException e) {
         reason = e.getMessage();
       }
@@ -169,6 +176,14 @@ final class Georeference {
             "applied",
             "operation",
             "X_projected = scale * R * X_reconstruction + translation",
+            "method",
+            method,
+            "method_note",
+            method.equals("similarity")
+                ? "Robust 3D similarity to the GPS camera centres"
+                : "GPS camera centres lie on one line: scale, line direction and translation from"
+                    + " GPS; roll about the line chosen so the mean camera viewing direction points"
+                    + " straight down (survey imagery). Tilt across the line is not measured.",
             "scale",
             transform.scale,
             "R_row_major",
@@ -195,7 +210,8 @@ final class Georeference {
             o.gpsThreshold,
             "accuracy_note",
             "Camera GPS accuracy, scene geometry and static datum transformations limit absolute"
-                + " accuracy. No epoch, antenna lever arm, geoid or ground control adjustment."));
+                + " accuracy. This similarity has no epoch, geoid or ground control adjustment; GPS time"
+                + " offset, lever arm and lens refit: gps_bundle.json."));
     Json.write(
         o.output.resolve("coordinates.json"),
         Json.object(
@@ -231,17 +247,164 @@ final class Georeference {
     }
     for (FeatureTracks.Track track : tracks)
       if (track.point != null) track.point = transform.apply(track.point);
+    String bundled = "";
+    if (o.gpsBundle.equals("prior")) {
+      Map<Integer, double[]> controls = new LinkedHashMap<>();
+      for (int i = 0; i < source.size(); i++)
+        if (Math3.norm(Math3.sub(transform.apply(source.get(i)), target.get(i))) <= o.gpsThreshold)
+          controls.put(ids.get(i), target.get(i));
+      // G1, extended: lens, GPS time offset/lever arm and rolling shutter (GpsAdjustment).
+      GpsAdjustment.Outcome after = GpsAdjustment.run(frames, tracks, o, crs, controls, dir, rms);
+      if (!after.summary().isEmpty())
+        bundled =
+            String.format(
+                Locale.ROOT,
+                "; GPS-weighted bundle (sigma %.2f m) RMS=%.3f m",
+                o.gpsSigma,
+                after.rms());
+    }
     String description =
         String.format(
             Locale.ROOT,
-            "%s easting/northing, metres; GPS camera fit RMS=%.3f m (%d/%d inliers). %s",
+            "%s easting/northing, metres; GPS camera fit RMS=%.3f m (%d/%d inliers)%s. %s",
             crs.name,
             rms,
             inliers,
             source.size(),
+            bundled,
             HEIGHT_NOTE);
     System.out.println("Georeference: " + description);
     return new Result(crs, description);
+  }
+
+  /**
+   * True when the points spread along one line: the second principal spread is below 3% of the
+   * first (standard deviations). GPS noise across a single flight line would otherwise decide the
+   * roll of the whole block.
+   */
+  static boolean collinear(List<double[]> points) {
+    double[] spread = principal(points);
+    return spread[1] < .03 * spread[0];
+  }
+
+  /** {std along first axis, std along second axis, axis x, y, z} of the point cloud. */
+  private static double[] principal(List<double[]> points) {
+    int n = points.size();
+    double[] mean = new double[3], c = new double[9];
+    for (double[] p : points) for (int k = 0; k < 3; k++) mean[k] += p[k] / n;
+    for (double[] p : points)
+      for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) c[r * 3 + k] += (p[r] - mean[r]) * (p[k] - mean[k]) / n;
+    Mat m = Math3.mat(c, 3, 3), w = new Mat(), u = new Mat(), vt = new Mat();
+    try {
+      Core.SVDecomp(m, w, u, vt);
+      double[] s = Math3.array(w), axes = Math3.array(u);
+      return new double[] {
+        Math.sqrt(Math.max(0, s[0])), Math.sqrt(Math.max(0, s[1])), axes[0], axes[3], axes[6]
+      };
+    } finally {
+      m.release();
+      w.release();
+      u.release();
+      vt.release();
+    }
+  }
+
+  /**
+   * Similarity for camera centres on one line. Scale, line direction and translation come from
+   * GPS; the roll about the line, which GPS cannot see, turns the mean camera viewing direction
+   * as close to straight down as possible. Outliers beyond the threshold are dropped iteratively.
+   */
+  static Similarity lineFit(
+      List<double[]> source, List<double[]> target, List<double[]> views, double threshold) {
+    int n = source.size();
+    boolean[] use = new boolean[n];
+    Arrays.fill(use, true);
+    Similarity best = null;
+    for (int iteration = 0; iteration < 5; iteration++) {
+      List<double[]> s = new ArrayList<>(), t = new ArrayList<>(), v = new ArrayList<>();
+      for (int i = 0; i < n; i++)
+        if (use[i]) {
+          s.add(source.get(i));
+          t.add(target.get(i));
+          v.add(views.get(i));
+        }
+      if (s.size() < Math.max(3, n / 2 + 1))
+        throw new IllegalArgumentException("Single-line GPS alignment has no inlier majority");
+      best = lineSimilarity(s, t, v);
+      boolean changed = false;
+      for (int i = 0; i < n; i++) {
+        boolean inlier =
+            Math3.norm(Math3.sub(best.apply(source.get(i)), target.get(i))) <= threshold;
+        changed |= inlier != use[i];
+        use[i] = inlier;
+      }
+      if (!changed) break;
+    }
+    return best;
+  }
+
+  private static Similarity lineSimilarity(
+      List<double[]> source, List<double[]> target, List<double[]> views) {
+    double[] ps = principal(source), pt = principal(target);
+    double[] us = {ps[2], ps[3], ps[4]}, ut = {pt[2], pt[3], pt[4]};
+    int n = source.size();
+    double[] ms = new double[3], mt = new double[3];
+    for (int i = 0; i < n; i++)
+      for (int k = 0; k < 3; k++) {
+        ms[k] += source.get(i)[k] / n;
+        mt[k] += target.get(i)[k] / n;
+      }
+    double cross = 0, ss = 0, tt = 0;
+    for (int i = 0; i < n; i++) {
+      double a = dot(Math3.sub(source.get(i), ms), us), b = dot(Math3.sub(target.get(i), mt), ut);
+      cross += a * b;
+      ss += a * a;
+      tt += b * b;
+    }
+    if (!(ss > 1e-12) || !(tt > 1e-12))
+      throw new IllegalArgumentException("GPS alignment requires distinct camera positions");
+    if (cross < 0) ut = Math3.times(ut, -1);
+    double scale = Math.sqrt(tt / ss);
+    double[] r0 = turn(us, ut);
+    // Roll about the line: bring the mean viewing direction to straight down.
+    double[] view = new double[3];
+    for (double[] v : views) view = Math3.add(view, v);
+    double[] w = Math3.mv(r0, view), down = {0, 0, -1};
+    double[] wp = Math3.sub(w, Math3.times(ut, dot(w, ut))),
+        dp = Math3.sub(down, Math3.times(ut, dot(down, ut)));
+    double[] rotation = r0;
+    if (Math3.norm(wp) > 1e-9 && Math3.norm(dp) > 1e-9) {
+      double angle =
+          Math.atan2(dot(ut, cross(wp, dp)), dot(wp, dp));
+      rotation = Math3.mul(Math3.rotation(Math3.times(ut, angle)), r0);
+    }
+    return new Similarity(
+        scale, rotation, Math3.sub(mt, Math3.times(Math3.mv(rotation, ms), scale)));
+  }
+
+  /** Smallest rotation taking unit vector a to unit vector b. */
+  private static double[] turn(double[] a, double[] b) {
+    double[] axis = cross(a, b);
+    double sin = Math3.norm(axis), cos = dot(a, b);
+    if (sin < 1e-12) {
+      if (cos > 0) return Math3.identity();
+      // Opposite: half turn about any axis perpendicular to a.
+      double[] p = Math.abs(a[0]) < .9 ? new double[] {1, 0, 0} : new double[] {0, 1, 0};
+      double[] q = cross(a, p);
+      return Math3.rotation(Math3.times(q, Math.PI / Math3.norm(q)));
+    }
+    return Math3.rotation(Math3.times(axis, Math.atan2(sin, cos) / sin));
+  }
+
+  private static double dot(double[] a, double[] b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  }
+
+  private static double[] cross(double[] a, double[] b) {
+    return new double[] {
+      a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]
+    };
   }
 
   static Similarity robustFit(List<double[]> source, List<double[]> target, double threshold) {

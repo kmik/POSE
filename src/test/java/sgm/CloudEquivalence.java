@@ -29,6 +29,31 @@ final class CloudEquivalence {
   }
 
   static BufferedReader confidence(Path run) throws IOException {
+    if (!Files.exists(run.resolve("07_results/point-confidence.csv.gz"))) {
+      var binary = new PointRecords.Reader(run.resolve("07_results/point-confidence.bin"));
+      return new BufferedReader(new StringReader("")) {
+        boolean header = true;
+
+        @Override
+        public String readLine() throws IOException {
+          if (header) {
+            header = false;
+            return PointRecords.HEADER.stripTrailing();
+          }
+          var row = binary.next();
+          return row == null ? null : row.csv().stripTrailing();
+        }
+
+        @Override
+        public void close() throws IOException {
+          try {
+            binary.close();
+          } finally {
+            super.close();
+          }
+        }
+      };
+    }
     return new BufferedReader(
         new InputStreamReader(
             new GZIPInputStream(

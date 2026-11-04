@@ -4,7 +4,6 @@ import java.io.*;
 import java.util.*;
 import org.opencv.calib3d.Calib3d;
 import org.opencv.core.*;
-import org.opencv.features2d.DescriptorMatcher;
 
 final class FeatureTracks {
   static final class Match {
@@ -42,6 +41,8 @@ final class FeatureTracks {
     final List<Observation> observations = new ArrayList<>();
     double[] point;
     int id = -1;
+    // Optional known position (ground control point) and its per-axis sigma, in world units.
+    double[] prior, priorSigma;
   }
 
   final List<Pair> pairs = new ArrayList<>();
@@ -63,7 +64,19 @@ final class FeatureTracks {
           "running",
           o.matchingAlgorithm + " extraction on processed undistorted images");
     int[] offset = new int[frames.size() + 1];
+    int chunk = Math.max(1, o.cores);
+    WorkProgress extraction = WorkProgress.start("Feature extraction", frames.size(), "images");
     for (int i = 0; i < frames.size(); i++) {
+      extraction.update(i);
+      // F1: decode the next chunk's rasters in parallel (identical pixels). Fingerprinting, cache
+      // reuse, extraction and output below stay serial and in the original order.
+      if (i % chunk == 0 && chunk > 1) {
+        long preloadStarted = System.nanoTime();
+        int decoded =
+            RasterCache.preload(frames.subList(i, Math.min(frames.size(), i + chunk)), chunk);
+        if (decoded > 0)
+          RunTelemetry.record("Parallel feature image preload (" + decoded + ")", preloadStarted);
+      }
       try (WorkProgress work =
           WorkProgress.start(
               "Feature extraction " + frames.get(i).path.getFileName(), 0, "keypoints")) {
@@ -81,7 +94,10 @@ final class FeatureTracks {
           frames.size(),
           frames.get(i).keypoints.length);
     }
+    extraction.done();
+    extraction.close();
     if (project != null && ReuseCache.matches(frames, this, o, false)) {
+      PairMatching.clear();
       if (project != null) {
         project.stage(
             "02_features",
@@ -101,20 +117,57 @@ final class FeatureTracks {
       project.stage("02_features", "complete", "All keypoints and descriptors exported");
       project.stage("03_matches", "running", "Reciprocal matching, RANSAC and track building");
     }
-    for (int[] edge : PairSelection.select(frames, o, project)) {
-      int a = edge[0], b = edge[1];
-      Pair pair;
-      try (WorkProgress work =
-          WorkProgress.start("Match/verify pair " + a + "-" + b, 0, "matches")) {
-        pair = match(frames.get(a), frames.get(b), o, project);
-        work.done();
-      }
-      if (pair.matches.size() < o.minMatches) continue;
-      pairs.add(pair);
-      for (Match m : pair.matches) uf.join(offset[a] + m.a, offset[b] + m.b);
+    int reusable = PairMatching.remembered();
+    int[] reused = {0};
+    List<int[]> edges = PairSelection.select(frames, o, project);
+    WorkProgress matching = WorkProgress.start("Matching image pairs", edges.size(), "pairs");
+    long[] consumed = {0};
+    PairMatching.ordered(
+        edges,
+        PairMatching.threads(o),
+        edge -> {
+          try (WorkProgress work =
+              WorkProgress.start("Match/verify pair " + edge[0] + "-" + edge[1], 0, "matches")) {
+            Result result = match(frames.get(edge[0]), frames.get(edge[1]), o, work);
+            work.done();
+            return result;
+          }
+        },
+        (edge, result) -> {
+          int a = edge[0], b = edge[1];
+          Pair pair = result.pair;
+          matching.update(++consumed[0]);
+          matching.detail("pair " + a + "-" + b);
+          try {
+            // Exports and track joins stay on this thread, in the original pair order.
+            if (project != null)
+              project.data.matches(
+                  frames.get(a),
+                  frames.get(b),
+                  pair,
+                  result.forward,
+                  result.reverse,
+                  result.ransacFlags,
+                  result.cheiralityFlags);
+          } finally {
+            for (Mat m : result.forward) m.release();
+          }
+          if (result.reused) reused[0]++;
+          if (pair.matches.size() < o.minMatches) return;
+          pairs.add(pair);
+          for (Match m : pair.matches) uf.join(offset[a] + m.a, offset[b] + m.b);
+          System.out.printf(
+              Locale.ROOT, "Pair %d-%d: %d geometric inliers%n", a, b, pair.matches.size());
+        });
+    matching.done();
+    matching.close();
+    if (reusable > 0)
       System.out.printf(
-          Locale.ROOT, "Pair %d-%d: %d geometric inliers%n", a, b, pair.matches.size());
-    }
+          Locale.ROOT,
+          "Pair matching: %d descriptor searches reused from focal initialization (%d available)%n",
+          reused[0],
+          reusable);
+    if (project != null) PairMatching.clear();
     Map<Integer, Track> groups = new TreeMap<>();
     for (int i = 0; i < frames.size(); i++)
       for (int k = 0; k < frames.get(i).keypoints.length; k++) {
@@ -147,27 +200,45 @@ final class FeatureTracks {
     if (project != null) ReuseCache.matches(frames, this, o, true);
   }
 
-  private static Pair match(ImageFrame a, ImageFrame b, Options o, Project project)
+  /** One verified pair plus the nearest-neighbor decisions its export needs. */
+  private static final class Result {
+    final Pair pair;
+    final List<MatOfDMatch> forward = new ArrayList<>();
+    final Map<Integer, Integer> reverse = new HashMap<>();
+    final Set<Integer> ransacFlags = new HashSet<>(), cheiralityFlags = new HashSet<>();
+    final boolean[] reusedSearch = new boolean[1];
+    boolean reused;
+
+    Result(Pair pair) {
+      this.pair = pair;
+    }
+  }
+
+  private static Result match(ImageFrame a, ImageFrame b, Options o, WorkProgress work)
       throws IOException {
-    DescriptorCache.pair(a, b);
-    Pair out = new Pair(a.id, b.id);
+    DescriptorCache.acquire(a, b);
+    Result result = new Result(new Pair(a.id, b.id));
+    try {
+      verify(a, b, o, work, result);
+      result.reused = result.reusedSearch[0];
+      return result;
+    } catch (RuntimeException | Error e) {
+      for (Mat m : result.forward) m.release();
+      throw e;
+    } finally {
+      DescriptorCache.release(a, b);
+    }
+  }
+
+  private static void verify(ImageFrame a, ImageFrame b, Options o, WorkProgress work, Result res) {
+    Pair out = res.pair;
     if (a.descriptors.empty() || b.descriptors.rows() < 2) {
       out.reason = "missing_descriptors";
-      if (project != null)
-        project.data.matches(
-            a,
-            b,
-            out,
-            Collections.emptyList(),
-            Collections.emptyMap(),
-            Collections.emptySet(),
-            Collections.emptySet());
-      return out;
+      return;
     }
-    DescriptorMatcher matcher = FeatureAlgorithms.matcher(o, a.descriptors);
-    List<MatOfDMatch> forward = new ArrayList<>(), backward = new ArrayList<>();
-    Map<Integer, Integer> reverse = new HashMap<>();
-    Set<Integer> ransacFlags = new HashSet<>(), cheiralityFlags = new HashSet<>();
+    List<MatOfDMatch> forward = res.forward;
+    Map<Integer, Integer> reverse = res.reverse;
+    Set<Integer> ransacFlags = res.ransacFlags, cheiralityFlags = res.cheiralityFlags;
     Mat p1 = new Mat(),
         p2 = new Mat(),
         mask = new Mat(),
@@ -175,13 +246,9 @@ final class FeatureTracks {
         r = new Mat(),
         t = new Mat();
     try {
-      matcher.knnMatch(a.descriptors, b.descriptors, forward, 2);
-      matcher.knnMatch(b.descriptors, a.descriptors, backward, 2);
-      for (MatOfDMatch row : backward) {
-        DMatch[] m = row.toArray();
-        if (m.length >= 2 && m[0].distance < o.ratio * m[1].distance)
-          reverse.put(m[0].queryIdx, m[0].trainIdx);
-      }
+      PairMatching.reciprocal(
+          o, a, b, forward, reverse, work::detail, false, res.reusedSearch);
+      work.detail("essential RANSAC and cheirality");
       List<Match> accepted = new ArrayList<>();
       List<Point> x = new ArrayList<>(), y = new ArrayList<>();
       for (MatOfDMatch row : forward) {
@@ -195,7 +262,7 @@ final class FeatureTracks {
       }
       if (accepted.size() < o.minMatches) {
         out.reason = "insufficient_reciprocal_ratio_matches";
-        return out;
+        return;
       }
       p1.release();
       p2.release();
@@ -210,7 +277,7 @@ final class FeatureTracks {
               p1, p2, 1.0, new Point(0, 0), Calib3d.RANSAC, .999, threshold, 2000, mask);
       if (e.empty() || e.rows() != 3) {
         out.reason = "essential_estimation_failed";
-        return out;
+        return;
       }
       out.essential = Math3.array(e);
       byte[] ransacMask = new byte[(int) mask.total()];
@@ -229,21 +296,13 @@ final class FeatureTracks {
       out.translation = Math3.array(t);
       out.reason =
           out.matches.size() >= o.minMatches ? "accepted" : "insufficient_geometric_inliers";
-      return out;
     } finally {
-      try {
-        if (project != null)
-          project.data.matches(a, b, out, forward, reverse, ransacFlags, cheiralityFlags);
-      } finally {
-        for (Mat m : forward) m.release();
-        for (Mat m : backward) m.release();
-        p1.release();
-        p2.release();
-        mask.release();
-        e.release();
-        r.release();
-        t.release();
-      }
+      p1.release();
+      p2.release();
+      mask.release();
+      e.release();
+      r.release();
+      t.release();
     }
   }
 

@@ -24,6 +24,17 @@ try {
             }
         }
     }
+    foreach ($artifact in @('pdfbox','pdfbox-io','fontbox')) {
+        $jar = "lib/$artifact-3.0.8.jar"
+        if (-not (Test-Path -LiteralPath $jar)) {
+            Invoke-WebRequest "https://repo.maven.apache.org/maven2/org/apache/pdfbox/$artifact/3.0.8/$artifact-3.0.8.jar" -OutFile "$jar.part"
+            Move-Item -LiteralPath "$jar.part" -Destination $jar
+        }
+    }
+    if (-not (Test-Path -LiteralPath 'lib/commons-logging-1.4.0.jar')) {
+        Invoke-WebRequest 'https://repo.maven.apache.org/maven2/commons-logging/commons-logging/1.4.0/commons-logging-1.4.0.jar' -OutFile 'lib/commons-logging-1.4.0.jar.part'
+        Move-Item -LiteralPath 'lib/commons-logging-1.4.0.jar.part' -Destination 'lib/commons-logging-1.4.0.jar'
+    }
     $dependency = 'lib/*'
     $javaCompiler = 'javac'
     $javaRuntime = 'java'

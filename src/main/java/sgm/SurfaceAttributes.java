@@ -46,7 +46,13 @@ record SurfaceAttributes(
   static SurfaceAttributes of(
       SurfaceGeometry.Plane plane, double[][] points, int n, double[] center, boolean trimmed) {
     double sum = plane.smallest() + plane.middle() + plane.largest(), radius = 0;
-    for (int i = 0; i < n; i++) radius = Math.max(radius, Math3.norm(Math3.sub(points[i], center)));
+    for (int i = 0; i < n; i++) {
+      double x = points[i][0] - center[0],
+          y = points[i][1] - center[1],
+          z = points[i][2] - center[2];
+      radius = Math.max(radius, x * x + y * y + z * z);
+    }
+    radius = Math.sqrt(radius);
     if (!(sum > 0 && plane.largest() > 0)) return missing(true);
     return new SurfaceAttributes(
         Math.sqrt(plane.smallest()),

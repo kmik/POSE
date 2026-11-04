@@ -40,6 +40,20 @@ final class StereoCost {
     return !o.sgmAggregate.equals("32") && fits ? 2 : 4;
   }
 
+  /**
+   * Subpixel offset in [-0.5, 0.5] from the winner's aggregated cost and its two neighbours. The
+   * default parabola is the original formula; equiangular fits a symmetric V (Shimizu/Okutomi).
+   * Both GPU and CPU selection call this, so they agree by construction.
+   */
+  static double subpixel(Options o, double before, double value, double after) {
+    if (o.subpixelFit.equals("equiangular")) {
+      double rise = Math.max(before, after) - value;
+      return rise > 0 ? Math.max(-.5, Math.min(.5, .5 * (before - after) / rise)) : 0;
+    }
+    double curvature = before + after - 2.0 * value;
+    return curvature > 0 ? Math.max(-.5, Math.min(.5, .5 * (before - after) / curvature)) : 0;
+  }
+
   /** Integer edge-aware jump penalty, identical for CPU/GPU and strip-boundary predecessors. */
   static int pathP2(int p1, int p2, int scale, byte[] gray, int current, int previous) {
     if (scale == 0) return p2;

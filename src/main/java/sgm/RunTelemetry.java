@@ -20,6 +20,17 @@ final class RunTelemetry implements AutoCloseable {
   private final Options options;
   private final Map<String, Object> initial;
   private final Object selectedDeviceMetadata;
+  private final GpuTelemetry gpuTelemetry;
+  private final List<Object> timeline = new ArrayList<>(), gpuProfiles = new ArrayList<>();
+  private double peakGpuUtilization, lastCpuPercent;
+  private long peakVram,
+      previousCpu = -1,
+      previousCpuClock,
+      lastTimeline,
+      timelinePeriod = 1000000000L;
+  private boolean gpuMeasured;
+  private boolean cpuMeasured;
+  private final Map<String, Long> gpuTotals = new TreeMap<>();
   private final List<Object> tasks = new ArrayList<>();
   private final Map<WorkProgress, String> active = new IdentityHashMap<>();
   private final ScheduledExecutorService sampler;
@@ -28,6 +39,9 @@ final class RunTelemetry implements AutoCloseable {
       new java.util.concurrent.atomic.AtomicLong();
   private boolean closed;
   private long lastSample, largestSamplingGap;
+  // Latest sample, for the terminal status line.
+  private static volatile long liveRss, liveVram = -1;
+  private static volatile double liveGpu = -1, liveCpu = -1;
 
   RunTelemetry(Path run, Options options) {
     this.run = run;
@@ -61,6 +75,8 @@ final class RunTelemetry implements AutoCloseable {
       }
     }
     selectedDeviceMetadata = deviceInfo;
+    gpuTelemetry =
+        GpuTelemetry.open(String.valueOf(ProcessingReport.object(deviceInfo).get("name")));
     CURRENT.set(this);
     sampler =
         Executors.newSingleThreadScheduledExecutor(
@@ -71,6 +87,16 @@ final class RunTelemetry implements AutoCloseable {
             });
     sample();
     sampler.scheduleWithFixedDelay(this::sample, 1, 1, TimeUnit.SECONDS);
+  }
+
+  /** Short live resource summary (RAM, CPU, GPU, VRAM); empty before the first sample. */
+  static String live() {
+    StringBuilder s = new StringBuilder();
+    if (liveRss > 0) s.append(String.format(Locale.ROOT, "RAM %.1f GB", liveRss / 1e9));
+    if (liveCpu >= 0) s.append(String.format(Locale.ROOT, "  CPU %.0f%%", liveCpu));
+    if (liveGpu >= 0) s.append(String.format(Locale.ROOT, "  GPU %.0f%%", liveGpu));
+    if (liveVram >= 0) s.append(String.format(Locale.ROOT, "  VRAM %.1f GB", liveVram / 1e9));
+    return s.toString().trim();
   }
 
   static RunTelemetry current() {
@@ -119,9 +145,59 @@ final class RunTelemetry implements AutoCloseable {
       peakHeap = Math.max(peakHeap, mem.getUsed());
       peakCommitted = Math.max(peakCommitted, mem.getCommitted());
       long[] process = processMemory();
+      liveRss = process[0];
       peakRss = Math.max(peakRss, process[0]);
       peakPrivate = Math.max(peakPrivate, process[1]);
       peakDevice = Math.max(peakDevice, DEVICE.get());
+      long cpu =
+          ProcessHandle.current().info().totalCpuDuration().map(Duration::toNanos).orElse(-1L);
+      if (cpu >= 0 && (previousCpu < 0 || now - previousCpuClock >= 100000000L)) {
+        if (previousCpu >= 0) {
+          lastCpuPercent =
+              Math.clamp(
+                  100.
+                      * (cpu - previousCpu)
+                      / (now - previousCpuClock)
+                      / Runtime.getRuntime().availableProcessors(),
+                  0,
+                  100);
+          cpuMeasured = true;
+          liveCpu = lastCpuPercent;
+        }
+        previousCpu = cpu;
+        previousCpuClock = now;
+      }
+      GpuTelemetry.Sample gpu = gpuTelemetry == null ? null : gpuTelemetry.sample();
+      if (gpu != null) {
+        gpuMeasured = true;
+        liveGpu = gpu.utilization();
+        liveVram = gpu.usedBytes();
+        peakGpuUtilization = Math.max(peakGpuUtilization, gpu.utilization());
+        peakVram = Math.max(peakVram, gpu.usedBytes());
+      }
+      if (timeline.isEmpty() || now - lastTimeline >= timelinePeriod) {
+        if (timeline.size() >= 4096) {
+          for (int i = timeline.size() - 2; i >= 0; i -= 2) timeline.remove(i);
+          timelinePeriod *= 2;
+        }
+        timeline.add(
+            Json.object(
+                "seconds",
+                (now - began) / 1e9,
+                "cpu_percent",
+                cpuMeasured ? lastCpuPercent : null,
+                "heap_bytes",
+                mem.getUsed(),
+                "rss_bytes",
+                process[0] == 0 ? null : process[0],
+                "tracked_opencl_bytes",
+                DEVICE.get(),
+                "gpu_percent",
+                gpu == null ? null : gpu.utilization(),
+                "device_vram_bytes",
+                gpu == null ? null : gpu.usedBytes()));
+        lastTimeline = now;
+      }
       samples++;
     } catch (RuntimeException ignored) {
     }
@@ -143,6 +219,49 @@ final class RunTelemetry implements AutoCloseable {
                 "complete",
                 "thread",
                 Thread.currentThread().getName()));
+      }
+  }
+
+  /** Records time accumulated across interleaved work, e.g. waits summed over fusion batches. */
+  static void recordTotal(String label, long nanoseconds, long events) {
+    RunTelemetry t = current();
+    if (t != null)
+      synchronized (t) {
+        t.tasks.add(
+            Json.object(
+                "task",
+                label,
+                "started_offset_seconds",
+                null,
+                "wall_seconds",
+                nanoseconds / 1e9,
+                "events",
+                events,
+                "status",
+                "accumulated",
+                "thread",
+                Thread.currentThread().getName()));
+      }
+  }
+
+  static void gpuProfile(String label, Object profile) {
+    RunTelemetry t = current();
+    if (t != null)
+      synchronized (t) {
+        if (t.gpuProfiles.size() < 2048)
+          t.gpuProfiles.add(Json.object("task", label, "profile", profile));
+        Map<String, Object> values = ProcessingReport.object(profile);
+        for (String key :
+            List.of(
+                "blocking_write_nanoseconds",
+                "blocking_read_nanoseconds",
+                "uploaded_bytes",
+                "downloaded_bytes"))
+          if (values.get(key) instanceof Number n) t.gpuTotals.merge(key, n.longValue(), Long::sum);
+        for (var e : ProcessingReport.object(values.get("device_kernel_nanoseconds")).entrySet())
+          if (e.getValue() instanceof Number n)
+            t.gpuTotals.merge("kernel_" + e.getKey() + "_nanoseconds", n.longValue(), Long::sum);
+        t.gpuTotals.merge("profiled_batches", 1L, Long::sum);
       }
   }
 
@@ -212,6 +331,29 @@ final class RunTelemetry implements AutoCloseable {
         peakPrivate == 0 ? null : peakPrivate,
         "peak_tracked_opencl_buffer_bytes",
         peakDevice,
+        "peak_device_gpu_utilization_percent",
+        gpuMeasured ? peakGpuUtilization : null,
+        "peak_device_vram_used_bytes",
+        gpuMeasured ? peakVram : null,
+        "gpu_utilization_scope",
+        gpuMeasured
+            ? "NVML, selected NVIDIA device-wide load and VRAM; includes other processes"
+            : "Hardware utilization/VRAM unavailable for this device/runtime; tracked program"
+                  + " buffers and OpenCL timings are separate",
+        "resource_timeline",
+        new ArrayList<>(timeline),
+        "timeline_scope",
+        "At most 4096 decimated samples; scalar peaks retain full-rate samples. CPU percent"
+            + " normalized to all logical processors. Heap is part of process RAM; do not add"
+            + " them.",
+        "opencl_profiles",
+        new ArrayList<>(gpuProfiles),
+        "opencl_profile_totals",
+        new TreeMap<>(gpuTotals),
+        "opencl_profile_scope",
+        "Measured program kernel durations, blocking transfers and bytes; totals include all"
+            + " batches, first 2048 detailed profiles retained. Overlapping times are not hardware"
+            + " utilization.",
         "resource_scope",
         "Process resident/private samples where available; OpenCL tracks this program's allocated"
             + " buffers, not driver/display VRAM. Heap is included in process RAM; do not add them."
@@ -226,8 +368,55 @@ final class RunTelemetry implements AutoCloseable {
         new ArrayList<>(active.values()));
   }
 
+  // Earlier pipeline steps of the same run (other processes) and this process's start offset.
+  private Map<String, Object> previous;
+  private double offsetSeconds;
+
+  /** Continue a run's telemetry: later persists append to what earlier steps recorded. */
+  void continueFrom(Path file, double offset) {
+    offsetSeconds = offset;
+    try {
+      if (Files.isRegularFile(file)) previous = JsonRead.object(JsonRead.read(file));
+    } catch (IOException | RuntimeException e) {
+      previous = null;
+    }
+  }
+
+  /** This snapshot appended to the earlier steps': offsets shifted, peaks maximal. */
+  private Map<String, Object> merged() {
+    Map<String, Object> now = snapshot();
+    if (previous == null && offsetSeconds == 0) return now;
+    Map<String, Object> out = new LinkedHashMap<>(now);
+    out.put("elapsed_wall_seconds", offsetSeconds + ((Number) now.get("elapsed_wall_seconds")).doubleValue());
+    for (String key : new String[] {"tasks", "resource_timeline", "active_tasks"}) {
+      List<Object> list = new ArrayList<>();
+      if (previous != null && previous.get(key) instanceof List<?> old && !key.equals("active_tasks")) list.addAll(old);
+      if (now.get(key) instanceof List<?> current)
+        for (Object item : current) {
+          if (!(item instanceof Map<?, ?> map)) {
+            list.add(item);
+            continue;
+          }
+          Map<String, Object> entry = new LinkedHashMap<>();
+          for (var e : map.entrySet()) entry.put(String.valueOf(e.getKey()), e.getValue());
+          for (String field : new String[] {"started_offset_seconds", "seconds"})
+            if (entry.get(field) instanceof Number n) entry.put(field, n.doubleValue() + offsetSeconds);
+          list.add(entry);
+        }
+      out.put(key, list);
+    }
+    if (previous != null)
+      for (var e : previous.entrySet())
+        if (e.getKey().startsWith("peak_") && e.getValue() instanceof Number old) {
+          Object current = out.get(e.getKey());
+          if (!(current instanceof Number c) || old.doubleValue() > c.doubleValue()) out.put(e.getKey(), old);
+        }
+    out.put("pipeline_note", "Run executed as separate pipeline steps; offsets are from the run start.");
+    return out;
+  }
+
   void persist() throws IOException {
-    Json.write(run.resolve("logs/processing.json"), snapshot());
+    Json.write(run.resolve("logs/processing.json"), merged());
   }
 
   public void close() throws IOException {

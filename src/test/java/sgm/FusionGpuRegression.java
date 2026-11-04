@@ -19,11 +19,19 @@ final class FusionGpuRegression {
     nu.pattern.OpenCV.loadLocally();
     Core.setNumThreads(1);
     Path root = Files.createTempDirectory(Path.of("target"), "fusion gpu ");
-    System.out.println("PASS fusion checks=" + run(root) + "; fixtures=" + root);
+    if (Arrays.asList(args).contains("--packed-banks")) {
+      checks = 0;
+      packedBanks(root);
+      System.out.println("PASS packed bank checks=" + checks + "; fixtures=" + root);
+    } else System.out.println("PASS fusion checks=" + run(root) + "; fixtures=" + root);
     GpuSgm.closeSession();
   }
 
   static int run(Path root) throws Exception {
+    return run(root, false);
+  }
+
+  static int run(Path root, boolean camera) throws Exception {
     checks = 0;
     boolean gpu = false;
     try {
@@ -40,7 +48,7 @@ final class FusionGpuRegression {
             "no refinement",
             "disk",
             "many pairs")) {
-      compare(root, fixture, gpu);
+      compare(root, fixture, gpu, camera);
     }
     check(Options.parse(new String[] {"--help"}).help, "Help remains available");
     check(Options.help().contains("--fusion-compute"), "Fusion selector is documented");
@@ -57,13 +65,15 @@ final class FusionGpuRegression {
     check(invalid, "Invalid fusion backend is rejected");
     if (gpu) {
       banks(root);
+      if (camera) packedBanks(root);
       runtimeFallback(root);
     }
     System.out.println("Fusion GPU hardware tested=" + gpu);
     return checks;
   }
 
-  private static void compare(Path root, String fixture, boolean hardware) throws Exception {
+  private static void compare(Path root, String fixture, boolean hardware, boolean camera)
+      throws Exception {
     int C = fixture.equals("many pairs") ? 32 : 7,
         width = C == 32 ? 320 : 160,
         height = C == 32 ? 200 : 100;
@@ -101,6 +111,7 @@ final class FusionGpuRegression {
     List<double[]> points = new ArrayList<>();
     List<Integer> source = new ArrayList<>();
     Options device = o.copy();
+    if (camera) device.fusionEvidence = "camera";
     device.fusionCompute = hardware ? "gpu" : "cpu";
     try (ReferenceDepthFusion reference = new ReferenceDepthFusion(cameras, w, h, o);
         DepthFusion cpu = new DepthFusion(cameras, w, h, o);
@@ -166,11 +177,17 @@ final class FusionGpuRegression {
               || old.independentPairs != indexed.independentPairs)
             throw new AssertionError(fixture + ": indexed CPU decisions differ from reference");
           for (int j = 0; j < 3; j++)
-            if (Double.doubleToLongBits(old.point[j]) != Double.doubleToLongBits(indexed.point[j]))
+            if (Double.doubleToLongBits(old.point[j]) != Double.doubleToLongBits(indexed.point[j])
+                && Math.abs(old.point[j] - indexed.point[j])
+                    > 1e-11 * Math.max(1, Math.abs(old.point[j])))
               throw new AssertionError(fixture + ": indexed CPU coordinates changed");
-          if (Double.doubleToLongBits(old.relativeSigma)
-                  != Double.doubleToLongBits(indexed.relativeSigma)
-              || Double.doubleToLongBits(old.shift) != Double.doubleToLongBits(indexed.shift))
+          // Direct cross-product weights remove the old inverse-trigonometry round trip.
+          // Decisions remain exact; certify the intended numeric change against the old oracle.
+          if ((Double.doubleToLongBits(old.relativeSigma)
+                      != Double.doubleToLongBits(indexed.relativeSigma)
+                  && !(Math.abs(old.relativeSigma - indexed.relativeSigma)
+                      <= 1e-12 * Math.max(1, Math.abs(old.relativeSigma))))
+              || Math.abs(old.shift - indexed.shift) > 1e-11)
             throw new AssertionError(fixture + ": indexed CPU confidence changed");
           if (!DepthFusion.equivalent(indexed, fast[i]))
             throw new AssertionError(
@@ -297,6 +314,57 @@ final class FusionGpuRegression {
         check(
             result[0] != null && DepthFusion.equivalent(cpu.fuse(source, p), result[0]),
             "Evidence addressing crosses four allocation banks without changing fusion");
+      }
+    }
+  }
+
+  private static void packedBanks(Path root) throws Exception {
+    Options o = TestSupport.options();
+    o.output = Files.createDirectories(root.resolve("packed-banks"));
+    o.diskDepth = false;
+    o.gpuDevice = Integer.getInteger("sgm.test.gpu", 0);
+    o.minViews = 2;
+    Camera a = new Camera(120, 120, 31.3, 15.2), b = a.copy();
+    b.translation[0] = -1;
+    Camera[] cameras = {a, b};
+    int[] w = {64, 64}, h = {32, 32};
+    double[] p = {.01, .02, 10};
+    try (DepthRaster ma = new DepthRaster(2048, o);
+        DepthRaster mb = new DepthRaster(2048, o);
+        DepthFusion cpu = new DepthFusion(cameras, w, h, o)) {
+      DepthRaster[] maps = {ma, mb};
+      for (int i = 0; i < 2; i++) {
+        double[] q = cameras[i].project(p);
+        int x = (int) Math.round(q[0]), y = (int) Math.round(q[1]);
+        maps[i].put(y * 64 + x, 10, DepthFusion.pack(q[0] - x, q[1] - y));
+      }
+      List<List<DepthFusion.Endpoint>> byCamera = List.of(new ArrayList<>(), new ArrayList<>());
+      int[][] pairs = new int[32][];
+      for (int i = 0; i < 32; i++) {
+        pairs[i] = new int[] {0, 1};
+        int id = cpu.addPair(0, 1);
+        cpu.add(id, p);
+        byCamera.get(0).add(new DepthFusion.Endpoint(i, 0, ma));
+        byCamera.get(1).add(new DepthFusion.Endpoint(i, 1, mb));
+      }
+      CameraEvidence atlas = CameraEvidence.build(byCamera, w, h, 1 << 20, 1 << 20, false);
+      check(atlas != null, "32-layer packed fixture fits its budget");
+      List<DepthFusion.Endpoint> endpoints = new ArrayList<>(byCamera.get(0));
+      endpoints.addAll(byCamera.get(1));
+      try {
+        for (String layout : List.of("coalesced", "reference")) {
+          o.fusionLayout = layout;
+          try (GpuFusion gpu = new GpuFusion(cameras, w, h, endpoints, pairs, o, 2, 8192, atlas)) {
+            var results = gpu.fuse(new int[] {0, 31}, new double[][] {p, p}, 2);
+            for (int i = 0; i < 2; i++)
+              check(
+                  results[i] != null
+                      && DepthFusion.equivalent(cpu.fuse(i == 0 ? 0 : 31, p), results[i]),
+                  "Packed high-bit layer and five GPU allocation banks preserve fusion");
+          }
+        }
+      } finally {
+        atlas.clear();
       }
     }
   }

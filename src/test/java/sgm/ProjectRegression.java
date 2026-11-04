@@ -383,7 +383,14 @@ final class ProjectRegression {
         Files.readString(run.resolve("00_inputs/adopted_root_files/readme.md"))
             .equals("preserve my existing README"),
         "Adoption archives colliding reserved filenames before replacing project indexes");
-    List<String> first = rows(run.resolve("06_fusion/candidates.csv.gz")).get(1);
+    // Quality filtering may remove the first candidate. Compare the actual first exported ID.
+    long firstId =
+        Long.parseLong(rows(run.resolve("07_results/point-confidence.csv.gz")).get(1).get(1));
+    List<String> first =
+        rows(run.resolve("06_fusion/candidates.csv.gz")).get(Math.toIntExact(firstId) + 1);
+    check(
+        Long.parseLong(first.get(0)) == firstId,
+        "Output confidence identifies its source candidate");
     ByteBuffer las =
         ByteBuffer.wrap(Files.readAllBytes(legacy.resolve("dense.las")))
             .order(ByteOrder.LITTLE_ENDIAN);

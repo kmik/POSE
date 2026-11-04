@@ -11,6 +11,67 @@ import org.opencv.imgproc.Imgproc;
 
 /** Estimates a horizontal matching interval from reciprocal rectified-image feature matches. */
 final class DisparityRange {
+  interface Pixels {
+    int width();
+
+    int height();
+
+    int mask(int x, int y);
+
+    void resize(Mat out, Size size, boolean mask);
+
+    double zncc(Pixels other, int x, int y, double disparity, int radius);
+  }
+
+  private static final class MatPixels implements Pixels {
+    final Mat gray, mask;
+    byte[] data, valid;
+
+    MatPixels(Mat gray, Mat mask) {
+      this.gray = gray;
+      this.mask = mask;
+    }
+
+    public int width() {
+      return gray.cols();
+    }
+
+    public int height() {
+      return gray.rows();
+    }
+
+    public int mask(int x, int y) {
+      if (valid == null) {
+        valid = new byte[width() * height()];
+        mask.get(0, 0, valid);
+      }
+      return valid[y * width() + x] & 255;
+    }
+
+    byte[] data() {
+      if (data == null) {
+        data = new byte[width() * height()];
+        gray.get(0, 0, data);
+      }
+      return data;
+    }
+
+    public void resize(Mat out, Size size, boolean validity) {
+      Imgproc.resize(
+          validity ? mask : gray,
+          out,
+          size,
+          0,
+          0,
+          validity ? Imgproc.INTER_NEAREST : Imgproc.INTER_AREA);
+    }
+
+    public double zncc(Pixels other, int x, int y, double disparity, int radius) {
+      return CensusSgm.zncc(
+          data(), ((MatPixels) other).data(), width(), height(), x, y, disparity, radius, 1);
+    }
+  }
+
   final int minimum, count, sampleCount;
   final double observedHigh;
   final double observedLow;
@@ -55,6 +116,10 @@ final class DisparityRange {
 
   static DisparityRange estimate(
       Mat left, Mat right, Mat maskLeft, Mat maskRight, Options o, List<Sample> extra) {
+    return estimate(new MatPixels(left, maskLeft), new MatPixels(right, maskRight), o, extra);
+  }
+
+  static DisparityRange estimate(Pixels left, Pixels right, Options o, List<Sample> extra) {
     if (o.disparitiesExplicit)
       return new DisparityRange(o.minDisparity, o.disparities, 0, Double.NaN, "explicit");
     Mat a = new Mat(),
@@ -69,17 +134,22 @@ final class DisparityRange {
     DescriptorMatcher matcher = null;
     List<Sample> samples = new ArrayList<>(extra);
     try {
-      double scale = Math.min(1, 640. / Math.max(left.cols(), left.rows()));
+      double scale = Math.min(1, 640. / Math.max(left.width(), left.height()));
       Size size =
           new Size(
-              Math.max(32, Math.round(left.cols() * scale)),
-              Math.max(32, Math.round(left.rows() * scale)));
-      Imgproc.resize(left, a, size, 0, 0, Imgproc.INTER_AREA);
-      Imgproc.resize(right, b, size, 0, 0, Imgproc.INTER_AREA);
-      Imgproc.resize(maskLeft, ma, size, 0, 0, Imgproc.INTER_NEAREST);
-      Imgproc.resize(maskRight, mb, size, 0, 0, Imgproc.INTER_NEAREST);
-      sift.detectAndCompute(a, ma, ka, da);
-      sift.detectAndCompute(b, mb, kb, db);
+              Math.max(32, Math.round(left.width() * scale)),
+              Math.max(32, Math.round(left.height() * scale)));
+      left.resize(a, size, false);
+      right.resize(b, size, false);
+      left.resize(ma, size, true);
+      right.resize(mb, size, true);
+      // Concurrent native SIFT (--stereo-pairs-in-flight) occasionally throws OpenCV's "unknown
+      // exception" (forest_10, 1 of 333 pairs). These 640 px detections take milliseconds, so
+      // they are serialized across pair workers; results are unchanged.
+      synchronized (DisparityRange.class) {
+        sift.detectAndCompute(a, ma, ka, da);
+        sift.detectAndCompute(b, mb, kb, db);
+      }
       if (da.rows() >= 2 && db.rows() >= 2) {
         matcher = FeatureAlgorithms.matcher(o, da);
         matcher.knnMatch(da, db, fw, 2);
@@ -97,23 +167,23 @@ final class DisparityRange {
               || m[0].distance >= .75 * m[1].distance
               || !Objects.equals(reverse.get(m[0].trainIdx), m[0].queryIdx)) continue;
           Point p = x[m[0].queryIdx].pt, q = y[m[0].trainIdx].pt;
-          double d = (p.x - q.x) * left.cols() / a.cols();
-          if (Math.abs(p.y - q.y) <= Math.max(1.25, 1.5 * o.reprojection * a.rows() / left.rows())
+          double d = (p.x - q.x) * left.width() / a.cols();
+          if (Math.abs(p.y - q.y) <= Math.max(1.25, 1.5 * o.reprojection * a.rows() / left.height())
               && d > o.minDisparity
-              && d < left.cols() - o.census)
+              && d < left.width() - o.census)
             samples.add(
                 new Sample(
                     d,
-                    p.x * left.cols() / a.cols(),
-                    p.y * left.rows() / a.rows(),
+                    p.x * left.width() / a.cols(),
+                    p.y * left.height() / a.rows(),
                     "rectified_preview",
                     false));
         }
       }
-      DisparityRange initial = fromEvidence(samples, left.cols(), left.rows(), o);
-      Probe guard = guard(left, right, maskLeft, maskRight, o, initial);
+      DisparityRange initial = fromEvidence(samples, left.width(), left.height(), o);
+      Probe guard = guard(left, right, o, initial);
       samples.addAll(guard.samples);
-      DisparityRange combined = fromEvidence(samples, left.cols(), left.rows(), o);
+      DisparityRange combined = fromEvidence(samples, left.width(), left.height(), o);
       boolean denseFallback =
           initial.method.startsWith("weak_evidence")
               && guard.samples.size() >= 24
@@ -122,7 +192,7 @@ final class DisparityRange {
           bounds(
               denseFallback ? combined.minimum : Math.min(initial.minimum, combined.minimum),
               Math.max(initial.minimum + initial.count - 1, combined.minimum + combined.count - 1),
-              left.cols(),
+              left.width(),
               o);
       return new DisparityRange(
           union.minimum,
@@ -369,11 +439,11 @@ final class DisparityRange {
    * Coarse whole-domain search guards against surfaces absent from sparse keypoints. Proposed
    * out-of-range depths must also pass a full-resolution ZNCC check.
    */
-  private static Probe guard(
-      Mat left, Mat right, Mat maskA, Mat maskB, Options original, DisparityRange proposed) {
+  private static Probe guard(Pixels left, Pixels right, Options original, DisparityRange proposed) {
     Options o = original.copy();
     o.compute = original.compute.equals("cpu") ? "cpu" : "auto";
     o.pyramidLevels = 1;
+    o.pairwiseSearch = "full";
     o.tiled = false;
     o.censusMode = "gray";
     o.census = Math.min(5, o.census);
@@ -382,7 +452,7 @@ final class DisparityRange {
     o.speckleRange = 1.5;
     o.uniqueness = Math.max(.05, o.uniqueness);
     o.correlation = Math.max(.5, o.correlation);
-    int w = left.cols(), h = left.rows(), longest = 128, pw = 0, ph = 0;
+    int w = left.width(), h = left.height(), longest = 128, pw = 0, ph = 0;
     double scale = 1;
     while (longest >= 32) {
       scale = Math.min(1, longest / (double) Math.max(w, h));
@@ -403,10 +473,10 @@ final class DisparityRange {
     Mat a = new Mat(), b = new Mat(), ma = new Mat(), mb = new Mat();
     try {
       Size size = new Size(pw, ph);
-      Imgproc.resize(left, a, size, 0, 0, Imgproc.INTER_AREA);
-      Imgproc.resize(right, b, size, 0, 0, Imgproc.INTER_AREA);
-      Imgproc.resize(maskA, ma, size, 0, 0, Imgproc.INTER_NEAREST);
-      Imgproc.resize(maskB, mb, size, 0, 0, Imgproc.INTER_NEAREST);
+      left.resize(a, size, false);
+      right.resize(b, size, false);
+      left.resize(ma, size, true);
+      right.resize(mb, size, true);
       byte[] av = new byte[pw * ph],
           bv = new byte[av.length],
           am = new byte[av.length],
@@ -419,7 +489,6 @@ final class DisparityRange {
           Locale.ROOT, "Disparity range validation: %dx%d whole-domain probe%n", pw, ph);
       var result = new CensusSgm(o).compute(av, bv, null, null, pw, ph, am, bm);
       int stride = Math.max(1, (int) Math.ceil(Math.sqrt(result.stats.valid / 512.)));
-      byte[] fullA = null, fullB = null, fullMaskA = null, fullMaskB = null;
       List<Sample> outside = new ArrayList<>();
       int checked = 0;
       double uncertainty = 1.5 / scale;
@@ -431,19 +500,9 @@ final class DisparityRange {
           if (!proposed.method.startsWith("weak_evidence")
               && predicted - uncertainty >= proposed.minimum
               && predicted + uncertainty <= proposed.minimum + proposed.count - 1) continue;
-          if (fullA == null) {
-            fullA = new byte[w * h];
-            fullB = new byte[w * h];
-            fullMaskA = new byte[w * h];
-            fullMaskB = new byte[w * h];
-            left.get(0, 0, fullA);
-            right.get(0, 0, fullB);
-            maskA.get(0, 0, fullMaskA);
-            maskB.get(0, 0, fullMaskB);
-          }
           int fx = (int) Math.round((x + .5) * w / pw - .5),
               fy = (int) Math.round((y + .5) * h / ph - .5);
-          if (fullMaskA[fy * w + fx] == 0) continue;
+          if (left.mask(fx, fy) == 0) continue;
           checked++;
           int lo = Math.max(original.minDisparity + 1, (int) Math.floor(predicted - uncertainty)),
               hi = Math.min(w - original.census, (int) Math.ceil(predicted + uncertainty));
@@ -453,9 +512,8 @@ final class DisparityRange {
           Arrays.fill(scores, -1);
           for (int k = lo; k <= hi; k++) {
             int target = fx - k;
-            if (target < 0 || target >= w || fullMaskB[fy * w + target] == 0) continue;
-            double score =
-                CensusSgm.zncc(fullA, fullB, w, h, fx, fy, k, original.correlationWindow / 2, 1);
+            if (target < 0 || target >= w || right.mask(target, fy) == 0) continue;
+            double score = left.zncc(right, fx, fy, k, original.correlationWindow / 2);
             scores[k - lo] = score;
             if (score > best) {
               best = score;
@@ -470,10 +528,8 @@ final class DisparityRange {
           double reverseBest = -1;
           for (int k = lo; k <= hi; k++) {
             int target = rightX + k;
-            if (target < 0 || target >= w || fullMaskA[fy * w + target] == 0) continue;
-            double score =
-                CensusSgm.zncc(
-                    fullB, fullA, w, h, rightX, fy, -k, original.correlationWindow / 2, 1);
+            if (target < 0 || target >= w || left.mask(target, fy) == 0) continue;
+            double score = right.zncc(left, rightX, fy, -k, original.correlationWindow / 2);
             if (score > reverseBest) {
               reverseBest = score;
               reverseWinner = k;

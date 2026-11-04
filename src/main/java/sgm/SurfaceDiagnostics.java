@@ -5,7 +5,6 @@ import java.nio.*;
 import java.nio.channels.*;
 import java.nio.file.*;
 import java.util.*;
-import java.util.zip.GZIPInputStream;
 
 /**
  * Read-only sampled surface diagnostics. A dominant plane is a hypothesis, never a terrain filter.
@@ -318,21 +317,17 @@ final class SurfaceDiagnostics {
       double size,
       double tolerance)
       throws IOException {
-    Path file = run.resolve("07_results/point-confidence.csv.gz");
     Map<Long, Point> ids = new HashMap<>();
     for (Point p : points) ids.put(p.id, p);
     Map<Integer, List<Double>> residuals = new TreeMap<>();
     long rows = 0, matched = 0, progress = System.nanoTime();
-    try (BufferedReader reader =
-            new BufferedReader(
-                new InputStreamReader(new GZIPInputStream(Files.newInputStream(file), 65536)));
+    try (PointRecords.Rows reader = new PointRecords.Rows(run);
         BufferedWriter writer =
             Files.newBufferedWriter(out.resolve("below_plane_attribution.csv"))) {
-      reader.readLine();
       writer.write(
           "point_id,fusion_pair_id,x,y,z,local_residual,supporting_views,independent_pairs,relative_sigma,refinement_shift\n");
       String line;
-      while ((line = reader.readLine()) != null) {
+      while ((line = reader.next(ids.containsKey(rows))) != null) {
         if (ids.containsKey(rows)) {
           String[] columns = line.split(",");
           Point p = ids.get(rows);

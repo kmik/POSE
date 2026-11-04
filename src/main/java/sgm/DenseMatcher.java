@@ -19,6 +19,9 @@ final class DenseMatcher {
       byte[] maskB,
       CensusSgm.Observer observer)
       throws IOException {
+    if (PointConfidence.bidirectional(o) && o.pyramidLevels != 1)
+      throw new IllegalArgumentException(
+          "Experimental bidirectional confidence requires ordinary SGM (--pyramid-levels 1)");
     if (o.pyramidLevels == 1)
       return new CensusSgm(o)
           .computeRecorded(left, right, color, colorRight, w, h, maskA, maskB, observer);
@@ -117,6 +120,9 @@ final class DenseMatcher {
       CensusSgm.Observer observer)
       throws IOException {
     float[] out = new float[w * h], correlation = new float[w * h], lr = new float[w * h];
+    float[] margin = new float[w * h], sharpness = new float[w * h];
+    Arrays.fill(margin, Float.NaN);
+    Arrays.fill(sharpness, Float.NaN);
     byte[] reasons = new byte[w * h];
     Arrays.fill(out, Float.NaN);
     Arrays.fill(correlation, Float.NaN);
@@ -206,6 +212,9 @@ final class DenseMatcher {
             out[dst] = Float.isFinite(value) ? value + t.minimum : Float.NaN;
             correlation[dst] = t.result.correlation == null ? Float.NaN : t.result.correlation[src];
             lr[dst] = t.result.leftRightError == null ? Float.NaN : t.result.leftRightError[src];
+            margin[dst] = t.result.costMargin == null ? Float.NaN : t.result.costMargin[src];
+            sharpness[dst] =
+                t.result.costSharpness == null ? Float.NaN : t.result.costSharpness[src];
             reasons[dst] = t.codes[src];
             byte flags = t.search[src];
             if ((flags & 4) != 0) stats.fullIntervalPixels++;
@@ -262,7 +271,10 @@ final class DenseMatcher {
               "path_scope",
               "Exact inside each refinement tile; overlapping pyramid tiles are a local"
                   + " approximation, distinct from exact strip-streamed full-image SGM"));
-    return new CensusSgm.Result(w, h, out, stats, correlation, lr);
+    CensusSgm.Result result = new CensusSgm.Result(w, h, out, stats, correlation, lr);
+    result.costMargin = margin;
+    result.costSharpness = sharpness;
+    return result;
   }
 
   private record Tile(

@@ -8,11 +8,59 @@ import java.util.*;
  */
 public final class Options {
   public Path input, output = Paths.get("photogrammetry-output"), calibration, poses;
-  public boolean help, rectified, calibrate, overwrite, gps, noGps, copyInputs;
+  public boolean help, rectified, calibrate, overwrite, gps, noGps, copyInputs, verbose;
+  public boolean diagnostics, compatibilityCopies;
+  public String densePairSelection = "all", calibrationPipeline = "bootstrap";
+  public String fusionEmission = "pair";
+  public String fusionEvidence = "auto";
+  public String fusionGpuEvidence = "auto";
+  public String windowedMode = "off";
+  public String fusionMode = "reference", fusionOutliers = "reference";
+  public String fusionAssociation = "pair";
+  public boolean fusionCameraCulling;
+  public boolean stereoPipeline;
+  public int fusionWindowMb;
+  public int densePairNeighbors = 3;
+  public Path exportConfidence;
   public boolean disparitiesExplicit, minDisparityExplicit, selfCalibration = true;
   Map<String, Camera> calibrationPoses = Collections.emptyMap();
   public String crs = "EPSG:3067";
   public double gpsThreshold = 10;
+  // G1: final bundle adjustment with GPS camera centres as weighted priors (off|prior) and their sigma.
+  public String gpsBundle = "prior";
+  // G3-G5 inside the GPS-weighted adjustment: shared lens refit (+ focal prior), GPS time offset and
+  // lever arm, rolling-shutter readout. estimate | off | fixed value.
+  public String gpsIntrinsics = "f,k1,k2,k3,cx,cy,p1,p2", gpsFocalPrior = "auto";
+  public double gpsFocalSigma = .03;
+  public String gpsTimeOffset = "estimate", gpsLeverArm = "estimate", rollingShutter = "estimate";
+  public int gpsAdjustmentRounds = 3;
+  // Without --bundle-iterations every bundle fit runs until it stops improving meaningfully.
+  public boolean bundleIterationsExplicit;
+  // C1: ground classification of the final cloud (opt-in) and its tuning.
+  public boolean classifyGround;
+  // GS1: correct each stereo pair's vertical ground offset; GS2: merge ground copies into one sheet.
+  // Both imply --classify-ground.
+  public boolean groundPairCorrection, groundAwareFusion;
+  // Sheet fusion radius for --ground-aware-fusion (0 = auto: twice the terrain cell).
+  public double groundFusionRadius = 0;
+  public double groundCell = 0, groundMaxSlope = 35, groundMaxObject = 30;
+  // Minimum depth of a real canopy gap for isolated ground patches (0 = auto from canopy height).
+  public double groundGapDepth = 0;
+  // Ground control points: CSV (gcp_id,x,y,z[,sx,sy,sz][,type]), optional markers to import,
+  // default sigmas (m) and the marker editor port.
+  public Path gcp, gcpMarkers;
+  public double gcpSigma = .02, gcpHeightSigma = .03;
+  public int gcpPort = 8765;
+  // Height sigma of the GPS camera prior: auto (0.2 m for DJI barometric heights, else gpsSigma).
+  public String gpsHeightSigma = "auto";
+  double gpsHeightSigmaValue = 2;
+  // Fitted readout time (s) of the last GPS-weighted adjustment; reporting only.
+  double rollingShutterReadout;
+  // T1: off | report (default) | exclude flagged cameras from dense matching.
+  public String cameraScreening = "report";
+  // S1: stereo pairs computed concurrently; 1 = serial (default), 0 = auto.
+  public int stereoPairsInFlight = 1;
+  public double gpsSigma = 2;
   public double focal = Double.NaN, sensorWidth = Double.NaN, baseline = 1, scale = 1;
   public double p1 = 4, p2 = 24, ratio = .75, reprojection = 2, uniqueness = .03, voxel = 0;
   public int sgmEdgeScale = 32;
@@ -22,6 +70,12 @@ public final class Options {
   public int speckleConnectivity = 8;
   public int minDisparity = 0, disparities = 128, census = 5, median = 3, directions = 8;
   public int maxDimension = 1600, features = 8000, minMatches = 20, neighbors = 3, iterations = 8;
+  // Image-fusion agreement neighbourhood in pixels; -1 = auto (0 for owner, else max(1, step)).
+  public int fusionAgreementRadius = -1;
+  // Image-fusion surface strategy: owner (default, previous rule), owner-consume, graph-average.
+  public String fusionStrategy = "owner";
+  // Image fusion: drop per-camera depth outliers far beyond the scene's depth range (T2).
+  public boolean fusionDepthOutliers = true;
   public int step = 2, cores = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
   public int boardColumns = 9, boardRows = 7;
   public double squareSize = .02, maxDepth = 10000;
@@ -34,7 +88,13 @@ public final class Options {
   public int imageWindow = 1024, descriptorMemoryMb = 256, imageMemoryMb = 0;
   public int esgmCandidates = 2;
   long gpuHostReserve;
+  PointConfidence.Selection stereoSelection;
   public String subpixelRefinement = "none";
+  public String pairwiseSearch = "full", subpixelFit = "parabola", onPairFailure = "abort";
+  public String fusionGpuFailure = "disable";
+  public int tsgmLevels = 3, tsgmMargin = 3;
+  /** Packed (x, y, disparity) sparse range samples for the current pair; tsgm band seeds. */
+  double[] tsgmSeeds;
   public double censusWeight = .5;
   public int adTruncation = 30, gradientTruncation = 60, gpuStripRows = 64;
   public int gpuBankMb = 1024;
@@ -67,6 +127,12 @@ public final class Options {
   public double correlation = .55, lrThreshold = .75, speckleRange = 1.0, minAngle = 1.0;
   public double fusionRelative = .005, fusionPixels = .75;
   public double fusionConsensus = .6, maxDepthUncertainty = .1;
+  public double confidenceThreshold = 0;
+  public double twoViewConfidenceThreshold = Double.NaN;
+  public String denseMethod = "sgm";
+  public int patchmatchIterations = 4, patchmatchViews = 4, patchmatchLevels = 3;
+  public double patchmatchEdgeSigma = 32;
+  public double patchmatchMinDepth = 0, patchmatchMaxDepth = 0;
   public boolean depthRefinement = true;
   public String depthRefinementMethod = "reprojection", surfaceConsolidation = "normal";
   public double surfaceRadius = 2, surfaceSpacing = 1, surfaceMaxShift = 2;
@@ -79,13 +145,15 @@ public final class Options {
   public boolean maxDimensionExplicit, estimateMemory;
   public String matchingAlgorithm = "sift",
       descriptorMatcher = "auto",
-      pairSelection = "sequential";
+      pairSelection = "sequential",
+      pairMatching = "parallel";
   public String alignmentQuality = "same", intrinsicsMode = "fixed", extrinsicsMode = "fixed";
-  public String refineIntrinsics = "f,k1,k2", rerunFrom = "none";
+  public String refineIntrinsics = "f,k1,k2,k3,cx,cy,p1,p2", rerunFrom = "none";
   public int alignmentMaxDimension = 0, pairCandidates = 6, tileSize = 512, tileOverlap = 32;
   public int pyramidLevels = 1, pyramidRadius = 16, cleanupPasses = 1, trackMinViews = 2;
   public double focalSigma = .05, radialSigma = .05, positionSigma = 10, rotationSigma = 10;
   public double trackMaxError = 4, trackMinAngle = .1;
+  boolean alignmentCalibration, alignmentCalibrationDone;
   public boolean resume, tiled, diskDepth = true;
   public String storage = "standard", compute = "auto";
   public String fusionCompute = "inherit";
@@ -94,7 +162,9 @@ public final class Options {
   public boolean fusionPipeline = true;
   public boolean fusionMeasuredReprojection = true;
   public int outputCompression = 6;
-  public String surfacePartition = "routed", processingReport = "html", reportDsmStatistic = "max";
+  public String surfacePartition = "routed", processingReport = "pdf", reportDsmStatistic = "max";
+  // PDF layout: summary (2 pages, default) or full (the earlier detailed report).
+  public String reportDetail = "summary";
   public int fusionPageSide = 64, fusionCacheMb = 0, fusionBatchSize = 16384;
   public int reportDsmMaxDimension = 1024, reportDsmMinPoints = 1;
   public double reportDsmResolution = 0;
@@ -111,12 +181,16 @@ public final class Options {
   public int orbFastThreshold = 20, briskThreshold = 30;
   java.nio.file.Path cacheDirectory;
   java.nio.file.Path projectDirectory;
+  Path runFeatureDirectory;
+  java.util.concurrent.atomic.AtomicLong runFeatureHits =
+      new java.util.concurrent.atomic.AtomicLong();
 
   public static Options parse(String[] args) {
     Options o = new Options();
     o.help = args.length == 0;
     Set<String> explicitFiltering = new TreeSet<>();
     boolean cacheDisabled = false;
+    boolean storageExplicit = false;
     for (int i = 0; i < args.length; i++) {
       String key = args[i], inline = null;
       int eq = key.indexOf('=');
@@ -125,6 +199,12 @@ public final class Options {
         key = key.substring(0, eq);
       }
       switch (key) {
+        case "--diagnostics":
+          o.diagnostics = true;
+          continue;
+        case "--compatibility-copies":
+          o.compatibilityCopies = true;
+          continue;
         case "--report-local-dsm":
           o.reportLocalDsm = true;
           continue;
@@ -144,6 +224,18 @@ public final class Options {
         case "--help":
         case "-help":
           o.help = true;
+          continue;
+        case "--verbose":
+          o.verbose = true;
+          continue;
+        case "--classify-ground":
+          o.classifyGround = true;
+          continue;
+        case "--ground-pair-correction":
+          o.groundPairCorrection = true;
+          continue;
+        case "--ground-aware-fusion":
+          o.groundAwareFusion = true;
           continue;
         case "--rectified":
           o.rectified = true;
@@ -223,6 +315,24 @@ public final class Options {
         case "--subpixel-refinement":
           o.subpixelRefinement = v.toLowerCase(Locale.ROOT);
           break;
+        case "--pairwise-search":
+          o.pairwiseSearch = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--subpixel-fit":
+          o.subpixelFit = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--on-pair-failure":
+          o.onPairFailure = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-gpu-failure":
+          o.fusionGpuFailure = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--tsgm-levels":
+          o.tsgmLevels = Integer.parseInt(v);
+          break;
+        case "--tsgm-margin":
+          o.tsgmMargin = Integer.parseInt(v);
+          break;
         case "--census-weight":
           o.censusWeight = number(v);
           break;
@@ -246,6 +356,9 @@ public final class Options {
           break;
         case "--image-reader":
           o.imageReader = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--windowed-mode":
+          o.windowedMode = v.toLowerCase(Locale.ROOT);
           break;
         case "--image-window":
           o.imageWindow = Integer.parseInt(v);
@@ -353,6 +466,7 @@ public final class Options {
           o.analysisRegion = v;
           break;
         case "--storage":
+          storageExplicit = true;
           o.storage = v.toLowerCase(Locale.ROOT);
           break;
         case "--compute":
@@ -369,6 +483,51 @@ public final class Options {
           break;
         case "--output-compression":
           o.outputCompression = Integer.parseInt(v);
+          break;
+        case "--export-confidence":
+          o.exportConfidence = Path.of(v);
+          break;
+        case "--dense-pair-selection":
+          o.densePairSelection = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--dense-pair-neighbors":
+          o.densePairNeighbors = Integer.parseInt(v);
+          break;
+        case "--calibration-pipeline":
+          o.calibrationPipeline = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-emission":
+          o.fusionEmission = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-evidence":
+          o.fusionEvidence = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-mode":
+          o.fusionMode = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--stereo-pipeline":
+          o.stereoPipeline = switch (v.toLowerCase(Locale.ROOT)) {
+            case "on" -> true; case "off" -> false;
+            default -> throw new IllegalArgumentException("--stereo-pipeline requires on|off");
+          };
+          break;
+        case "--fusion-camera-culling":
+          o.fusionCameraCulling = switch (v.toLowerCase(Locale.ROOT)) {
+            case "on" -> true; case "off" -> false;
+            default -> throw new IllegalArgumentException("--fusion-camera-culling requires on|off");
+          };
+          break;
+        case "--fusion-association":
+          o.fusionAssociation = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-outliers":
+          o.fusionOutliers = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-window-mb":
+          o.fusionWindowMb = Integer.parseInt(v);
+          break;
+        case "--fusion-gpu-evidence":
+          o.fusionGpuEvidence = v.toLowerCase(Locale.ROOT);
           break;
         case "--gpu-device":
           o.gpuDevice = Integer.parseInt(v);
@@ -405,6 +564,9 @@ public final class Options {
           break;
         case "--pair-selection":
           o.pairSelection = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--pair-matching":
+          o.pairMatching = v.toLowerCase(Locale.ROOT);
           break;
         case "--pair-candidates":
           o.pairCandidates = Integer.parseInt(v);
@@ -489,6 +651,72 @@ public final class Options {
         case "--gps-threshold":
           o.gpsThreshold = number(v);
           break;
+        case "--stereo-pairs-in-flight":
+          o.stereoPairsInFlight = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
+          break;
+        case "--camera-screening":
+          o.cameraScreening = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gps-bundle":
+          o.gpsBundle = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gps-sigma":
+          o.gpsSigma = number(v);
+          break;
+        case "--gps-intrinsics":
+          o.gpsIntrinsics = v.toLowerCase(Locale.ROOT).replace(" ", "");
+          break;
+        case "--gps-focal-prior":
+          o.gpsFocalPrior = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gps-focal-sigma":
+          o.gpsFocalSigma = number(v);
+          break;
+        case "--gps-time-offset":
+          o.gpsTimeOffset = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gps-lever-arm":
+          o.gpsLeverArm = v.toLowerCase(Locale.ROOT).replace(" ", "");
+          break;
+        case "--rolling-shutter":
+          o.rollingShutter = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--ground-fusion-radius":
+          o.groundFusionRadius = v.equalsIgnoreCase("auto") ? 0 : number(v);
+          break;
+        case "--ground-cell":
+          o.groundCell = v.equalsIgnoreCase("auto") ? 0 : number(v);
+          break;
+        case "--ground-max-slope":
+          o.groundMaxSlope = number(v);
+          break;
+        case "--gcp":
+          o.gcp = Path.of(v);
+          break;
+        case "--gcp-markers":
+          o.gcpMarkers = Path.of(v);
+          break;
+        case "--gcp-sigma":
+          o.gcpSigma = number(v);
+          break;
+        case "--gcp-height-sigma":
+          o.gcpHeightSigma = number(v);
+          break;
+        case "--gcp-port":
+          o.gcpPort = Integer.parseInt(v);
+          break;
+        case "--ground-gap-depth":
+          o.groundGapDepth = v.equalsIgnoreCase("auto") ? 0 : number(v);
+          break;
+        case "--ground-max-object":
+          o.groundMaxObject = number(v);
+          break;
+        case "--gps-height-sigma":
+          o.gpsHeightSigma = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gps-adjustment-rounds":
+          o.gpsAdjustmentRounds = Integer.parseInt(v);
+          break;
         case "--seed-pair":
           o.seedPair = v;
           break;
@@ -522,8 +750,55 @@ public final class Options {
         case "--min-angle":
           o.minAngle = number(v);
           break;
+        case "--confidence-threshold":
+          o.confidenceThreshold = number(v);
+          break;
+        case "--two-view-confidence-threshold":
+          o.twoViewConfidenceThreshold = number(v);
+          if (!Double.isFinite(o.twoViewConfidenceThreshold)
+              || o.twoViewConfidenceThreshold < 0
+              || o.twoViewConfidenceThreshold > 1)
+            throw new IllegalArgumentException(
+                "--two-view-confidence-threshold must be finite in 0..1");
+          break;
+        case "--dense-method":
+          o.denseMethod = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--patchmatch-iterations":
+          o.patchmatchIterations = Integer.parseInt(v);
+          break;
+        case "--patchmatch-edge-sigma":
+          o.patchmatchEdgeSigma = number(v);
+          break;
+        case "--patchmatch-views":
+          o.patchmatchViews = Integer.parseInt(v);
+          break;
+        case "--patchmatch-levels":
+          o.patchmatchLevels = Integer.parseInt(v);
+          break;
+        case "--patchmatch-min-depth":
+          o.patchmatchMinDepth = number(v);
+          break;
+        case "--patchmatch-max-depth":
+          o.patchmatchMaxDepth = number(v);
+          break;
         case "--min-views":
           o.minViews = Integer.parseInt(v);
+          break;
+        case "--fusion-strategy":
+          o.fusionStrategy = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-dedupe":
+          // Earlier name of --fusion-strategy (3 Nov 2026): consume = owner-consume.
+          o.fusionStrategy = v.toLowerCase(Locale.ROOT).equals("consume") ? "owner-consume" : v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-depth-outliers":
+          o.fusionDepthOutliers = !v.equalsIgnoreCase("off");
+          if (!v.equalsIgnoreCase("on") && !v.equalsIgnoreCase("off"))
+            throw new IllegalArgumentException("--fusion-depth-outliers must be on or off");
+          break;
+        case "--fusion-agreement-radius":
+          o.fusionAgreementRadius = v.equals("auto") ? -1 : Integer.parseInt(v);
           break;
         case "--fusion-relative":
           o.fusionRelative = number(v);
@@ -637,6 +912,7 @@ public final class Options {
           break;
         case "--bundle-iterations":
           o.iterations = Integer.parseInt(v);
+          o.bundleIterationsExplicit = true;
           break;
         case "--step":
           o.step = Integer.parseInt(v);
@@ -662,6 +938,9 @@ public final class Options {
           break;
         case "--report":
           o.processingReport = v;
+          break;
+        case "--report-detail":
+          o.reportDetail = v.toLowerCase(Locale.ROOT);
           break;
         case "--export-report":
           o.exportReport = Paths.get(v);
@@ -700,8 +979,12 @@ public final class Options {
     o.applyFilteringPreset(explicitFiltering);
     if (o.help) return o;
     choice(o.surfacePartition, "--surface-partition", "routed", "recursive");
-    choice(o.processingReport, "--report", "html", "none");
+    choice(o.processingReport, "--report", "pdf", "html", "none");
+    choice(o.reportDetail, "--report-detail", "summary", "full");
     choice(o.reportDsmStatistic, "--report-dsm-statistic", "max", "mean");
+    if (o.outputCompression < 1 || o.outputCompression > 9)
+      throw new IllegalArgumentException("Output compression must be 1..9");
+    if (o.cores < 1) throw new IllegalArgumentException("--cores must be positive");
     if (o.surfaceBatchSize < 1
         || o.surfaceBatchSize > 1024
         || o.fusionPageSide < 16
@@ -715,6 +998,11 @@ public final class Options {
         || o.reportDsmMaxDimension > 4096
         || o.reportDsmMinPoints < 1)
       throw new IllegalArgumentException("Invalid fusion cache/batch or report DSM settings");
+    if (java.util.stream.Stream.of(
+                o.exportReport, o.exportConfidence, o.analyzeRun, o.exportOrientations)
+            .filter(Objects::nonNull)
+            .count()
+        > 1) throw new IllegalArgumentException("Choose one standalone export/analysis action");
     if (o.exportReport != null) {
       if (!Files.isDirectory(o.exportReport)
           || o.analyzeRun != null
@@ -756,13 +1044,47 @@ public final class Options {
           throw new IllegalArgumentException("Unsupported orientation output format: " + format);
     if (!Double.isNaN(o.orientationPixelSize) && !(o.orientationPixelSize > 0))
       throw new IllegalArgumentException("Orientation physical pixel size must be positive mm");
+    if (o.exportConfidence != null) {
+      if (!Files.isDirectory(o.exportConfidence)
+          || o.exportOrientations != null
+          || o.exportReport != null
+          || o.analyzeRun != null)
+        throw new IllegalArgumentException(
+            "Choose one valid standalone confidence export directory");
+      return o;
+    }
     if (o.exportOrientations != null) {
       if (!Files.isDirectory(o.exportOrientations))
         throw new IllegalArgumentException(
             "--export-orientations must name a project run directory");
       return o;
     }
+    if (o.diagnostics && !storageExplicit) o.storage = "debug";
     choice(o.storage, "--storage", "minimal", "standard", "debug");
+    choice(o.densePairSelection, "--dense-pair-selection", "all", "coverage");
+    choice(o.calibrationPipeline, "--calibration-pipeline", "bootstrap", "joint");
+    choice(o.fusionEmission, "--fusion-emission", "pair", "camera");
+    choice(o.fusionEvidence, "--fusion-evidence", "pair", "camera", "auto");
+    choice(o.fusionGpuEvidence, "--fusion-gpu-evidence", "auto", "resident", "windowed");
+    choice(o.fusionMode, "--fusion-mode", "reference", "incremental", "image");
+    if (o.fusionMode.equals("image")
+        && (!o.fusionEmission.equals("pair") || !o.denseMethod.equals("sgm")))
+      throw new IllegalArgumentException(
+          "--fusion-mode image requires --dense-method sgm and --fusion-emission pair");
+    choice(o.fusionOutliers, "--fusion-outliers", "reference", "robust");
+    choice(o.fusionAssociation, "--fusion-association", "pair", "camera");
+    if (o.fusionAssociation.equals("camera") && !o.fusionMode.equals("incremental"))
+      throw new IllegalArgumentException("--fusion-association camera requires --fusion-mode incremental");
+    if (o.fusionWindowMb < 0)
+      throw new IllegalArgumentException("--fusion-window-mb must be nonnegative");
+    if (o.windowedMode.equals("on") && o.denseMethod.equals("patchmatch"))
+      throw new IllegalArgumentException(
+          "--windowed-mode on currently supports SGM; PatchMatch windowing is not implemented");
+    if (o.fusionEmission.equals("camera") && !o.surfaceConsolidation.equals("none"))
+      throw new IllegalArgumentException(
+          "Experimental camera emission requires --surface-consolidation none");
+    if (o.densePairNeighbors < 1 || o.densePairNeighbors > 16)
+      throw new IllegalArgumentException("--dense-pair-neighbors must be 1..16");
     choice(o.compute, "--compute", "cpu", "auto", "gpu");
     choice(o.matchingCost, "--matching-cost", "census", "ad-census", "census-gradient", "zncc");
     choice(o.medianMode, "--median-mode", "edge-preserving", "classic");
@@ -775,13 +1097,24 @@ public final class Options {
       throw new IllegalArgumentException(
           "Median edge threshold must be 0..255; speckle connectivity must be 4 or 8");
     choice(o.subpixelRefinement, "--subpixel-refinement", "none", "zncc");
+    choice(o.pairwiseSearch, "--pairwise-search", "full", "tsgm");
+    choice(o.subpixelFit, "--subpixel-fit", "parabola", "equiangular");
+    choice(o.onPairFailure, "--on-pair-failure", "abort", "skip");
+    choice(o.fusionGpuFailure, "--fusion-gpu-failure", "disable", "batch");
+    if (o.tsgmLevels < 0 || o.tsgmLevels > 5 || o.tsgmMargin < 1 || o.tsgmMargin > 32)
+      throw new IllegalArgumentException("--tsgm-levels must be 0..5; --tsgm-margin must be 1..32");
+    if (o.pairwiseSearch.equals("tsgm") && o.pyramidLevels != 1)
+      throw new IllegalArgumentException("--pairwise-search tsgm requires --pyramid-levels 1");
     choice(o.sgmAggregate, "--sgm-aggregate", "auto", "16", "32");
     StereoCost.aggregateBytes(o);
-    choice(o.gpuSgm, "--gpu-sgm", "auto", "resident", "streamed", "esgm");
+    choice(o.gpuSgm, "--gpu-sgm", "auto", "resident", "hybrid", "streamed", "esgm");
     if (o.esgmCandidates < 1 || o.esgmCandidates > 4)
       throw new IllegalArgumentException("--esgm-candidates must be 1..4");
     choice(o.gpuAggregate, "--gpu-aggregate", "auto", "ram", "disk", "recompute");
     choice(o.imageReader, "--image-reader", "auto", "windowed", "opencv");
+    choice(o.windowedMode, "--windowed-mode", "auto", "on", "off");
+    if (o.windowedMode.equals("on") && o.pyramidLevels != 1)
+      throw new IllegalArgumentException("--windowed-mode on requires --pyramid-levels 1");
     if (o.imageWindow < 64
         || o.imageWindow > 8192
         || o.descriptorMemoryMb < 1
@@ -802,11 +1135,37 @@ public final class Options {
         || o.gpuBankMb > 1024)
       throw new IllegalArgumentException(
           "Invalid matching-cost weight/truncation or GPU strip size");
+    choice(o.denseMethod, "--dense-method", "sgm", "patchmatch");
+    if (!Double.isNaN(o.twoViewConfidenceThreshold)
+        && (!Double.isFinite(o.twoViewConfidenceThreshold)
+            || o.twoViewConfidenceThreshold < 0
+            || o.twoViewConfidenceThreshold > 1
+            || !o.denseMethod.equals("sgm")
+            || o.pyramidLevels != 1))
+      throw new IllegalArgumentException(
+          "Experimental --two-view-confidence-threshold requires finite 0..1, --dense-method sgm"
+              + " and --pyramid-levels 1");
+    if (o.confidenceThreshold < 0 || o.confidenceThreshold > 1)
+      throw new IllegalArgumentException("--confidence-threshold must be in 0..1");
+    if (!Double.isFinite(o.patchmatchEdgeSigma)
+        || o.patchmatchEdgeSigma < 0
+        || o.patchmatchEdgeSigma > 255)
+      throw new IllegalArgumentException("--patchmatch-edge-sigma must be between 0 and 255");
+    if (o.patchmatchIterations < 1
+        || o.patchmatchIterations > 12
+        || o.patchmatchViews < 1
+        || o.patchmatchViews > 8
+        || o.patchmatchLevels < 1
+        || o.patchmatchLevels > 5
+        || o.patchmatchMinDepth < 0
+        || o.patchmatchMaxDepth < 0
+        || ((o.patchmatchMinDepth == 0) != (o.patchmatchMaxDepth == 0))
+        || (o.patchmatchMaxDepth > 0 && o.patchmatchMaxDepth <= o.patchmatchMinDepth))
+      throw new IllegalArgumentException(
+          "Invalid PatchMatch depth range or iterations/views/levels");
     choice(o.fusionCompute, "--fusion-compute", "inherit", "cpu", "auto", "gpu");
     choice(o.fusionWeightMath, "--fusion-weight-math", "direct", "reference");
     choice(o.fusionLayout, "--fusion-layout", "coalesced", "reference");
-    if (o.outputCompression < 1 || o.outputCompression > 9)
-      throw new IllegalArgumentException("Output compression must be 1..9");
     if (o.gpuDevice < 0 || o.gpuMemoryMb < 0)
       throw new IllegalArgumentException("GPU device and memory budget must be nonnegative");
     if (o.resume) {
@@ -827,6 +1186,14 @@ public final class Options {
     choice(o.matchingAlgorithm, "--matching-algorithm", "sift", "orb", "akaze", "kaze", "brisk");
     choice(o.descriptorMatcher, "--descriptor-matcher", "auto", "bruteforce", "flann");
     choice(o.pairSelection, "--pair-selection", "sequential", "overlap", "gps", "all");
+    choice(o.pairMatching, "--pair-matching", "parallel", "serial");
+    choice(o.fusionStrategy, "--fusion-strategy", "owner", "owner-consume", "graph-average");
+    choice(o.gpsBundle, "--gps-bundle", "off", "prior");
+    choice(o.cameraScreening, "--camera-screening", "off", "report", "exclude");
+    if (o.stereoPairsInFlight < 0 || o.stereoPairsInFlight > 16)
+      throw new IllegalArgumentException("--stereo-pairs-in-flight must be auto or 1..16");
+    if (!(o.gpsSigma > 0)) throw new IllegalArgumentException("--gps-sigma must be positive");
+    validateGpsAdjustment(o);
     choice(o.rectificationAlpha, "--rectification-alpha", "auto", "0", "1");
     choice(
         o.alignmentQuality,
@@ -850,7 +1217,7 @@ public final class Options {
         "stereo",
         "fusion");
     for (String p : o.refineIntrinsics.split(","))
-      choice(p, "--refine-intrinsics", "f", "k1", "k2");
+      choice(p, "--refine-intrinsics", "f", "k1", "k2", "k3", "cx", "cy", "p1", "p2");
     if (o.tileSize < 32
         || o.tileOverlap < 2
         || o.tileOverlap > o.tileSize
@@ -887,6 +1254,8 @@ public final class Options {
         || o.fusionPixels <= 0
         || o.fusionConsensus <= .5
         || o.fusionConsensus > 1
+        || o.fusionAgreementRadius < -1
+        || o.fusionAgreementRadius > 8
         || o.maxDepthUncertainty <= 0
         || o.maxDepthUncertainty > 1
         || o.correlationWindow < 3
@@ -961,6 +1330,51 @@ public final class Options {
       throw new IllegalArgumentException(
           "Invalid surface radius/spacing/shift/normal angle or memory budget");
     return o;
+  }
+
+  private static void validateGpsAdjustment(Options o) {
+    if (!o.gpsIntrinsics.equals("none"))
+      for (String name : o.gpsIntrinsics.split(","))
+        if (!Set.of("f", "k1", "k2", "k3", "cx", "cy", "p1", "p2").contains(name))
+          throw new IllegalArgumentException(
+              "--gps-intrinsics must be none or a comma list of f,k1,k2,k3,cx,cy,p1,p2");
+    if (!Set.of("auto", "none").contains(o.gpsFocalPrior) && !(number(o.gpsFocalPrior) > 0))
+      throw new IllegalArgumentException("--gps-focal-prior must be auto, none or focal pixels");
+    if (!(o.gpsFocalSigma > 0)) throw new IllegalArgumentException("--gps-focal-sigma must be positive");
+    if (!Set.of("estimate", "off").contains(o.gpsTimeOffset)
+        && !(Math.abs(number(o.gpsTimeOffset)) <= 2))
+      throw new IllegalArgumentException("--gps-time-offset must be estimate, off or -2..2 seconds");
+    if (!Set.of("estimate", "off").contains(o.gpsLeverArm)) {
+      String[] parts = o.gpsLeverArm.split(",");
+      if (parts.length != 3)
+        throw new IllegalArgumentException("--gps-lever-arm must be estimate, off or x,y,z metres");
+      for (String p : parts)
+        if (!(Math.abs(number(p)) <= 2))
+          throw new IllegalArgumentException("--gps-lever-arm components must be within 2 metres");
+    }
+    if (!Set.of("estimate", "off").contains(o.rollingShutter)
+        && !(Math.abs(number(o.rollingShutter)) <= .25))
+      throw new IllegalArgumentException(
+          "--rolling-shutter must be estimate, off or a readout time of -0.25..0.25 seconds");
+    if (!o.gpsHeightSigma.equals("auto") && !(number(o.gpsHeightSigma) > 0))
+      throw new IllegalArgumentException("--gps-height-sigma must be auto or positive metres");
+    if (o.groundFusionRadius < 0 || o.groundFusionRadius > 10)
+      throw new IllegalArgumentException("--ground-fusion-radius must be auto or 0.05..10 metres");
+    if (o.groundCell < 0 || o.groundCell > 10)
+      throw new IllegalArgumentException("--ground-cell must be auto or 0.01..10 metres");
+    if (!(o.groundMaxSlope > 0 && o.groundMaxSlope < 85))
+      throw new IllegalArgumentException("--ground-max-slope must be 0..85 degrees");
+    if (o.gcp != null && !Files.isRegularFile(o.gcp))
+      throw new IllegalArgumentException("--gcp file not found: " + o.gcp);
+    if (!(o.gcpSigma > 0) || !(o.gcpHeightSigma > 0))
+      throw new IllegalArgumentException("--gcp-sigma and --gcp-height-sigma must be positive");
+    if (o.gcpPort < 1 || o.gcpPort > 65535) throw new IllegalArgumentException("--gcp-port must be 1..65535");
+    if (o.groundGapDepth < 0 || o.groundGapDepth > 100)
+      throw new IllegalArgumentException("--ground-gap-depth must be auto or 0..100 metres");
+    if (!(o.groundMaxObject >= 1 && o.groundMaxObject <= 500))
+      throw new IllegalArgumentException("--ground-max-object must be 1..500 metres");
+    if (o.gpsAdjustmentRounds < 1 || o.gpsAdjustmentRounds > 20)
+      throw new IllegalArgumentException("--gps-adjustment-rounds must be 1..20");
   }
 
   private static double number(String s) {
@@ -1069,12 +1483,16 @@ public final class Options {
   Options copy() {
     Options out = new Options();
     out.cacheDirectory = cacheDirectory;
+    out.runFeatureDirectory = runFeatureDirectory;
+    out.runFeatureHits = runFeatureHits;
     out.projectDirectory = projectDirectory;
     out.orientationCalibrations = orientationCalibrations;
     out.orientationSourceUnits = orientationSourceUnits;
     out.orientationNotes = orientationNotes;
     out.stereoReportDirectory = stereoReportDirectory;
     out.gpuHostReserve = gpuHostReserve;
+    out.stereoSelection = stereoSelection;
+    out.tsgmSeeds = tsgmSeeds;
     try {
       for (java.lang.reflect.Field field : Options.class.getFields())
         field.set(out, field.get(this));
@@ -1092,9 +1510,37 @@ Run with no arguments, -h, --help or -help to display this help and exit.
 Values accept --option VALUE or --option=VALUE. Quote paths containing spaces.
 Defaults below apply unless overridden; pixel units refer to processed images.
 
+Pipeline steps (run one by one, or chained; the state is saved after each step):
+  photogrammetry -i IMAGES -o PROJECT [options]
+      All steps in one process (as before).
+  photogrammetry STEP [STEP ...] -o PROJECT [options]
+      Only the named steps, in order: inputs, calibrate, match, align, georeference,
+      gcp, dense, ground, finish. 'inputs' starts a new run (needs -i); the other
+      steps continue the latest run with the options saved by 'inputs'; options given
+      here are added and override them. 'finish' writes the report and final files.
+      'gcp' is skipped without --gcp. Until enough markers are pinned it ends as
+      'waiting' with predicted markers: pin them with gcp-edit, then run gcp again.
+  --run ID
+      Continue (or branch from) this run instead of the latest one.
+  --branch
+      Start a new run from the given run's saved state just before the first named
+      step and redo from there (e.g. 'dense ground finish --branch --min-views 2').
+      The source run is not changed.
+  photogrammetry status -o PROJECT [--run ID]
+      Show which steps of a run are done and the next one.
+  photogrammetry gcp-edit -o PROJECT [--run ID] [--gcp-port N]
+      Open the ground control point editor in the browser (local only). Click a GCP,
+      then click its exact position in each image; markers are saved as you go to
+      04_geometry/gcp/markers.json. Press Done, then run the gcp step again.
+
 Inputs and project output:
   -h, --help, -help
       Show this help without starting a project or loading images.
+  --verbose
+      Print every processing message to the terminal (the previous behaviour). Default:
+      one progress bar per stage with percent, counts, elapsed and estimated remaining
+      time, the current item and live RAM/CPU/GPU; a summary line as each stage ends;
+      warnings and errors always shown. logs/console.log always keeps the full text.
   -i, --images DIR
       Input image directory (required for reconstruction/calibration, not standalone
       help/GPU listing/export/analysis); files sort by filename.
@@ -1105,7 +1551,7 @@ Inputs and project output:
       Comma-separated input extensions (default: jpg,jpeg,png,tif,tiff,bmp).
   --copy-inputs
       Also archive full-resolution originals with EXIF (default: disabled).
-      Processed images and input provenance are always saved.
+      Input provenance is always saved; processed image exports require --diagnostics.
   --overwrite
       Adopt a nonempty directory as a project; unrelated files and prior runs
       are preserved. Existing mSGM projects do not require this flag.
@@ -1121,10 +1567,10 @@ Calibration and reconstruction modes:
       Focal length in millimetres; requires --s_w. Initializes focal in pixels.
   --s_w MM
       Physical sensor WIDTH in millimetres (not diagonal); requires --focal.
-      Without a calibration file, guarded shared f,k1,k2 refinement follows
-      initialization when observable; principal point stays centered.
+      Without a calibration file, guarded f,k1,k2 bootstrap refinement follows
+      initialization. Full-block alignment can then refine f,k1,k2,k3,cx,cy,p1,p2.
   --no-self-calibration
-      Disable that refinement; retain initialized focal and zero distortion.
+      Disable bootstrap and alignment self-calibration; retain initialized or supplied intrinsics.
   --poses FILE
       Known poses; native CSV uses X_camera = R * X_world + t. Other formats below.
       Every input needs a pose. Fixed by default; see --extrinsics-mode. Units come
@@ -1180,10 +1626,14 @@ Feature matching and final bundle adjustment:
       Geometric RANSAC tolerance and final bundle Huber threshold in pixels
       (default: 2; positive). Final sparse track rejection uses twice this value.
   --bundle-iterations N
-      Maximum accepted joint pose/point LM iterations (default: 8; 0 skips
-      final optimization). Intrinsics stay fixed; first pose and baseline norm
-      anchor the image-only solve. Pose priors instead anchor supplied-pose refinement.
-      Fixed supplied poses and rectified mode bypass this solve.
+      Fixed accepted LM iteration budget per pose/point fit. Default (option omitted):
+      every fit iterates until two successive iterations each improve the robust
+      objective by less than 1e-6 relative, up to 100 iterations. With N, shared lens
+      calibration uses staged fits and three focal starts, each with at least 12
+      iterations; progress labels identify each fit. 0 skips pose-only iterations;
+      --no-self-calibration separately disables lens refinement. The first pose
+      and baseline norm anchor image-only geometry; pose priors anchor supplied
+      refinement. Fixed supplied poses and rectified mode preserve their controls.
 
 Dense stereo / SGM:
   --disparities N
@@ -1216,6 +1666,27 @@ Dense stereo / SGM:
       stable non-edge matches within +/-0.75 pixels using grayscale correlation,
       before left/right checks. Can reduce pixel-locking/ripple on textured planes;
       costs CPU time and does not repair inaccurate calibration or orientation.
+  --pairwise-search full|tsgm
+      Default full searches every pair's whole disparity range. tsgm runs coarse-to-fine
+      SGM: a 2x pyramid, then per-pixel disparity bands derived from the coarser level and
+      sparse tie points; paths stay continuous across the image. Faster, smaller volumes;
+      the runner-up for confidence is limited to the band.
+  --on-pair-failure abort|skip
+      Default abort stops the run when a stereo pair fails. skip reports the pair in
+      05_stereo/skipped_pairs.json and continues (still aborts if every pair fails, or if
+      the pair had already written candidates).
+  --fusion-gpu-failure disable|batch
+      After a GPU fusion batch fails, its candidates are replayed on CPU. Default disable
+      keeps the CPU for the rest of the run; batch retries the GPU on later batches and
+      disables it after three consecutive failures. Fallbacks are listed in backend.json.
+  --subpixel-fit parabola|equiangular
+      Aggregated-cost subpixel interpolation (default: parabola). equiangular fits a
+      symmetric V, which suits Census/L1-like costs and reduces pixel-locking.
+  --tsgm-levels N
+      Coarser pyramid levels for tsgm (default: 3; 0..5). 0 = banded engine with full bands
+      (diagnostic; identical to full search).
+  --tsgm-margin N
+      Base band half-margin in pixels at each finer level (default: 3; 1..32).
   --similarity-window N, --ws_census N
       Dense Census/ZNCC similarity window side in pixels (default: 5; odd, 3..11). Larger windows
       gather more context but can blur depth boundaries and increase memory.
@@ -1259,7 +1730,8 @@ Dense stereo / SGM:
 Point filtering and multi-view fusion:
   --fusion-page-side N
       Depth evidence page side (default: 64; powers of two, 16..512). Smaller pages
-      reduce random audit/normal lookup I/O. Exact interleaved depth/offset values.
+      reduce random audit/normal lookup I/O. Each page holds N*N interleaved int32
+      cells (4*N*N bytes), not an N-by-N pixel tile. Depth/offset values remain exact.
   --fusion-cache-mb N
       CPU depth-page cache MiB (default: 0 = min(512, memory-mb/8), at least 1).
       Additional to GPU evidence and native image buffers; preserves all audits.
@@ -1300,6 +1772,40 @@ Point filtering and multi-view fusion:
   --min-angle N
       Minimum triangulation angle in degrees (default: 1; 0 <= N < 90).
       Larger angles require stronger depth geometry.
+  --confidence-threshold T
+      Final normalized evidence score cutoff, inclusive 0..1 (default: 0). Points
+      below T are removed; equality passes. Invalid/missing scores pass only at 0.
+      Scores rank matching and geometry evidence; they are not probabilities.
+      Pair-only points additionally require matching confidence >= 0.35 and
+      pass --max-depth-uncertainty. The default remains --min-views 3 pending
+      the two-view quality gate; confidence cannot resolve every false match.
+  --dense-method sgm|patchmatch
+      Default sgm. Experimental PatchMatch estimates camera-space depth/planes
+      directly from multiple views. Uses OpenCL GPU; --compute cpu selects its
+      slow reference implementation. No silent substitution with SGM.
+  --two-view-confidence-threshold T
+      Experimental opt-in SGM gate for points supported by exactly two cameras.
+      Require min(left matching confidence, corresponding right confidence) >= T;
+      the existing 0.35 matching floor remains in force on both sides. Finite 0..1;
+      try 0.5. Omit to retain the existing left-only gate and memory use.
+      Three-or-more-view acceptance and the global --confidence-threshold are
+      unchanged. Requires ordinary SGM (--pyramid-levels 1). No extra SGM pass.
+      Diagnostics: 06_fusion/two_view_confidence.json. Scores are not probabilities.
+  --patchmatch-iterations N
+      Minimum sweeps per scale/round (default: 4; 1..12). Large rasters add
+      enough sweeps for long-range propagation to reach one-pixel refinement.
+      Each level has a photometric round and two frozen-map geometric rounds.
+  --patchmatch-edge-sigma N
+      Reference intensity scale for edge-aware weighted ZNCC (default: 32;
+      0..255; 0 uses uniform patch weights). Invalid warps and inadequate
+      texture/support remain unavailable, rather than confident poor matches.
+  --patchmatch-views N
+      Maximum source views per reference camera (default 4; 1..8).
+  --patchmatch-levels N
+      Coarse-to-fine levels (default 3; 1..5).
+  --patchmatch-min-depth N / --patchmatch-max-depth N
+      Positive camera-Z bounds in reconstruction units, specified together.
+      Otherwise infer padded bounds from aligned tie points; fail if unavailable.
   --min-views N
       Minimum distinct supporting cameras (default: 3; minimum: 2), capped
       at registered image count. Two-image input uses stereo checks only; allowing
@@ -1313,6 +1819,27 @@ Point filtering and multi-view fusion:
   --fusion-consensus N
       Fraction of available per-ray depth evidence required for the dominant
       mode (preset default: 0.6 moderate; 0.5 < N <= 1).
+  --fusion-strategy owner|owner-consume|graph-average
+      Image fusion (--fusion-mode image): how cameras' copies of one surface become
+      points. owner (default): the confirming camera with the finest footprint emits
+      its own depth; other copies are dropped (the earlier rule). owner-consume: owner
+      plus, with cameras processed in order, a pixel is also a copy when an earlier
+      agreeing camera emitted a point nearby or an emitted point marked it; fewer
+      stacked sheets but on forest_10 also 42% fewer interior points (strips).
+      graph-average: every unused merged pixel seeds a point that averages, along its
+      ray, all agreeing depths of the overlapping cameras, weighted by their inverse
+      variance (triangulation angle); member pixels are then used and seed nothing.
+      Copies are combined instead of chosen, so offsets average out without thinning.
+      --fusion-dedupe owner|consume is the earlier name (consume = owner-consume).
+  --fusion-depth-outliers on|off
+      Image fusion: remove merged depths beyond 1.5x a camera's 99.5th percentile depth or
+      below 0.5x its 0.5th percentile (default on): isolated points far below the ground
+      or far above the scene. Counted as depth_outlier_rejected. off keeps them.
+  --fusion-agreement-radius auto|N
+      Image fusion: a cross-checked camera agrees when any merged depth within N
+      pixels of the projection lies inside --fusion-relative (centre first); merged
+      maps are sparse at step > 1. auto (default) = 0 for owner (exact previous
+      output), otherwise max(1, --step). Contradictions use the centre pixel. 0..8.
   --max-depth-uncertainty N
       Maximum estimated relative stereo depth sigma (default: 0.1 = 10%;
       0 < N <= 1). Geometric heuristic, not surveyed accuracy.
@@ -1377,6 +1904,105 @@ Georeferencing and output coordinates:
       Disable automatic GPS alignment; conflicts with --gps.
   --gps-threshold N
       GPS camera-center RANSAC inlier tolerance in metres (default: 10; positive).
+  --camera-screening off|report|exclude
+      After alignment, flag cameras whose sparse reprojection RMS or GPS residual is far
+      above the block's (>1.6x median or >4 robust deviations) or that were taken in
+      turns (heading change >45 degrees). report (default): 04_geometry/camera_screening.json
+      and a PDF quality flag. exclude: also leave flagged cameras out of dense matching.
+  --gps-bundle off|prior
+      prior (default): after the GPS similarity fit, run a final bundle adjustment in the
+      projected frame with the inlier GPS camera centres as weighted position priors
+      (rotations free). Limits block bending that the similarity fit cannot correct. The
+      options below extend this adjustment. off: similarity fit only.
+      Report: 04_geometry/georeference/gps_bundle.json.
+  --gps-sigma M
+      GPS camera-centre standard deviation for --gps-bundle prior (default: 2 metres,
+      consumer GNSS; use about 0.05 for RTK/PPK).
+  --gps-height-sigma auto|M
+      Height standard deviation of that prior (default auto: 0.2 m when DJI XMP
+      barometric relative altitudes are present, else --gps-sigma). Tight heights stop
+      radial distortion from doming a nadir block.
+  --gps-intrinsics none|LIST
+      Shared lens parameters refitted in the GPS-weighted adjustment (default: all of
+      f,k1,k2,k3,cx,cy,p1,p2). Skipped for fixed supplied calibrations.
+  --gps-focal-prior auto|none|PIXELS
+      Focal-length prior for that refit, in source pixels. auto (default): DJI XMP
+      CalibratedFocalLength, else the EXIF 35 mm equivalent. Nadir blocks barely separate
+      focal length from flying height, so this prior sets the ground height scale.
+  --gps-focal-sigma S
+      Relative standard deviation of the focal prior (default: 0.03 = 3%).
+  --gps-time-offset estimate|off|SECONDS
+      GPS time offset dt in gps = C + V dt + R^T L (default: estimate). Along-track GPS
+      errors that change sign with flight direction. Needs camera velocities: DJI XMP
+      flight speeds, or camera centres and capture times.
+  --gps-lever-arm estimate|off|X,Y,Z
+      GPS antenna offset L from the camera centre in camera axes (x right, y down, z
+      viewing), metres (default: estimate, with a 0.5 m prior).
+  --rolling-shutter estimate|off|SECONDS
+      Rolling-shutter readout time fitted in the GPS-weighted adjustment (default:
+      estimate; signed, positive when rows are read top to bottom). Translation only;
+      needs camera velocities. Dense matching uses the mid-exposure poses.
+  --gps-adjustment-rounds N
+      Alternations of the GPS antenna model and the bundle (default: 3; 1..20).
+  --classify-ground
+      Classify ground points in the final cloud (off by default; needs georeferenced
+      output). Progressive morphological filter on robust low points, bounded by camera
+      rays (terrain cannot stand above a ray that reached its point); tolerances tuned
+      from the cloud, no reference terrain needed. Writes LAS classes 2 (ground) and 7
+      (low noise) into dense.las, plus 07_results/dtm.tif, chm.tif, ground_support.tif
+      (1 observed, 2 interpolated, 3 blocks camera rays), ground_uncertainty.tif
+      (split-half) and ground.json.
+  --ground-pair-correction
+      With ground classification (implies --classify-ground): each stereo pair's ground is
+      compared with the consensus ground of all pairs and a robust offset (plus tilt for
+      pairs spanning 10 m or more) is fitted, like LiDAR strip adjustment. Offsets are
+      always measured and reported in ground.json (pair_offsets); this option also
+      subtracts them from all points of each pair (ground and canopy) in dense.las and
+      dense.ply, then classifies again. point-confidence.bin keeps the original heights.
+  --ground-aware-fusion
+      Merge the ground copies of all stereo pairs into one sheet (implies
+      --classify-ground). Each pair's own ground level per 1 m cell is shifted onto the
+      consensus, then copies merge to one point per point spacing at the view-weighted
+      mean height, and the merged ground is fused into one smooth sheet (robust local
+      plane over all pairs within --ground-fusion-radius). Shrubs and canopy are not
+      moved. Rewrites dense.las, dense.ply and point-confidence.bin; results in
+      ground.json (ground_aware_fusion).
+  --ground-fusion-radius auto|M
+      Sheet fusion radius (default auto: twice the terrain cell, e.g. 0.5 m). Ground
+      relief smaller than this is smoothed away.
+  --ground-cell auto|M
+      Terrain grid cell (default auto: 3x the point spacing, 0.25..2 m).
+  --ground-max-slope DEG
+      Steepest terrain kept as ground (default: 35 degrees).
+  --ground-max-object M
+      Largest non-ground object, e.g. a tree crown (default: 30 m); sets the
+      largest filter window.
+  --ground-gap-depth auto|M
+      Ground patches that are isolated or stand above the terrain of the large, smooth
+      ground areas must lie at least this far below the surrounding canopy to count as
+      ground seen through a gap; otherwise they are crown depressions and the terrain
+      is interpolated there (default auto: the depth that best separates gap-seen
+      ground from crown depressions in this cloud, 3..8 m).
+
+Ground control points (the gcp step):
+  --gcp FILE
+      Ground control point CSV: gcp_id,x,y,z with optional sx,sy,sz (sigmas, metres)
+      and type (control or check). Header optional; separator , ; or tab. Coordinates
+      are in --crs (or the GPS CRS). Check points are not used in the adjustment and
+      give an independent accuracy estimate.
+  --gcp-markers FILE
+      Start from these image markers (markers.json from another run) instead of
+      predicted ones.
+  --gcp-sigma M
+      Horizontal GCP sigma when the CSV has none (default: 0.02 m).
+  --gcp-height-sigma M
+      Vertical GCP sigma when the CSV has none (default: 0.03 m).
+  --gcp-port N
+      Local port of the gcp-edit editor (default: 8765).
+  The gcp step needs 3 control points with 2+ pinned images each (1 if the block
+  is already GPS-georeferenced). It moves the block onto the GCP datum, adjusts it
+  with the GCPs as weighted points (GPS fixes then get a datum offset) and writes
+  04_geometry/gcp/gcp_report.json and gcp_residuals.csv.
   --scale N
       Multiply final LAS/PLY coordinates by N (default: 1; positive). Camera CSV,
       sparse CSV and --max-depth remain in pre-multiplier reconstruction units.
@@ -1397,10 +2023,11 @@ Chessboard calibration (separate mode):
 
 Additional workflow controls:
   --storage minimal|standard|debug
-      Default standard retains orientations, keypoints/accepted matches, final
-      disparities, clouds and summaries. minimal omits image/feature/disparity
-      exports. debug retains the full diagnostic audit. No effect on point quality.
-      Working depth files are removed after successful fusion except in debug mode.
+      Default standard. Optional image/feature/disparity exports require --diagnostics;
+      minimal omits them, standard keeps selected exports, debug keeps the full audit.
+      Without diagnostics, all profiles keep normal deliverables, compact confidence
+      and summaries. Working depth files are retained after success only with both
+      --diagnostics and debug storage. No effect on reconstruction/filtering.
   --cache, --no-cache
       Stage cache writing is disabled by default. --cache enables it; --resume
       and --rerun-from imply it. Superseded generations of the same key are pruned.
@@ -1428,11 +2055,14 @@ Additional workflow controls:
       bound directions*(512 + effective P2) <= 65535; otherwise signed 32-bit.
       16 requires that bound; 32 forces reference storage. Arithmetic, raw costs
       (including invalid cost 512) and continuous path state are unchanged.
-  --gpu-sgm auto|resident|streamed|esgm
-      Default auto tries resident GPU SGM, then exact RAM-backed streaming.
+  --gpu-sgm auto|resident|hybrid|streamed|esgm
+      Default auto tries resident GPU SGM, then a GPU-resident aggregate with
+      streamed cost strips, then exact RAM-backed streaming.
       Beyond RAM, compact Census proposals plus mandatory exact verification
       are used when supported; other configurations use bounded recomputation.
-      resident requires complete GPU volumes. streamed preserves ordinary SGM
+      resident requires complete GPU volumes. hybrid requires the full aggregate
+      on GPU, but only one cost strip; no aggregate round trips through RAM.
+      streamed preserves ordinary SGM
       with continuous paths. esgm explicitly selects compact grayscale Census
       with safe 16-bit aggregates; unresolved matches are verified exactly,
       rather than discarded. Costs, signed ranges and filters are preserved.
@@ -1450,9 +2080,14 @@ Additional workflow controls:
       Planner may reduce this to fit memory. More proposals can reduce exact
       verification work but use more VRAM/compute. No confidence rule is relaxed.
   --image-reader auto|windowed|opencv
+  --windowed-mode off|auto|on
+                          Bounded disk-backed stereo rasters and continuous SGM paths (default off).
       Source decoding (default: auto). Sources above 64 MiB of RGB pixels and
       BigTIFF use source windows; other small sources retain the OpenCV reader.
-      windowed always uses bounded source regions and global area resampling.
+      windowed always uses global area resampling over source windows. TIFF windows
+      are true region reads; JPEG/PNG (which cannot skip earlier rows) are decoded
+      once when 4 bytes/pixel fit the image budget divided by --cores, otherwise
+      per window. Tiles use up to --cores readers; pixels are identical either way.
       Decoding produces 8-bit sRGB via the image color model, including supported
       16-bit grayscale/RGB TIFFs and BigTIFF. This does not implement native
       16-bit matching. Classic TIFF windows use the JDK codec; BigTIFF maps only
@@ -1486,6 +2121,63 @@ Additional workflow controls:
   --no-fusion-pipeline
       Disable default one-batch prefetch/validation overlapping ordered cloud output.
       Useful for profiling; output order and decisions are preserved.
+  --diagnostics
+      Export detailed confidence CSV, feature/match dumps and intermediate images.
+      Off by default. Compact lossless point metadata, reports, numerical checks,
+      calibration and cloud attributes are retained independently of this flag.
+      Enables debug detail unless --storage explicitly bounds it. Without this flag,
+      storage debug does not enable expensive optional exports.
+  --dense-pair-selection all|coverage
+      Default all preserves all verified pairs. Experimental coverage ranks pairs
+      by sparse coverage and predicted range cost; unknown coverage keeps all pairs.
+  --dense-pair-neighbors N
+      Coverage-mode minimum degree target per camera (default 3; 1..16).
+      Sparse coverage cannot guarantee dense branch completeness; compare quality.
+  --calibration-pipeline bootstrap|joint
+      Default bootstrap retains guarded focal/radial initialization. Experimental
+      joint uses a consistent EXIF focal as initialization and fits intrinsics in
+      the main alignment track graph. Missing EXIF falls back to the bootstrap.
+  --fusion-emission pair|camera
+      Default pair keeps existing sampling. Experimental camera groups accepted
+      observations by owner-camera pixel and separate depth layers, retaining the
+      strongest unchanged point per layer. Requires --surface-consolidation none;
+      does not remove pair evidence or invent additional supporting cameras.
+  --fusion-evidence auto|pair|camera
+      Exact evidence layout, independent of output sampling. Auto packs per-camera
+      sparse pair layers for blocks of 9+ cameras when this saves at least 20% and
+      fits safe host/commit allowance. Pair uses the reference paged maps. Camera
+      explicitly requires packing (maximum 32 incident pairs per camera).
+  --fusion-gpu-evidence auto|resident|windowed
+                          Auto uses bounded regional GPU evidence when full evidence cannot fit.
+  --stereo-pairs-in-flight N|auto
+      Compute N stereo pairs concurrently (default 1 = serial; auto = up to 4, one per 4
+      cores). Each pair gets its share of --cores and GPU memory and its own OpenCL
+      session; results are published strictly in pair order, so the output equals the
+      serial path. Windowed stereo, --diagnostics and PatchMatch stay serial.
+  --stereo-pipeline on|off
+      Bounded one-pair-ahead rectification/descriptor preparation (default off).
+      Keeps OpenCL and evidence publication on the coordinator. Falls back to
+      serial preparation for windowed stereo, diagnostics or insufficient RAM.
+  --fusion-camera-culling on|off
+      Conservative per-pair camera bounds and compact GPU scratch (default off).
+      Queries outside recorded bounds use exact CPU replay; no fixed camera cap.
+  --fusion-association pair|camera
+      Experimental incremental association ownership (default pair). camera uses
+      a shared visible reference camera and <=0.75 pixel anchored layer agreement;
+      does not invent camera support. Requires --fusion-mode incremental.
+  --fusion-mode reference|incremental|image
+                          Experimental provisional camera/pixel hypotheses; reference is default.
+                          image fuses per camera in image space: per-pixel consensus over the
+                          camera's pairs, 2D speckle filter, reciprocal cross-checks against the
+                          other cameras' merged maps, one owner camera per surface (see P2).
+  --fusion-outliers reference|robust
+                          Robust requires independent contradictory cameras for 3+ view points.
+  --fusion-window-mb N     Regional evidence cap; 0 chooses at most half the GPU budget.
+  --export-confidence RUN_DIRECTORY
+      Export point-confidence.bin to point-confidence.csv.gz without reconstructing.
+  --compatibility-copies
+      Also copy large final clouds to the project root. Off by default; latest-files.csv
+      identifies run outputs without duplicating cloud bytes.
   --output-compression N
       Gzip level for point-confidence output (default: 6; 1..9). Lower values
       trade larger output for less CPU compression work; point quality is unaffected.
@@ -1503,12 +2195,14 @@ Additional workflow controls:
       Supplied poses: fixed (default) preserves them; prior refines poses with position
       and rotation uncertainties; initial refines without measurement penalties.
   --refine-intrinsics LIST
-      Comma-separated f,k1,k2 subset (default: f,k1,k2). Other intrinsic parameters
-      remain fixed. f adjusts focal scale while preserving supplied fx/fy ratio.
+      Comma-separated subset of f,k1,k2,k3,cx,cy,p1,p2 (default: all eight).
+      Full-block alignment refines these in guarded stages; the bootstrap fits f,k1,k2.
+      f preserves supplied fx/fy ratio. Principal point priors use
+      2% of source width/height; --radial-sigma also controls p1/p2 priors.
   --focal-sigma N
       Relative focal prior standard deviation (default: 0.05, approximately 5%).
   --radial-sigma N
-      k1/k2 prior standard deviation (default: 0.05; normalized distortion units).
+      Radial/tangential prior standard deviation (default: 0.05; normalized units).
   --position-sigma N
       Pose-center prior standard deviation in supplied pose units (default: 10).
   --rotation-sigma N
@@ -1524,6 +2218,11 @@ Additional workflow controls:
   --descriptor-matcher auto|bruteforce|flann
       Default auto uses brute force. flann uses a KD-tree for floating descriptors;
       binary descriptors use exact Hamming brute force for compatibility.
+  --pair-matching parallel|serial
+      Default parallel matches image pairs on --cores workers. Each pair seeds the
+      OpenCV RNG from its image IDs, so FLANN/RANSAC results do not depend on thread
+      count or order, and stage 03 reuses identical calibration matches. serial keeps
+      the earlier single RNG stream across pairs (reproduces pre-revision results).
   --sift-contrast N
       SIFT contrast threshold (default: 0.04; positive). Lower retains weaker features.
   --sift-edge-threshold N
@@ -1606,12 +2305,20 @@ Additional workflow controls:
       storage, independent of --tiled, to reduce accumulated depth-map memory.
 
 Processing report:
-  --report html|none
-      Default html writes a self-contained 07_results/processing-report.html and
-      report JSON with all parameter values, supplied arguments, timings/resources.
+  --report pdf|html|none
+      Default pdf generates 07_results/processing-report.pdf directly in Java,
+      with embedded fonts, orthomosaic where source imagery/surface permit,
+      cameras, geometric overlap, settings and measured resource diagnostics.
+      HTML and JSON companions remain available. html omits PDF; none disables
+      report generation. Missing metrics/data are explicitly unavailable.
   --export-report RUN_DIRECTORY
       Regenerate a report from a completed run without reconstruction. Missing
       historical parameters/resources are labeled unavailable, never invented.
+  --report-detail summary|full
+      PDF layout. summary (default): the survey report: summary and quality flags,
+      survey data, camera calibration, camera locations, ground control points, elevation
+      models, processing parameters. full: the same followed by the detailed diagnostics
+      (solver profiles, resources, OpenCL, all settings). HTML/JSON keep every detail.
   --report-output DIRECTORY
       Standalone report destination (default: RUN_DIRECTORY/07_results/report).
   --report-dsm-resolution N
@@ -1695,12 +2402,13 @@ Read-only surface diagnosis:
       Local grid cell edge and plane-fit tolerance in cloud units (nonnegative).
       Default 0 chooses scene span/24 and cell-size*0.01, respectively.
   --analysis-confidence
-      Scan point-confidence.csv.gz to attribute sampled residuals to source pairs,
-      supporting views and uncertainty. Optional: a large confidence file takes time.
+      Scan compact point-confidence.bin (or a legacy CSV) to attribute sampled
+      residuals to source pairs, supporting views and uncertainty. Large scans take time.
 
 Unregistered images are skipped and reported at completion. At least two usable
 cameras and a productive stereo pair are required. Each final point has a row in
-07_results/point-confidence.csv.gz, in cloud order; confidence is not surveyed accuracy.
+07_results/point-confidence.bin, in cloud order; confidence is not surveyed accuracy.
+Use --diagnostics or --export-confidence for the compatible CSV export.
 
 Examples (from the repository directory):
   Windows reconstruction, automatic calibration and GPS when usable:
@@ -1713,7 +2421,8 @@ Examples (from the repository directory):
     bash sgm_java/photogrammetry.sh -i /data/images -o /data/project --calibration /data/camera.txt --quality high
 
 Outputs: per-run LAS/PLY clouds in 07_results/, interior/exterior orientations,
-keypoints/matches, bundle history, disparity rasters, fusion decisions and logs.
+compact confidence/provenance, reports, quality summaries and logs. Detailed
+keypoint/match tables, disparity rasters and decision traces require --diagnostics.
 Memory plan: runs/<run-id>/00_inputs/resolution_plan.json. Consult README.md and
 PROJECT_FORMAT.md for file conventions and calibration/pose formats.
 """

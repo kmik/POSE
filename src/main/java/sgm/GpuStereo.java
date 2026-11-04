@@ -35,24 +35,41 @@ final class GpuStereo {
     String aggregation = o.gpuSgm.equals("esgm") ? "recompute" : o.gpuAggregate;
     long n = (long) w * h, bank = bankBytes(device, o), budget = GpuSgm.budget(device, o);
     int words = (o.census * o.census - 1 + 63) / 64;
-    long input = n * (16L * words + 4), host = n * (96L + 32 * words);
+    long input = n * (16L * words + 4),
+        host = n * (116L + 32 * words) + PointConfidence.extraHostBytes(o, n);
     long hostBudget =
         Math.min(o.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .65))
             - o.gpuHostReserve;
     if (host > hostBudget) return null;
     if (D < 3
         || D > 4096
-        || (2L * D + group) * 4 > device.localMemory()
+        || (2L * D + group + 2) * 4 > device.localMemory()
         || bank < 8
         || n * words * 8 > device.allocation()) return null;
     long fullCells = n * D, resident = input + fullCells * (2 + sumBytes) + n * 24 + 64;
     if (!o.gpuSgm.equals("streamed")
+        && !o.gpuSgm.equals("hybrid")
         && !o.gpuSgm.equals("esgm")
         && resident <= budget
         && fullCells * sumBytes <= bank * 8
         && n * 24 <= device.allocation())
       return new Plan(false, h, bank, resident, host, "resident", h, 0);
     if (o.gpuSgm.equals("resident") || (long) w * D * 4 > device.allocation()) return null;
+    if ((o.gpuSgm.equals("auto") && o.gpuAggregate.equals("auto") || o.gpuSgm.equals("hybrid"))
+        && fullCells * sumBytes <= bank * 8) {
+      for (int rows = Math.min(h, o.gpuStripRows); rows >= 1; rows /= 2) {
+        long cells = (long) w * rows * D;
+        long bytes =
+            input + fullCells * sumBytes + cells * 2 + (long) w * rows * 24 + 8L * w * D + 256;
+        long staging = host + (long) w * rows * 24;
+        if (bytes <= budget
+            && cells * 2 <= bank * 8
+            && (long) w * rows * 24 <= device.allocation()
+            && staging <= hostBudget)
+          return new Plan(true, rows, bank, bytes, staging, "gpu", h, fullCells * sumBytes);
+      }
+    }
+    if (o.gpuSgm.equals("hybrid")) return null;
     for (int rows = Math.min(h, o.gpuStripRows); rows >= 1; rows /= 2) {
       long cells = (long) w * rows * D,
           bytes = input + cells * (2 + sumBytes) + (long) w * rows * 24 + 8L * w * D + 64;
@@ -121,7 +138,9 @@ final class GpuStereo {
           "storage",
           compact != null
               ? "compact_with_sparse_exact_verification"
-              : p.streamed ? "streamed_" + p.aggregateStorage : "resident_banked",
+              : p.aggregateStorage.equals("gpu")
+                  ? "hybrid_gpu_aggregate"
+                  : p.streamed ? "streamed_" + p.aggregateStorage : "resident_banked",
           "rows",
           compact != null ? compact.rows() : p.rows,
           "bank_bytes",
@@ -145,15 +164,19 @@ final class GpuStereo {
           "cost_generation_passes_are_upper_bound",
           compact != null || p.aggregateStorage.equals("recompute"),
           "aggregate_volume_reads",
-          p.streamed ? o.directions - 1 : 0,
+          p.streamed && !p.aggregateStorage.equals("gpu") ? o.directions - 1 : 0,
           "aggregate_volume_writes",
-          p.streamed ? o.directions - 1 : 0,
+          p.streamed && !p.aggregateStorage.equals("gpu") ? o.directions - 1 : 0,
           "aggregate_disk_bytes",
           compact == null && p.aggregateStorage.equals("disk") ? p.aggregateBytes : 0,
           "aggregate_ram_bytes",
           compact != null
               ? verification.aggregateBytes
-              : p.streamed && !p.aggregateStorage.equals("disk") ? p.aggregateBytes : 0,
+              : p.aggregateStorage.equals("ram") || p.aggregateStorage.equals("recompute")
+                  ? p.aggregateBytes
+                  : 0,
+          "aggregate_device_bytes",
+          p.aggregateStorage.equals("gpu") ? p.aggregateBytes : 0,
           "verification_block_rows",
           verification.blockRows,
           "recomputation_blocks",
@@ -240,6 +263,7 @@ final class GpuStereo {
           words = a.length,
           sumBytes = StereoCost.aggregateBytes(o);
       long stripCells = (long) w * rows * D;
+      boolean hybrid = plan.aggregateStorage.equals("gpu");
       MemorySegment first = arena.allocate((long) n * words * 8),
           second = arena.allocate(first.byteSize());
       for (int word = 0; word < words; word++) {
@@ -259,7 +283,7 @@ final class GpuStereo {
           gra = upload(cl, arena.allocateFrom(JAVA_BYTE, grayA)),
           grb = upload(cl, arena.allocateFrom(JAVA_BYTE, grayB));
       MemorySegment[] cost = banks(cl, stripCells * 2, plan.bankBytes),
-          sum = banks(cl, stripCells * sumBytes, plan.bankBytes);
+          sum = banks(cl, (hybrid ? (long) n * D : stripCells) * sumBytes, plan.bankBytes);
       MemorySegment out = cl.buffer((long) w * rows * 24),
           carry0 = cl.buffer(plan.streamed ? 4L * w * D : 8),
           carry1 = cl.buffer(plan.streamed ? 4L * w * D : 8);
@@ -306,10 +330,10 @@ final class GpuStereo {
                   + disk / 1048576
                   + " MiB temporary aggregate storage; insufficient disk space");
       }
-      MemorySegment host = arena.allocate(plan.streamed ? stripCells * sumBytes : 8),
+      MemorySegment host = arena.allocate(plan.streamed && !hybrid ? stripCells * sumBytes : 8),
           summary = arena.allocate((long) w * rows * 24);
       try (GpuAggregate aggregate =
-          plan.streamed
+          plan.streamed && !hybrid
               ? new GpuAggregate(
                   slots == null
                       ? plan.aggregateBytes
@@ -372,9 +396,11 @@ final class GpuStereo {
                     reverse,
                     words,
                     y0,
-                    actual);
+                    actual,
+                    hybrid ? y0 : 0,
+                    !hybrid || direction == 0);
               boolean target = y0 >= blockY && y0 < blockEnd;
-              if (plan.streamed && target && direction > 0) {
+              if (plan.streamed && !hybrid && target && direction > 0) {
                 MemorySegment data = host.asSlice(0, (long) sumBytes * w * actual * D);
                 aggregateTransfer(
                     aggregate, data, y0, w, actual, D, sumBytes, blockY, slots, low, high, false);
@@ -398,9 +424,10 @@ final class GpuStereo {
                   actual,
                   plan.streamed ? 1 : 0,
                   ordinal > 0 ? 1 : 0,
+                  hybrid ? y0 : 0,
                   input,
                   output,
-                  new GpuSgm.Local(4L * (2 * D + cl.group())));
+                  new GpuSgm.Local(4L * (2 * D + cl.group() + 2)));
               long lines = dy == 0 ? actual : dx == 0 ? w : w + actual - 1;
               cl.run(paths, lines * cl.group(), arguments.toArray());
               if (plan.streamed && target && direction == o.directions - 1) {
@@ -418,6 +445,7 @@ final class GpuStereo {
                     o,
                     y0,
                     actual,
+                    hybrid ? y0 : 0,
                     result,
                     stats,
                     reasons,
@@ -425,7 +453,7 @@ final class GpuStereo {
                     slots,
                     low,
                     high);
-              } else if (plan.streamed && target) {
+              } else if (plan.streamed && !hybrid && target) {
                 MemorySegment data = host.asSlice(0, (long) sumBytes * w * actual * D);
                 transferBanks(cl, sum, plan.bankBytes, data, true);
                 aggregateTransfer(
@@ -464,6 +492,7 @@ final class GpuStereo {
               o,
               0,
               h,
+              0,
               result,
               stats,
               reasons,
@@ -472,6 +501,18 @@ final class GpuStereo {
               0,
               Integer.MAX_VALUE);
       }
+      RunTelemetry.gpuProfile(
+          "SGM "
+              + (reverse ? "right" : "left")
+              + " "
+              + w
+              + "x"
+              + h
+              + " D="
+              + D
+              + " "
+              + plan.aggregateStorage,
+          cl.profile());
       return result;
     } catch (IOException e) {
       throw new UncheckedIOException(e);
@@ -526,6 +567,7 @@ final class GpuStereo {
       Options o,
       int y0,
       int actual,
+      int sumY,
       float[] result,
       CensusSgm.Stats stats,
       byte[] reasons,
@@ -535,7 +577,7 @@ final class GpuStereo {
       int high) {
     List<Object> args = new ArrayList<>();
     bankArguments(args, cost, sum, bank, StereoCost.aggregateBytes(o));
-    Collections.addAll(args, out, w, h, D, o.census / 2, y0, actual);
+    Collections.addAll(args, out, w, h, D, o.census / 2, y0, actual, sumY);
     cl.run(kernel, (long) w * actual, args.toArray());
     MemorySegment data = summary.asSlice(0, (long) w * actual * 24);
     cl.transfer(out, 0, data, true);
@@ -593,7 +635,9 @@ final class GpuStereo {
       boolean reverse,
       int words,
       int y0,
-      int rows) {
+      int rows,
+      int sumY,
+      boolean clearSum) {
     List<Object> args = new ArrayList<>();
     Collections.addAll(args, a, b, ma, mb, grayA, grayB);
     bankArguments(args, cost, sum, bank, StereoCost.aggregateBytes(o));
@@ -611,7 +655,9 @@ final class GpuStereo {
         StereoCost.code(o),
         (int) Math.round(o.censusWeight * 1000),
         o.adTruncation,
-        o.gradientTruncation);
+        o.gradientTruncation,
+        sumY,
+        clearSum ? 1 : 0);
     cl.run(kernel, (long) w * rows * D, args.toArray());
   }
 
@@ -674,13 +720,9 @@ final class GpuStereo {
         if (reasons != null) reasons[p] = 3;
         continue;
       }
-      double offset = 0;
-      if (before >= 0 && after >= 0) {
-        double curvature = (double) before + after - 2. * value;
-        if (curvature > 0)
-          offset = Math.max(-.5, Math.min(.5, .5 * (before - (double) after) / curvature));
-      }
+      double offset = before >= 0 && after >= 0 ? StereoCost.subpixel(o, before, value, after) : 0;
       result[p] = (float) (o.minDisparity + best + offset);
+      if (o.stereoSelection != null) o.stereoSelection.put(p, value, second, before, after);
       stats.selected++;
       if (reasons != null) reasons[p] = 0;
     }
@@ -703,8 +745,14 @@ int cr(ulong at,int B,CARGS){int bank=(int)(at/(ulong)B),i=(int)(at%(ulong)B);sw
 void cw(ulong at,int B,int v,CARGS){int bank=(int)(at/(ulong)B),i=(int)(at%(ulong)B);switch(bank){case 0:c0[i]=v;break;case 1:c1[i]=v;break;case 2:c2[i]=v;break;case 3:c3[i]=v;break;case 4:c4[i]=v;break;case 5:c5[i]=v;break;case 6:c6[i]=v;break;default:c7[i]=v;}}
 int sr(ulong at,int B,SARGS){int bank=(int)(at/(ulong)B),i=(int)(at%(ulong)B);switch(bank){case 0:return s0[i];case 1:return s1[i];case 2:return s2[i];case 3:return s3[i];case 4:return s4[i];case 5:return s5[i];case 6:return s6[i];default:return s7[i];}}
 void sw(ulong at,int B,int v,SARGS){int bank=(int)(at/(ulong)B),i=(int)(at%(ulong)B);switch(bank){case 0:s0[i]=v;break;case 1:s1[i]=v;break;case 2:s2[i]=v;break;case 3:s3[i]=v;break;case 4:s4[i]=v;break;case 5:s5[i]=v;break;case 6:s6[i]=v;break;default:s7[i]=v;}}
+// One 64-bit division per pixel: (bank, offset) of a pixel's first label; label k carries over banks.
+typedef struct{int bank;int off;} BK;
+BK bk(ulong at,int B){BK r;r.bank=(int)(at/(ulong)B);r.off=(int)(at%(ulong)B);return r;}
+int crk(BK b,int k,int B,CARGS){int i=b.off+k,bank=b.bank;while(i>=B){i-=B;bank++;}switch(bank){case 0:return c0[i];case 1:return c1[i];case 2:return c2[i];case 3:return c3[i];case 4:return c4[i];case 5:return c5[i];case 6:return c6[i];default:return c7[i];}}
+int srk(BK b,int k,int B,SARGS){int i=b.off+k,bank=b.bank;while(i>=B){i-=B;bank++;}switch(bank){case 0:return s0[i];case 1:return s1[i];case 2:return s2[i];case 3:return s3[i];case 4:return s4[i];case 5:return s5[i];case 6:return s6[i];default:return s7[i];}}
+void swk(BK b,int k,int B,int v,SARGS){int i=b.off+k,bank=b.bank;while(i>=B){i-=B;bank++;}switch(bank){case 0:s0[i]=v;break;case 1:s1[i]=v;break;case 2:s2[i]=v;break;case 3:s3[i]=v;break;case 4:s4[i]=v;break;case 5:s5[i]=v;break;case 6:s6[i]=v;break;default:s7[i]=v;}}
 __kernel void costs(__global const ulong *a,__global const ulong *b,__global const uchar *ta,__global const uchar *tb,
- __global const uchar *ga,__global const uchar *gb,CARGS,SARGS,int CB,int SB,int w,int h,int D,int md,int reverse,int r,int words,int y0,int rows,int mode,int weight,int adcap,int gradcap) {
+ __global const uchar *ga,__global const uchar *gb,CARGS,SARGS,int CB,int SB,int w,int h,int D,int md,int reverse,int r,int words,int y0,int rows,int mode,int weight,int adcap,int gradcap,int sumY,int clearSum) {
   size_t i=get_global_id(0),n=(size_t)w*h;if(i>=(size_t)w*rows*D)return;
   int localp=i/D,p=localp+y0*w,k=i%D,x=p%w,y=p/w,disp=md+k;
   long target=(long)x+(reverse?(long)disp:-(long)disp);int value=512;
@@ -727,45 +775,55 @@ __kernel void costs(__global const ulong *a,__global const ulong *b,__global con
 #endif
     }
   }
-  cw(i,CB,value,CV);sw(i,SB,0,SV);
+  cw(i,CB,value,CV);if(clearSum)sw(i+(ulong)sumY*w*D,SB,0,SV);
 }
 __kernel void paths(CARGS,SARGS,int CB,int SB,__global const uchar *valid,__global const uchar *gray,int w,int h,int D,int dx,int dy,int p1,int p2,int edgeScale,
- int y0,int rows,int streamed,int carry,__global const int *incoming,__global int *outgoing,__local int *state) {
+ int y0,int rows,int streamed,int carry,int sumY,__global const int *incoming,__global int *outgoing,__local int *state) {
   int line=get_group_id(0),tid=get_local_id(0),L=get_local_size(0),x,y;
   if(dy==0){x=dx>0?0:w-1;y=line;}
   else if(dx==0){x=line;y=dy>0?0:rows-1;}
   else if(line<w){x=line;y=dy>0?0:rows-1;}
   else{x=dx>0?0:w-1;y=dy>0?line-w+1:rows-2-(line-w);}
-  __local int *prev=state,*next=state+D,*mins=state+2*D;int step=0;
+  __local int *prev=state,*next=state+D,*mins=state+2*D,*slot=state+2*D+L;int step=0,minimum=0;
+  // Double-buffered atomic minimum: two barriers per step instead of a log2(L) tree.
+  if(tid==0){slot[0]=2147483647;slot[1]=2147483647;}barrier(CLK_LOCAL_MEM_FENCE);
   while(x>=0&&x<w&&y>=0&&y<rows) {
     int globalp=(y+y0)*w+x,px=x-dx,py=y+y0-dy;
     int has=px>=0&&px<w&&py>=0&&py<h&&(step>0||(streamed&&carry&&dy!=0))&&valid[py*w+px];
-    if(step==0&&has)for(int k=tid;k<D;k+=L)prev[k]=incoming[(size_t)px*D+k];
-    barrier(CLK_LOCAL_MEM_FENCE);
-    int minimum=2147483647;if(has)for(int k=tid;k<D;k+=L)minimum=min(minimum,prev[k]);
-    mins[tid]=minimum;barrier(CLK_LOCAL_MEM_FENCE);
-    for(int stride=L/2;stride>0;stride/=2){if(tid<stride)mins[tid]=min(mins[tid],mins[tid+stride]);barrier(CLK_LOCAL_MEM_FENCE);}
-    minimum=mins[0];
+    // x, y and step are uniform per work-group, so these barriers are reached by every item.
+    if(step==0&&has){
+      for(int k=tid;k<D;k+=L)prev[k]=incoming[(size_t)px*D+k];
+      barrier(CLK_LOCAL_MEM_FENCE);
+      int carried=2147483647;for(int k=tid;k<D;k+=L)carried=min(carried,prev[k]);
+      mins[tid]=carried;barrier(CLK_LOCAL_MEM_FENCE);
+      for(int stride=L/2;stride>0;stride/=2){if(tid<stride)mins[tid]=min(mins[tid],mins[tid+stride]);barrier(CLK_LOCAL_MEM_FENCE);}
+      minimum=mins[0];barrier(CLK_LOCAL_MEM_FENCE);
+    }
     int localP2=p2;if(has&&edgeScale>0){int difference=abs((int)gray[globalp]-(int)gray[py*w+px]);localP2=max(p1+1,(int)((long)p2*edgeScale/(edgeScale+difference)));}
-    for(int k=tid;k<D;k+=L){ulong at=((ulong)y*w+x)*D+k;int v=cr(at,CB,CV);
+    BK cbase=bk(((ulong)y*w+x)*D,CB),sbase=bk(((ulong)y*w+x)*D+(ulong)sumY*w*D,SB);int mine=2147483647;
+    for(int k=tid;k<D;k+=L){int v=crk(cbase,k,CB,CV);
       if(has){int t=min(prev[k],minimum+localP2);if(k>0)t=min(t,prev[k-1]+p1);if(k+1<D)t=min(t,prev[k+1]+p1);v+=t-minimum;}
-      next[k]=v;sw(at,SB,sr(at,SB,SV)+v,SV);
+      next[k]=v;mine=min(mine,v);swk(sbase,k,SB,srk(sbase,k,SB,SV)+v,SV);
       if(streamed&&dy!=0&&y==(dy>0?rows-1:0))outgoing[(size_t)x*D+k]=v;
     }
+    // Minimum of this pixel's path costs: the next step's predecessor minimum.
+    atomic_min(&slot[step&1],mine);barrier(CLK_LOCAL_MEM_FENCE);
+    minimum=slot[step&1];if(tid==0)slot[(step+1)&1]=2147483647;
     barrier(CLK_LOCAL_MEM_FENCE);__local int *tmp=prev;prev=next;next=tmp;x+=dx;y+=dy;step++;
   }
 }
-__kernel void winners(CARGS,SARGS,int CB,int SB,__global int *out,int w,int h,int D,int r,int y0,int rows) {
+__kernel void winners(CARGS,SARGS,int CB,int SB,__global int *out,int w,int h,int D,int r,int y0,int rows,int sumY) {
   int p=get_global_id(0);if((size_t)p>=(size_t)w*rows)return;
-  int best=-1,value=2147483647,second=2147483647,before=-1,after=-1,x=p%w,y=p/w+y0;ulong base=(ulong)p*D;
+  int best=-1,value=2147483647,second=2147483647,before=-1,after=-1,x=p%w,y=p/w+y0;ulong base=(ulong)p*D,agg=base+(ulong)sumY*w*D;
+  BK cb=bk(base,CB),sb=bk(agg,SB);
   if(x>=r&&x<w-r&&y>=r&&y<h-r){
-    for(int k=0;k<D;k++)if(cr(base+k,CB,CV)!=512&&sr(base+k,SB,SV)<value){best=k;value=sr(base+k,SB,SV);}
-    if(best>=0){for(int k=0;k<D;k++)if(abs(k-best)>1&&cr(base+k,CB,CV)!=512)second=min(second,sr(base+k,SB,SV));
-      if(best>0&&cr(base+best-1,CB,CV)!=512)before=sr(base+best-1,SB,SV);
-      if(best+1<D&&cr(base+best+1,CB,CV)!=512)after=sr(base+best+1,SB,SV);}
+    for(int k=0;k<D;k++)if(crk(cb,k,CB,CV)!=512){int s=srk(sb,k,SB,SV);if(s<value){best=k;value=s;}}
+    if(best>=0){for(int k=0;k<D;k++)if(abs(k-best)>1&&crk(cb,k,CB,CV)!=512)second=min(second,srk(sb,k,SB,SV));
+      if(best>0&&crk(cb,best-1,CB,CV)!=512)before=srk(sb,best-1,SB,SV);
+      if(best+1<D&&crk(cb,best+1,CB,CV)!=512)after=srk(sb,best+1,SB,SV);}
   }
   size_t at=(size_t)p*6;out[at]=best;out[at+1]=value;out[at+2]=second;out[at+3]=before;out[at+4]=after;
-  out[at+5]=(cr(base,CB,CV)!=512?1:0)|(cr(base+D-1,CB,CV)!=512?2:0);
+  out[at+5]=(crk(cb,0,CB,CV)!=512?1:0)|(crk(cb,D-1,CB,CV)!=512?2:0);
 }
 """;
 }

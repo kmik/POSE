@@ -2,6 +2,7 @@ package sgm;
 
 import java.io.*;
 import java.nio.file.*;
+import java.security.*;
 import java.util.*;
 import org.opencv.core.*;
 
@@ -11,6 +12,8 @@ import org.opencv.core.*;
 final class DescriptorCache {
   private static final LinkedHashMap<ImageFrame, Long> resident =
       new LinkedHashMap<>(16, .75f, true);
+  // Frames in use by concurrent pair matching; eviction skips them.
+  private static final Map<ImageFrame, Integer> pinned = new IdentityHashMap<>();
   private static long used;
 
   private static long limit(ImageFrame f) {
@@ -39,7 +42,11 @@ final class DescriptorCache {
       Files.createDirectories(f.options.output);
       Path file = Files.createTempFile(f.options.output, "feature-descriptors-", ".bin");
       boolean complete = false;
-      try (var out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(file)))) {
+      MessageDigest digest = digest();
+      try (var out =
+          new DataOutputStream(
+              new DigestOutputStream(
+                  new BufferedOutputStream(Files.newOutputStream(file)), digest))) {
         out.writeInt(f.descriptors.rows());
         out.writeInt(f.descriptors.cols());
         out.writeInt(f.descriptors.type());
@@ -69,6 +76,7 @@ final class DescriptorCache {
         if (!complete) Files.deleteIfExists(file);
       }
       f.descriptorFile = file;
+      f.descriptorDigest = HexFormat.of().formatHex(digest.digest());
     }
     evictFor(f, null, f.descriptorBytes);
     load(f);
@@ -90,6 +98,26 @@ final class DescriptorCache {
     evictFor(a, b, missing);
     load(a);
     if (a != b) load(b);
+  }
+
+  /** {@link #pair} for concurrent use: both frames stay resident until {@link #release}. */
+  static synchronized void acquire(ImageFrame a, ImageFrame b) throws IOException {
+    pair(a, b);
+    pinned.merge(a, 1, Integer::sum);
+    if (a != b) pinned.merge(b, 1, Integer::sum);
+  }
+
+  static synchronized void release(ImageFrame a, ImageFrame b) {
+    pinned.computeIfPresent(a, (k, n) -> n > 1 ? n - 1 : null);
+    if (a != b) pinned.computeIfPresent(b, (k, n) -> n > 1 ? n - 1 : null);
+  }
+
+  private static MessageDigest digest() {
+    try {
+      return MessageDigest.getInstance("SHA-256");
+    } catch (NoSuchAlgorithmException e) {
+      throw new IllegalStateException(e);
+    }
   }
 
   private static long bytes(ImageFrame f) {
@@ -132,7 +160,7 @@ final class DescriptorCache {
     while (used + extra > limit && iterator.hasNext()) {
       var entry = iterator.next();
       ImageFrame f = entry.getKey();
-      if (f == a || f == b) continue;
+      if (f == a || f == b || pinned.containsKey(f)) continue;
       if (f.descriptorFile != null) {
         used -= entry.getValue();
         f.descriptors.release();

@@ -38,8 +38,30 @@ final class MemoryLauncher {
   static void main(String[] args) {
     int exit;
     try {
-      long budget = requestedBudget(args);
+      // A continued pipeline step uses the memory budget saved by the first step.
+      long budget = requestedBudget(Main.launchArguments(args));
       long target = budget > 0 ? heapMiB(budget) : 0;
+      var memory = MemorySafety.snapshot();
+      if (target > 0 && memory.availableCommit() > 0) {
+        long safe =
+            Math.max(
+                256,
+                (memory.heapCommitted()
+                        + Math.max(
+                            0,
+                            memory.availableCommit()
+                                - Math.max(1024 * 1048576L, memory.availableCommit() / 8)))
+                    / 1048576L);
+        if (target > safe) {
+          System.out.printf(
+              Locale.ROOT,
+              "Memory: heap target capped from %,d to %,d MiB by available OS commit; effective"
+                  + " processing allowance will be smaller%n",
+              target,
+              safe);
+          target = safe;
+        }
+      }
       if (target > Runtime.getRuntime().maxMemory() / 1048576L) {
         if (Boolean.getBoolean("sgm.heap.reexecuted"))
           throw new IllegalArgumentException("The JVM did not provide the requested heap");

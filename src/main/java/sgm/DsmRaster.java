@@ -149,6 +149,8 @@ final class DsmRaster {
             Double.isFinite(high) ? high : null,
             "occupied_cells",
             occupied,
+            "source_points",
+            cloud.count,
             "nodata_cells",
             (long) w * h - occupied,
             "nodata",

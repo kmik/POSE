@@ -15,7 +15,9 @@ public final class AdversarialSceneTest {
     Core.setNumThreads(1);
     Path root = Paths.get(args[0]);
     Files.createDirectories(root);
-    Metrics clean = run(root.resolve("clean"), false), corrupt = run(root.resolve("corrupt"), true);
+    int minimumViews = args.length > 2 ? Integer.parseInt(args[2]) : 3;
+    Metrics clean = run(root.resolve("clean"), false, minimumViews),
+        corrupt = run(root.resolve("corrupt"), true, minimumViews);
     String report =
         "case,points,outside_true_plane,phantom_depth_points,plane_inliers\n"
             + clean.row("clean")
@@ -32,7 +34,7 @@ public final class AdversarialSceneTest {
     }
   }
 
-  private static Metrics run(Path root, boolean corrupt) throws IOException {
+  private static Metrics run(Path root, boolean corrupt, int minimumViews) throws IOException {
     Path images = root.resolve("images"), output = root.resolve("result");
     Files.createDirectories(images);
     int w = 320, h = 240, tw = 400;
@@ -74,6 +76,8 @@ public final class AdversarialSceneTest {
               "48",
               "--step",
               "2",
+              "--min-views",
+              Integer.toString(minimumViews),
               "--cores",
               "1"
             });

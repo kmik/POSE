@@ -270,9 +270,11 @@ final class StorageGpuRegression {
                   "0",
                   "--no-gps",
                   "--compute",
-                  "cpu"));
-      // Omit --storage for standard to exercise the actual user-facing default.
-      if (!mode.equals("standard")) args.addAll(List.of("--storage", mode));
+                  "cpu",
+                  "--diagnostics",
+                  "--compatibility-copies"));
+      // Exercise all legacy export profiles explicitly; compact defaults have separate controls.
+      args.addAll(List.of("--storage", mode));
       check(Main.run(args.toArray(String[]::new)) == 0, "Storage " + mode + " completes");
       Path run = latest(project);
       byte[] las = Files.readAllBytes(project.resolve("dense.las"));
@@ -305,7 +307,7 @@ final class StorageGpuRegression {
         check(Main.run(args.toArray(String[]::new)) == 0, "Opt-in stage caching succeeds");
         args.addAll(List.of("--rerun-from", "stereo"));
         check(Main.run(args.toArray(String[]::new)) == 0, "Selective cache refresh succeeds");
-        Path cache = project.resolve("cache/v3/standard/stereo");
+        Path cache = project.resolve("cache/v3/standard-diagnostics/stereo");
         try (var keys = Files.list(cache)) {
           for (Path key : keys.filter(Files::isDirectory).toList())
             try (var generations = Files.list(key)) {
