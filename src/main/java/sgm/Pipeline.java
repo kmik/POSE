@@ -593,7 +593,8 @@ final class Pipeline {
     markers.gcps.addAll(points);
     markers.markers.removeIf(k -> markers.gcp(k.gcp) == null || k.image >= frames.size());
     markers.crs = crs == null ? new Crs(options.crs).name : crs.name;
-    GroundControl.predict(markers, frames, crs != null);
+    GroundControl.Occlusion occlusion = crs != null ? GroundControl.Occlusion.of(features.tracks) : null;
+    GroundControl.predict(markers, frames, crs != null, occlusion);
     GroundControl.save(markers, file, frames);
     String waiting = GroundControl.readiness(markers, crs != null);
     if (waiting != null) {
@@ -614,7 +615,7 @@ final class Pipeline {
     GcpAdjustment.Result result =
         GcpAdjustment.run(frames, features.tracks, options, crs, markers, options.output.resolve("04_geometry/gcp"));
     publishCalibration(before, "gcp_adjustment_report", "04_geometry/gcp/gcp_report.json", "shared lens refitted in the GCP adjustment");
-    GroundControl.predict(markers, frames, true);
+    GroundControl.predict(markers, frames, true, GroundControl.Occlusion.of(features.tracks));
     GroundControl.save(markers, file, frames);
     String coordinates =
         result.crs().name + " easting/northing, metres; datum from ground control points. " + result.summary();

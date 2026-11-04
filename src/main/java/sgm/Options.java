@@ -1525,8 +1525,11 @@ Pipeline steps (run one by one, or chained; the state is saved after each step):
       Show which steps of a run are done and the next one.
   photogrammetry gcp-edit -o PROJECT [--run ID] [--gcp-port N]
       Open the ground control point editor in the browser (local only). Click a GCP,
-      then click its exact position in each image; markers are saved as you go to
-      04_geometry/gcp/markers.json. Press Done, then run the gcp step again.
+      then click its exact position in an image; the other images are then refined by
+      patch matching (blue markers: check and accept with A, or accept all). Images
+      whose view of the GCP is blocked by the tie points (canopy, roofs) are listed as
+      probably hidden. Markers are saved as you go to 04_geometry/gcp/markers.json.
+      Press Done, then run the gcp step again.
 
 Inputs and project output:
   -h, --help, -help

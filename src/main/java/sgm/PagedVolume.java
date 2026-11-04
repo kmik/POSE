@@ -150,8 +150,13 @@ final class PagedVolume implements AutoCloseable {
       this.channelLimit = Math.max(1, channelLimit);
     }
 
+    // The most recently used page: touching it again would not change the LRU order.
+    private Page recent;
+
     void touch(Page page) {
+      if (page == recent) return;
       entries.get(page);
+      recent = page;
     }
 
     void add(Page page, PagedVolume owner, long block) throws IOException {
@@ -167,10 +172,12 @@ final class PagedVolume implements AutoCloseable {
         evictions++;
         source.volume.evict(source.block, old);
       }
+      recent = entries.containsKey(page) ? page : null;
     }
 
     void drop(Page page) {
       if (entries.remove(page) != null) used -= page.bytes.capacity();
+      if (page == recent) recent = null;
       page.resident = false;
     }
 

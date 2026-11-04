@@ -129,9 +129,11 @@ it. [Pipeline steps](PIPELINE_STEPS.md) lists which step reads which option.
    .\photogrammetry.bat gcp-edit -o .\projects\forest
    ```
 
-   Pick a GCP, click an image, and click the exact position of the target. The other images
-   follow the points you have pinned. `R` marks an image where the target is not visible.
-   Press **Done** when finished.
+   Pick a GCP, click an image, and click the exact position of the target. The editor then
+   finds the target in the other images by itself (blue markers): check them and press `A` to
+   accept, or accept them all at once. Images where trees or roofs probably hide the target are
+   listed separately, and each pin shows its residual in pixels. `R` marks an image where the
+   target is not visible. Press **Done** when finished.
 
 4. Continue:
 

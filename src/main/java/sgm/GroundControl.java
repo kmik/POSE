@@ -40,7 +40,15 @@ final class GroundControl {
     final String gcp;
     final int image;
     double u = Double.NaN, v = Double.NaN, predictedU = Double.NaN, predictedV = Double.NaN;
+    /**
+     * predicted (from the geometry), refined (moved by patch matching to a pinned image, a
+     * suggestion: not used until pinned), pinned (placed by the user), rejected (not visible).
+     */
     String status = "predicted";
+    /** The ray from the camera to the GCP passes below the sparse surface (probably hidden). */
+    boolean hidden;
+    /** Patch-matching correlation of a refined marker. */
+    double score = Double.NaN;
 
     Marker(String gcp, int image) {
       this.gcp = gcp;
@@ -174,6 +182,8 @@ final class GroundControl {
       marker.v = number(m.get("v"));
       marker.predictedU = number(m.get("predicted_u"));
       marker.predictedV = number(m.get("predicted_v"));
+      marker.hidden = Boolean.TRUE.equals(m.get("hidden"));
+      marker.score = number(m.get("score"));
       out.markers.add(marker);
     }
     return out;
@@ -194,7 +204,9 @@ final class GroundControl {
               "u", finite(k.u),
               "v", finite(k.v),
               "predicted_u", finite(k.predictedU),
-              "predicted_v", finite(k.predictedV)));
+              "predicted_v", finite(k.predictedV),
+              "hidden", k.hidden,
+              "score", finite(k.score)));
     Path temp = file.resolveSibling(file.getFileName() + ".part");
     Json.write(
         temp,
@@ -301,26 +313,55 @@ final class GroundControl {
    * point; predicted-only markers that no longer fall in the image are dropped.
    */
   static void predict(Markers m, List<ImageFrame> frames, boolean georeferenced) {
-    Georeference.Similarity toLocal = null;
-    if (!georeferenced) {
-      List<double[]> world = new ArrayList<>(), local = new ArrayList<>();
-      for (Point3 p : m.gcps) {
-        double[] t = triangulate(m, p.id, frames);
-        if (t != null) {
-          world.add(p.xyz);
-          local.add(t);
-        }
-      }
-      if (world.size() >= 3)
-        try {
-          toLocal = Georeference.fit(world, local);
-        } catch (IllegalArgumentException e) {
-          toLocal = null;
-        }
-    }
+    predict(m, frames, georeferenced, null);
+  }
+
+  /** Similarity from GCP coordinates to a local block, from the GCPs with two pins (or null). */
+  static Georeference.Similarity toLocal(Markers m, List<ImageFrame> frames) {
+    List<double[]> world = new ArrayList<>(), local = new ArrayList<>();
     for (Point3 p : m.gcps) {
-      double[] where = triangulate(m, p.id, frames);
-      if (where == null) where = georeferenced ? p.xyz : toLocal == null ? null : toLocal.apply(p.xyz);
+      double[] t = triangulate(m, p.id, frames);
+      if (t != null) {
+        world.add(p.xyz);
+        local.add(t);
+      }
+    }
+    if (world.size() < 3) return null;
+    try {
+      return Georeference.fit(world, local);
+    } catch (IllegalArgumentException e) {
+      return null;
+    }
+  }
+
+  /**
+   * Best current 3D location of a GCP in the block frame: triangulated from two or more pins;
+   * otherwise its coordinates (georeferenced) or their similarity image (local), moved onto the
+   * ray of a single pin (the closest ray point), or null.
+   */
+  static double[] location(Markers m, String gcp, List<ImageFrame> frames, boolean georeferenced, Georeference.Similarity toLocal) {
+    double[] t = triangulate(m, gcp, frames);
+    if (t != null) return t;
+    Point3 p = m.gcp(gcp);
+    if (p == null) return null;
+    double[] x = georeferenced ? p.xyz : toLocal == null ? null : toLocal.apply(p.xyz);
+    if (x == null) return null;
+    for (Marker k : m.of(gcp))
+      if (k.pinned() && k.image < frames.size() && frames.get(k.image).camera.registered) {
+        ImageFrame f = frames.get(k.image);
+        double[] d = Math3.mv(Math3.transpose(f.camera.rotation), normalized(f, k.u, k.v)), c = f.camera.center();
+        double norm = Math3.norm(d), along = 0;
+        for (int i = 0; i < 3; i++) along += (x[i] - c[i]) * d[i] / norm;
+        if (along > 0) return new double[] {c[0] + along * d[0] / norm, c[1] + along * d[1] / norm, c[2] + along * d[2] / norm};
+      }
+    return x;
+  }
+
+  /** As above; with an occlusion surface, markers whose ray is blocked are flagged hidden. */
+  static void predict(Markers m, List<ImageFrame> frames, boolean georeferenced, Occlusion occlusion) {
+    Georeference.Similarity toLocal = georeferenced ? null : toLocal(m, frames);
+    for (Point3 p : m.gcps) {
+      double[] where = location(m, p.id, frames, georeferenced, toLocal);
       for (ImageFrame f : frames) {
         Marker k = m.marker(p.id, f.id);
         double[] uv = where == null || !f.camera.registered ? null : project(f, where);
@@ -332,14 +373,96 @@ final class GroundControl {
         }
         k.predictedU = visible ? uv[0] : Double.NaN;
         k.predictedV = visible ? uv[1] : Double.NaN;
+        k.hidden = visible && occlusion != null && georeferenced && occlusion.blocked(f.camera.center(), where);
+        if (k.status.equals("refined") && !visible) k.status = "predicted";
         if (k.status.equals("predicted")) {
           k.u = k.predictedU;
           k.v = k.predictedV;
+          k.score = Double.NaN;
         }
       }
     }
     m.markers.removeIf(k -> k.status.equals("predicted") && !Double.isFinite(k.u));
     m.markers.sort(Comparator.comparing((Marker k) -> k.gcp).thenComparingInt(k -> k.image));
+  }
+
+  /**
+   * Visibility of a GCP from a camera against the sparse tie points (the gcp step runs before
+   * dense matching). Per grid cell the second-highest tie point (two points are needed, so one
+   * stray point does not hide anything) is the surface; a ray from the camera to the GCP that
+   * passes clearly below it, away from the GCP itself, is blocked (canopy, roofs). Georeferenced
+   * (z up) blocks only.
+   */
+  static final class Occlusion {
+    final double x0, y0, cell, top;
+    final int w, h;
+    final float[] surface;
+
+    private Occlusion(double x0, double y0, double cell, int w, int h, float[] surface, double top) {
+      this.x0 = x0;
+      this.y0 = y0;
+      this.cell = cell;
+      this.w = w;
+      this.h = h;
+      this.surface = surface;
+      this.top = top;
+    }
+
+    static Occlusion of(List<FeatureTracks.Track> tracks) {
+      List<double[]> points = new ArrayList<>();
+      for (FeatureTracks.Track t : tracks)
+        if (t.point != null && t.prior == null && Double.isFinite(t.point[0] + t.point[1] + t.point[2])) points.add(t.point);
+      if (points.size() < 50) return null;
+      double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+      for (double[] p : points) {
+        minX = Math.min(minX, p[0]);
+        minY = Math.min(minY, p[1]);
+        maxX = Math.max(maxX, p[0]);
+        maxY = Math.max(maxY, p[1]);
+      }
+      double area = Math.max(1, (maxX - minX) * (maxY - minY));
+      // About four tie points per cell on average.
+      double cell = Math.clamp(Math.sqrt(4 * area / points.size()), .5, 5);
+      int w = (int) Math.ceil((maxX - minX) / cell) + 1, h = (int) Math.ceil((maxY - minY) / cell) + 1;
+      if ((long) w * h > 50_000_000L) return null;
+      float[] highest = new float[w * h], second = new float[w * h];
+      Arrays.fill(highest, Float.NEGATIVE_INFINITY);
+      Arrays.fill(second, Float.NEGATIVE_INFINITY);
+      double top = Double.NEGATIVE_INFINITY;
+      for (double[] p : points) {
+        int k = (int) ((p[1] - minY) / cell) * w + (int) ((p[0] - minX) / cell);
+        float z = (float) p[2];
+        if (z > highest[k]) {
+          second[k] = highest[k];
+          highest[k] = z;
+        } else if (z > second[k]) second[k] = z;
+      }
+      for (int k = 0; k < second.length; k++) {
+        if (second[k] == Float.NEGATIVE_INFINITY) second[k] = Float.NaN;
+        else top = Math.max(top, second[k]);
+      }
+      return new Occlusion(minX, minY, cell, w, h, second, top);
+    }
+
+    /** True if the ray camera -> point passes more than max(1 m, 2 cells) below the surface. */
+    boolean blocked(double[] camera, double[] point) {
+      double margin = Math.max(1, 2 * cell), near = 2 * cell + 1;
+      double dx = camera[0] - point[0], dy = camera[1] - point[1], dz = camera[2] - point[2];
+      double horizontal = Math.hypot(dx, dy);
+      if (horizontal < near || !(dz > 0)) return false;
+      int steps = (int) Math.min(4000, Math.ceil(horizontal / (cell / 2)));
+      for (int s = 1; s <= steps; s++) {
+        double t = s / (double) steps, along = t * horizontal;
+        if (along < near) continue;
+        double z = point[2] + t * dz;
+        if (z > top + margin) break;
+        int cx = (int) ((point[0] + t * dx - x0) / cell), cy = (int) ((point[1] + t * dy - y0) / cell);
+        if (cx < 0 || cy < 0 || cx >= w || cy >= h) continue;
+        float surfaceZ = surface[cy * w + cx];
+        if (Float.isFinite(surfaceZ) && surfaceZ > z + margin) return true;
+      }
+      return false;
+    }
   }
 
   /** Ready for the adjustment: enough pins to fix the datum. */

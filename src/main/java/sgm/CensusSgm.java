@@ -282,96 +282,21 @@ public final class CensusSgm {
       RunTelemetry.record("Stereo ZNCC subpixel refinement" + size, clock);
     }
     clock = System.nanoTime();
-    float[] checked = new float[n];
-    Arrays.fill(checked, Float.NaN);
-    int radius = options.census / 2;
-    final float[] lrChecked=checked;
-    long[] lrRejected=new long[height];
-    StereoRows.rows(radius,height-radius,y -> {
-      for (int x = radius; x < width - radius; x++) {
-        int p = y * width + x;
-        if (!Float.isFinite(dl[p])) continue;
-        int xr = Math.round(x - dl[p]);
-        if (xr < radius || xr >= width - radius) {
-          if (reasons != null) reasons[p] = 4;
-          continue;
-        }
-        float other = dr[y * width + xr];
-        if (Float.isFinite(other) && Math.abs(dl[p] - other) <= options.lrThreshold)
-          lrChecked[p] = dl[p];
-        else {
-          lrRejected[y]++;
-          if (reasons != null) reasons[p] = 4;
-        }
-      }
-    });
-    for(long rejected:lrRejected)stats.lrRejected+=rejected;
-    RunTelemetry.record("Stereo left/right check" + size, clock);
-    clock = System.nanoTime();
-
-    if (observer != null) observer.raster("02_left_right_validated", checked, width, height);
-    if (options.median > 1)
-      checked =
-          options.medianMode.equals("classic")
-              ? medianValid(checked, width, height, options.median)
-              : medianEdgePreserving(
-                  checked,
-                  width,
-                  height,
-                  options.median,
-                  options.medianMaxChange,
-                  left,
-                  options.medianEdgeThreshold);
-    if (observer != null) observer.raster("03_median", checked, width, height);
-    RunTelemetry.record("Stereo median" + size, clock);
-    clock = System.nanoTime();
-    float[] correlation = new float[n], lrError = new float[n];
-    if (correlation != null) {
-      Arrays.fill(correlation, Float.NaN);
-      Arrays.fill(lrError, Float.NaN);
-    }
-    // Median changes the matched coordinate, so validation must be repeated afterwards.
     byte[] photoLeft = options.censusMode.equals("color-distance") ? leftBgr : left;
     byte[] photoRight = options.censusMode.equals("color-distance") ? rightBgr : right;
     int channels = options.censusMode.equals("color-distance") ? 3 : 1;
-    final float[] photoChecked=checked;
-    long[] postRejected=new long[height],photoRejected=new long[height];
-    StereoRows.rows(0,height,y -> {
-      for (int x = 0; x < width; x++) {
-        int p = y * width + x;
-        float disparity = photoChecked[p];
-        if (!Float.isFinite(disparity)) continue;
-        int xr = Math.round(x - disparity);
-        if (lrError != null && xr >= 0 && xr < width && Float.isFinite(dr[y * width + xr]))
-          lrError[p] = Math.abs(disparity - dr[y * width + xr]);
-        if (!reciprocal(dr, width, height, x, y, disparity, options.lrThreshold, radius)) {
-          photoChecked[p] = Float.NaN;
-          postRejected[y]++;
-          if (reasons != null) reasons[p] = 5;
-          continue;
-        }
-        double score =
-            zncc(
-                photoLeft,
-                photoRight,
-                width,
-                height,
-                x,
-                y,
-                disparity,
-                options.correlationWindow / 2,
-                channels);
-        if (correlation != null) correlation[p] = (float) score;
-        if (score < options.correlation) {
-          photoChecked[p] = Float.NaN;
-          photoRejected[y]++;
-          if (reasons != null) reasons[p] = 6;
-        }
-      }
-    });
-    for(long rejected:postRejected)stats.postMedianLrRejected+=rejected;
-    for(long rejected:photoRejected)stats.photometricRejected+=rejected;
-    RunTelemetry.record("Stereo post-median reciprocal/ZNCC check" + size, clock);
+    int radius = options.census / 2;
+    // Left/right check, median and reciprocal/ZNCC check: on the GPU when available (bit-identical
+    // to the CPU code below), otherwise on the CPU.
+    Filtered filtered =
+        observer == null ? GpuStereoFilters.filter(options, dl, dr, left, photoLeft, photoRight, channels, width, height, radius) : null;
+    if (filtered == null)
+      filtered = filter(options, dl, dr, left, photoLeft, photoRight, channels, width, height, radius, reasons, observer, size);
+    else RunTelemetry.record("Stereo left/right, median, ZNCC check (GPU)" + size, clock);
+    float[] checked = filtered.checked(), correlation = filtered.correlation(), lrError = filtered.lrError();
+    stats.lrRejected += filtered.lrRejected();
+    stats.postMedianLrRejected += filtered.postRejected();
+    stats.photometricRejected += filtered.photoRejected();
 
     if (observer != null) {
       observer.raster("04_photometric", checked, width, height);
@@ -417,6 +342,101 @@ public final class CensusSgm {
     selection = null;
     reverseSelection = null;
     return result;
+  }
+
+  /** Disparities after the left/right check, median and reciprocal/ZNCC check, with counts. */
+  record Filtered(
+      float[] checked, float[] correlation, float[] lrError, long lrRejected, long postRejected, long photoRejected) {}
+
+  /**
+   * CPU filter chain after SGM: left/right check, median (classic or edge-preserving), then the
+   * reciprocal check and ZNCC at the median-filtered disparity. GpuStereoFilters reproduces it
+   * bit for bit.
+   */
+  static Filtered filter(
+      Options options, float[] dl, float[] dr, byte[] left, byte[] photoLeft, byte[] photoRight, int channels,
+      int width, int height, int radius, byte[] reasons, Observer observer, String size)
+      throws IOException {
+    int n = width * height;
+    long clock = System.nanoTime();
+    float[] checked = new float[n];
+    Arrays.fill(checked, Float.NaN);
+    final float[] lrChecked=checked;
+    long[] lrRejected=new long[height];
+    StereoRows.rows(radius,height-radius,y -> {
+      for (int x = radius; x < width - radius; x++) {
+        int p = y * width + x;
+        if (!Float.isFinite(dl[p])) continue;
+        int xr = Math.round(x - dl[p]);
+        if (xr < radius || xr >= width - radius) {
+          if (reasons != null) reasons[p] = 4;
+          continue;
+        }
+        float other = dr[y * width + xr];
+        if (Float.isFinite(other) && Math.abs(dl[p] - other) <= options.lrThreshold)
+          lrChecked[p] = dl[p];
+        else {
+          lrRejected[y]++;
+          if (reasons != null) reasons[p] = 4;
+        }
+      }
+    });
+    long lrTotal = 0;
+    for(long rejected:lrRejected)lrTotal+=rejected;
+    RunTelemetry.record("Stereo left/right check" + size, clock);
+    clock = System.nanoTime();
+
+    if (observer != null) observer.raster("02_left_right_validated", checked, width, height);
+    if (options.median > 1)
+      checked =
+          options.medianMode.equals("classic")
+              ? medianValid(checked, width, height, options.median)
+              : medianEdgePreserving(
+                  checked,
+                  width,
+                  height,
+                  options.median,
+                  options.medianMaxChange,
+                  left,
+                  options.medianEdgeThreshold);
+    if (observer != null) observer.raster("03_median", checked, width, height);
+    RunTelemetry.record("Stereo median" + size, clock);
+    clock = System.nanoTime();
+    float[] correlation = new float[n], lrError = new float[n];
+    Arrays.fill(correlation, Float.NaN);
+    Arrays.fill(lrError, Float.NaN);
+    // Median changes the matched coordinate, so validation must be repeated afterwards.
+    final float[] photoChecked=checked;
+    long[] postRejected=new long[height],photoRejected=new long[height];
+    StereoRows.rows(0,height,y -> {
+      for (int x = 0; x < width; x++) {
+        int p = y * width + x;
+        float disparity = photoChecked[p];
+        if (!Float.isFinite(disparity)) continue;
+        int xr = Math.round(x - disparity);
+        if (xr >= 0 && xr < width && Float.isFinite(dr[y * width + xr]))
+          lrError[p] = Math.abs(disparity - dr[y * width + xr]);
+        if (!reciprocal(dr, width, height, x, y, disparity, options.lrThreshold, radius)) {
+          photoChecked[p] = Float.NaN;
+          postRejected[y]++;
+          if (reasons != null) reasons[p] = 5;
+          continue;
+        }
+        double score =
+            zncc(photoLeft, photoRight, width, height, x, y, disparity, options.correlationWindow / 2, channels);
+        correlation[p] = (float) score;
+        if (score < options.correlation) {
+          photoChecked[p] = Float.NaN;
+          photoRejected[y]++;
+          if (reasons != null) reasons[p] = 6;
+        }
+      }
+    });
+    long post = 0, photo = 0;
+    for(long rejected:postRejected)post+=rejected;
+    for(long rejected:photoRejected)photo+=rejected;
+    RunTelemetry.record("Stereo post-median reciprocal/ZNCC check" + size, clock);
+    return new Filtered(checked, correlation, lrError, lrTotal, post, photo);
   }
 
   static long memoryEstimate(int width, int height, int disparities, int census) {

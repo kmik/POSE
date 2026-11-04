@@ -82,39 +82,45 @@ final class PointRecords {
       out.writeLong(MAGIC);
     }
 
+    // One buffer per record (the same big-endian bytes as DataOutputStream, without a stream call
+    // per field).
+    private final java.nio.ByteBuffer record = java.nio.ByteBuffer.allocate(206);
+
     void point(long id, SurfaceConsolidator.Sample p, double scale, double score)
         throws IOException {
       long started = System.nanoTime();
-      out.writeByte(1);
-      out.writeLong(id);
-      out.writeLong(p.id);
-      out.writeInt(p.source);
-      out.writeInt(p.pixel);
-      out.writeInt(p.rgb);
-      out.writeInt(p.views);
-      out.writeInt(p.pairs);
-      out.writeInt(p.merged);
-      for (double v : p.point) out.writeDouble(v * scale);
-      out.writeDouble(p.sigma);
-      out.writeDouble(p.shift * scale);
-      for (int k = 0; k < 3; k++) out.writeDouble(p.normal == null ? Double.NaN : p.normal[k]);
-      out.writeDouble(p.surfaceShift * scale);
+      java.nio.ByteBuffer b = record.clear();
+      b.put((byte) 1);
+      b.putLong(id);
+      b.putLong(p.id);
+      b.putInt(p.source);
+      b.putInt(p.pixel);
+      b.putInt(p.rgb);
+      b.putInt(p.views);
+      b.putInt(p.pairs);
+      b.putInt(p.merged);
+      for (double v : p.point) b.putDouble(v * scale);
+      b.putDouble(p.sigma);
+      b.putDouble(p.shift * scale);
+      for (int k = 0; k < 3; k++) b.putDouble(p.normal == null ? Double.NaN : p.normal[k]);
+      b.putDouble(p.surfaceShift * scale);
       var a = p.attributes;
-      out.writeDouble(a.roughness() * scale);
-      out.writeDouble(a.variation());
-      out.writeDouble(a.planarity());
-      out.writeDouble(a.radius() * scale);
-      out.writeInt(a.neighbors());
-      out.writeInt(a.status());
-      out.writeBoolean(a.trimmed());
-      out.writeDouble(score);
-      out.writeDouble(p.matchingConfidence);
-      out.writeDouble(p.costMargin);
-      out.writeDouble(p.costSharpness);
-      out.writeDouble(p.photometric);
-      out.writeDouble(p.lrError);
+      b.putDouble(a.roughness() * scale);
+      b.putDouble(a.variation());
+      b.putDouble(a.planarity());
+      b.putDouble(a.radius() * scale);
+      b.putInt(a.neighbors());
+      b.putInt(a.status());
+      b.put((byte) (a.trimmed() ? 1 : 0));
+      b.putDouble(score);
+      b.putDouble(p.matchingConfidence);
+      b.putDouble(p.costMargin);
+      b.putDouble(p.costSharpness);
+      b.putDouble(p.photometric);
+      b.putDouble(p.lrError);
       byte[] ids = p.supportingCameras == null ? new byte[0] : p.supportingCameras.toByteArray();
-      out.writeInt(ids.length);
+      b.putInt(ids.length);
+      out.write(b.array(), 0, b.position());
       out.write(ids);
       bytes += 206L + ids.length;
       nanos += System.nanoTime() - started;
@@ -157,45 +163,47 @@ final class PointRecords {
       }
     }
 
+    private final byte[] fixed = new byte[205];
+
     Row next() throws IOException {
       if (ended) return null;
-      int marker = in.readUnsignedByte();
+      int marker = in.read();
+      if (marker < 0) throw new java.io.EOFException();
       if (marker == 0) {
         ended = true;
         if (in.read() != -1) throw new IOException("Trailing point metadata");
         return null;
       }
       if (marker != 1) throw new IOException("Corrupt point metadata record");
-      long id = in.readLong();
+      // The fixed part in one read, decoded from a buffer (same big-endian layout).
+      int size = version2 ? 205 : 201;
+      in.readFully(fixed, 0, size);
+      java.nio.ByteBuffer b = java.nio.ByteBuffer.wrap(fixed, 0, size);
+      long id = b.getLong();
       var p = new SurfaceConsolidator.Sample();
-      p.id = in.readLong();
-      p.source = in.readInt();
-      p.pixel = version2 ? in.readInt() : 0;
-      p.rgb = in.readInt();
-      p.views = in.readInt();
-      p.pairs = in.readInt();
-      p.merged = in.readInt();
-      p.point = new double[] {in.readDouble(), in.readDouble(), in.readDouble()};
-      p.sigma = in.readDouble();
-      p.shift = in.readDouble();
-      p.normal = new double[] {in.readDouble(), in.readDouble(), in.readDouble()};
-      p.surfaceShift = in.readDouble();
-      p.attributes =
-          new SurfaceAttributes(
-              in.readDouble(),
-              in.readDouble(),
-              in.readDouble(),
-              in.readDouble(),
-              in.readInt(),
-              in.readInt(),
-              in.readBoolean());
-      double score = in.readDouble();
-      p.matchingConfidence = in.readDouble();
-      p.costMargin = in.readDouble();
-      p.costSharpness = in.readDouble();
-      p.photometric = in.readDouble();
-      p.lrError = in.readDouble();
-      int length = in.readInt();
+      p.id = b.getLong();
+      p.source = b.getInt();
+      p.pixel = version2 ? b.getInt() : 0;
+      p.rgb = b.getInt();
+      p.views = b.getInt();
+      p.pairs = b.getInt();
+      p.merged = b.getInt();
+      p.point = new double[] {b.getDouble(), b.getDouble(), b.getDouble()};
+      p.sigma = b.getDouble();
+      p.shift = b.getDouble();
+      p.normal = new double[] {b.getDouble(), b.getDouble(), b.getDouble()};
+      p.surfaceShift = b.getDouble();
+      double roughness = b.getDouble(), variation = b.getDouble(), planarity = b.getDouble(), radius = b.getDouble();
+      int neighbors = b.getInt(), status = b.getInt();
+      boolean trimmed = b.get() != 0;
+      p.attributes = new SurfaceAttributes(roughness, variation, planarity, radius, neighbors, status, trimmed);
+      double score = b.getDouble();
+      p.matchingConfidence = b.getDouble();
+      p.costMargin = b.getDouble();
+      p.costSharpness = b.getDouble();
+      p.photometric = b.getDouble();
+      p.lrError = b.getDouble();
+      int length = b.getInt();
       if (length < 0 || length > 1 << 20) throw new IOException("Invalid camera bitmap size");
       byte[] ids = new byte[length];
       in.readFully(ids);

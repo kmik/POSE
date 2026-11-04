@@ -139,10 +139,25 @@ photogrammetry gcp dense ground finish -o PROJECT
 - The editor (`gcp-edit`) runs a local web page (127.0.0.1, `--gcp-port`, default 8765) and opens
   the browser. Left: the GCP list with pin counts. Right: an image card per image the GCP should be
   visible in, centred on the predicted position. Click a card to zoom, click the exact position to
-  pin; in the zoom view `R` rejects the image (not visible), `U` unpins, arrows step through the
-  images, `+`/`-` zoom, Esc closes. Each pin is saved immediately and the
-  predictions of the other images are recomputed from the pins (after two pins they follow the
-  triangulated point). Done stops the editor.
+  pin; in the zoom view `A` or Enter accepts a refined marker, `R` rejects the image (not
+  visible), `U` unpins, arrows step through the images, `+`/`-` zoom, Esc closes. Each pin is
+  saved immediately and the predictions of the other images are recomputed from the pins (with
+  one pin they follow its ray, after two the triangulated point). Done stops the editor.
+- **Refinement (patch matching).** After each pin the other images of that GCP are searched in the
+  background: a patch around the pin, warped through the local ground-plane geometry, is matched
+  by normalized cross-correlation within ±40 px of the prediction, with a subpixel peak. Clear
+  matches (correlation ≥ 0.7, no rival peak within 0.05) become *refined* markers (blue). They are
+  suggestions and are not used by the adjustment until pinned: check them and press `A`, or
+  "Accept N refined" pins all with correlation ≥ 0.85. On forest_tiny 23 of 24 images were refined
+  from one pin per GCP; refined markers and pin meet in one point within 0.7 px.
+- **Hidden images.** With a georeferenced block the editor and the `gcp` step check the view of
+  each predicted marker against the sparse tie points (second-highest point per cell, so one stray
+  point does not count): if the ray to the GCP passes more than max(1 m, 2 cells) below that
+  surface away from the GCP, the image is listed under "Probably hidden" (canopy, roofs). Nothing
+  is removed; hidden images can still be pinned.
+- **Residuals.** Each pin shows its residual against the point triangulated from all pins (green
+  under 1 px, yellow under 3 px, red above), and the GCP list shows the pin RMS and maximum. With a
+  single pin in a georeferenced block the card shows its offset from the coordinate prediction.
 - Markers are stored in original, distorted image pixels, so they stay valid when the lens model
   changes. `--gcp-markers FILE` starts a new run (or branch) from another run's markers.json.
 - Running `gcp` again after more pins (or `--branch` from `gcp`) redoes the adjustment.

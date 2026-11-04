@@ -77,9 +77,72 @@ final class GcpRegression {
         markers.markers.add(m);
       }
     }
-    for (ImageFrame f : frames) f.close();
     Path gcps = root.resolve("gcps.csv");
     Files.writeString(gcps, csv);
+
+    // GCP8: one pin per GCP at its true pixel; the other images are refined by patch matching
+    // and must land on the true projections (the predictions start from the shifted coordinates).
+    GroundControl.Markers single = new GroundControl.Markers();
+    single.gcps.addAll(GroundControl.read(gcps, .02, .03));
+    for (int i = 0; i < chosen.size(); i++) {
+      FeatureTracks.Track t = chosen.get(i);
+      ImageFrame f = frames.get(t.observations.get(0).image);
+      GroundControl.Marker m = new GroundControl.Marker("G" + (i + 1), f.id);
+      m.status = "pinned";
+      double[] uv = GroundControl.project(f, t.point);
+      m.u = uv[0];
+      m.v = uv[1];
+      single.markers.add(m);
+    }
+    GroundControl.predict(single, frames, true);
+    GcpEditor.Editor refineEditor = new GcpEditor.Editor(frames, single, root.resolve("refine-markers.json"), true);
+    int refined = 0, candidates = 0;
+    double worst = 0, inconsistent = 0;
+    for (int i = 0; i < chosen.size(); i++) {
+      String id = "G" + (i + 1);
+      int source = chosen.get(i).observations.get(0).image;
+      refineEditor.refine(id, source);
+      List<GroundControl.Marker> found = new ArrayList<>();
+      for (GroundControl.Marker k : single.of(id)) {
+        if (k.pinned()) continue;
+        candidates++;
+        if (!k.status.equals("refined")) continue;
+        refined++;
+        found.add(k);
+        // The tie point itself is only good to about 2 source pixels (aligned at 1/8 resolution).
+        double[] truth = GroundControl.project(frames.get(k.image), chosen.get(i).point);
+        worst = Math.max(worst, Math.hypot(k.u - truth[0], k.v - truth[1]));
+      }
+      // Consistency: the refined markers and the pin meet in one 3D point.
+      if (found.size() >= 1) {
+        for (GroundControl.Marker k : found) k.status = "pinned";
+        double[] point = GroundControl.triangulate(single, id, frames);
+        for (GroundControl.Marker k : found) inconsistent = Math.max(inconsistent, GroundControl.residual(frames.get(k.image), k, point));
+        for (GroundControl.Marker k : found) k.status = "refined";
+      }
+    }
+    refineEditor.close();
+    check(candidates > 0 && refined >= candidates / 2, "most markers refined by patch matching: " + refined + " of " + candidates);
+    check(worst < 5, "refined markers near the tie-point projections (worst " + worst + " px)");
+    check(inconsistent < 1.5, "refined markers consistent with the pin (worst residual " + inconsistent + " px)");
+    System.out.printf(Locale.ROOT, "GCP refinement: %d of %d refined, worst %.2f px from the tie point, worst residual %.2f px%n", refined, candidates, worst, inconsistent);
+
+    // GCP10: a canopy block of tie points hides a point under it from an oblique camera.
+    List<FeatureTracks.Track> surface = new ArrayList<>();
+    for (int x = 0; x < 40; x++)
+      for (int y = 0; y < 40; y++)
+        for (int k = 0; k < 4; k++) {
+          FeatureTracks.Track t = new FeatureTracks.Track();
+          boolean canopy = x >= 15 && x < 25;
+          t.point = new double[] {x + k * .2, y + k * .2, canopy ? 15 : 0};
+          surface.add(t);
+        }
+    GroundControl.Occlusion occlusion = GroundControl.Occlusion.of(surface);
+    check(occlusion != null, "occlusion surface built");
+    check(occlusion.blocked(new double[] {35, 20, 40}, new double[] {12, 20, 0}), "ray through the canopy block is blocked");
+    check(!occlusion.blocked(new double[] {5, 20, 40}, new double[] {8, 20, 0}), "ray beside the block is not blocked");
+    check(!occlusion.blocked(new double[] {20, 20, 60}, new double[] {20.4, 20, 15}), "a point on the canopy is visible from above");
+    for (ImageFrame f : frames) f.close();
 
     // 0. Without --gcp (and without ground options) the optional steps need not be named.
     Path plain = root.resolve("n");
@@ -129,6 +192,21 @@ final class GcpRegression {
     check(posted.statusCode() == 200, "editor accepts a pin");
     var crop = http.send(HttpRequest.newBuilder(URI.create(String.format(Locale.ROOT, "http://127.0.0.1:%d/api/image?id=%d&cx=%.1f&cy=%.1f&size=200&out=200", port, first.image, first.u, first.v))).build(), HttpResponse.BodyHandlers.ofByteArray());
     check(crop.statusCode() == 200 && crop.body().length > 1000, "editor serves image crops");
+    // The pin starts a background refinement; the state reports it until done; then accept all.
+    String polled = null;
+    for (int attempt = 0; attempt < 300; attempt++) {
+      polled = http.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/state")).build(), HttpResponse.BodyHandlers.ofString()).body();
+      if (polled.contains("\"refining\":false")) break;
+      Thread.sleep(200);
+    }
+    check(polled != null && polled.contains("\"refining\":false"), "refinement after a pin finishes");
+    var accepted =
+        http.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/accept"))
+                .POST(HttpRequest.BodyPublishers.ofString("{\"gcp\":\"" + first.gcp + "\"}"))
+                .build(),
+            HttpResponse.BodyHandlers.ofString());
+    check(accepted.statusCode() == 200 && accepted.body().contains("\"markers\""), "accept-all endpoint");
     http.send(HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/done")).build(), HttpResponse.BodyHandlers.ofString());
     editor.join(20000);
     check(!editor.isAlive(), "editor stops on done");

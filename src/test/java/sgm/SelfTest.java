@@ -49,6 +49,7 @@ public final class SelfTest {
     checks += GroundClassificationRegression.run(root.resolve("ground"));
     checks += GroundStuffRegression.run(root.resolve("ground-stuff"));
     checks += GcpRegression.run(root.resolve("gcp"));
+    checks += GpuStereoFiltersRegression.run();
     checks += ReciprocalMatchingRegression.run();
     checks += SelfCalibrationRegression.run(root);
     checks += LayeringRegression.run();
