@@ -1034,6 +1034,7 @@ final class DenseReconstruction {
     candidatesWritten = true;
     long triangulationStarted = System.nanoTime(), triangulationProgress = triangulationStarted;
     java.nio.ByteBuffer record = java.nio.ByteBuffer.allocate(64);
+    boolean bidirectional = PointConfidence.bidirectional(options);
     for (TriangulatedRow[] rows : c.rows()) {
       for (TriangulatedRow row : rows) {
         int y = row.y();
@@ -1064,7 +1065,7 @@ final class DenseReconstruction {
           record.putFloat(result.costSharpness == null ? Float.NaN : result.costSharpness[i]);
           record.putFloat(result.correlation == null ? Float.NaN : result.correlation[i]);
           record.putFloat(result.leftRightError == null ? Float.NaN : result.leftRightError[i]);
-          if (PointConfidence.bidirectional(options))
+          if (bidirectional)
             record.putFloat(result.rightConfidence == null ? Float.NaN : result.rightConfidence[i]);
           out.write(record.array(), 0, record.position());
           if (project != null)

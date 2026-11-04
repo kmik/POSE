@@ -128,53 +128,93 @@ final class ReportMaps {
     try (WorkProgress work =
         WorkProgress.start("Report orthomosaic and geometric coverage", views.size(), "images")) {
       int completed = 0;
-      for (View view : views) {
-        work.detail(view.name);
-        Source source = sources.get(view.name);
-        BufferedImage photo = null;
-        if (source != null && Files.isRegularFile(source.file)) {
+      int workers = Math.max(1, options.cores);
+      // Source check and thumbnail decoding run a few images ahead on background threads; the
+      // images are still painted one by one in their order, so the result does not change.
+      java.util.concurrent.ExecutorService loader =
+          java.util.concurrent.Executors.newFixedThreadPool(
+              Math.min(4, workers),
+              r -> {
+                Thread t = new Thread(r, "report-thumbnail");
+                t.setDaemon(true);
+                return t;
+              });
+      List<java.util.concurrent.Future<BufferedImage>> photos = new ArrayList<>();
+      int ahead = Math.min(4, workers);
+      try {
+        for (int v = 0; v < views.size(); v++) {
+          while (photos.size() < views.size() && photos.size() <= v + ahead) {
+            View next = views.get(photos.size());
+            Source source = sources.get(next.name);
+            photos.add(
+                loader.submit(
+                    () -> {
+                      if (source == null || !Files.isRegularFile(source.file)) return null;
+                      try {
+                        if (!source.sha256.isBlank()
+                            && ReuseCache.hash(source.file).equalsIgnoreCase(source.sha256))
+                          return thumbnail(source.file, 1600);
+                      } catch (IOException failure) {
+                        System.err.println(
+                            "Report source unavailable: " + next.name + "; " + failure.getMessage());
+                      }
+                      return null;
+                    }));
+          }
+          View view = views.get(v);
+          work.detail(view.name);
+          BufferedImage photo;
           try {
-            if (!source.sha256.isBlank()
-                && ReuseCache.hash(source.file).equalsIgnoreCase(source.sha256))
-              photo = thumbnail(source.file, 1600);
-          } catch (IOException failure) {
-            System.err.println(
-                "Report source unavailable: " + view.name + "; " + failure.getMessage());
+            photo = photos.get(v).get();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Report interrupted", e);
+          } catch (java.util.concurrent.ExecutionException e) {
+            throw new IOException(e.getCause());
           }
+          photos.set(v, null);
+          if (photo == null) unavailable++;
+          else available++;
+          Camera camera = view.camera;
+          Camera k = view.calibration.camera(view.calibration.width, view.calibration.height);
+          double[] center = camera.center();
+          for (int j = 0; j < 3; j++) center[j] *= scale;
+          int[] paintedRows = new int[grid.height];
+          BufferedImage source = photo;
+          double s = scale;
+          // Cells are independent within one image: rows in parallel, same result.
+          Parallel.forEach(grid.height, workers, y -> {
+            for (int x = 0; x < grid.width; x++) {
+              int i = y * grid.width + x;
+              float z = grid.z[i];
+              if (!Float.isFinite(z)) continue;
+              double wx = grid.x + (x + .5) * grid.cell, wy = grid.y - (y + .5) * grid.cell;
+              double[] q = camera.view(new double[] {wx / s, wy / s, z / s});
+              if (!(q[2] > 0)) continue;
+              Point2D.Double uv = project(k, view.calibration.distortion, q);
+              if (!Double.isFinite(uv.x + uv.y)
+                  || uv.x < 0
+                  || uv.y < 0
+                  || uv.x >= view.calibration.width - 1
+                  || uv.y >= view.calibration.height - 1) continue;
+              coverage[i]++;
+              double score = Math.pow((uv.x - k.cx) / k.fx, 2) + Math.pow((uv.y - k.cy) / k.fy, 2);
+              if (source == null || score >= rank[i] || !visible(grid, center, wx, wy, z)) continue;
+              double px = (uv.x + .5) * source.getWidth() / view.calibration.width - .5;
+              double py = (uv.y + .5) * source.getHeight() / view.calibration.height - .5;
+              if (px < 0 || py < 0 || px >= source.getWidth() - 1 || py >= source.getHeight() - 1)
+                continue;
+              if (!Float.isFinite(rank[i])) paintedRows[y]++;
+              ortho.setRGB(x, y, 0xff000000 | bilinear(source, px, py));
+              rank[i] = (float) score;
+            }
+          });
+          for (int count : paintedRows) painted += count;
+          if (photo != null) photo.flush();
+          work.update(++completed);
         }
-        if (photo == null) unavailable++;
-        else available++;
-        Camera camera = view.camera;
-        Camera k = view.calibration.camera(view.calibration.width, view.calibration.height);
-        double[] center = camera.center();
-        for (int j = 0; j < 3; j++) center[j] *= scale;
-        for (int y = 0; y < grid.height; y++)
-          for (int x = 0; x < grid.width; x++) {
-            int i = y * grid.width + x;
-            float z = grid.z[i];
-            if (!Float.isFinite(z)) continue;
-            double wx = grid.x + (x + .5) * grid.cell, wy = grid.y - (y + .5) * grid.cell;
-            double[] q = camera.view(new double[] {wx / scale, wy / scale, z / scale});
-            if (!(q[2] > 0)) continue;
-            Point2D.Double uv = project(k, view.calibration.distortion, q);
-            if (!Double.isFinite(uv.x + uv.y)
-                || uv.x < 0
-                || uv.y < 0
-                || uv.x >= view.calibration.width - 1
-                || uv.y >= view.calibration.height - 1) continue;
-            coverage[i]++;
-            double score = Math.pow((uv.x - k.cx) / k.fx, 2) + Math.pow((uv.y - k.cy) / k.fy, 2);
-            if (photo == null || score >= rank[i] || !visible(grid, center, wx, wy, z)) continue;
-            double px = (uv.x + .5) * photo.getWidth() / view.calibration.width - .5;
-            double py = (uv.y + .5) * photo.getHeight() / view.calibration.height - .5;
-            if (px < 0 || py < 0 || px >= photo.getWidth() - 1 || py >= photo.getHeight() - 1)
-              continue;
-            if (!Float.isFinite(rank[i])) painted++;
-            ortho.setRGB(x, y, 0xff000000 | bilinear(photo, px, py));
-            rank[i] = (float) score;
-          }
-        if (photo != null) photo.flush();
-        work.update(++completed);
+      } finally {
+        loader.shutdownNow();
       }
       work.done();
     }

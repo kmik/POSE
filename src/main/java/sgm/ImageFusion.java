@@ -628,6 +628,20 @@ final class ImageFusion {
     long[] taken = consume || graph ? used[c] : null;
     Map<Integer, PairData> byPair = new HashMap<>();
     for (Splat s : splats) byPair.put(s.data().pair, s.data());
+    // Normal estimation back-projects up to 147 neighbours per emitted pixel; neighbouring pixels
+    // share them, so each merged pixel is back-projected once here (same values; m is read-only
+    // during the cross-check). Skipped above 512 MB, where the direct computation is used.
+    double[] points =
+        surface && 24L * w * h <= 512L << 20 && !Boolean.getBoolean("sgm.noNormalCache") ? new double[3 * w * h] : null;
+    if (points != null)
+      parallel(h, y -> {
+        for (int x = 0; x < w; x++) {
+          int at = y * w + x;
+          if (m.z[at] <= 0) continue;
+          double[] q = backProject(cam, rotationT, x + m.du[at], y + m.dv[at], m.z[at]);
+          System.arraycopy(q, 0, points, 3 * at, 3);
+        }
+      });
     Emission[][] rows = new Emission[h][];
     long[][] tallies = new long[h][7];
     parallel(h, y -> {
@@ -779,7 +793,7 @@ final class ImageFusion {
         r.confidence = PointConfidence.finalScore(r.matchingConfidence, r.relativeSigma);
         if (!r.accepted()) t[5]++;
         DepthFusion.SurfaceSample geometry =
-            surface && r.accepted() ? surfaceSample(c, m, X, mz, x, y) : null;
+            surface && r.accepted() ? surfaceSample(c, m, X, mz, x, y, points) : null;
         if (list == null) list = new ArrayList<>();
         list.add(
             new Emission(
@@ -849,7 +863,7 @@ final class ImageFusion {
   }
 
   /** Plane fit on the owner's merged map; mirrors DepthFusion.surfaceSample. */
-  private DepthFusion.SurfaceSample surfaceSample(int c, Merged m, double[] p, double mz, int x, int y) {
+  private DepthFusion.SurfaceSample surfaceSample(int c, Merged m, double[] p, double mz, int x, int y, double[] points) {
     Camera camera = fusion.camera(c);
     double[] rotationT = Math3.transpose(camera.rotation), center = camera.center();
     double footprint = mz / Math.min(camera.fx, camera.fy);
@@ -864,7 +878,10 @@ final class ImageFusion {
           int at = yy * m.w + xx;
           double z = m.z[at];
           if (z <= 0 || Math.abs(z - mz) > o.fusionRelative * Math.min(z, mz)) continue;
-          neighbors[n++] = backProject(camera, rotationT, xx + m.du[at], yy + m.dv[at], z);
+          neighbors[n++] =
+              points != null
+                  ? new double[] {points[3 * at], points[3 * at + 1], points[3 * at + 2]}
+                  : backProject(camera, rotationT, xx + m.du[at], yy + m.dv[at], z);
         }
       SurfaceGeometry.Plane plane = SurfaceGeometry.plane(neighbors, n);
       if (plane == null

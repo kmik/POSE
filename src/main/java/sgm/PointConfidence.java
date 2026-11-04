@@ -29,6 +29,23 @@ final class PointConfidence {
       byte[] maskLeft,
       byte[] maskRight,
       Options o) {
+    if (GpuStereoFilters.reverseConfidence(result, left, right, photoLeft, photoRight, channels, dr, selected, maskLeft, maskRight, o)) return;
+    reverseCpu(result, left, right, photoLeft, photoRight, channels, dr, selected, maskLeft, maskRight, o);
+  }
+
+  /** CPU version of {@link #reverse} (GpuStereoFilters reproduces it bit for bit). */
+  static void reverseCpu(
+      CensusSgm.Result result,
+      byte[] left,
+      byte[] right,
+      byte[] photoLeft,
+      byte[] photoRight,
+      int channels,
+      float[] dr,
+      Selection selected,
+      byte[] maskLeft,
+      byte[] maskRight,
+      Options o) {
     int w = result.width,
         h = result.height,
         n = w * h,
@@ -130,6 +147,7 @@ final class PointConfidence {
   }
 
   static void stereo(CensusSgm.Result result, byte[] left, byte[] right, Options options) {
+    if (GpuStereoFilters.stereoConfidence(result, left, right, options)) return;
     try (var rows = StereoRows.open(options.stereoPipeline ? Math.max(1,options.cores/2) : options.cores)) { stereo(result, left, right); }
   }
 

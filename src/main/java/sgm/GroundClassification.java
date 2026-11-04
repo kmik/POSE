@@ -90,6 +90,7 @@ final class GroundClassification {
   static Map<String, Object> classify(
       Options o, List<ImageFrame> frames, Path las, Path sidecar, Path results, int epsg)
       throws IOException {
+    threads = Math.max(1, Integer.getInteger("sgm.groundThreads", o.cores));
     long started = System.nanoTime();
     Cloud cloud = read(las, sidecar);
     double[][] cameras = new double[frames.size()][];
@@ -787,9 +788,12 @@ final class GroundClassification {
     boolean any = false;
     for (float v : z) any |= Float.isFinite(v);
     if (!any) return out;
-    for (int iter = 0; iter < 30; iter++)
-      for (int r = 0; r < g.h; r++)
-        for (int c = 0; c < g.w; c++) {
+    // Red-black relaxation: cells of one colour only read the other colour, so rows can run in
+    // parallel and the result does not depend on the thread count.
+    for (int iter = 0; iter < 60; iter++) {
+      int colour = iter % 2;
+      parallel(g.h, threads, r -> {
+        for (int c = (r + colour) % 2; c < g.w; c += 2) {
           int k = r * g.w + c;
           if (Float.isFinite(z[k])) continue;
           double sum = 0;
@@ -812,6 +816,8 @@ final class GroundClassification {
           }
           out[k] = (float) (sum / n);
         }
+      });
+    }
     return out;
   }
 
@@ -869,20 +875,31 @@ final class GroundClassification {
   }
 
   /** Square min/max filter of radius r: two 1-D monotone-deque passes, O(cells). */
+  /** Worker threads for the ground step (set from --cores by classify). */
+  static volatile int threads = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
+
+  static void parallel(int count, int workers, java.util.function.IntConsumer action) {
+    Parallel.forEach(count, workers, action);
+  }
+
   private static float[] separable(float[] z, Grid g, int r, boolean min) {
     float[] rows = new float[z.length], out = new float[z.length];
-    float[] line = new float[Math.max(g.w, g.h)], result = new float[line.length];
-    int[] deque = new int[line.length];
-    for (int y = 0; y < g.h; y++) {
+    int side = Math.max(g.w, g.h);
+    ThreadLocal<float[][]> buffers = ThreadLocal.withInitial(() -> new float[][] {new float[side], new float[side]});
+    ThreadLocal<int[]> deques = ThreadLocal.withInitial(() -> new int[side]);
+    // Rows, then columns; each line is independent, so the result does not depend on threads.
+    parallel(g.h, threads, y -> {
+      float[] line = buffers.get()[0], result = buffers.get()[1];
       System.arraycopy(z, y * g.w, line, 0, g.w);
-      slide(line, g.w, r, min, deque, result);
+      slide(line, g.w, r, min, deques.get(), result);
       System.arraycopy(result, 0, rows, y * g.w, g.w);
-    }
-    for (int x = 0; x < g.w; x++) {
+    });
+    parallel(g.w, threads, x -> {
+      float[] line = buffers.get()[0], result = buffers.get()[1];
       for (int y = 0; y < g.h; y++) line[y] = rows[y * g.w + x];
-      slide(line, g.h, r, min, deque, result);
+      slide(line, g.h, r, min, deques.get(), result);
       for (int y = 0; y < g.h; y++) out[y * g.w + x] = result[y];
-    }
+    });
     return out;
   }
 
@@ -906,37 +923,65 @@ final class GroundClassification {
    * second lowest}; the second needs two rays and survives a single false point.
    */
   static float[][] carve(Cloud c, double[][] cameras, Grid g, boolean[] use, double top) {
-    float[] lowest = new float[g.w * g.h], second = new float[g.w * g.h];
-    Arrays.fill(lowest, Float.POSITIVE_INFINITY);
-    Arrays.fill(second, Float.POSITIVE_INFINITY);
+    int cells = g.w * g.h;
     double margin = Math.max(.5, 3 * g.cell);
     int stride = Math.max(1, c.n / 2_000_000);
-    for (int i = 0; i < c.n; i += stride) {
-      if (!use[i]) continue;
-      for (int cam : new int[] {c.camA[i], c.camB[i]}) {
-        if (cam < 0 || cam >= cameras.length || cameras[cam] == null) continue;
-        double[] o = cameras[cam];
-        // One entry per cell and ray (its lowest sample there): the robust bound needs two rays.
-        int[] run = {-1};
-        float[] runLow = {Float.POSITIVE_INFINITY};
-        RayVisitor commit =
-            (k, z) -> {
-              int idx = g.index(k[0], k[1]);
-              if (idx != run[0] && run[0] >= 0) {
-                float h = runLow[0];
-                int at = run[0];
-                if (h < lowest[at]) {
-                  second[at] = lowest[at];
-                  lowest[at] = h;
-                } else if (h < second[at]) second[at] = h;
-                runLow[0] = Float.POSITIVE_INFINITY;
-              }
-              run[0] = idx;
-              if (idx >= 0) runLow[0] = Math.min(runLow[0], (float) z);
-            };
-        walk(o, c.x[i], c.y[i], c.z[i], top, margin, g.cell, commit);
-        commit.visit(new double[] {Double.NaN, Double.NaN}, 0);
+    int samples = (c.n + stride - 1) / stride;
+    // Per-thread {lowest, second} grids, merged afterwards: the two smallest heights per cell do not
+    // depend on the order of the rays, so the result is the same as a serial pass. Threads are
+    // limited so the per-thread grids stay within about 512 MB.
+    int workers = (int) Math.max(1, Math.min(threads, (512L << 20) / Math.max(1, 8L * cells)));
+    float[][][] parts = new float[workers][][];
+    int chunk = (samples + workers - 1) / workers;
+    parallel(workers, workers, t -> {
+      float[] lowest = new float[cells], second = new float[cells];
+      Arrays.fill(lowest, Float.POSITIVE_INFINITY);
+      Arrays.fill(second, Float.POSITIVE_INFINITY);
+      for (int s = t * chunk, end = Math.min(samples, s + chunk); s < end; s++) {
+        int i = s * stride;
+        if (!use[i]) continue;
+        for (int cam : new int[] {c.camA[i], c.camB[i]}) {
+          if (cam < 0 || cam >= cameras.length || cameras[cam] == null) continue;
+          double[] o = cameras[cam];
+          // One entry per cell and ray (its lowest sample there): the robust bound needs two rays.
+          int[] run = {-1};
+          float[] runLow = {Float.POSITIVE_INFINITY};
+          RayVisitor commit =
+              (k, z) -> {
+                int idx = g.index(k[0], k[1]);
+                if (idx != run[0] && run[0] >= 0) {
+                  float h = runLow[0];
+                  int at = run[0];
+                  if (h < lowest[at]) {
+                    second[at] = lowest[at];
+                    lowest[at] = h;
+                  } else if (h < second[at]) second[at] = h;
+                  runLow[0] = Float.POSITIVE_INFINITY;
+                }
+                run[0] = idx;
+                if (idx >= 0) runLow[0] = Math.min(runLow[0], (float) z);
+              };
+          walk(o, c.x[i], c.y[i], c.z[i], top, margin, g.cell, commit);
+          commit.visit(new double[] {Double.NaN, Double.NaN}, 0);
+        }
       }
+      parts[t] = new float[][] {lowest, second};
+    });
+    float[] lowest = parts[0][0], second = parts[0][1];
+    for (int t = 1; t < workers; t++) {
+      float[] l = parts[t][0], s2 = parts[t][1];
+      float[] low = lowest, sec = second;
+      parallel(cells, threads, k -> {
+        // Insert the other part's two values; ties count twice, as in the serial pass.
+        for (int j = 0; j < 2; j++) {
+          float h = j == 0 ? l[k] : s2[k];
+          if (h < low[k]) {
+            sec[k] = low[k];
+            low[k] = h;
+          } else if (h < sec[k]) sec[k] = h;
+        }
+      });
+      parts[t] = null;
     }
     for (int k = 0; k < second.length; k++) {
       if (second[k] == Float.POSITIVE_INFINITY) second[k] = Float.NaN;
