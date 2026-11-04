@@ -17,10 +17,12 @@ import org.apache.pdfbox.pdmodel.graphics.image.*;
  * setting).
  */
 final class PdfReport implements AutoCloseable {
-  private static final Color INK = new Color(26, 46, 62),
-      TEAL = new Color(0, 111, 115),
-      GRAY = new Color(91, 108, 119),
-      LIGHT = new Color(226, 238, 238),
+  /** POSE brand colours (from the logo): navy text, teal accent; headings in a darker teal. */
+  private static final Color INK = new Color(4, 48, 88),
+      ACCENT = new Color(0, 188, 176),
+      TEAL = new Color(0, 122, 115),
+      GRAY = new Color(84, 99, 115),
+      LIGHT = new Color(224, 243, 241),
       STRIPE = new Color(246, 248, 249),
       RULE = new Color(200, 210, 214),
       ORANGE = new Color(214, 110, 24),
@@ -39,8 +41,36 @@ final class PdfReport implements AutoCloseable {
     this.runId = runId;
     regular = font("LiberationSans-Regular.ttf");
     bold = font("LiberationSans-Bold.ttf");
-    document.getDocumentInformation().setTitle("Collinea processing report - " + runId);
-    document.getDocumentInformation().setCreator("Collinea Java photogrammetry");
+    document.getDocumentInformation().setTitle("POSE processing report - " + runId);
+    document.getDocumentInformation().setCreator("POSE (Photogrammetric Orientation and Surface Estimation)");
+  }
+
+  static final String NAME = "POSE", LONG_NAME = "Photogrammetric Orientation and Surface Estimation", VERSION = "0.1";
+
+  private PDImageXObject logo;
+  private boolean logoMissing;
+
+  /** The POSE logo (resource sgm/pose-logo.png), or null when the resource is not on the classpath. */
+  private PDImageXObject logo() throws IOException {
+    if (logo != null || logoMissing) return logo;
+    try (InputStream in = PdfReport.class.getResourceAsStream("/sgm/pose-logo.png")) {
+      java.awt.image.BufferedImage image = in == null ? null : javax.imageio.ImageIO.read(in);
+      if (image == null) logoMissing = true;
+      else logo = LosslessFactory.createFromImage(document, image);
+    }
+    return logo;
+  }
+
+  /** Draws the logo with its top-left at (x, top), the given height; text "POSE" without it. */
+  private float drawLogo(float x, float top, float height) throws IOException {
+    PDImageXObject image = logo();
+    if (image == null) {
+      text(NAME, x, top - height * .8f, height, bold, INK);
+      return bold.getStringWidth(NAME) * height / 1000;
+    }
+    float width = height * image.getWidth() / image.getHeight();
+    content.drawImage(image, x, top - height, width, height);
+    return width;
   }
 
   private PDFont font(String name) throws IOException {
@@ -108,15 +138,15 @@ final class PdfReport implements AutoCloseable {
     PDPage p = new PDPage(PDRectangle.A4);
     document.addPage(p);
     content = new PDPageContentStream(document, p);
-    fill(0, 780, 595, 62, TEAL);
-    text("COLLINEA", LEFT, 805, 14, bold, Color.WHITE);
-    text("Photogrammetric processing", 350, 805, 10, regular, Color.WHITE);
-    text("Processing Report", LEFT, 735, 28, bold, INK);
+    drawLogo(LEFT, 802, 46);
+    text(LONG_NAME, LEFT, 742, 9.5f, regular, GRAY);
+    fill(LEFT, 728, WIDTH, 2, ACCENT);
+    text("Processing Report", LEFT, 690, 26, bold, INK);
     String finished = String.valueOf(data.getOrDefault("processing_finished_utc", ""));
     String date = finished.length() >= 16 ? finished.substring(0, 10) + " " + finished.substring(11, 16) + " UTC" : finished;
-    text(project(data) + "  |  " + date, LEFT, 712, 11, regular, GRAY);
-    text("Run " + data.get("run_id") + "  |  " + data.get("run_status"), LEFT, 696, 9, regular, GRAY);
-    y = 680;
+    text(project(data) + "  |  " + date, LEFT, 668, 11, regular, GRAY);
+    text("Run " + data.get("run_id") + "  |  " + data.get("run_status"), LEFT, 653, 9, regular, GRAY);
+    y = 638;
     section = "Processing report";
     figure(out.resolve("orthomosaic.png"), 300);
     paragraph(
@@ -458,7 +488,7 @@ final class PdfReport implements AutoCloseable {
     var hardware = ProcessingReport.object(telemetry.get("hardware"));
     var device = ProcessingReport.object(telemetry.get("selected_opencl_device"));
     List<String[]> software = new ArrayList<>();
-    software.add(new String[] {"Software", "Collinea / mSGM Java"});
+    software.add(new String[] {"Software", NAME + " " + VERSION + " (" + LONG_NAME + ")"});
     if (hardware.get("java_version") != null) software.add(new String[] {"Java", pdf(hardware.get("java_version"))});
     if (hardware.get("os") != null) software.add(new String[] {"Platform", pdf(hardware.get("os")) + " " + pdf(hardware.getOrDefault("architecture", "")) + ", " + count(hardware.get("available_processors")) + " processors"});
     if (device.get("name") != null) software.add(new String[] {"OpenCL device", pdf(device.get("name"))});
@@ -791,16 +821,18 @@ final class PdfReport implements AutoCloseable {
     PDPage p = new PDPage(PDRectangle.A4);
     document.addPage(p);
     content = new PDPageContentStream(document, p);
-    fill(0, 800, 595, 42, TEAL);
-    text("COLLINEA", LEFT, 816, 12, bold, Color.WHITE);
-    text("PROCESSING REPORT", 350, 816, 10, regular, Color.WHITE);
-    text(title, LEFT, 766, 23, bold, INK);
-    y = 737;
+    // Header: logo left, report name right, accent rule below.
+    drawLogo(LEFT, 818, 20);
+    float label = regular.getStringWidth("PROCESSING REPORT") * 8.5f / 1000;
+    text("PROCESSING REPORT", LEFT + WIDTH - label, 805, 8.5f, regular, GRAY);
+    fill(LEFT, 790, WIDTH, 1.2f, ACCENT);
+    text(title, LEFT, 756, 23, bold, INK);
+    y = 727;
   }
 
   private void finish() throws IOException {
     if (content == null) return;
-    text("Collinea | " + runId, LEFT, 24, 8, regular, GRAY);
+    text(NAME + " " + VERSION + " | " + runId, LEFT, 24, 8, regular, GRAY);
     text("Page " + page, 507, 24, 8, regular, GRAY);
     content.close();
     content = null;

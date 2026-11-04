@@ -51,7 +51,9 @@ try {
     $sources = @(Get-ChildItem src/main/java -Recurse -Filter '*.java' | ForEach-Object { $_.FullName })
     & $javaCompiler --release 25 -encoding UTF-8 -cp $dependency -d target/classes $sources
     if ($LASTEXITCODE -ne 0) { throw 'Java compilation failed' }
-    $tests = @(Get-ChildItem src/test/java -Recurse -Filter '*.java' | ForEach-Object { $_.FullName })
+    # Resources (report logo) next to the classes.
+    Copy-Item -Recurse -Force src/main/resources/* target/classes/
+    $tests =@(Get-ChildItem src/test/java -Recurse -Filter '*.java' | ForEach-Object { $_.FullName })
     & $javaCompiler --release 25 -encoding UTF-8 -cp "target/classes;$dependency" -d target/test-classes $tests
     if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed' }
     & $javaRuntime --enable-native-access=ALL-UNNAMED -ea -cp "target/classes;target/test-classes;$dependency" sgm.SelfTest

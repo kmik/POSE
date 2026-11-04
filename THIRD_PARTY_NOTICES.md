@@ -1,6 +1,6 @@
 # Third-party dependencies
 
-Collinea has no project license assigned yet. This does not alter the licenses of its dependencies. Runtime jars are downloaded by the build and are not committed to this source distribution.
+POSE has no project license assigned yet. This does not alter the licenses of its dependencies. Runtime jars are downloaded by the build and are not committed to this source distribution.
 
 | Component | Pinned artifact | Upstream notices |
 | --- | --- | --- |

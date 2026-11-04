@@ -40,6 +40,7 @@ fi
 javac_bin="${JAVA_HOME:+$JAVA_HOME/bin/}javac"
 find src/main/java -name '*.java' -print > target/sources.txt
 "$javac_bin" --release 25 -encoding UTF-8 -cp "$dep" -d target/classes @target/sources.txt
+cp -R src/main/resources/. target/classes/
 find src/test/java -name '*.java' -print > target/tests.txt
 "$javac_bin" --release 25 -encoding UTF-8 -cp "target/classes:$dep" -d target/test-classes @target/tests.txt
 "${JAVA_HOME:+$JAVA_HOME/bin/}java" --enable-native-access=ALL-UNNAMED -ea -cp "target/classes:target/test-classes:$dep" sgm.SelfTest

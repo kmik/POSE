@@ -1,6 +1,6 @@
 # Pipeline steps
 
-Collinea splits the reconstruction into separate
+POSE splits the reconstruction into separate
 steps. Each step saves the project state of its run, so the next step can continue in a new
 process, later, or with changed options. Without step names the whole pipeline runs in one
 process as before (still saving the state after every step).

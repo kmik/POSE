@@ -1895,7 +1895,7 @@ final class ProjectArtifacts implements AutoCloseable {
   }
 
   static String guide() {
-    return "# mSGM project run\n\n"
+    return "# POSE project run\n\n"
                + "Detailed diagnostics are off by default. Orientations, final clouds, compact"
                + " lossless point-confidence.bin, reports and quality summaries remain available."
                + " --diagnostics enables optional exports and defaults storage to debug; an"

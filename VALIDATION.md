@@ -7,7 +7,7 @@ Complete Windows suite: **2,139 checks**, including **198** throughput/report ch
 Measurements, rejected experiments, temporary-disk tradeoffs and limits: [FOLLOWUP_PERFORMANCE.md](FOLLOWUP_PERFORMANCE.md), `research/followup/results-2026-10-31.json`. Reports from older runs do not invent missing historical memory peaks or settings.
 
 
-## Collinea follow-up: performance and attributes (2026-10-30)
+## POSE follow-up: performance and attributes (2026-10-30)
 
 Verified production release: `target/collinea-final` (134 production class files, 55 test class files), copied byte-for-byte into the normal launcher directories. Previous compiled directories are retained; `target/collinea-installed.json` records their locations. The IDE can rebuild normal output directories: a later local rebuild was observed without changes to Java source, and its installed launcher was also replayed successfully. `target/collinea-validation.json` records release and installed hashes at the final check.
 
@@ -39,7 +39,7 @@ These are single synthetic consolidation-only replays, not an end-to-end photogr
 
 Streamed SGM now performs eight rather than nine cost-generation passes and seven rather than eight aggregate-volume reads/writes for eight paths. Together with eligible 16-bit storage, logical aggregate host/device payload is 28 rather than 64 bytes per pixel-hypothesis per matching direction (56.25% lower); the aggregate spool is half-sized. These are deterministic payload/layout counts, not physical disk-traffic or wall-clock measurements; paging/driver overhead remains additional.
 
-Linux runtime remains unverified locally; cross-platform CI is configured for repository pushes. Cross-platform source/scripts and CI configuration are included. The source package excludes generated runs, jars, toolchains, internal work notes and credentials. Repository preference: **Collinea**, **private**, **no project license assigned**.
+Linux runtime remains unverified locally; cross-platform CI is configured for repository pushes. Cross-platform source/scripts and CI configuration are included. The source package excludes generated runs, jars, toolchains, internal work notes and credentials. Repository preference: **POSE**, **private**, **no project license assigned**.
 
 ## Reprojection refinement and normal-aware consolidation
 

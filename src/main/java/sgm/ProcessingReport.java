@@ -251,20 +251,30 @@ final class ProcessingReport {
     return result;
   }
 
+  /** The POSE logo as an embedded image (the report stays one file), or the name as text. */
+  static String brand() throws IOException {
+    try (InputStream in = ProcessingReport.class.getResourceAsStream("/sgm/pose-logo.png")) {
+      if (in == null) return "<div class=\"brand\">POSE</div>";
+      return "<div class=\"brand\"><img src=\"data:image/png;base64,"
+          + Base64.getEncoder().encodeToString(in.readAllBytes())
+          + "\" alt=\"POSE\" style=\"height:56px;width:auto\"></div>";
+    }
+  }
+
   private static String html(Map<String, Object> d, String overview, Path out) throws IOException {
     StringBuilder b =
         new StringBuilder(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\""
-                + " content=\"width=device-width,initial-scale=1\"><title>Collinea processing"
+                + " content=\"width=device-width,initial-scale=1\"><title>POSE processing"
                 + " report</title><style>");
     b.append(
         "body{margin:0;background:#eef2f6;color:#182735;font:15px/1.55"
             + " system-ui,Arial,sans-serif}main{max-width:1100px;margin:32px"
             + " auto;background:white;padding:42px;border-radius:12px;box-shadow:0 2px 18px"
             + " #102a4312}h1{font-size:34px;margin:0}h2{font-size:23px;border-bottom:2px solid"
-            + " #e5edf3;padding-bottom:8px;margin-top:34px}h3{font-size:17px}.brand{color:#126b83;font-weight:700;letter-spacing:2px}.sub,.note{color:#526777}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:24px"
+            + " #e5edf3;padding-bottom:8px;margin-top:34px}h3{font-size:17px}.brand{color:#043058;font-weight:700;letter-spacing:2px;margin-bottom:10px}.sub,.note{color:#526777}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:24px"
             + " 0}.card{border:1px solid #dbe4eb;border-radius:8px;padding:16px}.card"
-            + " strong{display:block;font-size:22px;color:#145c76}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:8px"
+            + " strong{display:block;font-size:22px;color:#043058}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:8px"
             + " 10px;text-align:left;border-bottom:1px solid"
             + " #e3eaf0;vertical-align:top;overflow-wrap:anywhere}th{background:#edf3f7}td:first-child{font-weight:500}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f7f9;padding:14px;border-radius:6px;font-size:12px}figure{margin:18px"
             + " 0;text-align:center}img,svg{max-width:100%;height:auto}figure"
@@ -275,8 +285,7 @@ final class ProcessingReport {
             + " 0}@media(max-width:700px){main{padding:18px;margin:0;border-radius:0}h1{font-size:27px}}@media"
             + " print{body{background:white}main{box-shadow:none;margin:0;padding:0;max-width:none}details{display:block}details>summary{display:block}details>div{display:block}table{font-size:10px}h2{break-after:avoid}figure{break-inside:avoid}pre{font-size:9px}}</style></head><body><main>");
     b.append(
-            "<div class=\"brand\">COLLINEA</div><h1>Photogrammetry processing report</h1><p"
-                + " class=\"sub\">Run ")
+            brand() + "<h1>Processing report</h1><p class=\"sub\">" + PdfReport.LONG_NAME + "<br>Run ")
         .append(esc(d.get("run_id")))
         .append(" &middot; <span class=\"pill\">")
         .append(esc(d.get("run_status")))

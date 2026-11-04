@@ -403,7 +403,7 @@ final class OrientationXml {
   private static void writeMetashape(Model model, Path dir) throws IOException {
     StringBuilder s =
         new StringBuilder(
-            "<?xml version=\"1.0\"?>\n<document version=\"1.4.0\"><chunk label=\"mSGM\"><sensors>");
+            "<?xml version=\"1.0\"?>\n<document version=\"1.4.0\"><chunk label=\"POSE\"><sensors>");
     int id = 0;
     for (View v : model.views.values()) {
       Calibration c = Objects.requireNonNull(v.calibration());

@@ -132,7 +132,7 @@ public final class CloudWriter implements AutoCloseable {
         plyOut.write(
             ("ply\n"
                     + "format binary_little_endian 1.0\n"
-                    + "comment mSGM Java; coordinates follow report.txt\n"
+                    + "comment POSE " + PdfReport.VERSION + "; coordinates follow report.txt\n"
                     + (crs == null
                         ? ""
                         : "comment horizontal_crs "
@@ -217,7 +217,7 @@ public final class CloudWriter implements AutoCloseable {
     h.position(24);
     h.put((byte) 1).put((byte) 2);
     ascii(h, "LAS.utils photogrammetry", 32);
-    ascii(h, "mSGM Java 0.1", 32);
+    ascii(h, "POSE " + PdfReport.VERSION, 32);
     LocalDate now = LocalDate.now();
     h.putShort((short) now.getDayOfYear()).putShort((short) now.getYear());
     h.putShort((short) 227)

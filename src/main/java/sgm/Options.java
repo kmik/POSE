@@ -1497,8 +1497,9 @@ public final class Options {
 
   public static String help() {
     return """
-Collinea / LAS.utils photogrammetry (Java/OpenCL)
+POSE - Photogrammetric Orientation and Surface Estimation (Java/OpenCL)
 Usage: photogrammetry -i IMAGE_DIR [-o PROJECT_DIR] [options]
+       (pose.bat / pose.sh start the same program as photogrammetry.bat / .sh)
 Run with no arguments, -h, --help or -help to display this help and exit.
 Values accept --option VALUE or --option=VALUE. Quote paths containing spaces.
 Defaults below apply unless overridden; pixel units refer to processed images.
@@ -1552,7 +1553,7 @@ Inputs and project output:
       Input provenance is always saved; processed image exports require --diagnostics.
   --overwrite
       Adopt a nonempty directory as a project; unrelated files and prior runs
-      are preserved. Existing mSGM projects do not require this flag.
+      are preserved. Existing POSE projects do not require this flag.
 
 Calibration and reconstruction modes:
   --calibration FILE, -d FILE, --dist FILE
