@@ -1,9 +1,10 @@
 # Portable packaging validation (2026-11-05)
 
-Scope: build/launch scripts, standalone release tools and installation documentation.
-No processing source, OpenCL kernel, existing test, application default, or output-format
-implementation was edited. All **201 files under src/** matched the SHA-256 baseline
-recorded before the changes. Local evidence is under `target/portable-packaging/`.
+Initial scope: build/launch scripts, standalone release tools and installation documentation.
+The initial packaging change preserved all **201 files under src/**. The follow-up below
+corrects stale expectations in three existing tests; processing source, OpenCL kernels, application
+defaults and output-format implementations remain unchanged. Local evidence is under
+`target/portable-packaging/`.
 
 ## Passed locally on Windows x86-64
 
@@ -24,7 +25,7 @@ recorded before the changes. Local evidence is under `target/portable-packaging/
 - The Linux release builder rejects a non-Linux host before attempting to build a
   compatibility artifact. It cannot label an upstream GLIBC_2.29 library as glibc 2.28.
 
-## Existing processing regression failures (not changed)
+## Initial processing regression failures
 
 `build.bat` compiles the current source successfully and starts its existing SelfTest suite.
 The first run hit a Windows native image-write failure at a 260-character diagnostic path.
@@ -34,9 +35,33 @@ That rerun then failed in `StorageGpuRegression.storage`, at the comparison read
 `gpuProject.resolve("dense.las")`. The GPU reconstruction itself completed, and its
 `latest-files.csv` identifies the canonical cloud under `runs/<id>/07_results/dense.las`.
 This test invocation does not request `--compatibility-copies`, which is off by default.
-The existing test's root-level filename expectation is therefore stale. No workaround,
-test edit, output-default change, or test bypass was added. Later SelfTest checks were not
-reached; do not describe the full processing suite as passing.
+The existing test's root-level filename expectation was therefore stale. The initial packaging
+commit did not work around it or change output defaults. Later SelfTest checks were not
+reached in that run.
+
+## Follow-up: canonical outputs and structured launcher checks
+
+After the same failure was reported on the Linux release builder, the GPU comparison in
+`StorageGpuRegression.storage` was changed to read the latest run's `07_results/dense.las`.
+The full suite then exposed the same obsolete project-root assumption in three LAS reads
+in `PairRangeRegression`; those reads now use the canonical run output too. All original
+byte/content comparisons are retained; no compatibility-copy option or test bypass was added.
+
+The later launcher regression expected a detailed console message which non-verbose planning
+no longer prints. It now checks the actual child memory budget and heap in
+`00_inputs/resolution_plan.json`, while retaining the successful-exit and relaunch checks.
+
+Focused validation passed: **58 storage/GPU checks with real hardware**, **58 pair-range
+checks**, and **255 launcher/help checks**. The previously unreached regression groups were
+run using a temporary runner under target/: fusion, stereo upgrades, orientations, overlap,
+surfaces, subpixel and measured reprojection groups passed; the final groups from launcher
+through pre-dense processing passed **1,134 checks**. This evidence combines the full-suite
+prefix, focused corrected tests, and continuation groups; it is not a claim that a final
+single uninterrupted SelfTest invocation or a Linux release build has passed.
+
+Exactly three existing test files differ from the initial source baseline. All processing
+Java and OpenCL/resource files still match. The Linux release builder continues to require
+the complete SelfTest suite to pass on the actual baseline machine before creating an archive.
 
 ## Linux release still requires a baseline build
 
