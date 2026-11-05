@@ -119,7 +119,7 @@ third-party components. The project's own license policy is unchanged.
 
 ## Packaging regression checks
 
-The new tests are separate from `src/` and do not change the existing processing tests:
+The packaging-specific checks live outside `src/`:
 
 ```bash
 bash packaging/test-launchers.sh

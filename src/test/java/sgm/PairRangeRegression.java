@@ -422,13 +422,13 @@ final class PairRangeRegression {
     check(
         report.contains("coarse_guard") && report.contains("overlap_normalized_x_coverage"),
         "Range diagnostics retain confidence and coarse safety validation");
-    byte[] original = Files.readAllBytes(auto.resolve("dense.las"));
+    byte[] original = Files.readAllBytes(latest(auto).resolve("07_results/dense.las"));
     args.add("--resume");
     check(
         Main.run(args.toArray(String[]::new)) == 0,
         "Automatic positive-minimum ranges resume correctly");
     check(
-        Arrays.equals(original, Files.readAllBytes(auto.resolve("dense.las"))),
+        Arrays.equals(original, Files.readAllBytes(latest(auto).resolve("07_results/dense.las"))),
         "Resumed narrowed stereo preserves LAS exactly");
     check(
         Files.readString(latest(auto).resolve("logs/console.log")).contains("Reused stereo cache"),
@@ -446,7 +446,7 @@ final class PairRangeRegression {
         "Explicit counts preserve the original exact interval");
     ByteBuffer compact = ByteBuffer.wrap(original).order(ByteOrder.LITTLE_ENDIAN),
         reference =
-            ByteBuffer.wrap(Files.readAllBytes(broad.resolve("dense.las")))
+            ByteBuffer.wrap(Files.readAllBytes(latest(broad).resolve("07_results/dense.las")))
                 .order(ByteOrder.LITTLE_ENDIAN);
     check(
         compact.getInt(107) >= reference.getInt(107) * .98,

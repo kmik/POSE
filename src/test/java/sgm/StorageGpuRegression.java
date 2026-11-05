@@ -377,7 +377,7 @@ final class StorageGpuRegression {
               == 0,
           "Full standard-storage pipeline runs on the GPU");
       check(
-          Arrays.equals(original, Files.readAllBytes(gpuProject.resolve("dense.las"))),
+          Arrays.equals(original, Files.readAllBytes(latest(gpuProject).resolve("07_results/dense.las"))),
           "GPU pipeline final LAS is bitwise identical to all three CPU storage modes");
       try (var files = Files.walk(gpuProject)) {
         check(
