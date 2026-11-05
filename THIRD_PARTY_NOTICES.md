@@ -15,4 +15,12 @@ The OpenPnP artifact's embedded Maven metadata declares a BSD License; OpenCV 4.
 
 LAS output uses the published [ASPRS LAS specification](https://www.asprs.org/wp-content/uploads/2019/07/LAS_1_4_r15.pdf). Algorithm/background references remain in the technical documentation. Local JDKs, formatting tools, original C++ third-party libraries, downloaded reference software and generated datasets are excluded from the standalone source package.
 
+Portable binary releases additionally include an Eclipse Temurin/OpenJDK 25 runtime.
+Retain the runtime's `legal/`, license, notice and release files in full. Consult
+[Adoptium](https://adoptium.net/) and the bundled notices for the applicable OpenJDK
+GPLv2 with Classpath Exception terms and third-party component licenses. Linux
+compatibility releases rebuild OpenCV 4.9.0 and replace only its native resource
+in a copy of the OpenPnP JAR; OpenCV and third-party source notices are retained
+under `legal/opencv-4.9.0/`. Java bindings and other JAR resources remain unchanged.
+
 The example point-cloud image has no separate license.

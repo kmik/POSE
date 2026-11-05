@@ -23,3 +23,5 @@
 .vscode/
 .codex/
 .DS_Store
+/runtime/
+/dist/
