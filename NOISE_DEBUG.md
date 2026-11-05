@@ -139,3 +139,58 @@ The final run had 83,889 sampled candidates, of which independent fusion rejecte
 - This remains a functional Java reimplementation with the algorithm differences described in [PORTING.md](PORTING.md), not an established numerical replica of the original C++ program.
 
 The OpenCV [SGM source](https://github.com/opencv/opencv/blob/4.9.0/modules/calib3d/src/stereosgbm.cpp) was consulted as a reference for confidence/speckle validation concepts. The implementation here continues to use the project's own Java census matcher and the independently tested fusion code.
+
+## Near-ground "salt and pepper" points — 2026-11-05
+
+**Symptom.** On smooth ground (city dataset, `--fusion-mode image`), isolated points float 0.2–1.5 m
+above the surface, almost never below it. With `--ground-aware-fusion` the ground itself becomes
+smooth, so the floaters stand out even more. (A first look suggested GS2 terraced the ground; that
+was an artefact of plotting heights against the cell-wise DTM. Against a fitted line the GS2 sheet is
+smooth.)
+
+**Measured** (raw city cloud at `--quality high`, 89 m flying height, points over observed
+ground): 7% of all points lie 0.25–1.5 m above the terrain, and 40–60% of those have at most one
+neighbour within 10 cm (ground sheet: 2–10%). They have fewer supporting views (5.6 vs 9.8),
+lower matching confidence and higher depth sigma than the ground.
+
+**Cause.** Image fusion's visibility test rejects a point only when another camera's reliable
+surface lies more than 3 x `--fusion-relative` x depth behind it: 1.33 m at 89 m. A depth that is
+too near by less than that (an ambiguous pixel keeps the nearest pair depth; a mismatched patch) is
+"confirmed" by the ground itself within the relative agreement tolerance (0.44 m) and passes. That
+gap is exactly the 0.2–1.5 m band, and it is one-sided: too-far depths are hidden behind the
+surface and fail the other checks.
+
+**Fixes** (image fusion, both default on, both off gives byte-identical output to before):
+
+- `--fusion-free-space on|strict|off`: a free-space vote at an image-scale margin. A camera *sees
+  through* a point when its reliable surface lies more than three pixel footprints (about 0.3 m
+  here) behind it; the point is rejected when at least two cameras see through it and more see
+  through it than confirm it. `strict` also requires confirmations within three footprints.
+- `--fusion-spike-filter on|off`: single-pixel depth spikes in each camera's merged map (further
+  from the 5 x 5 median than max(4 x robust spread, 2 footprints), not supported by two neighbours
+  at their own depth, so thin poles and branches stay).
+
+**Results** (same city cloud, points by height above the DTM; isolated = at most one neighbour
+within 15 cm):
+
+| Height band | raw | on (default) | strict |
+| --- | ---: | ---: | ---: |
+| 0.25–0.5 m | 253,965 (16% isolated) | 216,341 (13%) | 195,174 (11%) |
+| 0.5–1 m | 143,779 (24%) | 113,268 (18%) | 104,774 (16%) |
+| 1–1.5 m | 46,693 (17%) | 42,126 (14%) | 40,715 (13%) |
+| ground ±0.1 m | 2,710,485 | 2,735,717 | 2,722,365 |
+| 6–12 m (roofs, crowns) | 875,737 | 867,675 | 847,990 |
+| above 12 m | 285,426 | 277,041 | 267,613 |
+
+The default removes about a fifth of the near-ground floaters and leaves roofs and crowns within
+1–3%. `strict` removes more floaters but also 3–6% of roof and crown points, which are not
+isolated (their isolated share stays at 5%), so they are mostly real edge points. Rejected
+alternatives: requiring two pairs for the nearer cluster of an ambiguous pixel (shifted roof and
+crown points between height bands, did not reduce floaters); removing small depth islands of low
+support (islands have the same support as their surroundings); an isolation filter on the final
+cloud (removed sparse real ground).
+
+**Not fixed.** Floaters within about 0.3 m of the ground are inside the depth noise of a single
+pair at this baseline-to-height ratio; tightening the relative agreement (`--fusion-relative`,
+default 0.005) would remove them but changes the whole cloud. The isolation diagnostics:
+`NoiseProbe`, `NoiseZoom`, `HeightBands` (scratch tools, not in the repository).
