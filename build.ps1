@@ -48,6 +48,14 @@ try {
             $javaRuntime = Join-Path $portableJdk.FullName 'bin/java.exe'
         }
     }
+    if (Test-Path -LiteralPath 'runtime' -PathType Container) {
+        $javaCompiler = Join-Path $PSScriptRoot 'runtime/bin/javac.exe'
+        $javaRuntime = Join-Path $PSScriptRoot 'runtime/bin/java.exe'
+    }
+    if ($env:POSE_JAVA_HOME) {
+        $javaCompiler = Join-Path $env:POSE_JAVA_HOME 'bin/javac.exe'
+        $javaRuntime = Join-Path $env:POSE_JAVA_HOME 'bin/java.exe'
+    }
     $sources = @(Get-ChildItem src/main/java -Recurse -Filter '*.java' | ForEach-Object { $_.FullName })
     & $javaCompiler --release 25 -encoding UTF-8 -cp $dependency -d target/classes $sources
     if ($LASTEXITCODE -ne 0) { throw 'Java compilation failed' }

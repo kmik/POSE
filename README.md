@@ -32,6 +32,16 @@ its own or as part of [LAS.utils](https://github.com/kmik/LAS.utils).
 
 ## Build
 
+For installations without administrator rights or a suitable system Java, use a
+[portable POSE release](PORTABLE_INSTALL.md). It includes private Java 25; the Linux
+x86-64 compatibility package targets glibc 2.28 and is built once by the release
+maintainer. End users only extract and run it. See that guide for producing the
+archive; adding these scripts alone does not publish a release.
+
+The upstream OpenPnP native library used by a source build may require glibc 2.29
+or newer. On glibc 2.28, use a validated portable compatibility release rather
+than changing system libraries.
+
 You need:
 
 - a **64-bit JDK 25 or later** (`JAVA_HOME` set, or `java` and `javac` on PATH);

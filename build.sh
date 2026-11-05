@@ -2,6 +2,8 @@
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$root"
+source "$root/scripts/java-env.sh"
+pose_select_java "$root" yes
 dep="lib/opencv-4.9.0-0.jar"
 mkdir -p lib target/classes target/test-classes
 if [[ ! -f "$dep" ]]; then
@@ -37,10 +39,10 @@ if [[ ! -f lib/commons-logging-1.4.0.jar ]]; then
   curl --fail --location --retry 3 'https://repo.maven.apache.org/maven2/commons-logging/commons-logging/1.4.0/commons-logging-1.4.0.jar' -o lib/commons-logging-1.4.0.jar.part
   mv -- lib/commons-logging-1.4.0.jar.part lib/commons-logging-1.4.0.jar
 fi
-javac_bin="${JAVA_HOME:+$JAVA_HOME/bin/}javac"
+javac_bin="$pose_javac"
 find src/main/java -name '*.java' -print > target/sources.txt
 "$javac_bin" --release 25 -encoding UTF-8 -cp "$dep" -d target/classes @target/sources.txt
 cp -R src/main/resources/. target/classes/
 find src/test/java -name '*.java' -print > target/tests.txt
 "$javac_bin" --release 25 -encoding UTF-8 -cp "target/classes:$dep" -d target/test-classes @target/tests.txt
-"${JAVA_HOME:+$JAVA_HOME/bin/}java" --enable-native-access=ALL-UNNAMED -ea -cp "target/classes:target/test-classes:$dep" sgm.SelfTest
+"$pose_java" --enable-native-access=ALL-UNNAMED -ea -cp "target/classes:target/test-classes:$dep" sgm.SelfTest
