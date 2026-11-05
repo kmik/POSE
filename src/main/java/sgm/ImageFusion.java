@@ -37,12 +37,12 @@ import java.util.stream.IntStream;
 final class ImageFusion {
   /** Rejection and emission counters for the fusion summary. */
   static final class Counters {
-    long pixels, ambiguous, speckle, unsupported, visibility, uncertainty, twoView, notOwner, consumed, emitted, refined;
+    long pixels, ambiguous, spikes, freeSpace, speckle, unsupported, visibility, uncertainty, twoView, notOwner, consumed, emitted, refined;
     long members, depthOutliers;
     long ambiguousKept, pairReads, bytesRead;
 
     long rejected() {
-      return ambiguous + speckle + unsupported + visibility + uncertainty + twoView;
+      return ambiguous + spikes + freeSpace + speckle + unsupported + visibility + uncertainty + twoView;
     }
 
     Object json() {
@@ -50,6 +50,8 @@ final class ImageFusion {
           "merged_valid_pixels", pixels,
           "ambiguous_layer_rejected", ambiguous,
           "ambiguous_nearer_layer_kept", ambiguousKept,
+          "spike_rejected", spikes,
+          "free_space_rejected", freeSpace,
           "speckle_rejected", speckle,
           "depth_outlier_rejected", depthOutliers,
           "support_rejected", unsupported,
@@ -70,6 +72,7 @@ final class ImageFusion {
   private final int cameras, words, fields, record;
   private final Path candidates;
   private final long[] start;
+
   private final ForkJoinPool pool;
   private final float[][] compact;
   private final int[][] neighbours;
@@ -271,6 +274,7 @@ final class ImageFusion {
         Merged m = merge(c, splats, counters);
         mergeNanos += System.nanoTime() - clock;
         clock = System.nanoTime();
+        counters.spikes += spikes(m, fusion.camera(c));
         counters.speckle += speckles(m, fusion.camera(c));
         if (o.fusionDepthOutliers) counters.depthOutliers += depthOutliers(m.z);
         speckleNanos += System.nanoTime() - clock;
@@ -561,6 +565,63 @@ final class ImageFusion {
   /** Removes 4-connected components smaller than the speckle size; returns removed pixels.
    * Neighbours connect within the relative fusion tolerance or two pixel footprints (z / f), so
    * slanted surfaces at coarse resolution are not fragmented. */
+  /**
+   * Impulse ("salt and pepper") filter on a merged depth map: a pixel whose depth stands out from
+   * a coherent 5 x 5 neighbourhood is a spike, not a surface. Coherent: at least 12 of the 24
+   * neighbours valid and their robust spread (1.4826 MAD) at most one footprint (depth / focal,
+   * the pixel's size on the surface). Spike: further from the neighbours' median than max(4
+   * spreads, 2 footprints). On smooth surfaces this removes isolated depths a few decimetres off
+   * (a single nearer depth winning an ambiguous pixel, then "confirmed" by the surface itself
+   * within the relative fusion tolerance); in vegetation and at depth edges the neighbourhood is
+   * not coherent and nothing is removed. Decided on the unfiltered map, so the result does not
+   * depend on order or threads.
+   */
+
+  private long spikes(Merged m, Camera camera) {
+    if (!o.fusionSpikeFilter) return 0;
+    int w = m.w, h = m.h, r = 2;
+    double focal = Math.min(camera.fx, camera.fy);
+    float[] z = m.z;
+    boolean[] spike = new boolean[w * h];
+    long[] counts = new long[h];
+    parallel(h, y -> {
+      float[] values = new float[(2 * r + 1) * (2 * r + 1)], deviations = new float[values.length];
+      for (int x = 0; x < w; x++) {
+        int p = y * w + x;
+        float centre = z[p];
+        if (centre <= 0) continue;
+        int n = 0;
+        for (int dy = -r; dy <= r; dy++)
+          for (int dx = -r; dx <= r; dx++) {
+            int xx = x + dx, yy = y + dy;
+            if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+            float v = z[yy * w + xx];
+            if (v > 0) values[n++] = v;
+          }
+        if (n < 12) continue;
+        Arrays.sort(values, 0, n);
+        float median = n % 2 == 1 ? values[n / 2] : .5f * (values[n / 2 - 1] + values[n / 2]);
+        for (int i = 0; i < n; i++) deviations[i] = Math.abs(values[i] - median);
+        Arrays.sort(deviations, 0, n);
+        double spread = 1.4826 * (n % 2 == 1 ? deviations[n / 2] : .5 * (deviations[n / 2 - 1] + deviations[n / 2]));
+        double footprint = median / focal, limit = Math.max(4 * spread, 2 * footprint);
+        if (Math.abs(centre - median) <= limit) continue;
+        // A thin structure (pole, wire, branch) is a line of pixels: two neighbours at its depth
+        // keep it. A spike stands alone.
+        int own = 0;
+        double near = Math.max(spread, footprint);
+        for (int i = 0; i < n && own < 2; i++) if (Math.abs(values[i] - centre) <= near) own++;
+        if (own >= 2) continue;
+        spike[p] = true;
+        counts[y]++;
+      }
+    });
+    long removed = 0;
+    for (int p = 0; p < z.length; p++) if (spike[p]) z[p] = 0;
+    for (long c : counts) removed += c;
+    return removed;
+  }
+
   private long speckles(Merged m, Camera camera) {
     if (o.speckleSize <= 0) return 0;
     double slope = 2 / Math.min(camera.fx, camera.fy);
@@ -623,7 +684,7 @@ final class ImageFusion {
     double twoView = fusion.twoViewConfidenceThreshold();
     int[] near = neighbours[c];
     int agreementRadius = agreementRadius(o);
-    boolean consume = o.fusionStrategy.equals("owner-consume");
+    boolean consume = o.fusionStrategy.equals("owner-consume"), freeSpace = !o.fusionFreeSpace.equals("off"), strictFreeSpace = o.fusionFreeSpace.equals("strict");
     boolean graph = o.fusionStrategy.equals("graph-average");
     long[] taken = consume || graph ? used[c] : null;
     Map<Integer, PairData> byPair = new HashMap<>();
@@ -643,7 +704,7 @@ final class ImageFusion {
         }
       });
     Emission[][] rows = new Emission[h][];
-    long[][] tallies = new long[h][7];
+    long[][] tallies = new long[h][8];
     parallel(h, y -> {
       List<Emission> list = null;
       long[] t = tallies[y];
@@ -673,7 +734,7 @@ final class ImageFusion {
         for (int k = 0; k < words; k++) views[k] = m.partners.length > 0 ? m.partners[p * words + k] : 0;
         views[c >>> 6] |= 1L << (c & 63);
         long independent = m.support[p];
-        int contradictions = 0;
+        int contradictions = 0, closeViews = 0, seeThrough = 0;
         boolean outsideSupport = false;
         for (int j : near) {
           float[] other = compact[j];
@@ -722,6 +783,23 @@ final class ImageFusion {
               agreeDepth[agreed++] = (float) vj[2];
             }
           }
+          if (freeSpace && (zj > 0 || agrees)) {
+            // Free-space vote. Margin: three footprints (beyond depth noise, far below the 3 x
+            // relative tolerance of the contradiction test). "on": cameras confirming under the
+            // relative agreement above count for the point. "strict": confirmation at the same
+            // image-scale margin too (removes more floaters, also some roof and crown edges).
+            double margin = 3 * vj[2] / Math.min(oc.fx, oc.fy);
+            boolean close = agrees && !strictFreeSpace;
+            for (int dy = -agreementRadius; strictFreeSpace && !close && dy <= agreementRadius; dy++)
+              for (int dx = -agreementRadius; !close && dx <= agreementRadius; dx++) {
+                int xx = xj + dx, yy = yj + dy;
+                if (xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
+                double zn = other[yy * ow + xx];
+                close = zn > 0 && Math.abs(zn - vj[2]) <= margin;
+              }
+            if (close) closeViews++;
+            else if (zj > 0 && vj[2] < zj - margin && !(vj[2] < zj * (1 - 3 * tol)) && reliable(other, ow, xj, yj)) seeThrough++;
+          }
           if (!agrees && zj <= 0) continue;
           if (agrees) {
             if ((views[j >>> 6] & 1L << (j & 63)) == 0) outsideSupport = true;
@@ -736,6 +814,10 @@ final class ImageFusion {
         String status = "accepted";
         double sigma = 1 / Math.sqrt(Math.max(1e-30, m.wsum[p])) / mz;
         if (contradictions >= needed) status = "visibility_contradiction_rejected";
+        // Free space: cameras whose surface lies clearly behind this point (more than three
+        // footprints, beyond depth noise) see through it; when more of them do than confirm it, it
+        // floats in front of the surface (a mismatch the relative tolerance let through).
+        else if (seeThrough >= 2 && seeThrough > closeViews) status = "free_space_rejected";
         else if (m.ambiguous[p] && !outsideSupport) status = "depth_consensus_rejected";
         else if (viewCount < required) status = "independent_support_rejected";
         else if (sigma > o.maxDepthUncertainty) status = "depth_uncertainty_rejected";
@@ -746,6 +828,7 @@ final class ImageFusion {
         if (!status.equals("accepted")) {
           switch (status) {
             case "visibility_contradiction_rejected" -> t[0]++;
+            case "free_space_rejected" -> t[7]++;
             case "depth_consensus_rejected" -> t[1]++;
             case "independent_support_rejected" -> t[2]++;
             default -> t[3]++;
@@ -817,6 +900,7 @@ final class ImageFusion {
       counters.notOwner += t[4];
       counters.twoView += t[5];
       counters.consumed += t[6];
+      counters.freeSpace += t[7];
     }
     return rows;
   }

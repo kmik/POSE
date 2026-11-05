@@ -74,6 +74,9 @@ public final class Options {
   public String fusionStrategy = "owner";
   // Image fusion: drop per-camera depth outliers far beyond the scene's depth range (T2).
   public boolean fusionDepthOutliers = true;
+  // Image fusion impulse filter on merged depth maps (salt-and-pepper spikes on smooth surfaces).
+  public boolean fusionSpikeFilter = true;
+  public String fusionFreeSpace = "on";
   public int step = 2, cores = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
   public int boardColumns = 9, boardRows = 7;
   public double squareSize = .02, maxDepth = 10000;
@@ -786,6 +789,16 @@ public final class Options {
         case "--fusion-dedupe":
           // Earlier name of --fusion-strategy (3 Nov 2026): consume = owner-consume.
           o.fusionStrategy = v.toLowerCase(Locale.ROOT).equals("consume") ? "owner-consume" : v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-free-space":
+          o.fusionFreeSpace = v.toLowerCase(Locale.ROOT);
+          if (!Set.of("on", "off", "strict").contains(o.fusionFreeSpace))
+            throw new IllegalArgumentException("--fusion-free-space must be on, strict or off");
+          break;
+        case "--fusion-spike-filter":
+          if (!v.equalsIgnoreCase("on") && !v.equalsIgnoreCase("off"))
+            throw new IllegalArgumentException("--fusion-spike-filter must be on or off");
+          o.fusionSpikeFilter = v.equalsIgnoreCase("on");
           break;
         case "--fusion-depth-outliers":
           o.fusionDepthOutliers = !v.equalsIgnoreCase("off");
@@ -1830,6 +1843,21 @@ Point filtering and multi-view fusion:
       variance (triangulation angle); member pixels are then used and seed nothing.
       Copies are combined instead of chosen, so offsets average out without thinning.
       --fusion-dedupe owner|consume is the earlier name (consume = owner-consume).
+  --fusion-free-space on|strict|off
+      Image fusion: reject a point that floats in front of the surface the other cameras
+      see: more cameras look through it (their surface lies more than 3 pixel footprints
+      behind it) than confirm it, and at least two (default on). Removes near-ground
+      "salt and pepper" points that the relative --fusion-relative tolerance accepts
+      (the existing visibility test only acts beyond 3 x that tolerance, 1.3 m at 90 m).
+      strict also counts a camera as confirming only within 3 footprints: more floaters
+      go, and a few percent of roof and crown edge points with them. off: as before.
+      Counted as free_space_rejected.
+  --fusion-spike-filter on|off
+      Image fusion: remove isolated depth spikes ("salt and pepper" points a few
+      decimetres off a smooth surface) from each camera's merged depth map before the
+      cross-check (default on). Only where the 5 x 5 neighbourhood is smooth (spread at
+      most one pixel footprint); vegetation and depth edges are not touched. Counted as
+      spike_rejected.
   --fusion-depth-outliers on|off
       Image fusion: remove merged depths beyond 1.5x a camera's 99.5th percentile depth or
       below 0.5x its 0.5th percentile (default on): isolated points far below the ground
