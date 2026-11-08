@@ -14,6 +14,8 @@ final class SurfaceConsolidator implements AutoCloseable {
     long id;
     int source, pixel, rgb, views, pairs, merged = 1;
     double[] point, normal;
+    /** --surface-flatten: plane-fit normal for samples without one; consolidation-only. */
+    double[] fitNormal;
     SurfaceAttributes attributes = SurfaceAttributes.missing(false);
     BitSet supportingCameras = new BitSet();
     double sigma, shift, footprint, normalSigma, surfaceShift;
@@ -58,6 +60,9 @@ final class SurfaceConsolidator implements AutoCloseable {
     void point(Sample p) throws IOException;
 
     default void merged(Sample p, long representative) throws IOException {}
+
+    /** --surface-flatten removal: the sample is not published. */
+    default void removed(Sample p) throws IOException {}
   }
 
   private static final class Tile {
@@ -131,7 +136,14 @@ final class SurfaceConsolidator implements AutoCloseable {
   private double largestFootprint;
   private final double[] footprints = new double[8192];
   private int footprintCount;
-  private long emitted, merged, moved, unreliable, unchangedBudget, recheckRejected, ambiguous;
+  private long emitted, merged, moved, unreliable, recheckRejected, isolatedRemoved, fittedNormals;
+  // Updated from parallel proposal workers.
+  private final java.util.concurrent.atomic.AtomicLong unchangedBudget =
+      new java.util.concurrent.atomic.AtomicLong(),
+      ambiguous = new java.util.concurrent.atomic.AtomicLong(),
+      medianNanos = new java.util.concurrent.atomic.AtomicLong();
+  /** CPU look-ahead block when fusion has parallel workers (same output as one at a time). */
+  static final int CPU_BLOCK = 512;
   private double maxShift;
   private long temporaryBytes, peakTemporaryBytes, compressedInputBytes;
   private final long started = System.nanoTime();
@@ -139,18 +151,38 @@ final class SurfaceConsolidator implements AutoCloseable {
   private GpuSurface device;
   private Object deviceProfile;
   private long neighborhoodTrials, trialCpuEstimate, trialGpuNanos;
-  private long medianNanos;
-  private double[] pairWeights;
-  private int[] pairSeen;
-  private int weightStamp;
-  private long splitNanos, loadNanos, gridNanos, neighborhoodNanos, validationNanos, outputNanos;
+  /** Per-thread pair-weight scratch for propose(). */
+  private static final class WeightScratch {
+    double[] weights;
+    int[] seen;
+    int stamp;
+
+    WeightScratch(int pairs) {
+      weights = new double[Math.max(1, pairs)];
+      seen = new int[weights.length];
+    }
+  }
+
+  private final ThreadLocal<WeightScratch> weightScratch;
+  private long splitNanos, loadNanos, gridNanos, neighborhoodNanos, validationNanos, outputNanos,
+      readerNanos;
   private long loadedRecords, haloRecords, decompressedBytes, cacheHits, validationPoints;
   private double maximumHalo;
   private final LinkedHashMap<Path, byte[]> decoded = new LinkedHashMap<>(16, .75f, true);
   private long decodedBytes;
   private final long decodedLimit;
 
-  private record Proposal(int index, List<Neighbor> neighbors, double[] point, double delta) {}
+  private record Proposal(
+      int index, List<Neighbor> neighbors, double[] point, double delta, boolean remove) {
+    Proposal(int index, List<Neighbor> neighbors, double[] point, double delta) {
+      this(index, neighbors, point, delta, false);
+    }
+  }
+
+  /** Source-depth normal, else the --surface-flatten fit (always null when that is off). */
+  private static double[] nrm(Sample p) {
+    return p.normal != null ? p.normal : p.fitNormal;
+  }
 
   private record MergeCheck(int anchor, int neighbor) {}
 
@@ -166,8 +198,8 @@ final class SurfaceConsolidator implements AutoCloseable {
     this.options = options;
     this.fusion = fusion;
     maxRecordBytes = RECORD_BYTES + (fusion.cameraCount() + 7) / 8;
-    pairWeights = new double[Math.max(1, fusion.pairCount())];
-    pairSeen = new int[pairWeights.length];
+    int pairCount = fusion.pairCount();
+    weightScratch = ThreadLocal.withInitial(() -> new WeightScratch(pairCount));
     directory = Files.createTempDirectory(options.output, "surface-work-");
     root = new Tile(directory.resolve("accepted.bin.gz"));
     spool = output(root.path);
@@ -180,7 +212,9 @@ final class SurfaceConsolidator implements AutoCloseable {
     }
     // Includes Java object/hash-grid overhead, halo records and sort/query scratch.
     long budget = Math.min(options.surfaceMemoryMb, Math.max(8, options.memoryMb / 4)) * 1048576L;
-    decodedLimit = budget / 8;
+    // Decoded-partition cache only (no effect on partitioning or results): neighbouring
+    // partitions reread the same halo files, so allow up to 512 MiB within --memory-mb/16.
+    decodedLimit = Math.max(budget / 8, Math.min(512L << 20, options.memoryMb * 1048576L / 16));
     capacity =
         (int)
             Math.min(
@@ -247,8 +281,13 @@ final class SurfaceConsolidator implements AutoCloseable {
             + " and representative sampling%n",
         root.count,
         leaves.size());
+    // Image fusion leaves the pair evidence unprepared; freeze it for parallel CPU re-validation.
+    long readersStarted = System.nanoTime();
+    if (!Boolean.getBoolean("sgm.surfaceNoFreeze")) fusion.prepareSurfaceReaders(root.count);
+    readerNanos = System.nanoTime() - readersStarted;
     try {
-      device = fusion.surfaceDevice(capacity);
+      // --surface-flatten uses consolidation-only normals that the GPU neighbourhoods lack.
+      if (options.surfaceFlatten == 0) device = fusion.surfaceDevice(capacity);
     } catch (RuntimeException e) {
       if (options.surfaceValidation.equals("gpu")) throw e;
       System.out.println("Surface GPU neighborhoods unavailable; using CPU: " + e.getMessage());
@@ -457,7 +496,13 @@ final class SurfaceConsolidator implements AutoCloseable {
     }
     addLeaves(nodes, 0);
     partitionProgress.detail("routing full samples once; final partitions " + leaves.size());
-    LinkedHashMap<Tile, DataOutputStream> writers = new LinkedHashMap<>(16, .75f, true);
+    // Records arrive in fusion order, scattered over all partitions. Buffer them per partition
+    // and append large gzip members (same records, same order per partition) instead of
+    // reopening a stream for nearly every record.
+    Map<Tile, ByteArrayOutputStream> pending = new LinkedHashMap<>();
+    long pendingBytes = 0;
+    final int tileFlush = 1 << 20;
+    final long totalFlush = 64L << 20;
     Compression.GzipPool gzipPool = new Compression.GzipPool();
     try (DataInputStream in = input(root.path);
         FileChannel ids = FileChannel.open(coordinateFile)) {
@@ -478,22 +523,20 @@ final class SurfaceConsolidator implements AutoCloseable {
         routing.position(routing.position() + 24);
         Tile tile = nodes.get(id).tile;
         if (tile == null) throw new IOException("Invalid final spatial partition id");
-        DataOutputStream out = writers.get(tile);
-        if (out == null) {
-          if (writers.size() >= 8) {
-            var iterator = writers.entrySet().iterator();
-            var old = iterator.next();
-            old.getValue().close();
-            iterator.remove();
-          }
-          out =
-              new DataOutputStream(
-                  gzipPool.open(Files.newOutputStream(tile.path, StandardOpenOption.APPEND)));
-          writers.put(tile, out);
-        }
+        ByteArrayOutputStream buffer =
+            pending.computeIfAbsent(tile, t -> new ByteArrayOutputStream(65536));
         int bytes = readRecord(in, raw);
-        out.write(raw, 0, bytes);
+        buffer.write(raw, 0, bytes);
+        pendingBytes += bytes;
         tile.includeRaw(record, bytes);
+        if (buffer.size() >= tileFlush) {
+          pendingBytes -= buffer.size();
+          appendMember(gzipPool, tile, buffer);
+        }
+        if (pendingBytes >= totalFlush) {
+          for (var e : pending.entrySet()) appendMember(gzipPool, e.getKey(), e.getValue());
+          pendingBytes = 0;
+        }
         if ((i & 16383) == 0) {
           partitionProgress.update(routedRecords + i);
           if ((i & 1048575) == 0) updateTemporaryPeak();
@@ -503,11 +546,11 @@ final class SurfaceConsolidator implements AutoCloseable {
         throw new IOException("Surface coordinate/record counts disagree");
     } finally {
       IOException failure = null;
-      for (DataOutputStream out : writers.values())
+      for (var e : pending.entrySet())
         try {
-          out.close();
-        } catch (IOException e) {
-          failure = e;
+          appendMember(gzipPool, e.getKey(), e.getValue());
+        } catch (IOException x) {
+          failure = x;
         }
       gzipPool.close();
       if (failure != null) throw failure;
@@ -517,6 +560,17 @@ final class SurfaceConsolidator implements AutoCloseable {
     Files.delete(root.path);
     temporaryBytes = 0;
     for (Tile tile : leaves) temporaryBytes += Files.size(tile.path);
+  }
+
+  /** Appends buffered records to a partition file as one gzip member and empties the buffer. */
+  private static void appendMember(
+      Compression.GzipPool pool, Tile tile, ByteArrayOutputStream buffer) throws IOException {
+    if (buffer.size() == 0) return;
+    try (OutputStream out =
+        pool.open(Files.newOutputStream(tile.path, StandardOpenOption.APPEND))) {
+      buffer.writeTo(out);
+    }
+    buffer.reset();
   }
 
   private void addLeaves(List<SplitNode> nodes, int id) throws IOException {
@@ -565,6 +619,7 @@ final class SurfaceConsolidator implements AutoCloseable {
       return;
     }
     long clock = System.nanoTime();
+    prefetch(owner, halo);
     List<Sample> points = new ArrayList<>();
     load(owner, owner, 0, points);
     int owned = points.size();
@@ -600,6 +655,21 @@ final class SurfaceConsolidator implements AutoCloseable {
     Map<Cell, Indices> grid = new HashMap<>();
     for (int i = 0; i < points.size(); i++)
       grid.computeIfAbsent(cell(points.get(i).point, cellSize), k -> new Indices()).add(i);
+    if (options.surfaceFlatten > 0) {
+      // Fits read only positions and source-depth normals, so they are order independent.
+      double[][] fitted = new double[points.size()][];
+      final Map<Cell, Indices> fitGrid = grid;
+      fusion.parallel(
+          points.size(),
+          i -> {
+            Sample p = points.get(i);
+            if (p.normal == null) fitted[i] = fitNormal(p, points, fitGrid, cellSize);
+          });
+      for (int i = 0; i < fitted.length; i++) {
+        points.get(i).fitNormal = fitted[i];
+        if (fitted[i] != null && i < owned) fittedNormals++;
+      }
+    }
     Integer[] order = new Integer[owned];
     for (int i = 0; i < owned; i++) order[i] = i;
     Arrays.sort(
@@ -622,10 +692,15 @@ final class SurfaceConsolidator implements AutoCloseable {
                 + owned
                 + " owner samples; output "
                 + emitted);
+      // Look-ahead blocks give the same output as one sample at a time (proposals read only
+      // immutable positions/normals/normal sigmas; emission re-checks covered/processed in
+      // order). On the CPU path they let validation and proposals use all fusion workers.
       int block =
           fusion.surfaceBatching()
               ? Math.max(1, Math.min(options.surfaceBatchSize, capacity / 256))
-              : 1;
+              : fusion.cpuParallel() && !Boolean.getBoolean("sgm.surfaceSerial")
+                  ? Math.max(1, Math.min(CPU_BLOCK, capacity / 256))
+                  : 1;
       int length = Math.min(block, owned - base);
       Proposal[] proposals = new Proposal[length];
       List<Integer> sources = new ArrayList<>();
@@ -637,22 +712,32 @@ final class SurfaceConsolidator implements AutoCloseable {
           device == null
               ? null
               : deviceNeighbors(order, base, length, covered, points, grid, cellSize, cosine);
+      final int blockStart = base;
+      java.util.function.IntConsumer proposeOne =
+          k -> {
+            int i = order[blockStart + k];
+            Sample p = points.get(i);
+            if (covered[i] || nrm(p) == null) return;
+            if (options.surfaceFlatten > 0 && isolated(i, p, points, grid, cellSize, cosine)) {
+              proposals[k] = new Proposal(i, List.of(), p.point, 0, true);
+              return;
+            }
+            proposals[k] =
+                propose(
+                    i,
+                    p,
+                    points,
+                    accelerated == null
+                        ? neighbors(p, points, grid, cellSize, cosine)
+                        : accelerated.get(k));
+          };
+      if (accelerated == null) fusion.parallel(length, proposeOne);
+      else for (int k = 0; k < length; k++) proposeOne.accept(k);
       for (int k = 0; k < length; k++) {
-        int i = order[base + k];
-        Sample p = points.get(i);
-        if (covered[i] || p.normal == null) continue;
-        proposals[k] =
-            propose(
-                i,
-                p,
-                points,
-                accelerated == null
-                    ? neighbors(p, points, grid, cellSize, cosine)
-                    : accelerated.get(k));
         Proposal q = proposals[k];
         if (q != null && Math.abs(q.delta) > 1e-12) {
           checks[k] = positions.size();
-          sources.add(p.source);
+          sources.add(points.get(q.index).source);
           positions.add(q.point);
         }
       }
@@ -679,8 +764,9 @@ final class SurfaceConsolidator implements AutoCloseable {
                   * options.step
                   * Math.min(p.footprint, neighbor.footprint);
           if (n.tangent > spacing * spacing) continue;
-          double offset = SurfaceGeometry.dot(Math3.sub(q.point, neighbor.point), p.normal);
-          double[] projected = Math3.add(neighbor.point, Math3.times(p.normal, offset));
+          double[] anchorNormal = nrm(p);
+          double offset = SurfaceGeometry.dot(Math3.sub(q.point, neighbor.point), anchorNormal);
+          double[] projected = Math3.add(neighbor.point, Math3.times(anchorNormal, offset));
           if (!fusion.surfaceDisplacement(neighbor.source, neighbor.point, projected)) continue;
           merges.add(new MergeCheck(k, j));
           sources.add(neighbor.source);
@@ -698,7 +784,7 @@ final class SurfaceConsolidator implements AutoCloseable {
         if (covered[i]) continue;
         processed[i] = true;
         Sample p = points.get(i);
-        if (p.normal == null) {
+        if (nrm(p) == null) {
           unreliable++;
           emit(p, sink);
           continue;
@@ -706,6 +792,12 @@ final class SurfaceConsolidator implements AutoCloseable {
         Proposal q = proposals[k];
         if (q == null) {
           emit(p, sink);
+          continue;
+        }
+        if (q.remove) {
+          // --surface-flatten: isolated off a dominant surface; neither cloud nor record row.
+          isolatedRemoved++;
+          sink.removed(p);
           continue;
         }
         DepthFusion.Result check = checks[k] < 0 ? null : results[checks[k]];
@@ -775,26 +867,28 @@ final class SurfaceConsolidator implements AutoCloseable {
       while (low > 0 && nearby.get(low).offset - nearby.get(low - 1).offset <= gap) low--;
       while (high + 1 < nearby.size()
           && nearby.get(high + 1).offset - nearby.get(high).offset <= gap) high++;
-      if (low > 0 || high + 1 < nearby.size()) ambiguous++;
+      if (low > 0 || high + 1 < nearby.size()) ambiguous.incrementAndGet();
       nearby = new ArrayList<>(nearby.subList(low, high + 1));
-      int stamp = ++weightStamp, pairCount = 0;
+      WeightScratch s = weightScratch.get();
+      int stamp = ++s.stamp, pairCount = 0;
       if (stamp == 0) {
-        Arrays.fill(pairSeen, 0);
-        stamp = ++weightStamp;
+        Arrays.fill(s.seen, 0);
+        stamp = ++s.stamp;
       }
       for (Neighbor n : nearby) {
         Sample q = points.get(n.index);
-        if (q.source >= pairWeights.length) {
-          pairWeights = Arrays.copyOf(pairWeights, Math.max(q.source + 1, pairWeights.length * 2));
-          pairSeen = Arrays.copyOf(pairSeen, pairWeights.length);
+        if (q.source >= s.weights.length) {
+          s.weights = Arrays.copyOf(s.weights, Math.max(q.source + 1, s.weights.length * 2));
+          s.seen = Arrays.copyOf(s.seen, s.weights.length);
         }
-        if (pairSeen[q.source] != stamp) {
-          pairSeen[q.source] = stamp;
-          pairWeights[q.source] = 0;
+        if (s.seen[q.source] != stamp) {
+          s.seen[q.source] = stamp;
+          s.weights[q.source] = 0;
           pairCount++;
         }
-        pairWeights[q.source] += weight(q);
+        s.weights[q.source] += weight(q);
       }
+      double[] pairWeights = s.weights;
       if (nearby.size() < 3 || pairCount < 2) {
         return null;
       }
@@ -817,9 +911,9 @@ final class SurfaceConsolidator implements AutoCloseable {
               -options.surfaceMaxShift * p.footprint,
               Math.min(options.surfaceMaxShift * p.footprint, delta));
 
-      return new Proposal(i, nearby, Math3.add(p.point, Math3.times(p.normal, delta)), delta);
+      return new Proposal(i, nearby, Math3.add(p.point, Math3.times(nrm(p), delta)), delta);
     } finally {
-      medianNanos += System.nanoTime() - clock;
+      medianNanos.addAndGet(System.nanoTime() - clock);
     }
   }
 
@@ -841,9 +935,9 @@ final class SurfaceConsolidator implements AutoCloseable {
         if (covered[i] || points.get(i).normal == null) continue;
         active++;
         if (sampled < 2) {
-          long clock = System.nanoTime(), budgetBefore = unchangedBudget;
+          long clock = System.nanoTime(), budgetBefore = unchangedBudget.get();
           neighbors(points.get(i), points, grid, cellSize, cosine);
-          unchangedBudget = budgetBefore;
+          unchangedBudget.set(budgetBefore);
           cpu += System.nanoTime() - clock;
           sampled++;
         }
@@ -869,7 +963,7 @@ final class SurfaceConsolidator implements AutoCloseable {
                         * p.footprint
                         / cellSize);
         if (reach > 8) {
-          unchangedBudget++;
+          unchangedBudget.incrementAndGet();
           continue;
         }
         Cell c = cell(p.point, cellSize);
@@ -1002,17 +1096,22 @@ final class SurfaceConsolidator implements AutoCloseable {
     return new Neighbor(index, offset, tangent);
   }
 
-  private List<Neighbor> neighbors(
-      Sample p, List<Sample> points, Map<Cell, Indices> grid, double cellSize, double cosine) {
-    double radius = options.surfaceRadius * options.step * p.footprint,
-        height = options.surfaceMaxShift * p.footprint;
+  /**
+   * --surface-flatten: true when p is isolated off a dominant surface. Neighbours within twice
+   * the tangential radius and K footprints along p's normal (compatible normals, no displacement
+   * guard) are split into layers at the usual gap. p's own layer is weak evidence (at most 2
+   * samples, or all from a single stereo pair) while another layer has >= 6 samples from >= 2
+   * pairs, at least 3x p's layer and more than half of all of them.
+   */
+  private boolean isolated(
+      int i, Sample p, List<Sample> points, Map<Cell, Indices> grid, double cellSize, double cosine) {
+    double[] pn = nrm(p);
+    double radius = 2 * options.surfaceRadius * options.step * p.footprint,
+        height = options.surfaceFlatten * p.footprint;
     int reach = (int) Math.ceil((radius + height) / cellSize);
+    if (pn == null || reach > 8) return false;
     Cell c = cell(p.point, cellSize);
-    if (reach > 8) {
-      unchangedBudget++;
-      return List.of();
-    }
-    List<Neighbor> out = new ArrayList<>();
+    List<Neighbor> all = new ArrayList<>();
     for (long x = c.x - reach; x <= c.x + reach; x++)
       for (long y = c.y - reach; y <= c.y + reach; y++)
         for (long z = c.z - reach; z <= c.z + reach; z++) {
@@ -1021,17 +1120,141 @@ final class SurfaceConsolidator implements AutoCloseable {
           for (int member = 0; member < members.size; member++) {
             int index = members.values[member];
             Sample q = points.get(index);
-            if (q.normal == null || SurfaceGeometry.dot(p.normal, q.normal) < cosine) continue;
+            double[] qn = nrm(q);
+            if (qn == null || SurfaceGeometry.dot(pn, qn) < cosine) continue;
             double dx = q.point[0] - p.point[0],
                 dy = q.point[1] - p.point[1],
                 dz = q.point[2] - p.point[2];
-            double offset = dx * p.normal[0] + dy * p.normal[1] + dz * p.normal[2];
+            double offset = dx * pn[0] + dy * pn[1] + dz * pn[2];
+            double tangent = Math.max(0, dx * dx + dy * dy + dz * dz - offset * offset);
+            if (Math.abs(offset) > height || tangent > radius * radius) continue;
+            all.add(new Neighbor(index, offset, tangent));
+          }
+        }
+    if (all.size() < 7) return false;
+    all.sort(
+        Comparator.comparingDouble(Neighbor::offset)
+            .thenComparingLong(n -> points.get(n.index).id));
+    double gap = Math.max(.5 * p.footprint, Math.min(p.footprint, p.normalSigma) * 1.5);
+    int own = 0, ownPairs = 0, dominant = 0, dominantPairs = 0;
+    for (int s = 0; s < all.size(); ) {
+      int e = s;
+      while (e + 1 < all.size() && all.get(e + 1).offset - all.get(e).offset <= gap) e++;
+      boolean containsAnchor = false;
+      BitSet sources = new BitSet();
+      for (int k = s; k <= e; k++) {
+        if (all.get(k).index == i) containsAnchor = true;
+        sources.set(points.get(all.get(k).index).source);
+      }
+      int size = e - s + 1;
+      if (containsAnchor) {
+        own = size;
+        ownPairs = sources.cardinality();
+      } else if (size > dominant) {
+        dominant = size;
+        dominantPairs = sources.cardinality();
+      }
+      s = e + 1;
+    }
+    return own > 0
+        && (own <= 2 || ownPairs <= 1)
+        && dominant >= 6
+        && dominantPairs >= 2
+        && dominant >= 3 * own
+        && 2 * dominant > all.size();
+  }
+
+  /**
+   * --surface-flatten: robust plane-fit normal from the 3D neighbourhood of a sample without a
+   * source-depth normal (sphere of max(radius, 3) footprints; trimmed PCA; oriented like the
+   * neighbours' normals). Null when the neighbourhood is not clearly planar.
+   */
+  private double[] fitNormal(Sample p, List<Sample> points, Map<Cell, Indices> grid, double cellSize) {
+    double rho = Math.max(options.surfaceRadius * options.step, 3) * p.footprint;
+    int reach = (int) Math.ceil(rho / cellSize);
+    if (!(rho > 0) || reach > 8) return null;
+    Cell c = cell(p.point, cellSize);
+    List<double[]> near = new ArrayList<>();
+    double[] reference = new double[3];
+    int valid = 0;
+    for (long x = c.x - reach; x <= c.x + reach; x++)
+      for (long y = c.y - reach; y <= c.y + reach; y++)
+        for (long z = c.z - reach; z <= c.z + reach; z++) {
+          Indices members = grid.get(new Cell(x, y, z));
+          if (members == null) continue;
+          for (int member = 0; member < members.size; member++) {
+            Sample q = points.get(members.values[member]);
+            double[] d = Math3.sub(q.point, p.point);
+            if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > rho * rho) continue;
+            near.add(d);
+            if (q.normal != null) {
+              reference = Math3.add(reference, q.normal);
+              valid++;
+            }
+          }
+        }
+    int n = near.size();
+    double referenceLength = Math3.norm(reference);
+    if (!(referenceLength > 0)) return null;
+    // Fallback: the neighbours' own normals agree closely (mean resultant >= 0.9).
+    double[] fallback =
+        valid >= 6 && referenceLength >= .9 * valid ? Math3.times(reference, 1 / referenceLength) : null;
+    if (n < 9) return fallback;
+    double[][] pts = near.toArray(double[][]::new);
+    SurfaceGeometry.Plane plane = SurfaceGeometry.plane(pts, n);
+    if (plane == null) return fallback;
+    double[] residuals = new double[n];
+    for (int k = 0; k < n; k++)
+      residuals[k] = Math.abs(SurfaceGeometry.distance(pts[k], plane.center(), plane.normal()));
+    double[] sorted = residuals.clone();
+    Arrays.sort(sorted);
+    double band = Math.max(.5 * p.footprint, 3 * 1.4826 * sorted[n / 2]);
+    int kept = 0;
+    for (int k = 0; k < n; k++) if (residuals[k] <= band) pts[kept++] = pts[k];
+    if (kept < .6 * n) return fallback;
+    plane = SurfaceGeometry.plane(pts, kept);
+    if (plane == null || plane.smallest() > .12 * plane.middle()) return fallback;
+    double[] normal = plane.normal();
+    double agreement = SurfaceGeometry.dot(normal, reference) / referenceLength;
+    if (agreement < 0) {
+      normal = Math3.times(normal, -1);
+      agreement = -agreement;
+    }
+    return agreement >= .5 ? normal : fallback;
+  }
+
+  private List<Neighbor> neighbors(
+      Sample p, List<Sample> points, Map<Cell, Indices> grid, double cellSize, double cosine) {
+    double radius = options.surfaceRadius * options.step * p.footprint,
+        height = options.surfaceMaxShift * p.footprint;
+    int reach = (int) Math.ceil((radius + height) / cellSize);
+    Cell c = cell(p.point, cellSize);
+    if (reach > 8) {
+      unchangedBudget.incrementAndGet();
+      return List.of();
+    }
+    List<Neighbor> out = new ArrayList<>();
+    double[] pn = nrm(p);
+    for (long x = c.x - reach; x <= c.x + reach; x++)
+      for (long y = c.y - reach; y <= c.y + reach; y++)
+        for (long z = c.z - reach; z <= c.z + reach; z++) {
+          Indices members = grid.get(new Cell(x, y, z));
+          if (members == null) continue;
+          for (int member = 0; member < members.size; member++) {
+            int index = members.values[member];
+            Sample q = points.get(index);
+            double[] qn = nrm(q);
+            if (qn == null || SurfaceGeometry.dot(pn, qn) < cosine) continue;
+            double dx = q.point[0] - p.point[0],
+                dy = q.point[1] - p.point[1],
+                dz = q.point[2] - p.point[2];
+            double offset = dx * pn[0] + dy * pn[1] + dz * pn[2];
             double tangent = Math.max(0, dx * dx + dy * dy + dz * dz - offset * offset);
             if (Math.abs(offset) > height || tangent > radius * radius) continue;
             if (!fusion.surfaceDisplacement(
-                    p.source, p.point, Math3.add(p.point, Math3.times(p.normal, offset)))
+                    p.source, p.point, Math3.add(p.point, Math3.times(pn, offset)))
                 || !fusion.surfaceDisplacement(
-                    q.source, q.point, Math3.add(q.point, Math3.times(p.normal, -offset))))
+                    q.source, q.point, Math3.add(q.point, Math3.times(pn, -offset))))
               continue;
             out.add(new Neighbor(index, offset, tangent));
           }
@@ -1100,6 +1323,52 @@ final class SurfaceConsolidator implements AutoCloseable {
     throw new IOException("Invalid surface record status");
   }
 
+  /**
+   * Decompresses the owner and halo partitions that are not cached, in parallel, into the decode
+   * cache. load() then reads them in the usual order, so the loaded samples are unchanged.
+   */
+  private void prefetch(Tile owner, double halo) throws IOException {
+    List<Tile> wanted = new ArrayList<>();
+    long total = 0;
+    for (Tile t : leaves)
+      if (t == owner || intersects(owner, t, halo)) {
+        // get() refreshes LRU order so cached halo files survive the insertions below.
+        if (decoded.get(t.path) != null || t.uncompressedBytes > decodedLimit) continue;
+        wanted.add(t);
+        total += t.uncompressedBytes;
+      }
+    if (wanted.size() < 2 || total > decodedLimit) return;
+    byte[][] data = new byte[wanted.size()][];
+    try {
+      java.util.stream.IntStream.range(0, wanted.size())
+          .parallel()
+          .forEach(
+              k -> {
+                Tile t = wanted.get(k);
+                try (DataInputStream in = input(t.path)) {
+                  byte[] bytes = in.readNBytes(Math.toIntExact(t.uncompressedBytes));
+                  if (bytes.length != t.uncompressedBytes)
+                    throw new EOFException("Truncated surface partition");
+                  data[k] = bytes;
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
+                }
+              });
+    } catch (UncheckedIOException e) {
+      throw e.getCause();
+    }
+    for (int k = 0; k < wanted.size(); k++) {
+      while (decodedBytes + data[k].length > decodedLimit && !decoded.isEmpty()) {
+        var it = decoded.entrySet().iterator();
+        decodedBytes -= it.next().getValue().length;
+        it.remove();
+      }
+      decompressedBytes += data[k].length;
+      decoded.put(wanted.get(k).path, data[k]);
+      decodedBytes += data[k].length;
+    }
+  }
+
   private DataInputStream cachedInput(Tile t) throws IOException {
     byte[] data = decoded.get(t.path);
     if (data != null) {
@@ -1127,7 +1396,7 @@ final class SurfaceConsolidator implements AutoCloseable {
     try (DataInputStream in = input(t.path)) {
       for (long i = 0; i < t.count; i++) {
         emit(read(in), sink);
-        unchangedBudget++;
+        unchangedBudget.incrementAndGet();
       }
     }
   }
@@ -1155,12 +1424,18 @@ final class SurfaceConsolidator implements AutoCloseable {
             moved,
             "unreliable_normals_preserved",
             unreliable,
+            "surface_flatten_footprints",
+            options.surfaceFlatten,
+            "fitted_normals",
+            fittedNormals,
+            "isolated_off_surface_removed",
+            isolatedRemoved,
             "movement_revalidation_rejected",
             recheckRejected,
             "resolved_layer_gaps",
-            ambiguous,
+            ambiguous.get(),
             "budget_passthrough_samples",
-            unchangedBudget,
+            unchangedBudget.get(),
             "partitions",
             leaves.size(),
             "working_set_record_capacity",
@@ -1201,6 +1476,8 @@ final class SurfaceConsolidator implements AutoCloseable {
             options.surfaceNormalAngle,
             "profile",
             Json.object(
+                "evidence_freeze_seconds",
+                readerNanos / 1e9,
                 "partition_seconds",
                 splitNanos / 1e9,
                 "load_seconds",
@@ -1210,7 +1487,7 @@ final class SurfaceConsolidator implements AutoCloseable {
                 "neighborhood_seconds",
                 neighborhoodNanos / 1e9,
                 "median_and_layer_seconds",
-                medianNanos / 1e9,
+                medianNanos.get() / 1e9,
                 "validation_seconds",
                 validationNanos / 1e9,
                 "output_seconds",

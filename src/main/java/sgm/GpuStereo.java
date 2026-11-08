@@ -255,7 +255,7 @@ final class GpuStereo {
       throw new IllegalArgumentException("No GPU SGM memory plan fits the requested range");
     try (GpuSgm.Compute cl =
             new GpuSgm.Compute(
-                o, kernels(o.matchingCost.equals("zncc"), StereoCost.aggregateBytes(o)));
+                o, kernels(o.matchingCost.equals("zncc"), StereoCost.aggregateBytes(o), StereoCost.gpuSource(o)));
         Arena arena = Arena.ofConfined()) {
       int n = w * h,
           D = o.disparities,
@@ -729,9 +729,15 @@ final class GpuStereo {
   }
 
   static String kernels(boolean zncc, int sumBytes) {
+    return kernels(zncc, sumBytes, "");
+  }
+
+  /** costExtension: StereoCost.gpuSource(o), empty unless the opt-in census modes are set. */
+  static String kernels(boolean zncc, int sumBytes, String costExtension) {
     return (zncc ? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#define ZNCC 1\n" : "")
         + "#pragma OPENCL FP_CONTRACT OFF\n"
         + (sumBytes == 2 ? "typedef ushort SUM;\n" : "typedef int SUM;\n")
+        + costExtension
         + KERNELS;
   }
 
@@ -759,6 +765,9 @@ __kernel void costs(__global const ulong *a,__global const ulong *b,__global con
   if(x>=r&&x<w-r&&y>=r&&y<h-r&&ta[p]&&target>=r&&target<w-r) {
     int q=y*w+(int)target;
     if(tb[q]) {
+#ifdef CENSUS_EXT
+      value=ccost(a,b,ta,tb,ga,gb,n,p,q,w,h,r,words,mode,weight,adcap,gradcap);
+#else
       int ham=0;for(int j=0;j<words;j++)ham+=popcount(a[(size_t)j*n+p]^b[(size_t)j*n+q]);
       value=ham;int bits=(2*r+1)*(2*r+1)-1;
       if(mode==1||mode==2){int difference,cap;
@@ -766,6 +775,7 @@ __kernel void costs(__global const ulong *a,__global const ulong *b,__global con
         else{int ax=(int)ga[p+1]-ga[p-1],ay=(int)ga[p+w]-ga[p-w],bx=(int)gb[q+1]-gb[q-1],by=(int)gb[q+w]-gb[q-w];difference=abs(ax-bx)+abs(ay-by);cap=gradcap;}
         int den=1000*cap;value=(weight*ham*cap+(1000-weight)*min(difference,cap)*bits+den/2)/den;
       }
+#endif
 #ifdef ZNCC
       if(mode==3){long sa=0,sb=0,saa=0,sbb=0,sab=0;int count=(2*r+1)*(2*r+1);
         for(int dy=-r;dy<=r;dy++)for(int dx=-r;dx<=r;dx++){int av=ga[p+dy*w+dx],bv=gb[q+dy*w+dx];sa+=av;sb+=bv;saa+=av*av;sbb+=bv*bv;sab+=av*bv;}

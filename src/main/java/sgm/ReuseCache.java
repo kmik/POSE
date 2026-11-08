@@ -83,6 +83,12 @@ final class ReuseCache {
           MemorySafety.class,
           WindowedRasters.class,
           WindowedStereo.class,
+          DepthOutlierFilter.class,
+          SurfacePatchGrid.class,
+          AerialTileStereo.class,
+          AerialRectifier.class,
+          AerialPairMap.class,
+          AerialTiledReconstruction.class,
           StereoRows.class,
           FusionScope.class,
           IncrementalFusion.class,
@@ -94,6 +100,7 @@ final class ReuseCache {
           StereoCost.class,
           ZnccCosts.class,
           PhotometricRefinement.class,
+          MultiViewDisparityRefinement.class,
           OverlapSelection.class,
           OrientationIO.class,
           OrientationText.class,
@@ -607,6 +614,10 @@ final class ReuseCache {
                     "lrThreshold",
                     "speckleSize",
                     "speckleRange",
+                    "depthOutlierFilter",
+                    "depthOutlierRadius",
+                    "depthOutlierDeviation",
+                    "depthOutlierEdgeThreshold",
                     "pyramidLevels",
                     "pyramidRadius",
                     "tileSize",
@@ -621,7 +632,18 @@ final class ReuseCache {
                         + ":margin="
                         + o.tsgmMargin
                         + ":seeds="
-                        + (o.tsgmSeeds == null ? 0 : Arrays.hashCode(o.tsgmSeeds))));
+                        + (o.tsgmSeeds == null ? 0 : Arrays.hashCode(o.tsgmSeeds)))
+                // Opt-in depth-edge settings, appended only when used (keys otherwise unchanged).
+                + (o.censusEdgeMask == 0 && o.censusShift == 0 && o.disparityEdgeErosion == 0
+                    ? ""
+                    : ":edges="
+                        + o.censusEdgeMask
+                        + ","
+                        + o.censusShift
+                        + ","
+                        + o.disparityEdgeErosion
+                        + ","
+                        + o.disparityEdgeJump));
     CensusSgm.Result[] holder = new CensusSgm.Result[1];
     if (read(
         o,
@@ -645,7 +667,17 @@ final class ReuseCache {
           holder[0].costMargin = floats(in, w * h);
           holder[0].costSharpness = floats(in, w * h);
           if (PointConfidence.bidirectional(o)) holder[0].rightConfidence = floats(in, w * h);
-        })) return holder[0];
+          if (DepthOutlierFilter.enabled(o)) {
+            holder[0].stats.depthOutlierRejected=in.readLong();
+            holder[0].stats.depthOutlierReasons=new long[DepthOutlierFilter.REASONS.length];
+            for(int i=0;i<DepthOutlierFilter.REASONS.length;i++)holder[0].stats.depthOutlierReasons[i]=in.readLong();
+          }
+        })) {
+      var diagnostics=new DepthOutlierFilter.Diagnostics();
+      diagnostics.add(holder[0].stats.depthOutlierReasons);
+      DepthOutlierFilter.report(o,holder[0].stats.depthOutlierRejected,diagnostics);
+      return holder[0];
+    }
     CensusSgm.Result r = DenseMatcher.compute(o, a, b, ca, cb, w, h, ma, mb, observer);
     PointConfidence.stereo(r, a, b, o);
     write(
@@ -669,6 +701,10 @@ final class ReuseCache {
           floats(out, r.costMargin);
           floats(out, r.costSharpness);
           if (PointConfidence.bidirectional(o)) floats(out, r.rightConfidence);
+          if (DepthOutlierFilter.enabled(o)) {
+            out.writeLong(r.stats.depthOutlierRejected);
+            for(long count:r.stats.depthOutlierReasons)out.writeLong(count);
+          }
         });
     return r;
   }

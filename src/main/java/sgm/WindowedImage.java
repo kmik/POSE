@@ -61,6 +61,58 @@ final class WindowedImage {
     void write(int x, int y, byte[] bgr) throws IOException;
   }
 
+  /** Reusable source-window decoder on the same global area-resampling grid as readTo. */
+  static final class RegionReader implements AutoCloseable {
+    private final Source source;
+    private final ImageFrame frame;
+    private final int targetWidth, targetHeight;
+    RegionReader(ImageFrame frame) throws IOException {
+      this(frame, frame.width, frame.height);
+    }
+    RegionReader(ImageFrame frame, int width, int height) throws IOException {
+      this.frame = frame;
+      targetWidth = width;
+      targetHeight = height;
+      source = new Source(frame.path);
+    }
+    byte[] read(int x, int y, int width, int height) throws IOException {
+      if (x < 0 || y < 0 || width < 1 || height < 1
+          || (long)x + width > targetWidth || (long)y + height > targetHeight)
+        throw new IllegalArgumentException("Source region is outside the processed image");
+      return tile(source, null, x, y, width, height,
+          frame.sourceWidth / (double)targetWidth, frame.sourceHeight / (double)targetHeight,
+          frame.sourceWidth, frame.sourceHeight, frame.options.imageWindow, new AtomicInteger());
+    }
+    /** Approximate preview only: codec subsampling followed by a small area resize.
+     * Full-resolution matching always uses the exact global area grid above. */
+    byte[] preview(int x,int y,int width,int height) throws IOException {
+      double sx=frame.sourceWidth/(double)targetWidth,sy=frame.sourceHeight/(double)targetHeight;
+      int step=Math.max(1,(int)Math.floor(Math.min(sx,sy)/4));
+      if(!source.tiff || source.big!=null || step<2)return read(x,y,width,height);
+      int left=(int)Math.floor(x*sx),top=(int)Math.floor(y*sy);
+      int right=Math.min(frame.sourceWidth,(int)Math.ceil((x+width)*sx));
+      int bottom=Math.min(frame.sourceHeight,(int)Math.ceil((y+height)*sy));
+      int sw=Math.ceilDiv(right-left,step),sh=Math.ceilDiv(bottom-top,step);
+      if(10L*sw*sh>frame.options.memoryMb*1048576L/8)return read(x,y,width,height);
+      ImageReadParam param=source.reader.getDefaultReadParam();
+      param.setSourceRegion(new Rectangle(left,top,right-left,bottom-top));
+      param.setSourceSubsampling(step,step,0,0);
+      BufferedImage decoded=source.reader.read(0,param);
+      components(decoded);
+      org.opencv.core.Mat input=new org.opencv.core.Mat(decoded.getHeight(),decoded.getWidth(),CvType.CV_8UC3),
+          out=new org.opencv.core.Mat();
+      try {
+        int[] rgb=pixels(decoded,0,0,decoded.getWidth(),decoded.getHeight());
+        byte[] bgr=new byte[3*rgb.length];
+        for(int i=0;i<rgb.length;i++){bgr[3*i]=(byte)rgb[i];bgr[3*i+1]=(byte)(rgb[i]>>>8);bgr[3*i+2]=(byte)(rgb[i]>>>16);}
+        input.put(0,0,bgr);
+        org.opencv.imgproc.Imgproc.resize(input,out,new Size(width,height),0,0,org.opencv.imgproc.Imgproc.INTER_AREA);
+        byte[] result=new byte[3*width*height];out.get(0,0,result);return result;
+      } finally {decoded.flush();input.release();out.release();}
+    }
+    public void close() { source.close(); }
+  }
+
   static void readTo(
       Path path, int sourceWidth, int sourceHeight, int width, int height, int window, RowSink sink)
       throws IOException {

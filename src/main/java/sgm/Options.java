@@ -9,12 +9,18 @@ import java.util.*;
 public final class Options {
   public Path input, output = Paths.get("photogrammetry-output"), calibration, poses;
   public boolean help, rectified, calibrate, overwrite, gps, noGps, copyInputs, verbose;
-  public boolean diagnostics, compatibilityCopies;
+  public boolean diagnostics, compatibilityCopies, exportDisparityImages;
   public String densePairSelection = "all", calibrationPipeline = "bootstrap";
   public String fusionEmission = "pair";
   public String fusionEvidence = "auto";
   public String fusionGpuEvidence = "auto";
   public String windowedMode = "off";
+  public String depthOutlierFilter = "off";
+  public int depthOutlierRadius = 3, depthOutlierEdgeThreshold = 24;
+  public double depthOutlierDeviation = 1.5;
+  public String densePipeline = "standard";
+  public int aerialTileSize = 512, aerialOverlap = 32, aerialCoarseDimension = 1024,
+      aerialDisparityMargin = 16;
   public String fusionMode = "reference", fusionOutliers = "reference";
   public String fusionAssociation = "pair";
   public boolean fusionCameraCulling;
@@ -57,11 +63,14 @@ public final class Options {
   // T1: off | report (default) | exclude flagged cameras from dense matching.
   public String cameraScreening = "report";
   // S1: stereo pairs computed concurrently; 1 = serial (default), 0 = auto.
-  public int stereoPairsInFlight = 1;
+  public int stereoPairsInFlight = 0; // 0 = auto (up to 4, one per 4 cores); output equals serial
   public double gpsSigma = 2;
   public double focal = Double.NaN, sensorWidth = Double.NaN, baseline = 1, scale = 1;
   public double p1 = 4, p2 = 24, ratio = .75, reprojection = 2, uniqueness = .03, voxel = 0;
   public int sgmEdgeScale = 32;
+  // Opt-in depth-edge handling; 0 keeps the previous behaviour exactly.
+  public int disparityEdgeErosion = 0, censusEdgeMask = 0, censusShift = 0;
+  public double disparityEdgeJump = 2.0;
   public String medianMode = "edge-preserving";
   public double medianMaxChange = .5;
   public int medianEdgeThreshold = 24;
@@ -77,6 +86,13 @@ public final class Options {
   // Image fusion impulse filter on merged depth maps (salt-and-pepper spikes on smooth surfaces).
   public boolean fusionSpikeFilter = true;
   public String fusionFreeSpace = "on";
+  // --thin-surfaces (image fusion; THIN_SURFACES_FUSION.md): uncertainty-scaled agreement, precise-
+  // disagreement rejection, best-first seeding, narrow pairs as support, local sigma limit.
+  public String fusionTolerance = "relative", fusionSeedOrder = "camera";
+  public boolean fusionPrecisionCheck = false;
+  // Exact GPU brute-force Hamming k=2 search for binary feature descriptors (GpuHamming).
+  public boolean gpuFeatureMatching = true;
+  public double fusionSigmaK = 3, fusionSeedMinAngle = 0, fusionLocalSigma = 0;
   public int step = 2, cores = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
   public int boardColumns = 9, boardRows = 7;
   public double squareSize = .02, maxDepth = 10000;
@@ -91,6 +107,9 @@ public final class Options {
   long gpuHostReserve;
   PointConfidence.Selection stereoSelection;
   public String subpixelRefinement = "none";
+  public String disparityRefinement = "off";
+  public double disparityAnchorAngle = 4;
+  public int disparityRefinementMemoryMb = 128;
   public String pairwiseSearch = "full", subpixelFit = "parabola", onPairFailure = "abort";
   public String fusionGpuFailure = "disable";
   public int tsgmLevels = 3, tsgmMargin = 3;
@@ -137,6 +156,8 @@ public final class Options {
   public boolean depthRefinement = true;
   public String depthRefinementMethod = "reprojection", surfaceConsolidation = "normal";
   public double surfaceRadius = 2, surfaceSpacing = 1, surfaceMaxShift = 2;
+  /** Opt-in --surface-flatten window in footprints; 0 keeps consolidation unchanged. */
+  public double surfaceFlatten = 0;
   public double surfaceNormalAngle = 30;
   public int surfaceMemoryMb = 128, surfaceBatchSize = 64;
   public String surfaceValidation = "auto", pointAttributes = "surface";
@@ -203,6 +224,9 @@ public final class Options {
         case "--diagnostics":
           o.diagnostics = true;
           continue;
+        case "--export-disparity-images":
+          o.exportDisparityImages = true;
+          continue;
         case "--compatibility-copies":
           o.compatibilityCopies = true;
           continue;
@@ -228,6 +252,16 @@ public final class Options {
           continue;
         case "--verbose":
           o.verbose = true;
+          continue;
+        case "--thin-surfaces":
+          // Order matters: options after it override these values.
+          o.fusionTolerance = "sigma";
+          o.fusionPrecisionCheck = true;
+          o.fusionSeedOrder = "precision";
+          o.fusionLocalSigma = 3;
+          o.surfaceConsolidation = "normal";
+          o.surfaceFlatten = 8;
+          o.subpixelRefinement = "zncc";
           continue;
         case "--classify-ground":
           o.classifyGround = true;
@@ -298,6 +332,18 @@ public final class Options {
         case "--sgm-edge-scale":
           o.sgmEdgeScale = Integer.parseInt(v);
           break;
+        case "--disparity-edge-erosion":
+          o.disparityEdgeErosion = Integer.parseInt(v);
+          break;
+        case "--disparity-edge-jump":
+          o.disparityEdgeJump = number(v);
+          break;
+        case "--census-edge-mask":
+          o.censusEdgeMask = Integer.parseInt(v);
+          break;
+        case "--census-shift":
+          o.censusShift = Integer.parseInt(v);
+          break;
         case "--median-mode":
           o.medianMode = v.toLowerCase(Locale.ROOT);
           break;
@@ -357,6 +403,42 @@ public final class Options {
           break;
         case "--image-reader":
           o.imageReader = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--depth-outlier-filter":
+          o.depthOutlierFilter = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--disparity-refinement":
+          o.disparityRefinement = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--disparity-anchor-angle":
+          o.disparityAnchorAngle = number(v);
+          break;
+        case "--disparity-refinement-memory-mb":
+          o.disparityRefinementMemoryMb = Integer.parseInt(v);
+          break;
+        case "--depth-outlier-radius":
+          o.depthOutlierRadius = Integer.parseInt(v);
+          break;
+        case "--depth-outlier-deviation":
+          o.depthOutlierDeviation = number(v);
+          break;
+        case "--depth-outlier-edge-threshold":
+          o.depthOutlierEdgeThreshold = Integer.parseInt(v);
+          break;
+        case "--dense-pipeline":
+          o.densePipeline = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--aerial-tile-size":
+          o.aerialTileSize = Integer.parseInt(v);
+          break;
+        case "--aerial-overlap":
+          o.aerialOverlap = Integer.parseInt(v);
+          break;
+        case "--aerial-coarse-dimension":
+          o.aerialCoarseDimension = Integer.parseInt(v);
+          break;
+        case "--aerial-disparity-margin":
+          o.aerialDisparityMargin = Integer.parseInt(v);
           break;
         case "--windowed-mode":
           o.windowedMode = v.toLowerCase(Locale.ROOT);
@@ -513,10 +595,13 @@ public final class Options {
           };
           break;
         case "--fusion-camera-culling":
-          o.fusionCameraCulling = switch (v.toLowerCase(Locale.ROOT)) {
-            case "on" -> true; case "off" -> false;
-            default -> throw new IllegalArgumentException("--fusion-camera-culling requires on|off");
-          };
+          o.fusionCameraCulling =
+              switch (v.toLowerCase(Locale.ROOT)) {
+                case "on" -> true;
+                case "off" -> false;
+                default ->
+                    throw new IllegalArgumentException("--fusion-camera-culling requires on|off");
+              };
           break;
         case "--fusion-association":
           o.fusionAssociation = v.toLowerCase(Locale.ROOT);
@@ -788,7 +873,35 @@ public final class Options {
           break;
         case "--fusion-dedupe":
           // Earlier name of --fusion-strategy (3 Nov 2026): consume = owner-consume.
-          o.fusionStrategy = v.toLowerCase(Locale.ROOT).equals("consume") ? "owner-consume" : v.toLowerCase(Locale.ROOT);
+          o.fusionStrategy =
+              v.toLowerCase(Locale.ROOT).equals("consume")
+                  ? "owner-consume"
+                  : v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gpu-feature-matching":
+          if (!Set.of("on", "off").contains(v.toLowerCase(Locale.ROOT)))
+            throw new IllegalArgumentException("--gpu-feature-matching must be on or off");
+          o.gpuFeatureMatching = v.equalsIgnoreCase("on");
+          break;
+        case "--fusion-tolerance":
+          o.fusionTolerance = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-sigma-k":
+          o.fusionSigmaK = number(v);
+          break;
+        case "--fusion-precision-check":
+          if (!Set.of("on", "off").contains(v.toLowerCase(Locale.ROOT)))
+            throw new IllegalArgumentException("--fusion-precision-check must be on or off");
+          o.fusionPrecisionCheck = v.equalsIgnoreCase("on");
+          break;
+        case "--fusion-seed-order":
+          o.fusionSeedOrder = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--fusion-seed-min-angle":
+          o.fusionSeedMinAngle = number(v);
+          break;
+        case "--fusion-local-sigma":
+          o.fusionLocalSigma = number(v);
           break;
         case "--fusion-free-space":
           o.fusionFreeSpace = v.toLowerCase(Locale.ROOT);
@@ -840,6 +953,9 @@ public final class Options {
           break;
         case "--surface-spacing":
           o.surfaceSpacing = number(v);
+          break;
+        case "--surface-flatten":
+          o.surfaceFlatten = number(v);
           break;
         case "--surface-max-shift":
           o.surfaceMaxShift = number(v);
@@ -1070,6 +1186,61 @@ public final class Options {
     if (o.diagnostics && !storageExplicit) o.storage = "debug";
     choice(o.storage, "--storage", "minimal", "standard", "debug");
     choice(o.densePairSelection, "--dense-pair-selection", "all", "coverage");
+    choice(o.densePipeline, "--dense-pipeline", "standard", "aerial-tiled");
+    choice(o.depthOutlierFilter, "--depth-outlier-filter", "off", "edge-aware");
+    choice(o.disparityRefinement, "--disparity-refinement", "off", "multiview");
+    if (!Double.isFinite(o.disparityAnchorAngle)
+        || o.disparityAnchorAngle <= 0
+        || o.disparityAnchorAngle >= 90
+        || o.disparityRefinementMemoryMb < 8
+        || o.disparityRefinementMemoryMb > 4096)
+      throw new IllegalArgumentException(
+          "Disparity refinement requires anchor angle >0..<90 and memory 8..4096 MiB");
+    if (o.disparityRefinement.equals("multiview")
+        && (!o.denseMethod.equals("sgm")
+            || !o.densePipeline.equals("standard")
+            || !o.fusionMode.equals("image")
+            || o.step != 1
+            || o.pyramidLevels != 1
+            || o.rectified
+            || o.windowedMode.equals("on")))
+      throw new IllegalArgumentException(
+          "--disparity-refinement multiview requires standard SGM, --fusion-mode image"
+              + " --pyramid-levels 1 --step 1, unrectified images and non-windowed pairs");
+    if (o.depthOutlierRadius < 2
+        || o.depthOutlierRadius > 8
+        || !Double.isFinite(o.depthOutlierDeviation)
+        || o.depthOutlierDeviation <= 0
+        || o.depthOutlierDeviation > 32
+        || o.depthOutlierEdgeThreshold < 0
+        || o.depthOutlierEdgeThreshold > 255)
+      throw new IllegalArgumentException(
+          "Depth outlier settings require radius 2..8,"
+              + " deviation >0..32 disparity pixels, edge threshold 0..255");
+    if (!o.depthOutlierFilter.equals("off") && !o.denseMethod.equals("sgm"))
+      throw new IllegalArgumentException(
+          "--depth-outlier-filter edge-aware currently requires --dense-method sgm");
+    if (o.aerialTileSize < 64 || o.aerialTileSize > 2048
+        || o.aerialOverlap < 8 || o.aerialOverlap > o.aerialTileSize / 2
+        || o.aerialCoarseDimension < 128 || o.aerialCoarseDimension > 2048
+        || o.aerialDisparityMargin < 4 || o.aerialDisparityMargin > 256)
+      throw new IllegalArgumentException("Invalid aerial tile settings: tile 64..2048, overlap"
+          + " 8..tile/2, coarse dimension 128..2048, disparity margin 4..256");
+    if (o.densePipeline.equals("aerial-tiled")
+        && (!o.denseMethod.equals("sgm")
+            || o.compute.equals("cpu")
+            || o.pyramidLevels != 1
+            || !o.fusionMode.equals("reference")
+            || !o.fusionEmission.equals("pair")
+            || !o.surfaceConsolidation.equals("none")
+            || !o.fusionStrategy.equals("owner")
+            || o.voxel != 0
+            || o.windowedMode.equals("on")))
+      throw new IllegalArgumentException(
+          "--dense-pipeline aerial-tiled requires OpenCL GPU SGM, --pyramid-levels 1, --fusion-mode"
+              + " reference, --fusion-emission pair, --surface-consolidation none,"
+              + " --fusion-strategy owner, --voxel 0 and --windowed-mode off|auto. It uses bounded"
+              + " block fusion, not image/incremental fusion or global consolidation.");
     choice(o.calibrationPipeline, "--calibration-pipeline", "bootstrap", "joint");
     choice(o.fusionEmission, "--fusion-emission", "pair", "camera");
     choice(o.fusionEvidence, "--fusion-evidence", "pair", "camera", "auto");
@@ -1082,7 +1253,8 @@ public final class Options {
     choice(o.fusionOutliers, "--fusion-outliers", "reference", "robust");
     choice(o.fusionAssociation, "--fusion-association", "pair", "camera");
     if (o.fusionAssociation.equals("camera") && !o.fusionMode.equals("incremental"))
-      throw new IllegalArgumentException("--fusion-association camera requires --fusion-mode incremental");
+      throw new IllegalArgumentException(
+          "--fusion-association camera requires --fusion-mode incremental");
     if (o.fusionWindowMb < 0)
       throw new IllegalArgumentException("--fusion-window-mb must be nonnegative");
     if (o.windowedMode.equals("on") && o.denseMethod.equals("patchmatch"))
@@ -1099,6 +1271,17 @@ public final class Options {
     if (o.sgmEdgeScale < 0 || o.sgmEdgeScale > 255 || o.medianMaxChange < 0)
       throw new IllegalArgumentException(
           "--sgm-edge-scale must be 0..255; --median-max-change must be nonnegative pixels");
+    if (o.disparityEdgeErosion < 0 || o.disparityEdgeErosion > 8)
+      throw new IllegalArgumentException("--disparity-edge-erosion must be 0..8 pixels");
+    if (!(o.disparityEdgeJump > 0) || !Double.isFinite(o.disparityEdgeJump))
+      throw new IllegalArgumentException("--disparity-edge-jump must be positive pixels");
+    if (o.censusEdgeMask < 0 || o.censusEdgeMask > 255)
+      throw new IllegalArgumentException("--census-edge-mask must be 0..255");
+    if (o.censusShift < 0 || o.censusShift > 2)
+      throw new IllegalArgumentException("--census-shift must be 0, 1 or 2");
+    if ((o.censusEdgeMask > 0 || o.censusShift > 0) && o.matchingCost.equals("zncc"))
+      throw new IllegalArgumentException(
+          "--census-edge-mask and --census-shift require a census-based --matching-cost");
     if (o.medianEdgeThreshold < 0
         || o.medianEdgeThreshold > 255
         || (o.speckleConnectivity != 4 && o.speckleConnectivity != 8))
@@ -1337,6 +1520,21 @@ public final class Options {
         || o.surfaceMemoryMb < 8)
       throw new IllegalArgumentException(
           "Invalid surface radius/spacing/shift/normal angle or memory budget");
+    if (!(o.surfaceFlatten >= 0 && o.surfaceFlatten <= 16))
+      throw new IllegalArgumentException("--surface-flatten must be 0..16 footprints");
+    choice(o.fusionTolerance, "--fusion-tolerance", "relative", "sigma");
+    choice(o.fusionSeedOrder, "--fusion-seed-order", "camera", "precision");
+    if (!(o.fusionSigmaK >= 1 && o.fusionSigmaK <= 10)
+        || !(o.fusionSeedMinAngle >= 0 && o.fusionSeedMinAngle < 60)
+        || !(o.fusionLocalSigma == 0 || o.fusionLocalSigma >= 1 && o.fusionLocalSigma <= 100))
+      throw new IllegalArgumentException(
+          "--fusion-sigma-k must be 1..10, --fusion-seed-min-angle 0..<60 degrees,"
+              + " --fusion-local-sigma 0 (off) or 1..100");
+    if (o.thinSurfaceFusion() && !o.fusionMode.equals("image"))
+      throw new IllegalArgumentException(
+          "--thin-surfaces and --fusion-tolerance sigma, --fusion-precision-check on,"
+              + " --fusion-seed-order precision, --fusion-seed-min-angle and --fusion-local-sigma"
+              + " require --fusion-mode image");
     return o;
   }
 
@@ -1348,10 +1546,12 @@ public final class Options {
               "--gps-intrinsics must be none or a comma list of f,k1,k2,k3,cx,cy,p1,p2");
     if (!Set.of("auto", "none").contains(o.gpsFocalPrior) && !(number(o.gpsFocalPrior) > 0))
       throw new IllegalArgumentException("--gps-focal-prior must be auto, none or focal pixels");
-    if (!(o.gpsFocalSigma > 0)) throw new IllegalArgumentException("--gps-focal-sigma must be positive");
+    if (!(o.gpsFocalSigma > 0))
+      throw new IllegalArgumentException("--gps-focal-sigma must be positive");
     if (!Set.of("estimate", "off").contains(o.gpsTimeOffset)
         && !(Math.abs(number(o.gpsTimeOffset)) <= 2))
-      throw new IllegalArgumentException("--gps-time-offset must be estimate, off or -2..2 seconds");
+      throw new IllegalArgumentException(
+          "--gps-time-offset must be estimate, off or -2..2 seconds");
     if (!Set.of("estimate", "off").contains(o.gpsLeverArm)) {
       String[] parts = o.gpsLeverArm.split(",");
       if (parts.length != 3)
@@ -1376,7 +1576,8 @@ public final class Options {
       throw new IllegalArgumentException("--gcp file not found: " + o.gcp);
     if (!(o.gcpSigma > 0) || !(o.gcpHeightSigma > 0))
       throw new IllegalArgumentException("--gcp-sigma and --gcp-height-sigma must be positive");
-    if (o.gcpPort < 1 || o.gcpPort > 65535) throw new IllegalArgumentException("--gcp-port must be 1..65535");
+    if (o.gcpPort < 1 || o.gcpPort > 65535)
+      throw new IllegalArgumentException("--gcp-port must be 1..65535");
     if (!(o.groundMaxObject >= 1 && o.groundMaxObject <= 500))
       throw new IllegalArgumentException("--ground-max-object must be 1..500 metres");
     if (o.gpsAdjustmentRounds < 1 || o.gpsAdjustmentRounds > 20)
@@ -1459,6 +1660,15 @@ public final class Options {
         filteringOverrides.isEmpty() ? "none" : filteringOverrides);
   }
 
+  /** Whether any --thin-surfaces image-fusion part is enabled (all off reproduces the old output). */
+  boolean thinSurfaceFusion() {
+    return fusionTolerance.equals("sigma")
+        || fusionPrecisionCheck
+        || fusionSeedOrder.equals("precision")
+        || fusionSeedMinAngle > 0
+        || fusionLocalSigma > 0;
+  }
+
   int qualityDownsample() {
     switch (quality) {
       case "ultra":
@@ -1509,7 +1719,9 @@ public final class Options {
   }
 
   public static String help() {
-    return """
+    return String.join(
+        "",
+        """
 POSE - Photogrammetric Orientation and Surface Estimation (Java/OpenCL)
 Usage: photogrammetry -i IMAGE_DIR [-o PROJECT_DIR] [options]
        (pose.bat / pose.sh start the same program as photogrammetry.bat / .sh)
@@ -1732,6 +1944,29 @@ Dense stereo / SGM:
       Effective P2=max(scaled P1+1, floor(scaled P2*N/(N+intensity difference))).
       N=0 restores constant P2. Applies per path to grayscale values, including
       reverse matching and streamed strip boundaries, identically on CPU/GPU.
+  --census-edge-mask T
+      Opt-in edge-limited ("weighted") census, default 0 = off. Only census comparisons
+      whose neighbour lies within T grey levels of the window centre in the reference
+      image are counted; the Hamming cost is rescaled to the full bit count. The window
+      then stops at intensity edges, which reduces foreground fattening at depth jumps
+      (roof eaves, walls). Windows keeping fewer than a quarter of their comparisons
+      use the ordinary cost. Try 16..32. Census-based --matching-cost only; CPU/GPU.
+  --census-shift S
+      Opt-in shiftable windows, default 0 = off. The matching cost is the minimum over
+      census windows shifted by up to S pixels (1 or 2), so a pixel next to a depth jump
+      can use a window lying entirely on its own side. Costs (2S+1)^2 evaluations per
+      hypothesis. Combines with --census-edge-mask. Census-based costs only; CPU/GPU.
+  --disparity-edge-erosion N
+      Opt-in, default 0 = off. After the left/right, median and ZNCC checks, reject
+      every valid disparity that has another valid disparity within N pixels (square
+      neighbourhood) differing by more than --disparity-edge-jump, and the N pixels at
+      both ends of a horizontal invalid gap (an occlusion, at most the disparity
+      difference + 2N wide) whose two sides differ by more than that. Removes about N
+      pixels on both sides of depth jumps, where mixed roof/ground disparities fan out
+      into rays. Never fills or moves values. Try 1 or 2. Counted as reason code 8.
+  --disparity-edge-jump J
+      Disparity difference in pixels that counts as a depth jump for
+      --disparity-edge-erosion (default: 2; positive).
   --uniqueness N
       Relative best/alternative cost separation (default: 0.03; 0 <= N < 1).
       Higher values reject more ambiguous matches; a minimum cost gap remains.
@@ -1766,6 +2001,36 @@ Point filtering and multi-view fusion:
       mild         0.01             1.25           0.55       0.45         20
       moderate     0.005            0.75           0.60       0.55         50
       aggressive   0.0025           0.50           0.75       0.65         100
+  --depth-outlier-filter off|edge-aware
+      Default off preserves the existing output. Opt-in edge-aware rejects disparity
+      outliers against a dominant local plane using local noise and stereo uncertainty.
+      Protects connected directional thin features, extending surfaces and depth edges.
+      Adds multiscale, separate-layer surface checks and precise independent-camera
+      validation of suspect patches during fusion; uncertain compatibility is neutral.
+      Diagnostics report preservation/rejection reasons. Surviving local depths never move.
+      Supports standard/pyramid, windowed and aerial-tiled SGM; not PatchMatch.
+  --disparity-refinement off|multiview
+      Default off. Experimental second-pass search guided by independently triangulated
+      surfaces; four anchor cameras exclude both producing cameras. Rechecks image
+      agreement and local photometric reciprocity; unresolved surface conflicts are
+      rejected. Reliable geometry and directional thin features are retained unchanged.
+      Currently requires standard, non-windowed SGM, --fusion-mode image,
+      --pyramid-levels 1 --step 1, and at least six registered cameras.
+      Raw stereo reports precede this pass; separate refinement reports describe changes.
+  --disparity-anchor-angle DEG
+      Minimum anchor triangulation angle (default 4; >0..<90). --min-angle still
+      controls the candidates available for recovery; use 1 to revisit weak matches.
+  --disparity-refinement-memory-mb N
+      Anchor-grid budget (default 128 MiB; 8..4096). Grid spacing adapts to the
+      camera count/resolution; one rectified pair and ordinary fusion are additional.
+  --depth-outlier-radius N
+      Neighbourhood radius (default 3; 2..8 processed pixels).
+  --depth-outlier-deviation N
+      Minimum deviation from the fitted plane (default 1.5; >0..32 disparity pixels).
+      Lower values remove smaller deviations but may lose real small features.
+  --depth-outlier-edge-threshold N
+      Maximum grayscale difference used for local support (default 24; 0..255).
+      Larger values cross more image edges. This is an intensity, not depth, threshold.
   --min-correlation N
       Minimum zero-mean normalized cross correlation (-1..1; preset default:
       0.55 moderate). Higher values require stronger photometric agreement.
@@ -1795,6 +2060,19 @@ Point filtering and multi-view fusion:
       Default sgm. Experimental PatchMatch estimates camera-space depth/planes
       directly from multiple views. Uses OpenCL GPU; --compute cpu selects its
       slow reference implementation. No silent substitution with SGM.
+  --dense-pipeline standard|aerial-tiled
+      Default standard is unchanged. Opt-in aerial-tiled requires a compatible OpenCL GPU.
+      It rectifies source regions on demand, predicts tile search intervals from a coarse
+      disparity map, matches overlapping tiles in VRAM, and fuses compact maps in blocks.
+      Tile-local SGM is approximate; weak predictions and search boundaries trigger widening.
+      Requires --fusion-mode reference --fusion-strategy owner --surface-consolidation none --voxel 0;
+      image/incremental fusion and --windowed-mode on are incompatible.
+  --aerial-tile-size N / --aerial-overlap N
+      Core tile side (default 512; 64..2048), context and seam-check overlap (default 32).
+      Tiles subdivide to fit host/device budgets; overlap must be 8..tile-size/2.
+  --aerial-coarse-dimension N / --aerial-disparity-margin N
+      Maximum coarse-map side (default 1024; 128..2048), full-resolution search margin
+      (default 16; 4..256). Low coverage or boundary pressure restores the pair interval.
   --two-view-confidence-threshold T
       Experimental opt-in SGM gate for points supported by exactly two cameras.
       Require min(left matching confidence, corresponding right confidence) >= T;
@@ -1843,6 +2121,41 @@ Point filtering and multi-view fusion:
       variance (triangulation angle); member pixels are then used and seed nothing.
       Copies are combined instead of chosen, so offsets average out without thinning.
       --fusion-dedupe owner|consume is the earlier name (consume = owner-consume).
+  --thin-surfaces
+      Image fusion preset for thin flat surfaces (off by default; options after it
+      override its parts). Sets --fusion-tolerance sigma, --fusion-precision-check on,
+      --fusion-seed-order precision, --fusion-local-sigma 3,
+      --surface-consolidation normal, --surface-flatten 8, --subpixel-refinement zncc.
+      Requires --fusion-mode image. See THIN_SURFACES_FUSION.md.
+  --fusion-tolerance relative|sigma
+      Image fusion depth agreement. relative (default): |dz| <= --fusion-relative x depth
+      (0.005 = 44 cm at 88 m). sigma: |dz| <= K x combined stereo sigma of both depths
+      (from triangulation angles, 0.5 px disparity), at least one pixel footprint and at
+      most the relative band. Precise wide-baseline depths then only confirm what agrees
+      at their precision.
+  --fusion-sigma-k K
+      Sigma multiplier for --fusion-tolerance sigma and --fusion-precision-check (default 3).
+  --fusion-precision-check on|off
+      Image fusion (default off): a point that cameras with at least 2x smaller sigma see
+      within the relative band but not within K sigma (a near miss, not an occlusion) is
+      rejected when such cameras outnumber the precise confirmations; confirmed points are
+      averaged with the precise depths along their ray (any --fusion-strategy). Counted as
+      precision_rejected.
+  --fusion-seed-order camera|precision
+      Image fusion emission order. camera (default): camera by camera. precision: three
+      passes over all cameras: precise pixels (merged sigma <= 1 footprint) first, then
+      the rest, then pixels seen only by narrow pairs (--fusion-seed-min-angle), so precise
+      points absorb noisier copies of the same surface. About 3x pass-2 time.
+  --fusion-seed-min-angle DEG
+      Image fusion (default 0 = off; not part of --thin-surfaces): pixels whose merged depth
+      comes only from pairs with triangulation angle below DEG may still confirm and be
+      averaged, but emit a point only when at least two cameras outside their own pairs
+      confirm it. Counted as narrow_unconfirmed_rejected. On city2, 12 removed 1.1M points and
+      ~14% of vegetation/edge coverage for a marginal flatness gain.
+  --fusion-local-sigma K
+      Image fusion (default 0 = off): reject a point whose final sigma exceeds K x the best
+      merged sigma within 4 pixels in its camera (precise evidence nearby that it did not
+      join). Counted as local_sigma_rejected.
   --fusion-free-space on|strict|off
       Image fusion: reject a point that floats in front of the surface the other cameras
       see: more cameras look through it (their surface lies more than 3 pixel footprints
@@ -1890,6 +2203,16 @@ Point filtering and multi-view fusion:
   --surface-max-shift N
       Maximum normal displacement in local pixel footprints (default: 2; 0 < N <= 10).
       Every moved result must pass multi-view checks again.
+  --surface-flatten K
+      Opt-in, default 0 = off (consolidation unchanged). With K > 0 footprints:
+      samples without a reliable source-depth normal get a robust plane-fit normal from
+      their 3D neighbours, or the agreeing neighbour normals (used only for
+      consolidation; exported normals unchanged), so they are refined like the others;
+      and a sample whose own layer is weak evidence (<= 2 samples, or all from one
+      stereo pair) is removed when a dominant layer (>= 6 samples from >= 2 pairs, 3x
+      larger and a majority) lies within K footprints along the normal. Features
+      confirmed by several pairs are kept. Try 6..8. Counted as
+      isolated_off_surface_removed in surface_consolidation.json.
   --surface-normal-angle N
       Maximum angle between compatible normals, degrees (default: 30; 0 < N <= 60).
   --surface-memory-mb N
@@ -1919,6 +2242,8 @@ Point filtering and multi-view fusion:
       Optional voxel edge in final output units; keep one point per voxel
       (default: 0 disables; nonnegative).
 
+"""
+        , """
 Georeferencing and output coordinates:
   --crs EPSG:CODE, --epsg CODE
       Target projected metre-based EPSG CRS (default: EPSG:3067). GPS alignment
@@ -2148,6 +2473,11 @@ Additional workflow controls:
       calibration and cloud attributes are retained independently of this flag.
       Enables debug detail unless --storage explicitly bounds it. Without this flag,
       storage debug does not enable expensive optional exports.
+  --export-disparity-images
+      Keep the final per-pair disparity map without enabling --diagnostics:
+      05_stereo/pair_<a>_<b>/disparity.pfm (numeric, NaN = invalid), disparity.png
+      (grayscale preview over the searched range) and disparity.json. Applies to the
+      standard SGM path; windowed, aerial-tiled and PatchMatch paths do not export it.
   --dense-pair-selection all|coverage
       Default all preserves all verified pairs. Experimental coverage ranks pairs
       by sparse coverage and predicted range cost; unknown coverage keeps all pairs.
@@ -2171,8 +2501,8 @@ Additional workflow controls:
   --fusion-gpu-evidence auto|resident|windowed
                           Auto uses bounded regional GPU evidence when full evidence cannot fit.
   --stereo-pairs-in-flight N|auto
-      Compute N stereo pairs concurrently (default 1 = serial; auto = up to 4, one per 4
-      cores). Each pair gets its share of --cores and GPU memory and its own OpenCL
+      Compute N stereo pairs concurrently (default auto = up to 4, one per 4 cores;
+      1 = serial). Each pair gets its share of --cores and GPU memory and its own OpenCL
       session; results are published strictly in pair order, so the output equals the
       serial path. Windowed stereo, --diagnostics and PatchMatch stay serial.
   --stereo-pipeline on|off
@@ -2239,6 +2569,11 @@ Additional workflow controls:
   --descriptor-matcher auto|bruteforce|flann
       Default auto uses brute force. flann uses a KD-tree for floating descriptors;
       binary descriptors use exact Hamming brute force for compatibility.
+  --gpu-feature-matching on|off
+      Default on: exact Hamming brute-force searches for binary descriptors (ORB, BRISK,
+      AKAZE) run on the OpenCL GPU with the CPU matcher's neighbours and tie order. The
+      first search is checked against the CPU matcher; a mismatch or GPU failure falls
+      back to the CPU. Ignored with --compute cpu.
   --pair-matching parallel|serial
       Default parallel matches image pairs on --cores workers. Each pair seeds the
       OpenCV RNG from its image IDs, so FLANN/RANSAC results do not depend on thread
@@ -2385,8 +2720,8 @@ Orientation import/export (supported variants and conventions in ORIENTATIONS.md
   --orientation-component N
       Zero-based OpenSfM component or Metashape chunk index (default: 0).
   --orientation-rotation auto|world-to-camera|camera-to-world
-      INPHO/MicMac matrix direction override; auto uses each format's documented
-      camera-to-world convention. Other formats use their specified conventions.
+      Matrix direction override; auto uses world-to-camera for INPHO EXT_ORI,
+      camera-to-world for MicMac. Other formats use their specified conventions.
   --orientation-axes auto|opencv|photogrammetric
       INPHO camera-axis override (default auto: x right, y up, z backward).
       Internally all formats become OpenCV x right, y down, z forward, world-to-camera.
@@ -2446,7 +2781,7 @@ compact confidence/provenance, reports, quality summaries and logs. Detailed
 keypoint/match tables, disparity rasters and decision traces require --diagnostics.
 Memory plan: runs/<run-id>/00_inputs/resolution_plan.json. Consult README.md and
 PROJECT_FORMAT.md for file conventions and calibration/pose formats.
-"""
+""")
         .replace("@CORES@", Integer.toString(new Options().cores));
   }
 }

@@ -476,9 +476,22 @@ final class GpuSgm implements AutoCloseable {
     private final Arena argumentArena;
     private final MemorySegment argumentScratch;
     private boolean closed;
+    // A dedicated session is owned (and released) by this Compute, not by the calling thread, so
+    // worker threads can share it and closeSession() elsewhere cannot invalidate it.
+    private final boolean dedicated;
 
     Compute(Options options, String source) {
-      owner = session(options);
+      this(options, source, false);
+    }
+
+    Compute(Options options, String source, boolean dedicated) {
+      this.dedicated = dedicated;
+      if (dedicated) {
+        List<Device> devices = devices();
+        if (options.gpuDevice >= devices.size())
+          throw new IllegalStateException("No OpenCL GPU at index " + options.gpuDevice + "; use --list-gpus");
+        owner = new GpuSgm(devices.get(options.gpuDevice), options.gpuDevice);
+      } else owner = session(options);
       device = owner.device;
       argumentArena = Arena.ofShared();
       argumentScratch = argumentArena.allocate(8, 8);
@@ -724,6 +737,7 @@ final class GpuSgm implements AutoCloseable {
       release("clReleaseProgram", program);
       program = null;
       argumentArena.close();
+      if (dedicated && owner != null) owner.close();
     }
   }
 

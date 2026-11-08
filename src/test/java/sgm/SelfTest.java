@@ -50,6 +50,9 @@ public final class SelfTest {
     checks += GroundStuffRegression.run(root.resolve("ground-stuff"));
     checks += GcpRegression.run(root.resolve("gcp"));
     checks += GpuStereoFiltersRegression.run();
+    checks += DepthEdgeRegression.run();
+    checks += DepthOutlierRegression.run(root.resolve("depth-outlier"));
+    checks += MultiViewDisparityRegression.run(root.resolve("multiview-disparity"));
     checks += ReciprocalMatchingRegression.run();
     checks += SelfCalibrationRegression.run(root);
     checks += LayeringRegression.run();
@@ -78,6 +81,7 @@ public final class SelfTest {
     checks += FenceRegression.run(root);
     checks += RegularizationSurfaceRegression.run();
     checks += SurfaceFusionRegression.run(root);
+    checks += ConsolidationSpeedRegression.run(root);
     checks += FollowupRegression.run(root);
     checks += FollowupThroughputRegression.run(root.resolve("throughput-report"));
     checks += ScalingRegression.run(root);

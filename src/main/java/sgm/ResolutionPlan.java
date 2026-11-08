@@ -35,7 +35,8 @@ final class ResolutionPlan {
           processed = o.processedSize(original[0], original[1]);
       long n = (long) processed[0] * processed[1];
       if (!o.estimateMemory
-          && n > (o.windowedMode.equals("off") ? Integer.MAX_VALUE / 3 : Integer.MAX_VALUE - 8L))
+          && n > (o.windowedMode.equals("off") && !o.densePipeline.equals("aerial-tiled")
+              ? Integer.MAX_VALUE / 3 : Integer.MAX_VALUE - 8L))
         throw new IllegalArgumentException(
             "Processed image exceeds the dense color-array index limit; select --quality or"
                 + " --max-dimension explicitly: "
@@ -103,6 +104,22 @@ final class ResolutionPlan {
                 Math.max(1, o.fusionCacheMb > 0 ? o.fusionCacheMb : Math.min(512, o.memoryMb / 8))
                     * 1048576L)
             : evidence;
+    if (o.densePipeline.equals("aerial-tiled")) {
+      Files.createDirectories(o.output.resolve("00_inputs"));
+      Json.write(o.output.resolve("00_inputs/resolution_plan.json"),Json.object(
+          "dense_pipeline","aerial-tiled","matching_backend","OpenCL GPU required",
+          "approximate_tile_paths",true,"images",images,"tile_core_side",o.aerialTileSize,
+          "tile_overlap",o.aerialOverlap,"coarse_max_dimension",o.aerialCoarseDimension,
+          "disparity_margin",o.aerialDisparityMargin,"estimated_pairs",pairs,
+          "estimated_compact_map_bytes",evidence*5/4,"indexed_depth_evidence_bytes",evidence,
+          "aggregate_disk_bytes",0,"candidate_spool_bytes",0,
+          "scope","Whole-image cost volumes are not allocated. Actual source footprints and"
+              + " local disparity spans determine tile budgets; oversized tiles subdivide."
+              + " Compact pair maps and indexed fusion evidence still grow with pair count."));
+      System.out.println("Aerial tiled plan: GPU-resident local search; no aggregate/XYZ spool;"
+          + " compact disparity maps and bounded block fusion. Actual tile budgets checked at runtime.");
+      return;
+    }
     if (o.denseMethod.equals("patchmatch")) {
       long atlas = maxPixels * Math.min(paths.size(), o.patchmatchViews + 1L);
       long deviceBytes = 2 * atlas + 64 * maxPixels, hostBytes = 4 * atlas + 160 * maxPixels;
@@ -407,7 +424,8 @@ final class ResolutionPlan {
       throw new IllegalArgumentException(
           "Selected quality leaves an image too small for the census window; choose a higher"
               + " quality");
-    if (!o.estimateMemory && (limit < 3 || o.disparitiesExplicit && o.disparities > limit))
+    if (!o.estimateMemory && !o.densePipeline.equals("aerial-tiled")
+        && (limit < 3 || o.disparitiesExplicit && o.disparities > limit))
       throw new IllegalArgumentException(
           "Selected quality/resolution cannot fit the "
               + (o.disparitiesExplicit ? o.disparities : "minimum")

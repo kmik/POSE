@@ -23,8 +23,8 @@ final class DenseMatcher {
       throw new IllegalArgumentException(
           "Experimental bidirectional confidence requires ordinary SGM (--pyramid-levels 1)");
     if (o.pyramidLevels == 1)
-      return new CensusSgm(o)
-          .computeRecorded(left, right, color, colorRight, w, h, maskA, maskB, observer);
+      return DepthOutlierFilter.filter(o,new CensusSgm(o)
+          .computeRecorded(left, right, color, colorRight, w, h, maskA, maskB, observer),left,observer);
     int levels = o.pyramidLevels;
     if (levels == 0) {
       levels = 1;
@@ -101,7 +101,7 @@ final class DenseMatcher {
       ph = lh;
       if (observer != null) observer.raster("pyramid_level_" + level, result.disparity, lw, lh);
     }
-    return result;
+    return DepthOutlierFilter.filter(o,result,left,observer);
   }
 
   private static CensusSgm.Result refine(
@@ -232,6 +232,7 @@ final class DenseMatcher {
         case 5 -> stats.postMedianLrRejected++;
         case 6 -> stats.photometricRejected++;
         case 7 -> stats.speckleRejected++;
+        case 8 -> stats.edgeErosionRejected++;
         default -> {}
       }
     }
@@ -240,7 +241,8 @@ final class DenseMatcher {
             + stats.lrRejected
             + stats.postMedianLrRejected
             + stats.photometricRejected
-            + stats.speckleRejected;
+            + stats.speckleRejected
+            + stats.edgeErosionRejected;
     if (observer != null) {
       observer.raster("05_final_stereo", out, w, h);
       observer.raster("zncc", correlation, w, h);

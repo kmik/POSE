@@ -320,7 +320,7 @@ final class BandedSgm {
           long target = (long) x + (reverse ? (long) md + low[p] + j : -((long) md + low[p] + j));
           if (x >= r && x < w - r && y >= r && y < h - r && ta[p] && target >= r && target < w - r) {
             int q = y * w + (int) target;
-            if (tb[q]) value = StereoCost.value(o, a, b, grayA, grayB, p, q, w);
+            if (tb[q]) value = StereoCost.cost(o, a, b, grayA, grayB, ta, tb, p, q, w, h);
           }
           cost[at + j] = (short) value;
         }

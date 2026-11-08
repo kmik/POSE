@@ -175,16 +175,12 @@ final class BundleAdjuster {
       boolean accepted = false;
       double after = before;
       Linear system = null;
+      // Rejected trials restore the exact previous parameters, so one linearization serves every
+      // damping trial of this iteration.
+      work.detail("iteration " + (iteration + 1) + "; linearizing " + count + " cameras");
+      Linear undamped = linearize(frames, tracks, index, count, huber, lens);
       for (int trial = 0; trial < 8; trial++) {
-        work.detail(
-            "iteration "
-                + (iteration + 1)
-                + ", trial "
-                + (trial + 1)
-                + "; linearizing "
-                + count
-                + " cameras");
-        system = linearize(frames, tracks, index, count, huber, lambda, lens);
+        system = undamped.damped(lambda);
         work.detail(
             "iteration "
                 + (iteration + 1)
@@ -211,18 +207,27 @@ final class BundleAdjuster {
           if (lens != null) lens.move(result.x, count * 6);
           for (ImageFrame f : frames)
             if (index[f.id] >= 0) move(f.camera, result.x, index[f.id] * 6);
-          for (Block p : system.points) {
-            double[] rhs = p.b.clone();
-            for (Edge e : p.edges)
-              for (int k = 0; k < 3; k++)
-                for (int j = 0; j < 6; j++)
-                  rhs[k] -= e.cross[j * 3 + k] * result.x[e.camera * 6 + j];
-            if (lens != null)
-              for (int k = 0; k < 3; k++)
-                for (int j = 0; j < SharedCalibration.SIZE; j++)
-                  rhs[k] -= p.lensCross[j * 3 + k] * result.x[count * 6 + j];
-            p.track.point = Math3.add(p.track.point, mv(p.inverse, rhs, 3));
-          }
+          // Independent per point (identical arithmetic, any order).
+          List<Block> blocks = system.points;
+          double[] step = result.x;
+          int cameras = count;
+          int pointChunks = chunks(blocks.size(), 0);
+          parallel(pointChunks, chunk -> {
+            int from = (int) ((long) blocks.size() * chunk / pointChunks), to = (int) ((long) blocks.size() * (chunk + 1) / pointChunks);
+            for (int i = from; i < to; i++) {
+              Block p = blocks.get(i);
+              double[] rhs = p.b.clone();
+              for (Edge e : p.edges)
+                for (int k = 0; k < 3; k++)
+                  for (int j = 0; j < 6; j++)
+                    rhs[k] -= e.cross[j * 3 + k] * step[e.camera * 6 + j];
+              if (lens != null)
+                for (int k = 0; k < 3; k++)
+                  for (int j = 0; j < SharedCalibration.SIZE; j++)
+                    rhs[k] -= p.lensCross[j * 3 + k] * step[cameras * 6 + j];
+              p.track.point = Math3.add(p.track.point, mv(p.inverse, rhs, 3));
+            }
+          });
           double newLength = Math3.norm(Math3.sub(frames.get(scaleCamera).camera.center(), origin));
           if (newLength > 1e-12 && Double.isFinite(newLength)) {
             double factor = absolutePriors ? 1 : baseline / newLength;
@@ -330,20 +335,42 @@ final class BundleAdjuster {
       double huber,
       SharedCalibration lens) {
     double total = lens == null ? 0 : lens.priorCost();
-    for (FeatureTracks.Track t : tracks)
-      if (t.point != null)
+    // Per-observation robust costs in parallel (pure), then added serially in the original order:
+    // the result is bit-identical to the serial loop.
+    int n = tracks.size();
+    int[] start = observationOffsets(tracks);
+    double[] costs = new double[start[n]];
+    int chunks = chunks(n, 0);
+    parallel(chunks, chunk -> {
+      int from = (int) ((long) n * chunk / chunks), to = (int) ((long) n * (chunk + 1) / chunks);
+      for (int i = from; i < to; i++) {
+        FeatureTracks.Track t = tracks.get(i);
+        if (t.point == null) continue;
+        int at = start[i];
         for (FeatureTracks.Observation o : t.observations) {
           ImageFrame f = frames.get(o.image);
-          if (!f.camera.registered) continue;
+          if (!f.camera.registered) {
+            costs[at++] = Double.NaN; // skipped
+            continue;
+          }
           Point observed =
               lens == null ? f.keypoints[o.feature].pt : lens.observed[f.id][o.feature];
           double[] uv =
               lens == null ? f.camera.project(t.point) : lens.project(f, t.point, observed.y);
-          if (uv == null || !Double.isFinite(uv[0]) || !Double.isFinite(uv[1]))
-            return Double.POSITIVE_INFINITY;
+          if (uv == null || !Double.isFinite(uv[0]) || !Double.isFinite(uv[1])) {
+            costs[at++] = Double.POSITIVE_INFINITY;
+            continue;
+          }
           double e = Math.hypot(uv[0] - observed.x, uv[1] - observed.y);
-          total += e <= huber ? .5 * e * e : huber * (e - .5 * huber);
+          costs[at++] = e <= huber ? .5 * e * e : huber * (e - .5 * huber);
         }
+      }
+    });
+    for (double c : costs) {
+      if (Double.isNaN(c)) continue;
+      if (c == Double.POSITIVE_INFINITY) return Double.POSITIVE_INFINITY;
+      total += c;
+    }
     boolean antenna = lens != null && lens.antennaModel();
     for (ImageFrame f : frames)
       if (f.camera.registered)
@@ -469,18 +496,35 @@ final class BundleAdjuster {
 
   private static final class Block {
     final FeatureTracks.Track track;
-    final double[] normal = new double[9], b = new double[3];
+    final double[] normal, b;
     double[] inverse;
-    final double[] lensCross = new double[SharedCalibration.SIZE * 3];
-    final List<Edge> edges = new ArrayList<>();
+    final double[] lensCross;
+    final List<Edge> edges;
 
     Block(FeatureTracks.Track track) {
       this.track = track;
+      normal = new double[9];
+      b = new double[3];
+      lensCross = new double[SharedCalibration.SIZE * 3];
+      edges = new ArrayList<>();
+    }
+
+    /** Damped copy: own point normal and inverse; Jacobian products are shared read-only. */
+    Block(Block undamped, double lambda) {
+      track = undamped.track;
+      normal = undamped.normal.clone();
+      b = undamped.b;
+      lensCross = undamped.lensCross;
+      edges = undamped.edges;
+      damp(normal, 3, lambda);
+      inverse = BundleAdjuster.inverse(normal, 3);
+      if (inverse == null) throw new IllegalStateException("Singular damped point block");
     }
   }
 
   private record Result(double[] x, int iterations, double relative, String method) {}
 
+  /** Undamped system, then damped by lambda (the previous single-step behaviour). */
   private static Linear linearize(
       List<ImageFrame> frames,
       List<FeatureTracks.Track> tracks,
@@ -489,82 +533,161 @@ final class BundleAdjuster {
       double huber,
       double lambda,
       SharedCalibration lens) {
+    return linearize(frames, tracks, index, count, huber, lens).damped(lambda);
+  }
+
+  /** One observation's Jacobians for the shared camera/lens sums. */
+  private record ObservationTerms(int camera, double[][] jc, double[][] jl, double[] residual, double weight) {}
+
+  /** A track's point block plus its observations' terms, in observation order. */
+  private record TrackTerms(Block block, ObservationTerms[] terms) {}
+
+  /**
+   * Gauss-Newton normal equations without damping. Jacobians and residuals do not depend on the
+   * LM damping, so one linearization serves every damping trial of an iteration ({@link
+   * Linear#damped}). Per-track work (projections, Jacobians, point blocks) runs in parallel; the
+   * shared camera/lens sums are then accumulated serially in the original track/observation
+   * order, so the system is bit-identical to the serial loop.
+   */
+  private static Linear linearize(
+      List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks,
+      int[] index,
+      int count,
+      double huber,
+      SharedCalibration lens) {
     Linear s = new Linear(count, lens != null, frames.get(0).options.memoryMb * 1048576L);
-    for (FeatureTracks.Track t : tracks)
-      if (t.point != null) {
-        Block block = new Block(t);
-        for (FeatureTracks.Observation o : t.observations) {
-          ImageFrame f = frames.get(o.image);
-          Camera c = f.camera;
-          if (!c.registered) continue;
-          Point obs = lens == null ? f.keypoints[o.feature].pt : lens.observed[f.id][o.feature];
-          // With rolling shutter, q is the camera-frame point at the row's exposure time. It moves
-          // with pose updates exactly like the plain view, so the pose Jacobian below is unchanged.
-          double[] q = lens == null ? c.view(t.point) : lens.view(f, t.point, obs.y);
-          if (q[2] <= 1e-8) continue;
-          double[] uv = lens == null ? c.projectView(q) : lens.project(f, t.point, obs.y);
-          double[] residual = {uv[0] - obs.x, uv[1] - obs.y};
-          double weight =
-              Math.min(1, huber / Math.max(1e-12, Math.hypot(residual[0], residual[1])));
-          double[][] jq = {
-            {c.fx / q[2], 0, -c.fx * q[0] / (q[2] * q[2])},
-            {0, c.fy / q[2], -c.fy * q[1] / (q[2] * q[2])}
-          };
-          if (lens != null) jq = lens.spatialJacobian(f, t.point, obs.y);
-          double[][] jl = lens == null ? null : lens.lensJacobian(f, t.point, obs.y);
-          double[][] jp = new double[2][3], jc = new double[2][6];
-          for (int row = 0; row < 2; row++) {
-            for (int j = 0; j < 3; j++)
-              for (int k = 0; k < 3; k++) jp[row][j] += jq[row][k] * c.rotation[k * 3 + j];
-            jc[row][0] = -jq[row][1] * q[2] + jq[row][2] * q[1];
-            jc[row][1] = jq[row][0] * q[2] - jq[row][2] * q[0];
-            jc[row][2] = -jq[row][0] * q[1] + jq[row][1] * q[0];
-            for (int j = 0; j < 3; j++) jc[row][j + 3] = jq[row][j];
-          }
-          accumulate(block.normal, block.b, jp, residual, weight);
-          int ci = index[o.image];
-          if (lens != null) {
-            accumulate(s.lensNormal, s.lensRhs, jl, residual, weight);
-            for (int j = 0; j < SharedCalibration.SIZE; j++) {
-              for (int k = 0; k < 3; k++)
-                block.lensCross[j * 3 + k] += weight * (jl[0][j] * jp[0][k] + jl[1][j] * jp[1][k]);
-              if (ci >= 0)
-                for (int k = 0; k < 6; k++)
-                  s.coupling[ci][k * SharedCalibration.SIZE + j] +=
-                      weight * (jc[0][k] * jl[0][j] + jc[1][k] * jl[1][j]);
-            }
-          }
-          if (ci < 0) continue;
-          accumulate(s.cameraNormal[ci], s.cameraRhs[ci], jc, residual, weight);
-          Edge e = new Edge(ci);
-          for (int j = 0; j < 6; j++)
-            for (int k = 0; k < 3; k++)
-              e.cross[j * 3 + k] = weight * (jc[0][j] * jp[0][k] + jc[1][j] * jp[1][k]);
-          block.edges.add(e);
-        }
-        if (t.prior != null)
-          // Known position (GCP): r = (X - prior) / sigma, J = I / sigma.
-          for (int k = 0; k < 3; k++) {
-            double w = 1 / (t.priorSigma[k] * t.priorSigma[k]);
-            block.normal[k * 3 + k] += w;
-            block.b[k] -= w * (t.point[k] - t.prior[k]);
-          }
-        damp(block.normal, 3, lambda);
-        block.inverse = inverse(block.normal, 3);
-        if (block.inverse == null) throw new IllegalStateException("Singular damped point block");
-        s.points.add(block);
+    int n = tracks.size(), chunks = chunks(n, 0);
+    TrackTerms[] terms = new TrackTerms[n];
+    parallel(chunks, chunk -> {
+      int from = (int) ((long) n * chunk / chunks), to = (int) ((long) n * (chunk + 1) / chunks);
+      for (int i = from; i < to; i++) {
+        FeatureTracks.Track t = tracks.get(i);
+        if (t.point != null) terms[i] = linearizeTrack(frames, t, index, huber, lens);
       }
+    });
+    // Shared sums, parallel by destination: the lens block and each camera's normal/coupling are
+    // owned by one task that visits its observations in the original track/observation order, so
+    // every element receives the same additions in the same order (bit-identical).
+    List<List<ObservationTerms>> byCamera = new ArrayList<>();
+    for (int c = 0; c < count; c++) byCamera.add(new ArrayList<>());
+    List<ObservationTerms> all = new ArrayList<>();
+    for (TrackTerms track : terms) {
+      if (track == null) continue;
+      for (ObservationTerms o : track.terms()) {
+        all.add(o);
+        if (o.camera() >= 0) byCamera.get(o.camera()).add(o);
+      }
+      s.points.add(track.block());
+    }
+    // One task per destination row (6 per camera, one per lens parameter).
+    // One task per camera (its 6 rows, one pass) and one per lens row (the heaviest destination).
+    parallel(count + (lens != null ? SharedCalibration.SIZE : 0), task -> {
+      if (task >= count) {
+        int x = task - count;
+        for (ObservationTerms o : all) accumulateRow(s.lensNormal, s.lensRhs, o.jl(), o.residual(), o.weight(), x);
+        return;
+      }
+      int c = task;
+      for (ObservationTerms o : byCamera.get(c)) {
+        if (lens != null)
+          for (int j = 0; j < SharedCalibration.SIZE; j++)
+            for (int k = 0; k < 6; k++)
+              s.coupling[c][k * SharedCalibration.SIZE + j] +=
+                  o.weight() * (o.jc()[0][k] * o.jl()[0][j] + o.jc()[1][k] * o.jl()[1][j]);
+        accumulate(s.cameraNormal[c], s.cameraRhs[c], o.jc(), o.residual(), o.weight());
+      }
+    });
     boolean antenna = lens != null && lens.antennaModel();
     for (ImageFrame f : frames)
       if (antenna && f.camera.registered) antennaPriorNormal(f.camera, index[f.id], s, lens);
       else if (index[f.id] >= 0)
         priorNormal(f.camera, s.cameraNormal[index[f.id]], s.cameraRhs[index[f.id]]);
-    if (lens != null) {
-      lens.priorNormal(s.lensNormal, s.lensRhs);
-      damp(s.lensNormal, SharedCalibration.SIZE, lambda);
-    }
-    for (int i = 0; i < count; i++) damp(s.cameraNormal[i], 6, lambda);
+    if (lens != null) lens.priorNormal(s.lensNormal, s.lensRhs);
     return s;
+  }
+
+  private static TrackTerms linearizeTrack(
+      List<ImageFrame> frames,
+      FeatureTracks.Track t,
+      int[] index,
+      double huber,
+      SharedCalibration lens) {
+    Block block = new Block(t);
+    List<ObservationTerms> terms = new ArrayList<>(t.observations.size());
+    for (FeatureTracks.Observation o : t.observations) {
+      ImageFrame f = frames.get(o.image);
+      Camera c = f.camera;
+      if (!c.registered) continue;
+      Point obs = lens == null ? f.keypoints[o.feature].pt : lens.observed[f.id][o.feature];
+      // With rolling shutter, q is the camera-frame point at the row's exposure time. It moves
+      // with pose updates exactly like the plain view, so the pose Jacobian below is unchanged.
+      double[] q = lens == null ? c.view(t.point) : lens.view(f, t.point, obs.y);
+      if (q[2] <= 1e-8) continue;
+      double[] uv = lens == null ? c.projectView(q) : lens.project(f, t.point, obs.y);
+      double[] residual = {uv[0] - obs.x, uv[1] - obs.y};
+      double weight =
+          Math.min(1, huber / Math.max(1e-12, Math.hypot(residual[0], residual[1])));
+      double[][] jq = {
+        {c.fx / q[2], 0, -c.fx * q[0] / (q[2] * q[2])},
+        {0, c.fy / q[2], -c.fy * q[1] / (q[2] * q[2])}
+      };
+      if (lens != null) jq = lens.spatialJacobian(f, t.point, obs.y);
+      double[][] jl = lens == null ? null : lens.lensJacobian(f, t.point, obs.y);
+      double[][] jp = new double[2][3], jc = new double[2][6];
+      for (int row = 0; row < 2; row++) {
+        for (int j = 0; j < 3; j++)
+          for (int k = 0; k < 3; k++) jp[row][j] += jq[row][k] * c.rotation[k * 3 + j];
+        jc[row][0] = -jq[row][1] * q[2] + jq[row][2] * q[1];
+        jc[row][1] = jq[row][0] * q[2] - jq[row][2] * q[0];
+        jc[row][2] = -jq[row][0] * q[1] + jq[row][1] * q[0];
+        for (int j = 0; j < 3; j++) jc[row][j + 3] = jq[row][j];
+      }
+      accumulate(block.normal, block.b, jp, residual, weight);
+      int ci = index[o.image];
+      if (lens != null)
+        for (int j = 0; j < SharedCalibration.SIZE; j++)
+          for (int k = 0; k < 3; k++)
+            block.lensCross[j * 3 + k] += weight * (jl[0][j] * jp[0][k] + jl[1][j] * jp[1][k]);
+      terms.add(new ObservationTerms(ci, jc, jl, residual, weight));
+      if (ci < 0) continue;
+      Edge e = new Edge(ci);
+      for (int j = 0; j < 6; j++)
+        for (int k = 0; k < 3; k++)
+          e.cross[j * 3 + k] = weight * (jc[0][j] * jp[0][k] + jc[1][j] * jp[1][k]);
+      block.edges.add(e);
+    }
+    if (t.prior != null)
+      // Known position (GCP): r = (X - prior) / sigma, J = I / sigma.
+      for (int k = 0; k < 3; k++) {
+        double w = 1 / (t.priorSigma[k] * t.priorSigma[k]);
+        block.normal[k * 3 + k] += w;
+        block.b[k] -= w * (t.point[k] - t.prior[k]);
+      }
+    return new TrackTerms(block, terms.toArray(ObservationTerms[]::new));
+  }
+
+  /** Start of each track's observations in a flat per-observation array (length tracks + 1). */
+  private static int[] observationOffsets(List<FeatureTracks.Track> tracks) {
+    int[] start = new int[tracks.size() + 1];
+    for (int i = 0; i < tracks.size(); i++) {
+      FeatureTracks.Track t = tracks.get(i);
+      start[i + 1] = start[i] + (t.point == null ? 0 : t.observations.size());
+    }
+    return start;
+  }
+
+  /** Number of work chunks: depends only on the problem size, never on the thread count. */
+  static int chunks(int items, int unused) {
+    return (int) Math.max(1, Math.min(64, items / 256 + 1));
+  }
+
+  static void parallel(int n, java.util.function.IntConsumer body) {
+    if (n <= 1) {
+      for (int i = 0; i < n; i++) body.accept(i);
+      return;
+    }
+    java.util.stream.IntStream.range(0, n).parallel().forEach(body);
   }
 
   /**
@@ -619,6 +742,13 @@ final class BundleAdjuster {
     }
   }
 
+  /** Row x of accumulate (rows are independent; same per-element arithmetic). */
+  private static void accumulateRow(double[] a, double[] b, double[][] j, double[] r, double w, int x) {
+    int n = b.length;
+    b[x] -= w * (j[0][x] * r[0] + j[1][x] * r[1]);
+    for (int y = 0; y < n; y++) a[x * n + y] += w * (j[0][x] * j[0][y] + j[1][x] * j[1][y]);
+  }
+
   private static void damp(double[] a, int n, double lambda) {
     for (int i = 0; i < n; i++) a[i * n + i] += lambda * Math.max(1, a[i * n + i]);
   }
@@ -659,16 +789,43 @@ final class BundleAdjuster {
     final double[] lensNormal = new double[SharedCalibration.SIZE * SharedCalibration.SIZE],
         lensRhs = new double[SharedCalibration.SIZE];
     final double[][] coupling;
-    final long workspaceBudget;
+    final long workspaceBudget, memoryBudget;
     double[] reduced;
 
     Linear(int n, boolean shared, long memoryBudget) {
+      this.memoryBudget = memoryBudget;
       workspaceBudget = Math.min(32L * 1048576, memoryBudget / 16);
       this.shared = shared;
       coupling = new double[n][6 * SharedCalibration.SIZE];
       count = n;
       cameraNormal = new double[n][36];
       cameraRhs = new double[n][6];
+    }
+
+    /**
+     * This undamped system with LM damping applied, as the single-pass linearization produced it:
+     * the same sums plus lambda on the diagonals, point blocks inverted after damping.
+     */
+    Linear damped(double lambda) {
+      Linear d = new Linear(count, shared, memoryBudget);
+      for (int c = 0; c < count; c++) {
+        System.arraycopy(cameraNormal[c], 0, d.cameraNormal[c], 0, 36);
+        System.arraycopy(cameraRhs[c], 0, d.cameraRhs[c], 0, 6);
+        System.arraycopy(coupling[c], 0, d.coupling[c], 0, coupling[c].length);
+        damp(d.cameraNormal[c], 6, lambda);
+      }
+      System.arraycopy(lensNormal, 0, d.lensNormal, 0, lensNormal.length);
+      System.arraycopy(lensRhs, 0, d.lensRhs, 0, lensRhs.length);
+      if (shared) damp(d.lensNormal, SharedCalibration.SIZE, lambda);
+      Block[] blocks = new Block[points.size()];
+      int chunks = chunks(blocks.length, 0);
+      parallel(chunks, chunk -> {
+        int from = (int) ((long) blocks.length * chunk / chunks), to = (int) ((long) blocks.length * (chunk + 1) / chunks);
+        for (int i = from; i < to; i++) blocks[i] = new Block(points.get(i), lambda);
+      });
+      d.points.addAll(Arrays.asList(blocks));
+      d.edgeLists = edgesByCamera(); // same point/edge structure
+      return d;
     }
 
     /** Assemble only the small camera/lens system; points are still eliminated analytically. */
@@ -689,10 +846,20 @@ final class BundleAdjuster {
               h[(c * 6 + j) * n + off + k] =
                   h[(off + k) * n + c * 6 + j] = coupling[c][j * SharedCalibration.SIZE + k];
       }
-      for (Block b : points) {
-        if (shared) subtractRows(h, n, b, b.lensCross, count * 6, SharedCalibration.SIZE);
-        for (Edge e : b.edges) subtractRows(h, n, b, e.cross, e.camera * 6, 6);
-      }
+      // Point eliminations, parallel by destination rows: each camera's (and the lens') rows are
+      // written by one task that visits the points in their original order, so every element
+      // receives the same subtractions in the same order as the serial loop (bit-identical).
+      List<List<int[]>> byCamera = edgesByCamera();
+      parallel(count + (shared ? SharedCalibration.SIZE : 0), task -> {
+        if (task >= count) {
+          for (Block b : points) subtractRow(h, n, b, b.lensCross, count * 6, task - count);
+          return;
+        }
+        for (int[] pe : byCamera.get(task)) {
+          Block b = points.get(pe[0]);
+          subtractRows(h, n, b, b.edges.get(pe[1]).cross, task * 6, 6);
+        }
+      });
       // The mathematical Schur matrix is symmetric. Remove only round-off asymmetry.
       for (int i = 0; i < n; i++)
         for (int j = 0; j < i; j++)
@@ -700,8 +867,51 @@ final class BundleAdjuster {
       return reduced = h;
     }
 
+    private List<List<int[]>> edgeLists;
+
+    /** Per camera, its (point, edge) index pairs in point/edge order; built once per system. */
+    List<List<int[]>> edgesByCamera() {
+      if (edgeLists != null) return edgeLists;
+      List<List<int[]>> lists = new ArrayList<>();
+      for (int c = 0; c < count; c++) lists.add(new ArrayList<>());
+      for (int p = 0; p < points.size(); p++) {
+        List<Edge> edges = points.get(p).edges;
+        for (int e = 0; e < edges.size(); e++) lists.get(edges.get(e).camera).add(new int[] {p, e});
+      }
+      return edgeLists = lists;
+    }
+
+    /**
+     * target[lens rows] -= lensCross * w[p] and target[camera rows] -= cross * w[p] for every point
+     * p (w holds 3 values per point). Parallel by destination rows; each owner visits points in
+     * their original order, so the result is bit-identical to the serial point loop.
+     */
+    private void scatter(double[] target, double[] w) {
+      List<List<int[]>> byCamera = edgesByCamera();
+      parallel(count + (shared ? SharedCalibration.SIZE : 0), task -> {
+        if (task >= count) {
+          int j = task - count, row = count * 6 + j;
+          for (int p = 0; p < points.size(); p++) {
+            Block b = points.get(p);
+            for (int k = 0; k < 3; k++) target[row] -= b.lensCross[j * 3 + k] * w[3 * p + k];
+          }
+          return;
+        }
+        for (int[] pe : byCamera.get(task)) {
+          Edge e = points.get(pe[0]).edges.get(pe[1]);
+          for (int j = 0; j < 6; j++)
+            for (int k = 0; k < 3; k++) target[task * 6 + j] -= e.cross[j * 3 + k] * w[3 * pe[0] + k];
+        }
+      });
+    }
+
     private void subtractRows(double[] h, int n, Block b, double[] left, int offset, int rows) {
-      for (int j = 0; j < rows; j++) {
+      for (int j = 0; j < rows; j++) subtractRow(h, n, b, left, offset, j);
+    }
+
+    /** Row j of subtractRows (rows are independent). */
+    private void subtractRow(double[] h, int n, Block b, double[] left, int offset, int j) {
+      {
         double v0 = 0, v1 = 0, v2 = 0;
         for (int k = 0; k < 3; k++) {
           v0 += left[j * 3 + k] * b.inverse[k * 3];
@@ -772,25 +982,31 @@ final class BundleAdjuster {
               out[off + k] += coupling[c][j * SharedCalibration.SIZE + k] * x[c * 6 + j];
             }
       }
-      double[] v = new double[3], u = new double[3];
-      for (Block b : points) {
-        Arrays.fill(v, 0);
-        if (shared)
-          for (int k = 0; k < 3; k++)
-            for (int j = 0; j < SharedCalibration.SIZE; j++)
-              v[k] += b.lensCross[j * 3 + k] * x[count * 6 + j];
-        for (Edge e : b.edges)
-          for (int k = 0; k < 3; k++)
-            for (int j = 0; j < 6; j++) v[k] += e.cross[j * 3 + k] * x[e.camera * 6 + j];
-        Arrays.fill(u, 0);
-        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) u[i] += b.inverse[i * 3 + j] * v[j];
-        if (shared)
-          for (int j = 0; j < SharedCalibration.SIZE; j++)
-            for (int k = 0; k < 3; k++) out[count * 6 + j] -= b.lensCross[j * 3 + k] * u[k];
-        for (Edge e : b.edges)
-          for (int j = 0; j < 6; j++)
-            for (int k = 0; k < 3; k++) out[e.camera * 6 + j] -= e.cross[j * 3 + k] * u[k];
-      }
+      // Per-point u = inverse * (cross^T x) in parallel (pure), then subtracted serially in point
+      // order: bit-identical to the serial loop.
+      int pointCount = points.size(), chunks = chunks(pointCount, 0);
+      double[] us = new double[3 * pointCount];
+      parallel(chunks, chunk -> {
+        double[] v = new double[3];
+        int from = (int) ((long) pointCount * chunk / chunks), to = (int) ((long) pointCount * (chunk + 1) / chunks);
+        for (int p = from; p < to; p++) {
+          Block b = points.get(p);
+          Arrays.fill(v, 0);
+          if (shared)
+            for (int k = 0; k < 3; k++)
+              for (int j = 0; j < SharedCalibration.SIZE; j++)
+                v[k] += b.lensCross[j * 3 + k] * x[count * 6 + j];
+          for (Edge e : b.edges)
+            for (int k = 0; k < 3; k++)
+              for (int j = 0; j < 6; j++) v[k] += e.cross[j * 3 + k] * x[e.camera * 6 + j];
+          for (int i = 0; i < 3; i++) {
+            double u = 0;
+            for (int j = 0; j < 3; j++) u += b.inverse[i * 3 + j] * v[j];
+            us[3 * p + i] = u;
+          }
+        }
+      });
+      scatter(out, us);
       return out;
     }
 
@@ -808,30 +1024,37 @@ final class BundleAdjuster {
         System.arraycopy(cameraRhs[c], 0, rhs, c * 6, 6);
         diag[c] = cameraNormal[c].clone();
       }
+      // Reduced right-hand side: per-point v in parallel, ordered scatter (bit-identical).
+      int pointCount = points.size(), chunks = chunks(pointCount, 0);
+      double[] vs = new double[3 * pointCount];
+      parallel(chunks, chunk -> {
+        int from = (int) ((long) pointCount * chunk / chunks), to = (int) ((long) pointCount * (chunk + 1) / chunks);
+        for (int p = from; p < to; p++) {
+          Block b = points.get(p);
+          System.arraycopy(mv(b.inverse, b.b, 3), 0, vs, 3 * p, 3);
+        }
+      });
+      scatter(rhs, vs);
+      double[] solveRhs = suppliedRhs == null ? rhs : suppliedRhs;
+      Result direct = direct(solveRhs);
+      if (direct != null) return direct;
+      // Block-Jacobi preconditioner: only the PCG fallback needs it.
       for (Block b : points) {
-        double[] v = mv(b.inverse, b.b, 3);
         if (shared)
-          for (int j = 0; j < SharedCalibration.SIZE; j++) {
-            for (int k = 0; k < 3; k++) rhs[count * 6 + j] -= b.lensCross[j * 3 + k] * v[k];
+          for (int j = 0; j < SharedCalibration.SIZE; j++)
             for (int l = 0; l < SharedCalibration.SIZE; l++)
               for (int k = 0; k < 3; k++)
                 for (int m = 0; m < 3; m++)
                   lensDiag[j * SharedCalibration.SIZE + l] -=
                       b.lensCross[j * 3 + k] * b.inverse[k * 3 + m] * b.lensCross[l * 3 + m];
-          }
         for (Edge e : b.edges)
-          for (int j = 0; j < 6; j++) {
-            for (int k = 0; k < 3; k++) rhs[e.camera * 6 + j] -= e.cross[j * 3 + k] * v[k];
+          for (int j = 0; j < 6; j++)
             for (int l = 0; l < 6; l++)
               for (int k = 0; k < 3; k++)
                 for (int m = 0; m < 3; m++)
                   diag[e.camera][j * 6 + l] -=
                       e.cross[j * 3 + k] * b.inverse[k * 3 + m] * e.cross[l * 3 + m];
-          }
       }
-      double[] solveRhs = suppliedRhs == null ? rhs : suppliedRhs;
-      Result direct = direct(solveRhs);
-      if (direct != null) return direct;
       for (int c = 0; c < count; c++) {
         diag[c] = inverse(diag[c], 6);
         if (diag[c] == null) return null;

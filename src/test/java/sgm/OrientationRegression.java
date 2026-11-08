@@ -259,6 +259,61 @@ final class OrientationRegression {
         "OpenMVG Brown serializes all five terms in disto_t2");
     near(mv.calibration().distortion[4], .001, "OpenMVG Brown k3 order");
     near(mv.pose().center()[1], 2, "OpenMVG centre is not translation");
+    // Independent fixture: do not obtain EXT_ORI from our exporter. Its previous
+    // transpose bug was shared by the importer and therefore survived round trips.
+    Path tiltedInpho = base.resolve("independent-inpho.prj");
+    Files.writeString(
+        tiltedInpho,
+        """
+        $PROJECT 15.0.0
+          $ANGULAR_UNITS : grad
+        $END
+        $PHOTO
+          $PHOTO_FILE : tilted.tif
+          $CAMERA_ID : tilted-camera
+          $EXT_ORI : 00:00:00 01/01/2000
+            4 100 200 1000
+            0.8 0 0.6
+            0 1 0
+            -0.6 0 0.8
+        $END
+        $CAMERA_DEFINITION
+          $ID : tilted-camera
+          $CCD_COLUMNS : 640
+          $CCD_ROWS : 480
+          $PIXEL_REFERENCE : CenterTopLeft
+          $ACTIVE_CALIBRATION : 1
+          $CALIBRATION_SET :
+            $ID : 1
+            $CCD_INTERIOR_ORIENTATION :
+              200 0 319.5
+              0 -200 239.5
+            $PRINCIPAL_POINT_PPA : 0 0
+          $END
+        $END
+        """);
+    View tilted = read(tiltedInpho, "inpho", Map.of(), o).views.get("tilted.tif");
+    near(tilted.pose().rotation[2], .6, "INPHO EXT_ORI is world-to-camera by default");
+    near(tilted.pose().rotation[6], .6, "INPHO backward-z axis conversion");
+    near(tilted.pose().center()[0], 100, "INPHO exterior centre is not translation");
+    near(tilted.pose().center()[2], 1000, "INPHO exterior height");
+    Camera tiltedCamera = tilted.pose().copy();
+    Calibration tiltedCalibration = tilted.calibration();
+    tiltedCamera.fx = tiltedCalibration.fx;
+    tiltedCamera.fy = tiltedCalibration.fy;
+    tiltedCamera.cx = tiltedCalibration.cx;
+    tiltedCamera.cy = tiltedCalibration.cy;
+    double[] projected = tiltedCamera.project(new double[] {100, 200, 900});
+    // Direct collinearity: photo coordinates (-60,0,-80), CV (-60,0,80).
+    near(projected[0], -280.5, "Independent INPHO collinearity x");
+    near(projected[1], 239.5, "Independent INPHO collinearity y");
+    Options alternateInpho = o.copy();
+    alternateInpho.orientationRotation = "camera-to-world";
+    near(
+        read(tiltedInpho, "inpho", Map.of(), alternateInpho)
+            .views.get("tilted.tif").pose().rotation[2],
+        -.6,
+        "INPHO explicit camera-to-world override remains available");
     Path inpho = base.resolve("inpho/inpho/orientations.prj");
     String prj =
         Files.readString(inpho)

@@ -680,7 +680,9 @@ final class Pipeline {
       project.stage(
           "05_stereo",
           "running",
-          options.denseMethod.equals("patchmatch")
+          options.densePipeline.equals("aerial-tiled")
+              ? "Source-region rectification and GPU aerial tiles"
+              : options.denseMethod.equals("patchmatch")
               ? "PatchMatch multi-view depth and plane estimation"
               : "Rectification and Java SGM");
     boolean reload = false;

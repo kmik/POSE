@@ -487,7 +487,10 @@ final class OrientationText {
       if (values.length < 13)
         throw new IllegalArgumentException("INPHO EXT_ORI needs focal, centre and 3x3 rotation");
       double[] rotation = Arrays.copyOfRange(values, 4, 13);
-      if (!o.orientationRotation.equals("world-to-camera")) rotation = Math3.transpose(rotation);
+      // EXT_ORI maps object coordinates into photogrammetric camera coordinates.
+      // Transposing it reverses the small roll/pitch corrections of aerial cameras;
+      // nearly nadir images can still match, but their reconstructed surfaces bend.
+      if (o.orientationRotation.equals("camera-to-world")) rotation = Math3.transpose(rotation);
       if (!o.orientationAxes.equals("opencv")) rotation = flipRows(rotation);
       Camera pose = centered(rotation, Arrays.copyOfRange(values, 1, 4));
       double pixel =
@@ -536,7 +539,7 @@ final class OrientationText {
       m.add(new View(image, calibration, pose));
     }
     m.notes.add(
-        "INPHO digital pinhole EXT_ORI; default camera-to-world photogrammetric axes; pixel size in"
+        "INPHO digital pinhole EXT_ORI; default world-to-camera photogrammetric axes; pixel size in"
             + " mm; nonzero scanner/interior-affine rotations require conversion");
     return m;
   }
@@ -696,7 +699,7 @@ final class OrientationText {
               "INPHO pinhole export supports square pixels and distortion-free imagery; choose"
                   + " processed pixels for lossless distortion-free export");
         double f = c.fx * o.orientationPixelSize;
-        double[] center = p.center(), r = Math3.transpose(flipRows(p.rotation));
+        double[] center = p.center(), r = flipRows(p.rotation);
         out.write(
             "$CAMERA_DEFINITION\n  $ID : camera_"
                 + id

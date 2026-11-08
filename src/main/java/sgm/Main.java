@@ -57,11 +57,17 @@ public final class Main {
     return new Command(steps, status, rest.toArray(String[]::new), runId, branch, editor);
   }
 
-  /** Project root from -o/--output, without full option parsing. */
+  /**
+   * Project root from -o/--output, without full option parsing. The last one wins, as in Options:
+   * a continued step's saved arguments come first, so a copied or moved project resolves to the
+   * -o of this command, not the one saved when the run started.
+   */
   static Path projectRoot(String[] args) {
+    Path root = null;
     for (int i = 0; i + 1 < args.length; i++)
-      if (args[i].equals("-o") || args[i].equals("--output")) return Path.of(args[i + 1]).toAbsolutePath().normalize();
-    throw new IllegalArgumentException("Give the project directory with -o PROJECT");
+      if (args[i].equals("-o") || args[i].equals("--output")) root = Path.of(args[i + 1]).toAbsolutePath().normalize();
+    if (root == null) throw new IllegalArgumentException("Give the project directory with -o PROJECT");
+    return root;
   }
 
   static String latestRun(Path root) throws IOException {

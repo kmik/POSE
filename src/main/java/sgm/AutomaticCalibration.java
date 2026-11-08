@@ -174,6 +174,7 @@ final class AutomaticCalibration {
               if (last) frames.get(a).close();
             });
         pairs.done();
+        GpuHamming.close();
       }
     } finally {
       for (ImageFrame f : frames) f.close();

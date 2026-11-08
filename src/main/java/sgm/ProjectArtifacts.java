@@ -1244,7 +1244,9 @@ final class ProjectArtifacts implements AutoCloseable {
                 "6",
                 "photometric ZNCC",
                 "7",
-                "speckle"),
+                "speckle",
+                "8",
+                "disparity edge erosion (opt-in)"),
             "fusion_status_codes",
             Json.object(
                 "0",
@@ -1297,7 +1299,8 @@ final class ProjectArtifacts implements AutoCloseable {
           {0, 0, 255},
           {255, 128, 0},
           {0, 255, 255},
-          {255, 0, 0}
+          {255, 0, 0},
+          {255, 255, 255}
         };
         for (int i = 0; i < codes.length; i++)
           for (int c = 0; c < 3; c++) colors[i * 3 + c] = (byte) palette[codes[i] & 255][c];
@@ -1337,7 +1340,7 @@ final class ProjectArtifacts implements AutoCloseable {
         effective.minDisparity + effective.disparities - 1);
   }
 
-  private static void scalar(
+  static void scalar(
       Path dir, String name, float[] values, int width, int height, double low, double high)
       throws IOException {
     Files.createDirectories(dir);

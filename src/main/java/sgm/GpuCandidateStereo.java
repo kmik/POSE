@@ -236,7 +236,7 @@ final class GpuCandidateStereo {
     if ((2L * d + GpuSgm.selectedGroup(o) + 2) * 4 > device.localMemory())
       throw new IllegalArgumentException("Prototype path state exceeds local memory");
     try (Arena arena = Arena.ofConfined();
-        GpuSgm.Compute cl = new GpuSgm.Compute(o, source())) {
+        GpuSgm.Compute cl = new GpuSgm.Compute(o, source(o))) {
       MemorySegment ga = descriptors(cl, arena, da), gb = descriptors(cl, arena, db);
       MemorySegment ta = upload(cl, arena.allocateFrom(JAVA_BYTE, mask(ma))),
           tb = upload(cl, arena.allocateFrom(JAVA_BYTE, mask(mb))),
@@ -407,8 +407,8 @@ final class GpuCandidateStereo {
     args.add((int) (bank / 2));
   }
 
-  private static String source() {
-    String source = GpuStereo.kernels(false, 2);
+  private static String source(Options o) {
+    String source = GpuStereo.kernels(false, 2, StereoCost.gpuSource(o));
     source =
         replace(
             source,

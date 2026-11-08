@@ -54,7 +54,7 @@ final class FeatureAlgorithms {
     Mat queries = new Mat();
     try {
       progress.accept("forward nearest neighbors; " + a.rows() + " queries");
-      matcher.knnMatch(a, b, forward, 2);
+      if (!GpuHamming.knn2(o, a, b, forward)) matcher.knnMatch(a, b, forward, 2);
       BitSet needed = new BitSet(b.rows());
       for (MatOfDMatch row : forward) {
         DMatch[] m = row.toArray();
@@ -81,7 +81,7 @@ final class FeatureAlgorithms {
       }
       int searched = full ? b.rows() : count;
       progress.accept("reverse nearest neighbors; " + searched + "/" + b.rows() + " queries");
-      matcher.knnMatch(full ? b : queries, a, backward, 2);
+      if (!GpuHamming.knn2(o, full ? b : queries, a, backward)) matcher.knnMatch(full ? b : queries, a, backward, 2);
       for (MatOfDMatch row : backward) {
         DMatch[] m = row.toArray();
         if (m.length >= 2 && m[0].distance < o.ratio * m[1].distance) {

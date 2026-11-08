@@ -176,6 +176,11 @@ final class FusionOutput implements AutoCloseable {
               if (surfaceDecisions != null)
                 surfaceDecisions.write(p.id + "," + representative + ",merged,0\n");
             }
+
+            public void removed(SurfaceConsolidator.Sample p) throws IOException {
+              if (surfaceDecisions != null)
+                surfaceDecisions.write(p.id + ",-1,isolated_off_surface_removed,0\n");
+            }
           });
     records.flush();
     Json.write(

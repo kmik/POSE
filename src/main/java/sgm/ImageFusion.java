@@ -40,13 +40,18 @@ final class ImageFusion {
     long pixels, ambiguous, spikes, freeSpace, speckle, unsupported, visibility, uncertainty, twoView, notOwner, consumed, emitted, refined;
     long members, depthOutliers;
     long ambiguousKept, pairReads, bytesRead;
+    long edgeSupported,edgeFreeSpace,edgeUnknown;
+    long patchSuspects,patchUnsupported,patchFreeSpace,uncertainAverageSkipped,averageReverted;
+    long precisionRejected, narrowRejected, localSigmaRejected;
+    boolean edgeEnabled, thinEnabled;
 
     long rejected() {
-      return ambiguous + spikes + freeSpace + speckle + unsupported + visibility + uncertainty + twoView;
+      return ambiguous + spikes + freeSpace + speckle + unsupported + visibility + uncertainty + twoView
+          + precisionRejected + narrowRejected + localSigmaRejected;
     }
 
     Object json() {
-      return Json.object(
+      Map<String, Object> out = Json.object(
           "merged_valid_pixels", pixels,
           "ambiguous_layer_rejected", ambiguous,
           "ambiguous_nearer_layer_kept", ambiguousKept,
@@ -63,7 +68,23 @@ final class ImageFusion {
           "graph_members_averaged", members,
           "emitted", emitted,
           "pair_reads", pairReads,
-          "candidate_bytes_read", bytesRead);
+          "candidate_bytes_read", bytesRead,
+          "edge_aware_camera_checks",edgeEnabled?Json.object(
+              "version",3,"positive_support","Precise center measurement; uncertainty compatibility is neutral",
+              "supported_checks",edgeSupported,"free_space_rejected_checks",edgeFreeSpace,
+              "unknown_or_occluded_checks",edgeUnknown,"surface_patch_suspects",patchSuspects,
+              "surface_patch_without_precise_support_rejected",patchUnsupported,
+              "surface_patch_free_space_votes",patchFreeSpace,
+              "uncertain_averaging_members_skipped",uncertainAverageSkipped,
+              "surface_departing_averages_reverted",averageReverted):null);
+      if (thinEnabled)
+        out.put(
+            "thin_surface_checks",
+            Json.object(
+                "precision_rejected", precisionRejected,
+                "narrow_unconfirmed_rejected", narrowRejected,
+                "local_sigma_rejected", localSigmaRejected));
+      return out;
     }
   }
 
@@ -75,6 +96,7 @@ final class ImageFusion {
 
   private final ForkJoinPool pool;
   private final float[][] compact;
+  private SurfacePatchGrid[] surfaceContext;
   private final int[][] neighbours;
   // owner-consume / graph-average: per camera, merged pixels already represented by an emitted point.
   private final long[][] used;
@@ -83,6 +105,12 @@ final class ImageFusion {
   // graph-average: per camera, the merged pixels' inverse-variance weight sums.
   private final float[][] compactWeight;
   private final List<List<Integer>> pairsOf = new ArrayList<>();
+  // --thin-surfaces parts (all off: identical to the previous output).
+  private final boolean sigmaTolerance, precisionCheck, storeWeights;
+  private final int tierCount;
+  private final double sigmaK, seedMinSine, localSigma;
+  // --fusion-local-sigma: per camera, the smallest merged sigma (depth units) within 4 pixels.
+  private final float[][] localBest;
 
   /** One pair's candidates, read from the stream; sinef = f * sin(triangulation angle). */
   private static final class PairData {
@@ -90,6 +118,8 @@ final class ImageFusion {
     final double[] world;
     final float[] sinef, evidence;
     final int[] rgb, pixel;
+    // --fusion-seed-min-angle: sinef below this is a narrow-pair candidate.
+    double narrowSinef;
 
     PairData(int pair, int count, int fields, boolean full) {
       this.pair = pair;
@@ -114,6 +144,8 @@ final class ImageFusion {
     final byte[] support;
     final long[] partners;
     final boolean[] ambiguous;
+    // --fusion-seed-min-angle: every merged member came from a narrow-angle candidate.
+    final boolean[] narrow;
 
     Merged(int w, int h, int words) {
       this.w = w;
@@ -129,6 +161,7 @@ final class ImageFusion {
       support = new byte[n];
       partners = new long[(long) n * words > Integer.MAX_VALUE - 8 ? 0 : n * words];
       ambiguous = new boolean[n];
+      narrow = new boolean[n];
       Arrays.fill(repIndex, -1);
     }
   }
@@ -141,6 +174,14 @@ final class ImageFusion {
     this.fusion = fusion;
     this.candidates = candidates;
     this.start = start;
+    sigmaTolerance = o.fusionTolerance.equals("sigma");
+    precisionCheck = o.fusionPrecisionCheck;
+    sigmaK = o.fusionSigmaK;
+    seedMinSine = o.fusionSeedMinAngle > 0 ? Math.sin(Math.toRadians(o.fusionSeedMinAngle)) : 0;
+    localSigma = o.fusionLocalSigma;
+    tierCount = o.fusionSeedOrder.equals("precision") ? (seedMinSine > 0 ? 3 : 2) : 1;
+    storeWeights =
+        o.fusionStrategy.equals("graph-average") || DepthOutlierFilter.enabled(o) || o.thinSurfaceFusion();
     cameras = fusion.cameraCount();
     words = (cameras + 63) / 64;
     fields = Double.isFinite(fusion.twoViewConfidenceThreshold()) ? 6 : 5;
@@ -155,11 +196,14 @@ final class ImageFusion {
     long compactBytes = 0, worstCamera = 0;
     for (int c = 0; c < cameras; c++) {
       long pixels = (long) fusion.width(c) * fusion.height(c), pairBytes = 0;
-      compactBytes += 4 * pixels;
+      compactBytes += (DepthOutlierFilter.enabled(o)?8:4) * pixels;
+      if (!DepthOutlierFilter.enabled(o) && o.thinSurfaceFusion()) compactBytes += 4 * pixels;
+      if (o.fusionLocalSigma > 0) compactBytes += 4 * pixels;
       for (int k : pairsOf.get(c)) pairBytes += (start[k + 1] - start[k]) * (24L + 12 + 4L * fields) + 20 * pixels;
       worstCamera = Math.max(worstCamera, pairBytes + pixels * (34L + 8L * words));
     }
     long needed = compactBytes + worstCamera, budget = (long) (Runtime.getRuntime().maxMemory() * .75);
+    if(DepthOutlierFilter.enabled(o))needed+=4096L*cameras*SurfacePatchGrid.cacheCells(o,cameras);
     if (needed > budget)
       throw new IllegalArgumentException(
           "Image-space fusion needs about " + needed / 1048576 + " MiB heap (compact maps "
@@ -170,6 +214,7 @@ final class ImageFusion {
     used = new long[cameras][];
     emitted = new long[cameras][];
     compactWeight = new float[cameras][];
+    localBest = new float[cameras][];
     pool = new ForkJoinPool(Math.max(1, o.cores));
   }
 
@@ -240,6 +285,7 @@ final class ImageFusion {
     Camera ca = fusion.camera(a), cb = fusion.camera(b);
     double[] centerA = ca.center(), centerB = cb.center();
     double focal = Math.min(Math.min(ca.fx, ca.fy), Math.min(cb.fx, cb.fy));
+    data.narrowSinef = focal * seedMinSine;
     parallel(n, j -> {
       double[] p = data.point(j), u = Math3.sub(p, centerA), v = Math3.sub(p, centerB);
       double denominator = Math3.norm(u) * Math3.norm(v);
@@ -259,6 +305,8 @@ final class ImageFusion {
   private Counters fuse(FusionOutput output, TwoViewConfidence.Diagnostics diagnostics)
       throws IOException {
     Counters counters = new Counters();
+    counters.edgeEnabled=DepthOutlierFilter.enabled(o);
+    counters.thinEnabled = o.thinSurfaceFusion();
     double[][] samples = new double[cameras][];
     long splatNanos = 0, mergeNanos = 0, speckleNanos = 0;
     try (FileChannel channel = FileChannel.open(candidates, StandardOpenOption.READ)) {
@@ -280,17 +328,27 @@ final class ImageFusion {
         speckleNanos += System.nanoTime() - clock;
         for (float z : m.z) if (z > 0) counters.pixels++;
         compact[c] = m.z;
-        if (o.fusionStrategy.equals("graph-average")) compactWeight[c] = m.wsum;
+        if (storeWeights) compactWeight[c] = m.wsum;
+        if (localSigma > 0) localBest[c] = localMinimumSigma(m.z, m.wsum, m.w, m.h, 4);
         samples[c] = sample(c, m, splats);
       }
       RunTelemetry.recordTotal("Image fusion: pass 1 splats (pair reads)", splatNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: pass 1 per-camera merge", mergeNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: pass 1 2D speckle filter", speckleNanos, cameras);
       long clock = System.nanoTime();
+      if(DepthOutlierFilter.enabled(o)) {
+        surfaceContext=new SurfacePatchGrid[cameras];
+        for(int c=0;c<cameras;c++)if(compact[c]!=null) {
+          final float[] raster=compact[c];
+          surfaceContext[c]=new SurfacePatchGrid(fusion.width(c),fusion.height(c),p->raster[p],o.fusionRelative,SurfacePatchGrid.cacheCells(o,cameras));
+        }
+      }
       for (int c = 0; c < cameras; c++) neighbours[c] = overlapping(c, samples);
       RunTelemetry.record("Image fusion: camera overlap", clock);
       long remergeNanos = 0, checkNanos = 0, outputNanos = 0;
       // Pass 2: re-merge one camera at a time (identical), cross-check, own and emit.
+      // --fusion-seed-order precision repeats it per precision tier (precise seeds first).
+      for (int tier = 0; tier < tierCount; tier++)
       for (int c = 0; c < cameras; c++) {
         progress.update(cameras + c);
         if (compact[c] == null) continue;
@@ -302,7 +360,7 @@ final class ImageFusion {
         for (int p = 0; p < kept.length; p++) if (kept[p] <= 0) m.z[p] = 0;
         remergeNanos += System.nanoTime() - clock;
         clock = System.nanoTime();
-        Emission[][] rows = crossCheck(c, m, splats, counters);
+        Emission[][] rows = crossCheck(c, m, splats, counters, tier);
         checkNanos += System.nanoTime() - clock;
         clock = System.nanoTime();
         for (Emission[] row : rows)
@@ -399,7 +457,8 @@ final class ImageFusion {
   private Merged merge(int c, Splat[] splats, Counters counters) {
     int w = fusion.width(c), h = fusion.height(c);
     Merged m = new Merged(w, h, words);
-    double tol = o.fusionRelative, limit = o.fusionPixels * o.fusionPixels;
+    double limit = o.fusionPixels * o.fusionPixels;
+    double focal = Math.min(fusion.camera(c).fx, fusion.camera(c).fy);
     long[] ambiguous = new long[h];
     parallel(h, y -> {
       int n = splats.length;
@@ -444,7 +503,7 @@ final class ImageFusion {
           int members = 0;
           double weights = 0;
           for (int b = 0; b < found; b++)
-            if (Math.abs(depth[b] - depth[a]) <= tol * Math.min(depth[a], depth[b])) {
+            if (agree(depth[b], depth[a], weight[b], weight[a], focal)) {
               members++;
               weights += weight[b];
             }
@@ -464,8 +523,13 @@ final class ImageFusion {
         }
         double center = depth[bestCenter], sum = 0, wsum = 0, top = -1;
         int chosen = -1, members = 0;
+        boolean allNarrow = seedMinSine > 0;
         for (int b = 0; b < found; b++) {
-          if (Math.abs(depth[b] - center) > tol * Math.min(center, depth[b])) continue;
+          if (!agree(depth[b], center, weight[b], weight[bestCenter], focal)) continue;
+          if (allNarrow) {
+            PairData member = splats[from[b]].data();
+            allNarrow = member.sinef[samples[b]] < member.narrowSinef;
+          }
           sum += weight[b] * depth[b];
           wsum += weight[b];
           members++;
@@ -485,6 +549,7 @@ final class ImageFusion {
         m.wsum[p] = (float) wsum;
         m.support[p] = (byte) Math.min(127, members);
         m.ambiguous[p] = !majority;
+        m.narrow[p] = allNarrow;
         m.du[p] = (float) offsetX[chosen];
         m.dv[p] = (float) offsetY[chosen];
       }
@@ -674,7 +739,7 @@ final class ImageFusion {
       float[] agreementDepths) {}
 
   /** Cross-check, ownership and emission for camera c, row-parallel and row-ordered. */
-  private Emission[][] crossCheck(int c, Merged m, Splat[] splats, Counters counters) {
+  private Emission[][] crossCheck(int c, Merged m, Splat[] splats, Counters counters, int tier) {
     int w = m.w, h = m.h, required = fusion.requiredViews();
     Camera cam = fusion.camera(c);
     double[] rotationT = Math3.transpose(cam.rotation);
@@ -686,6 +751,11 @@ final class ImageFusion {
     int agreementRadius = agreementRadius(o);
     boolean consume = o.fusionStrategy.equals("owner-consume"), freeSpace = !o.fusionFreeSpace.equals("off"), strictFreeSpace = o.fusionFreeSpace.equals("strict");
     boolean graph = o.fusionStrategy.equals("graph-average");
+    // Inverse-variance averaging along the ray: graph-average, or --fusion-precision-check (snap a
+    // confirmed point onto the precise depths that confirmed it).
+    boolean average = graph || precisionCheck;
+    double focal = Math.min(cam.fx, cam.fy);
+    float[] best = localBest[c];
     long[] taken = consume || graph ? used[c] : null;
     Map<Integer, PairData> byPair = new HashMap<>();
     for (Splat s : splats) byPair.put(s.data().pair, s.data());
@@ -704,7 +774,7 @@ final class ImageFusion {
         }
       });
     Emission[][] rows = new Emission[h][];
-    long[][] tallies = new long[h][8];
+    long[][] tallies = new long[h][20];
     parallel(h, y -> {
       List<Emission> list = null;
       long[] t = tallies[y];
@@ -715,6 +785,7 @@ final class ImageFusion {
         int p = y * w + x;
         float mz = m.z[p];
         if (mz <= 0) continue;
+        if (tierCount > 1 && tier(m, p, focal) != tier) continue;
         if (taken != null && (taken[p >>> 6] & 1L << (p & 63)) != 0) {
           t[6]++;
           continue;
@@ -728,14 +799,20 @@ final class ImageFusion {
         double[] X = backProject(cam, rotationT, u, v, mz);
         // graph-average: inverse-variance sums of depths along this pixel's ray. dX/dz is the ray
         // direction per unit of this camera's depth; another camera's depth is linear along it.
-        double sumW = graph ? m.wsum[p] : 0, sumWZ = graph ? m.wsum[p] * (double) mz : 0;
-        double[] ray = graph ? Math3.mv(rotationT, new double[] {(u - cam.cx) / cam.fx, (v - cam.cy) / cam.fy, 1}) : null;
+        double sumW = average ? m.wsum[p] : 0, sumWZ = average ? m.wsum[p] * (double) mz : 0;
+        double[] ray = average ? Math3.mv(rotationT, new double[] {(u - cam.cx) / cam.fx, (v - cam.cy) / cam.fy, 1}) : null;
         Arrays.fill(confirmed, 0);
         for (int k = 0; k < words; k++) views[k] = m.partners.length > 0 ? m.partners[p * words + k] : 0;
         views[c >>> 6] |= 1L << (c & 63);
         long independent = m.support[p];
         int contradictions = 0, closeViews = 0, seeThrough = 0;
+        int edgeSupport=0,edgeThrough=0;
+        var ownPatch=surfaceContext==null?SurfacePatchGrid.Prediction.UNKNOWN:surfaceContext[c].predict(u,v,mz);
+        boolean patchSuspect=ownPatch.kind()==2||ownPatch.kind()==3;
         boolean outsideSupport = false;
+        double seedWeight = m.wsum[p];
+        int preciseConfirm = 0, preciseDisagree = 0, outsideConfirm = 0;
+        boolean narrowSeed = seedMinSine > 0 && m.narrow[p];
         for (int j : near) {
           float[] other = compact[j];
           Camera oc = fusion.camera(j);
@@ -746,32 +823,90 @@ final class ImageFusion {
           int xj = (int) Math.round(uj), yj = (int) Math.round(wj);
           if (xj < 1 || yj < 1 || xj >= ow - 1 || yj >= oh - 1) continue;
           double zj = other[yj * ow + xj];
+          boolean preciseAgreement=false;
+          if(DepthOutlierFilter.enabled(o)) {
+            // The merged map is one vote per camera. Source-pair cameras cannot independently
+            // confirm their own mismatch. Uncertainty comes from the generating pair and the
+            // other camera's merged inverse-variance weight, where available.
+            int pair=data.pair;
+            {
+              double low=Double.POSITIVE_INFINITY,high=0;int count=0;
+              for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
+                double z=other[(yj+dy)*ow+xj+dx];
+                if(z>0){low=Math.min(low,z);high=Math.max(high,z);count++;}
+              }
+              double footprint=vj[2]/Math.min(oc.fx,oc.fy);
+              double sourceSigma=vj[2]/Math.sqrt(Math.max(1e-30,m.wsum[p]))/mz;
+              double weight=compactWeight[j]==null?0:compactWeight[j][yj*ow+xj];
+              double otherSigma=weight>0?1/Math.sqrt(weight):footprint;
+              int vote=DepthOutlierFilter.cameraVote(vj[2],zj,low,high,count,
+                  Math.hypot(sourceSigma,otherSigma),footprint,o.fusionRelative);
+              preciseAgreement=vote==1;
+              if(j!=fusion.pairCamera(pair,false) && j!=fusion.pairCamera(pair,true)) {
+                if(vote==0) {
+                  var patch=surfaceContext[j].predict(uj,wj,vj[2]);
+                  if(patch.kind()==2) {
+                    patchSuspect=true;
+                    double band=3*Math.hypot(sourceSigma,Math.hypot(patch.sigma(),footprint));
+                    if(vj[2]<patch.depth()-band){vote=2;t[13]++;}
+                  }
+                }
+                if(vote==1)edgeSupport++;else if(vote==2)edgeThrough++;
+              }
+            }
+          }
           // Merged maps are sparse at step > 1 and broken at canopy gaps, so the exact pixel may
           // be empty or an occluder while the same surface lies one sample away. Agreement is
           // therefore accepted within a small neighbourhood (centre first); contradiction still
           // uses the centre pixel only. Without this, two copies of one surface that miss each
           // other's samples are both "unconfirmed", both own themselves and both emit.
-          boolean agrees = zj > 0 && Math.abs(zj - vj[2]) <= tol * Math.min(zj, vj[2]);
+          // --fusion-tolerance sigma: the seed's sigma moved to j's depth scale.
+          float[] weightsJ = compactWeight[j];
+          double focalJ = Math.min(oc.fx, oc.fy);
+          double seedJ = seedWeight * ((double) mz / vj[2]) * ((double) mz / vj[2]);
+          boolean agrees = zj > 0 && agree(zj, vj[2], weightsJ == null ? 0 : weightsJ[yj * ow + xj], seedJ, focalJ);
           int ax = xj, ay = yj;
           for (int dy = -agreementRadius; !agrees && dy <= agreementRadius; dy++)
             for (int dx = -agreementRadius; !agrees && dx <= agreementRadius; dx++) {
               int xx = xj + dx, yy = yj + dy;
               if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
               double zn = other[yy * ow + xx];
-              agrees = zn > 0 && Math.abs(zn - vj[2]) <= tol * Math.min(zn, vj[2]);
+              agrees = zn > 0 && agree(zn, vj[2], weightsJ == null ? 0 : weightsJ[yy * ow + xx], seedJ, focalJ);
               if (agrees) {
                 ax = xx;
                 ay = yy;
               }
             }
-          if (agrees && consume) {
+          if (precisionCheck && zj > 0 && weightsJ != null && weightsJ[yj * ow + xj] > 4 * seedJ) {
+            // Camera j is at least 2x more precise here. Confirmation at its precision, or a near
+            // miss: the same surface within the relative band but outside K sigma (occluders and
+            // other layers lie beyond the band and stay neutral).
+            boolean tight = false;
+            for (int dy = -agreementRadius; !tight && dy <= agreementRadius; dy++)
+              for (int dx = -agreementRadius; !tight && dx <= agreementRadius; dx++) {
+                int xx = xj + dx, yy = yj + dy;
+                if (xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
+                double zn = other[yy * ow + xx], wn = weightsJ[yy * ow + xx];
+                tight = zn > 0 && wn > 0 && agreeSigma(zn, vj[2], wn, seedJ, focalJ);
+              }
+            if (tight) preciseConfirm++;
+            else if (Math.abs(zj - vj[2]) <= tol * Math.min(zj, vj[2]) && reliable(other, ow, xj, yj)) preciseDisagree++;
+          }
+          if (agrees && (m.partners.length == 0 || (m.partners[p * words + (j >>> 6)] & 1L << (j & 63)) == 0))
+            outsideConfirm++;
+          if(agrees && DepthOutlierFilter.enabled(o) && !preciseAgreement)t[14]++;
+          // Sigma agreement is already precise; the coherent-patch vote is only needed for the
+          // relative band.
+          boolean averageAgreement=agrees&&(!DepthOutlierFilter.enabled(o)||preciseAgreement||sigmaTolerance);
+          if(averageAgreement&&DepthOutlierFilter.enabled(o)&&preciseAgreement){ax=xj;ay=yj;}
+          if (averageAgreement && consume) {
             agreeAt[agreed] = (long) j << 42 | (long) ay << 21 | ax;
             agreeDepth[agreed++] = (float) vj[2];
             // An earlier camera that agrees already emitted this surface here: this is a copy.
             if (j < c && !duplicate && emitted[j] != null)
               duplicate = emittedNear(j, xj, yj, vj[2], Math.max(agreementRadius, o.step));
           }
-          if (agrees && graph) {
+          if (averageAgreement && average) {
             // The member's depth along j's ray at (ax, ay), moved to this pixel's ray: depth in j
             // changes by slope per unit of this camera's depth. Grazing members are not averaged.
             double slope = oc.rotation[6] * ray[0] + oc.rotation[7] * ray[1] + oc.rotation[8] * ray[2];
@@ -779,8 +914,10 @@ final class ImageFusion {
             if (slope > .2 && wm > 0) {
               sumW += wm;
               sumWZ += wm * (mz + (zm - vj[2]) / slope);
-              agreeAt[agreed] = (long) j << 42 | (long) ay << 21 | ax;
-              agreeDepth[agreed++] = (float) vj[2];
+              if (graph) {
+                agreeAt[agreed] = (long) j << 42 | (long) ay << 21 | ax;
+                agreeDepth[agreed++] = (float) vj[2];
+              }
             }
           }
           if (freeSpace && (zj > 0 || agrees)) {
@@ -812,8 +949,15 @@ final class ImageFusion {
         for (long word : views) viewCount += Long.bitCount(word);
         int needed = robust ? Math.max(1, (viewCount + 1) / 2) : 1;
         String status = "accepted";
+        if(DepthOutlierFilter.enabled(o)) {
+          if(patchSuspect)t[11]++;
+          if(DepthOutlierFilter.cameraReject(edgeSupport,edgeThrough))t[9]++;
+          else if(edgeSupport>0)t[8]++;else t[10]++;
+        }
         double sigma = 1 / Math.sqrt(Math.max(1e-30, m.wsum[p])) / mz;
-        if (contradictions >= needed) status = "visibility_contradiction_rejected";
+        if (DepthOutlierFilter.enabled(o) && DepthOutlierFilter.cameraReject(edgeSupport,edgeThrough)) status="free_space_rejected";
+        else if (patchSuspect && edgeSupport==0) {status="independent_support_rejected";t[12]++;}
+        else if (contradictions >= needed) status = "visibility_contradiction_rejected";
         // Free space: cameras whose surface lies clearly behind this point (more than three
         // footprints, beyond depth noise) see through it; when more of them do than confirm it, it
         // floats in front of the surface (a mismatch the relative tolerance let through).
@@ -821,6 +965,10 @@ final class ImageFusion {
         else if (m.ambiguous[p] && !outsideSupport) status = "depth_consensus_rejected";
         else if (viewCount < required) status = "independent_support_rejected";
         else if (sigma > o.maxDepthUncertainty) status = "depth_uncertainty_rejected";
+        // --fusion-precision-check: more precise cameras see this surface elsewhere than they confirm.
+        else if (precisionCheck && preciseDisagree > preciseConfirm) status = "precision_rejected";
+        // --fusion-seed-min-angle: a narrow-pair-only depth needs two confirmations outside its pairs.
+        else if (narrowSeed && outsideConfirm < 2) status = "narrow_unconfirmed_rejected";
         if (status.equals("accepted") && duplicate) {
           t[6]++;
           continue;
@@ -831,6 +979,8 @@ final class ImageFusion {
             case "free_space_rejected" -> t[7]++;
             case "depth_consensus_rejected" -> t[1]++;
             case "independent_support_rejected" -> t[2]++;
+            case "precision_rejected" -> t[16]++;
+            case "narrow_unconfirmed_rejected" -> t[17]++;
             default -> t[3]++;
           }
           continue;
@@ -858,10 +1008,22 @@ final class ImageFusion {
         // Only the representative's own cell emits it (sparse maps reuse neighbouring samples).
         if (Math.round(u) != x || Math.round(v) != y) continue;
         BitSet supporting = BitSet.valueOf(views.clone());
-        if (graph && sumW > 0) {
+        if (average && sumW > 0) {
           double zf = sumWZ / sumW;
+          if(surfaceContext!=null && ownPatch.kind()==1) {
+            int after=surfaceContext[c].predict(u,v,zf).kind();
+            if(after==2||after==3){zf=mz;sumW=m.wsum[p];t[15]++;}
+          }
           X = backProject(cam, rotationT, u, v, zf);
           sigma = 1 / Math.sqrt(sumW) / zf;
+        }
+        // --fusion-local-sigma: precise evidence nearby that this point did not join.
+        if (best != null) {
+          double own = 1 / Math.sqrt(Math.max(1e-30, average && sumW > 0 ? sumW : m.wsum[p]));
+          if (best[p] > 0 && own > localSigma * best[p]) {
+            t[18]++;
+            continue;
+          }
         }
         DepthFusion.Result r =
             new DepthFusion.Result(X, viewCount, (int) independent, sigma, Math3.norm(Math3.sub(X, data.point(rep))), "accepted");
@@ -901,6 +1063,12 @@ final class ImageFusion {
       counters.twoView += t[5];
       counters.consumed += t[6];
       counters.freeSpace += t[7];
+      counters.edgeSupported+=t[8];counters.edgeFreeSpace+=t[9];counters.edgeUnknown+=t[10];
+      counters.patchSuspects+=t[11];counters.patchUnsupported+=t[12];counters.patchFreeSpace+=t[13];
+      counters.uncertainAverageSkipped+=t[14];counters.averageReverted+=t[15];
+      counters.precisionRejected += t[16];
+      counters.narrowRejected += t[17];
+      counters.localSigmaRejected += t[18];
     }
     return rows;
   }
@@ -929,6 +1097,55 @@ final class ImageFusion {
   static int agreementRadius(Options o) {
     if (o.fusionAgreementRadius >= 0) return o.fusionAgreementRadius;
     return o.fusionStrategy.equals("owner") ? 0 : Math.max(1, o.step);
+  }
+
+  /**
+   * Depth agreement. --fusion-tolerance relative: within --fusion-relative x depth (the previous
+   * rule, bit for bit). sigma: {@link #agreeSigma} where both inverse-variance weights are known.
+   */
+  private boolean agree(double a, double b, double wa, double wb, double focal) {
+    if (sigmaTolerance && wa > 0 && wb > 0) return agreeSigma(a, b, wa, wb, focal);
+    return Math.abs(a - b) <= o.fusionRelative * Math.min(a, b);
+  }
+
+  /**
+   * |a - b| within K combined stereo sigmas (weights are inverse variances), at least one pixel
+   * footprint (depth / focal) and at most the relative band.
+   */
+  private boolean agreeSigma(double a, double b, double wa, double wb, double focal) {
+    double near = Math.min(a, b);
+    double band = Math.max(sigmaK * Math.sqrt(1 / wa + 1 / wb), near / focal);
+    return Math.abs(a - b) <= Math.min(band, o.fusionRelative * near);
+  }
+
+  /**
+   * --fusion-seed-order precision tier of a merged pixel: 0 = merged sigma within one footprint, 1
+   * = the rest, 2 = narrow-pair-only depth (--fusion-seed-min-angle).
+   */
+  private int tier(Merged m, int p, double focal) {
+    if (seedMinSine > 0 && m.narrow[p]) return 2;
+    double sigma = 1 / Math.sqrt(Math.max(1e-30, m.wsum[p]));
+    return sigma <= m.z[p] / focal ? 0 : 1;
+  }
+
+  /** Separable (2r+1)^2 minimum of merged sigma = 1/sqrt(wsum) over valid pixels; 0 = none. */
+  static float[] localMinimumSigma(float[] z, float[] wsum, int w, int h, int r) {
+    float[] sigma = new float[w * h], rows = new float[w * h], out = new float[w * h];
+    for (int p = 0; p < sigma.length; p++)
+      sigma[p] = z[p] > 0 && wsum[p] > 0 ? (float) (1 / Math.sqrt(wsum[p])) : Float.POSITIVE_INFINITY;
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        float best = Float.POSITIVE_INFINITY;
+        for (int xx = Math.max(0, x - r); xx <= Math.min(w - 1, x + r); xx++) best = Math.min(best, sigma[y * w + xx]);
+        rows[y * w + x] = best;
+      }
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+        float best = Float.POSITIVE_INFINITY;
+        for (int yy = Math.max(0, y - r); yy <= Math.min(h - 1, y + r); yy++) best = Math.min(best, rows[yy * w + x]);
+        out[y * w + x] = Float.isInfinite(best) ? 0 : best;
+      }
+    return out;
   }
 
   /** A coherent, densely observed 3x3 patch (as the reference visibility test requires). */

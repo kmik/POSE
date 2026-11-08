@@ -22,6 +22,11 @@ final class DepthFusion implements AutoCloseable {
   private final double[][] centers, inverseRotations;
   private GpuFusion gpu;
   private boolean prepared;
+  /**
+   * Edge-aware surface-patch votes. Set by prepare() (reference fusion), not by
+   * prepareSurfaceReaders(): image-fusion consolidation keeps its previous decisions.
+   */
+  private boolean patchContext;
   private ExecutorService workers;
   private int cpuWorkers;
   private CameraEvidence cameraEvidence;
@@ -34,6 +39,11 @@ final class DepthFusion implements AutoCloseable {
   private Object memoryAdmission;
   private final List<Object> gpuFailures = Collections.synchronizedList(new ArrayList<>());
   private int consecutiveGpuFailures;
+  private final java.util.concurrent.atomic.LongAdder edgeSupported=new java.util.concurrent.atomic.LongAdder(),
+      edgeFreeSpace=new java.util.concurrent.atomic.LongAdder(),edgeUnknown=new java.util.concurrent.atomic.LongAdder();
+  private final java.util.concurrent.atomic.LongAdder patchSuspects=new java.util.concurrent.atomic.LongAdder(),
+      patchUnsupported=new java.util.concurrent.atomic.LongAdder(),patchFreeSpace=new java.util.concurrent.atomic.LongAdder();
+  private final Map<DepthRaster,SurfacePatchGrid> surfaceContexts=new ConcurrentHashMap<>();
 
   private long reads() {
     return pagePool.reads + pagePool.frozenReads.sum();
@@ -310,6 +320,11 @@ final class DepthFusion implements AutoCloseable {
   /** Missing depth and a nearer occluder are neutral; reliable free space is contradictory. */
   private Result visibility(int source, Result result) {
     if (!result.accepted()) return result;
+    String edgeStatus=DepthOutlierFilter.enabled(options)?edgeDecision(source,result):null;
+    if(edgeStatus!=null) {
+      return new Result(result.point,result.views,result.independentPairs,result.relativeSigma,
+          result.shift,edgeStatus);
+    }
     PairDepth origin = pairs.get(source);
     int inspected = 0, contradictions = 0;
     boolean robust = options.fusionOutliers.equals("robust");
@@ -369,6 +384,71 @@ final class DepthFusion implements AutoCloseable {
     return result;
   }
 
+  /** Check distinct cameras outside the generating pair, using two distinct partner maps
+   * per camera. No agreement is inferred from a missing map or a foreground occluder. */
+  private boolean edgeVisibility(int source,Result result) {
+    return edgeDecision(source,result)!=null;
+  }
+  private SurfacePatchGrid context(int image,DepthRaster raster) {
+    return surfaceContexts.computeIfAbsent(raster,key->new SurfacePatchGrid(widths[image],heights[image],p->key.get(p),options.fusionRelative,SurfacePatchGrid.cacheCells(options,2*pairs.size())));
+  }
+  private String edgeDecision(int source,Result result) {
+    PairDepth origin=pairs.get(source);
+    int supports=0,free=0;
+    boolean suspect=false;
+    if(patchContext) {
+      double[] uv=cameras[origin.a].project(result.point);
+      if(uv!=null) {
+        int kind=context(origin.a,origin.first).predict(uv[0],uv[1],cameras[origin.a].view(result.point)[2]).kind();
+        suspect=kind==2||kind==3;
+      }
+    }
+    for(int image=0;image<cameras.length;image++) {
+      if(image==origin.a || image==origin.b || byCamera.get(image).size()<2)continue;
+      Camera camera=cameras[image];double[] view=camera.view(result.point),uv=camera.project(result.point);
+      if(view[2]<=0 || uv==null || uv[0]<1 || uv[1]<1 || uv[0]>=widths[image]-1 || uv[1]>=heights[image]-1)continue;
+      int x=(int)Math.round(uv[0]),y=(int)Math.round(uv[1]);
+      if(x>=widths[image]-1 || y>=heights[image]-1)continue;
+      BitSet partners=new BitSet(cameras.length);
+      int agree=0,through=0;
+      for(Endpoint e:byCamera.get(image)) {
+        PairDepth pair=pairs.get(e.pair);int partner=pair.a==image?pair.b:pair.a;
+        if(partners.get(partner))continue;
+        double low=Double.POSITIVE_INFINITY,high=0;int count=0;
+        for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
+          double z=e.map.get((y+dy)*widths[image]+x+dx);
+          if(z>0){low=Math.min(low,z);high=Math.max(high,z);count++;}
+        }
+        double sine=Math.sin(Math.toRadians(triangulationAngleDegrees(result.point,centers[image],centers[partner])));
+        double footprint=view[2]/Math.min(camera.fx,camera.fy);
+        double measurement=footprint*.5/Math.max(1e-6,sine);
+        double sigma=Math.hypot(Math.abs(result.relativeSigma*view[2]),measurement);
+        int vote=DepthOutlierFilter.cameraVote(view[2],e.map.get(y*widths[image]+x),low,high,count,sigma,footprint,options.fusionRelative);
+        if(vote==0&&patchContext) {
+          var patch=context(image,e.map).predict(uv[0],uv[1],view[2]);
+          if(patch.kind()==2) {
+            suspect=true;
+            double band=3*Math.hypot(Math.abs(result.relativeSigma*view[2]),Math.hypot(patch.sigma(),footprint));
+            if(view[2]<patch.depth()-band){vote=2;patchFreeSpace.increment();}
+          }
+        }
+        if(vote==1 || vote==2){partners.set(partner);if(vote==1)agree++;else through++;}
+      }
+      if(agree>=2)supports++;
+      else if(through>=2)free++;
+    }
+    if(suspect)patchSuspects.increment();
+    if(DepthOutlierFilter.cameraReject(supports,free)){edgeFreeSpace.increment();return "visibility_contradiction_rejected";}
+    if(suspect&&supports==0){patchUnsupported.increment();return "independent_support_rejected";}
+    if(supports>0)edgeSupported.increment();else edgeUnknown.increment();
+    return null;
+  }
+  private static double triangulationAngleDegrees(double[] p,double[] a,double[] b) {
+    double[] u=Math3.sub(p,a),v=Math3.sub(p,b);
+    double cosine=(u[0]*v[0]+u[1]*v[1]+u[2]*v[2])/Math.max(1e-30,Math3.norm(u)*Math3.norm(v));
+    return Math.toDegrees(Math.acos(Math.max(-1,Math.min(1,cosine))));
+  }
+
   boolean surfaceDisplacement(int source, double[] before, double[] after) {
     PairDepth p = pairs.get(source);
     return backProjection(p, before, after);
@@ -384,6 +464,11 @@ final class DepthFusion implements AutoCloseable {
     for (int i = 0; i < pairs.size(); i++)
       endpoints[i] = new int[] {pairs.get(i).a, pairs.get(i).b};
     return new GpuSurface(cameras, endpoints, capacity, options, gpu.surfaceBudget());
+  }
+
+  /** True when parallel() actually uses CPU fusion workers. */
+  boolean cpuParallel() {
+    return workers != null;
   }
 
   boolean surfaceBatching() {
@@ -837,6 +922,20 @@ final class DepthFusion implements AutoCloseable {
   }
 
   void prepare(long count) {
+    prepare(count, true);
+    patchContext = true;
+  }
+
+  /**
+   * Image fusion never prepares this per-pair backend. Surface consolidation re-validates moved
+   * points against it, so it freezes the evidence (read-only, concurrently readable) and starts
+   * the CPU workers here, without a GPU backend: results equal the serial CPU reference.
+   */
+  void prepareSurfaceReaders(long count) {
+    prepare(count, false);
+  }
+
+  private void prepare(long count, boolean allowGpu) {
     if (prepared) return;
     prepared = true;
     long freezeStarted = System.nanoTime(), evidenceBytes = 0;
@@ -949,7 +1048,7 @@ final class DepthFusion implements AutoCloseable {
                       "fusion-cpu"));
     String compute =
         options.fusionCompute.equals("inherit") ? options.compute : options.fusionCompute;
-    if (!compute.equals("cpu")
+    if (allowGpu && !compute.equals("cpu")
         && (compute.equals("gpu") || count * Math.max(1, pairs.size()) >= 1000000)) {
       try {
         List<Endpoint> endpoints = new ArrayList<>();
@@ -1281,6 +1380,12 @@ final class DepthFusion implements AutoCloseable {
 
   Object backendReport() {
     return Json.object(
+        "edge_aware_camera_checks",DepthOutlierFilter.enabled(options)?Json.object(
+            "version",3,"positive_support","Precise center measurements from distinct partners; uncertainty compatibility is neutral",
+            "supported_checks",edgeSupported.sum(),"free_space_rejected_checks",edgeFreeSpace.sum(),
+            "unknown_or_occluded_checks",edgeUnknown.sum(),"surface_patch_suspects",patchSuspects.sum(),
+            "surface_patch_without_precise_support_rejected",patchUnsupported.sum(),
+            "surface_patch_free_space_votes",patchFreeSpace.sum()):null,
         "gpu_fallbacks", gpuFailures.size(),
         "gpu_fallback_details", new ArrayList<>(gpuFailures),
         "gpu_fallback_policy", options.fusionGpuFailure,

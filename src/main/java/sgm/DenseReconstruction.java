@@ -73,6 +73,32 @@ final class DenseReconstruction {
 
   long run(List<FeatureTracks.Pair> pairs) throws IOException {
     pairs = DensePairSelection.select(frames, pairs, tracks, options);
+    if (options.disparityRefinement.equals("multiview")) {
+      if (frames.stream().filter(f -> f.camera.registered && !f.camera.denseExcluded).count() < 6)
+        throw new IllegalArgumentException(
+            "Multi-view disparity refinement needs at least six registered cameras");
+      for (var pair : pairs)
+        if (frames.get(pair.a).camera.registered
+            && frames.get(pair.b).camera.registered
+            && windowed(frames.get(pair.a), frames.get(pair.b)))
+          throw new IllegalArgumentException(
+              "Multi-view disparity refinement currently needs non-windowed stereo;"
+                  + " lower processed resolution or select --disparity-refinement off");
+    }
+    if (options.densePipeline.equals("aerial-tiled")) {
+      try (var aerial =
+          new AerialTiledReconstruction(
+              options,
+              frames,
+              project,
+              crs,
+              fusion,
+              (a, b, source) -> rectify(a, b, false, source, true))) {
+        long count = aerial.run(pairs);
+        aerialSummary = aerial.summary();
+        return count;
+      }
+    }
     stereoPairs = pairs;
     if(options.stereoPipeline && !options.diagnostics && options.cores>1)
       pairPreparer=Executors.newSingleThreadExecutor(r -> new Thread(r,"stereo-prepare"));
@@ -107,10 +133,12 @@ final class DenseReconstruction {
           }
           long preloadStarted = System.nanoTime();
           int preloaded = RasterCache.preload(needed, options.cores);
-          if (preloaded > 0) RunTelemetry.record("Parallel image preload (" + preloaded + ")", preloadStarted);
+          if (preloaded > 0)
+            RunTelemetry.record("Parallel image preload (" + preloaded + ")", preloadStarted);
         }
         if (!options.denseMethod.equals("patchmatch"))
-          try (WorkProgress densePairs = WorkProgress.start("Dense matching pairs", pairs.size(), "pairs")) {
+          try (WorkProgress densePairs =
+              WorkProgress.start("Dense matching pairs", pairs.size(), "pairs")) {
           int inFlight = pairsInFlight(pairs);
           if (inFlight > 1) count = parallelPairs(pairs, out, densePairs, count, inFlight);
           else
@@ -144,8 +172,12 @@ final class DenseReconstruction {
                       "fusion_pair_id", source, "image_a", pair.a, "image_b", pair.b,
                       "error", String.valueOf(failure.getMessage()),
                       "type", failure.getClass().getSimpleName()));
-              System.err.printf(
-                  Locale.ROOT, "Warning: skipping failed pair %d-%d: %s%n", pair.a, pair.b, failure);
+                  System.err.printf(
+                      Locale.ROOT,
+                      "Warning: skipping failed pair %d-%d: %s%n",
+                      pair.a,
+                      pair.b,
+                      failure);
               if (project != null)
                 project.event(
                     "stereo_pair_failed",
@@ -175,12 +207,54 @@ final class DenseReconstruction {
         Files.createDirectories(options.output.resolve("05_stereo"));
         Json.write(
             options.output.resolve("05_stereo/skipped_pairs.json"),
-            Json.object("policy", options.onPairFailure, "attempted", attemptedPairs, "skipped", skippedPairs));
+            Json.object(
+                "policy",
+                options.onPairFailure,
+                "attempted",
+                attemptedPairs,
+                "skipped",
+                skippedPairs));
         if (skippedPairs.size() >= attemptedPairs)
           throw new IOException("Every stereo pair failed; see 05_stereo/skipped_pairs.json");
       }
-      this.candidates = count;
       rawCandidates = count;
+      if (options.disparityRefinement.equals("multiview")) {
+        closePreparation();
+        int[][] identities = new int[fusion.pairCount()][2];
+        long[] starts = new long[identities.length + 1];
+        for (int p = 0; p < identities.length; p++) {
+          identities[p] = new int[] {fusion.pairCamera(p, false), fusion.pairCamera(p, true)};
+          starts[p] = p < pairStarts.size() ? pairStarts.get(p) : count;
+        }
+        starts[starts.length - 1] = count;
+        var refinement =
+            new MultiViewDisparityRefinement(
+                options,
+                frames,
+                identities,
+                options.disparityAnchorAngle,
+                Math.min(
+                    options.disparityRefinementMemoryMb * 1048576L,
+                    Math.min(
+                        options.memoryMb * 1048576L / 8, Runtime.getRuntime().maxMemory() / 16)));
+        refinement.anchors(candidates, starts);
+        var result =
+            refinement.refine(
+                candidates,
+                starts,
+                (a, b, p) -> {
+                  synchronized (RasterCache.class) {
+                    return rectifyLocked(frames.get(a), frames.get(b), false, -1, false, false);
+                  }
+                },
+                null);
+        count = result.count();
+        pairStarts.clear();
+        for (int p = 0; p < identities.length; p++) pairStarts.add(result.starts()[p]);
+        Files.createDirectories(options.output.resolve("05_stereo"));
+        Json.write(options.output.resolve("05_stereo/disparity_refinement.json"), result.report());
+      }
+      this.candidates = count;
       Files.write(options.output.resolve("stereo-quality.csv"), quality);
       if (project != null) {
         project.stage(
@@ -198,7 +272,8 @@ final class DenseReconstruction {
       boolean imageFusion = options.fusionMode.equals("image");
       // Image-space fusion reads candidates directly; the per-candidate evidence backend is unused.
       if (!imageFusion)
-        try (WorkProgress work = WorkProgress.start("Prepare fusion evidence/backend", 0, "pixels")) {
+        try (WorkProgress work =
+            WorkProgress.start("Prepare fusion evidence/backend", 0, "pixels")) {
           fusion.prepare(count);
           work.done();
         }
@@ -346,7 +421,8 @@ final class DenseReconstruction {
             fusionRejected);
         long finishStarted = System.nanoTime();
         output.finish();
-        RunTelemetry.record("Fusion output finish (deferred normals, consolidation, LAS/PLY)", finishStarted);
+          RunTelemetry.record(
+              "Fusion output finish (deferred normals, consolidation, LAS/PLY)", finishStarted);
         normalNanos += output.deferredNormalNanos();
         kept = output.count();
         beforeSurface = output.stagedCount();
@@ -413,7 +489,10 @@ final class DenseReconstruction {
     }
   }
 
+  private String aerialSummary;
+
   String summary() {
+    if (aerialSummary != null) return aerialSummary;
     return "Dense candidates="
         + candidates
         + "\nPairs retried serially after a parallel failure=" + retriedPairs
@@ -549,12 +628,17 @@ final class DenseReconstruction {
                   () -> {
                     ImageFrame a = frames.get(pair.a), b = frames.get(pair.b);
                     if ((a.id + "-" + b.id).equals(System.getProperty("sgm.test.failPair")))
-                      throw new IllegalStateException("Injected test failure for pair " + a.id + "-" + b.id);
+                      throw new IllegalStateException(
+                          "Injected test failure for pair " + a.id + "-" + b.id);
                     try (WorkProgress task =
-                        WorkProgress.start("Rectify/match/triangulate pair " + pair.a + "-" + pair.b, 0, "pixels")) {
+                        WorkProgress.start(
+                            "Rectify/match/triangulate pair " + pair.a + "-" + pair.b,
+                            0,
+                            "pixels")) {
                       PairPixels pixels;
                       synchronized (RasterCache.class) {
-                        pixels = new PairPixels(rectifyLocked(a, b, false, -1, false, false), options);
+                        pixels =
+                            new PairPixels(rectifyLocked(a, b, false, -1, false, false), options);
                       }
                       try {
                         PairCompute computed = compute(pixels, source, base, false);
@@ -617,7 +701,8 @@ final class DenseReconstruction {
                   "fusion_pair_id", source, "image_a", pair.a, "image_b", pair.b,
                   "error", String.valueOf(failure.getMessage()),
                   "type", failure.getClass().getSimpleName()));
-          System.err.printf(Locale.ROOT, "Warning: skipping failed pair %d-%d: %s%n", pair.a, pair.b, failure);
+          System.err.printf(
+              Locale.ROOT, "Warning: skipping failed pair %d-%d: %s%n", pair.a, pair.b, failure);
           if (project != null)
             project.event(
                 "stereo_pair_failed",
@@ -887,6 +972,16 @@ final class DenseReconstruction {
         writeDisparity(options.output.resolve(prefix + ".pfm"), result);
       if (project != null && options.diagnostics && options.storage.equals("standard"))
         project.data.finalDisparity(source, result, matching);
+      // --export-disparity-images: keep only the final disparity map, independent of diagnostics.
+      if (options.exportDisparityImages)
+        ProjectArtifacts.scalar(
+            rangeDirectory,
+            "disparity",
+            result.disparity,
+            w,
+            h,
+            matching.minDisparity,
+            matching.minDisparity + matching.disparities - 1);
       String qualityRow = prefix + "," + result.stats.csv();
       String warning =
           !(result.stats.lowerClipped() || result.stats.upperClipped())
@@ -897,7 +992,8 @@ final class DenseReconstruction {
                   + result.stats.lowerBoundaryRejected
                   + " lower and "
                   + result.stats.upperBoundaryRejected
-                  + " upper search-boundary matches with a full search interval. The disparity range"
+                  + " upper search-boundary matches with a full search interval. The disparity"
+                  + " range"
                   + (options.disparitiesExplicit
                       ? " may be truncated; consider increasing --disparities."
                       : " still touches the automatic search limit. Inspect disparity_range.json;"
@@ -1571,7 +1667,9 @@ final class DenseReconstruction {
         try { if(project!=null)try(Rectified geometry=rectify(a,b,false,source,true)) {} }
         catch(RuntimeException|IOException failure){ready.close();throw failure;}
         preparedPairs++;return ready;
-      } catch(InterruptedException e){Thread.currentThread().interrupt();throw new IOException("Pair preparation interrupted",e);}
+      } catch(InterruptedException e){Thread.currentThread().interrupt();
+        throw new IOException("Pair preparation interrupted", e);
+      }
       catch(ExecutionException e){if(e.getCause() instanceof IOException io)throw io;if(e.getCause() instanceof RuntimeException r)throw r;throw new IOException(e.getCause());}
     }
     serialPairs++;return new PairPixels(rectify(a,b,false,source),options);
@@ -1631,7 +1729,8 @@ final class DenseReconstruction {
   private Rectified rectifyLocked(ImageFrame a,ImageFrame b,boolean swapped,int source,boolean geometryOnly,boolean report) throws IOException {
     long loadStarted = System.nanoTime();
     if (!geometryOnly) RasterCache.pair(a, b);
-    if (!geometryOnly) RunTelemetry.record("Rectification image load " + a.id + "-" + b.id, loadStarted);
+    if (!geometryOnly)
+      RunTelemetry.record("Rectification image load " + a.id + "-" + b.id, loadStarted);
     if (a.width != b.width || a.height != b.height)
       throw new IllegalArgumentException(
           "Dense pairs currently require equal processed image dimensions");
@@ -1807,7 +1906,8 @@ final class DenseReconstruction {
       Imgproc.remap(a.validMask, out.leftMask, mapX, mapY, Imgproc.INTER_LINEAR);
       remapNanos += System.nanoTime() - clock;
       clock = System.nanoTime();
-      if (report && project != null) project.data.rectificationMaps(source, "left", mapX, mapY, out.vertical);
+      if (report && project != null)
+        project.data.rectificationMaps(source, "left", mapX, mapY, out.vertical);
       mapExportNanos += System.nanoTime() - clock;
       clock = System.nanoTime();
       Calib3d.initUndistortRectifyMap(k2, d, r2, p2, b.gray.size(), CvType.CV_32FC1, mapX, mapY);
@@ -1892,7 +1992,7 @@ final class DenseReconstruction {
     }
   }
 
-  private static final class Rectified implements AutoCloseable {
+  static final class Rectified implements AutoCloseable {
     final ImageFrame a, b;
     boolean vertical;
     double[] r1, r2, p1, p2, q;

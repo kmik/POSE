@@ -159,6 +159,7 @@ final class FeatureTracks {
           System.out.printf(
               Locale.ROOT, "Pair %d-%d: %d geometric inliers%n", a, b, pair.matches.size());
         });
+    GpuHamming.close();
     matching.done();
     matching.close();
     if (reusable > 0)

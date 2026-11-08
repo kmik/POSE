@@ -274,7 +274,8 @@ final class WindowedStereo implements AutoCloseable {
   private Input input(boolean reverse, int y, int actual) {
     var a = reverse ? right : left;
     var b = reverse ? left : right;
-    int halo = o.census / 2 + 1,
+    // --census-shift reads shifted windows up to S rows away (0 when off: halo unchanged).
+    int halo = o.census / 2 + 1 + o.censusShift,
         top = Math.max(0, y - halo),
         bottom = Math.min(h, y + actual + halo),
         height = bottom - top;
@@ -322,7 +323,7 @@ final class WindowedStereo implements AutoCloseable {
           c0 = null,
           c1 = null,
           out = null;
-      int halo = r + 1,
+      int halo = r + 1 + o.censusShift,
           maxPixels = w * Math.min(h, rows + 2 * halo),
           words = (o.census * o.census - 1 + 63) / 64;
       if (cl != null) {
@@ -470,7 +471,7 @@ final class WindowedStereo implements AutoCloseable {
                     if (in.ta[p] && x >= r && x < w - r && target >= r && target < w - r) {
                       int q = (y0 + yy - in.y) * w + target;
                       if (in.tb[q])
-                        value = StereoCost.value(o, in.a, in.b, in.grayA, in.grayB, p, q, w);
+                        value = StereoCost.cost(o, in.a, in.b, in.grayA, in.grayB, in.ta, in.tb, p, q, w, in.grayA.length / w);
                     }
                     costs.set(JAVA_SHORT, (((long) yy * w + x) * d + k) * 2, (short) value);
                   }
@@ -607,8 +608,13 @@ final class WindowedStereo implements AutoCloseable {
   }
 
   private static String kernels(Options o) {
-    return GpuStereo.kernels(o.matchingCost.equals("zncc"), StereoCost.aggregateBytes(o))
+    return GpuStereo.kernels(
+            o.matchingCost.equals("zncc"), StereoCost.aggregateBytes(o), StereoCost.gpuSource(o))
         .replace("int sumY,int clearSum) {", "int sumY,int clearSum,int inputY,int inputRows) {")
+        // Opt-in census modes: pass window-local indices, word stride and row count.
+        .replace(
+            "value=ccost(a,b,ta,tb,ga,gb,n,p,q,w,h,",
+            "value=ccost(a,b,ta,tb,ga,gb,(size_t)w*inputRows,p-inputY*w,q-inputY*w,w,inputRows,")
         .replace("a[(size_t)j*n+p]", "a[(size_t)j*w*inputRows+p-inputY*w]")
         .replace("b[(size_t)j*n+q]", "b[(size_t)j*w*inputRows+q-inputY*w]")
         .replace("ta[p]", "ta[p-inputY*w]")
@@ -706,7 +712,9 @@ final class WindowedStereo implements AutoCloseable {
           put(gp, FINAL, d);
         }
     }
+    if (o.disparityEdgeErosion > 0) erodeEdges();
     speckles();
+    if(DepthOutlierFilter.enabled(o))depthOutliers();
     for (int y = 0; y < h; y += rows) {
       int top = Math.max(0, y - halo),
           bottom = Math.min(h, y + rows + halo),
@@ -746,6 +754,63 @@ final class WindowedStereo implements AutoCloseable {
       }
     }
     for (long p = 0; p < (long) w * h; p++) if (Float.isFinite(get(p, FINAL))) stats.valid++;
+  }
+
+  private void depthOutliers() throws IOException {
+    // One bit per pixel on bounded paged storage; do not mutate FINAL until all
+    // strips have made their decisions from the original, unfiltered raster.
+    var rejected=store.volume(Math.ceilDiv((long)w*h,32),0);
+    try {
+      var diagnostics=new DepthOutlierFilter.Diagnostics();
+      int radius=o.depthOutlierRadius;
+      int strip=Math.max(1,Math.min(rows,(int)Math.max(1,o.memoryMb*1048576L/16/(5L*w)-2L*radius)));
+      for(int y=0;y<h;y+=strip) {
+        int top=Math.max(0,y-radius),bottom=Math.min(h,y+strip+radius),actual=Math.min(strip,h-y);
+        var mask=DepthOutlierFilter.mask(o,floats(FINAL,top,bottom-top),
+            left.bytes(left.gray,top,bottom-top,1),w,bottom-top,y-top,y-top+actual,
+            floats(LR,top,bottom-top),diagnostics,null);
+        for(int p=mask.nextSetBit(0);p>=0;p=mask.nextSetBit(p+1)) {
+          long global=(long)top*w+p,word=global/32;
+          rejected.set(word,rejected.get(word)|(1<<(int)(global%32)));
+        }
+      }
+      for(long word=0;word<Math.ceilDiv((long)w*h,32);word++) {
+        int bits=rejected.get(word);
+        while(bits!=0) {
+          int bit=Integer.numberOfTrailingZeros(bits);
+          put(word*32+bit,FINAL,Float.NaN);stats.depthOutlierRejected++;bits&=bits-1;
+        }
+      }
+      stats.depthOutlierReasons=diagnostics.counts;
+      DepthOutlierFilter.report(o,stats.depthOutlierRejected,diagnostics);
+    } finally {rejected.close();store.files.remove(rejected);}
+  }
+
+  /** Opt-in --disparity-edge-erosion on the disk-backed FINAL raster; same rule as CensusSgm. */
+  private void erodeEdges() throws IOException {
+    int radius = o.disparityEdgeErosion;
+    BitSet reject = new BitSet();
+    // Row blocks with a radius-row halo; decisions read only the unmodified FINAL raster.
+    for (int y = 0; y < h; y += rows) {
+      int top = Math.max(0, y - radius),
+          bottom = Math.min(h, y + rows + radius),
+          actual = Math.min(rows, h - y);
+      boolean[] flags =
+          CensusSgm.edgeFlags(
+              floats(FINAL, top, bottom - top),
+              w,
+              bottom - top,
+              y - top,
+              y - top + actual,
+              radius,
+              o.disparityEdgeJump);
+      for (int i = (y - top) * w; i < (y - top + actual) * w; i++)
+        if (flags[i]) reject.set(top * w + i);
+    }
+    for (int i = reject.nextSetBit(0); i >= 0; i = reject.nextSetBit(i + 1)) {
+      put(i, FINAL, Float.NaN);
+      stats.edgeErosionRejected++;
+    }
   }
 
   private void speckles() throws IOException {

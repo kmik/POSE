@@ -70,6 +70,10 @@ public final class CensusSgm {
   }
   private PointConfidence.Selection selection;
   private PointConfidence.Selection reverseSelection;
+  // Lightweight boundary capture for tile retries, without enabling diagnostic observers
+  // (which intentionally select the CPU reference post-filters).
+  boolean captureSearchBoundary;
+  byte[] lastSearchBoundary;
 
   public CensusSgm(Options options) {
     this.options = options;
@@ -180,8 +184,8 @@ public final class CensusSgm {
                 + " MiB available");
     }
     Stats stats = new Stats();
-    byte[] reasons = observer == null ? null : new byte[n];
-    byte[] searchBoundary = observer == null ? null : new byte[n];
+    byte[] reasons = observer == null && !captureSearchBoundary ? null : new byte[n];
+    byte[] searchBoundary = observer == null && !captureSearchBoundary ? null : new byte[n];
     if (reasons != null) Arrays.fill(reasons, (byte) 1);
     String size = " " + width + "x" + height + " D=" + d;
     long clock = System.nanoTime();
@@ -262,6 +266,9 @@ public final class CensusSgm {
     RunTelemetry.record(
         "Stereo SGM right" + (plan != null ? " (banded)" : gpu ? " (GPU)" : " (CPU)") + size, clock);
     clock = System.nanoTime();
+    if (captureSearchBoundary)
+      for (int i = 0; i < n; i++)
+        if (reasons[i] == 2) searchBoundary[i] |= 8; // unresolved packed-band edge
     if (observer != null) observer.searchBoundary(searchBoundary, width, height);
     if (observer != null) {
       observer.raster("00_left_selected", dl, width, height);
@@ -303,6 +310,25 @@ public final class CensusSgm {
       observer.raster("zncc", correlation, width, height);
       observer.raster("left_right_error", lrError, width, height);
     }
+    if (options.disparityEdgeErosion > 0) {
+      clock = System.nanoTime();
+      stats.edgeErosionRejected =
+          erodeDisparityEdges(
+              checked,
+              width,
+              height,
+              options.disparityEdgeErosion,
+              options.disparityEdgeJump,
+              reasons);
+      RunTelemetry.record("Stereo disparity edge erosion" + size, clock);
+      System.out.printf(
+          Locale.ROOT,
+          "Disparity edge erosion: %,d pixels within %d px of jumps > %.2f px rejected%n",
+          stats.edgeErosionRejected,
+          options.disparityEdgeErosion,
+          options.disparityEdgeJump);
+      if (observer != null) observer.raster("04b_edge_eroded", checked, width, height);
+    }
     float[] beforeSpeckle = observer == null ? null : checked.clone();
     clock = System.nanoTime();
     stats.speckleRejected =
@@ -341,6 +367,7 @@ public final class CensusSgm {
     if (reverseSelection != null) RunTelemetry.record("Stereo right-image confidence" + size, clock);
     selection = null;
     reverseSelection = null;
+    lastSearchBoundary = captureSearchBoundary ? searchBoundary : null;
     return result;
   }
 
@@ -612,7 +639,7 @@ public final class CensusSgm {
               if (target < radius || target >= width - radius) continue;
               int q = y * width + (int) target, hamming = 0;
               if (!texturedB[q]) continue;
-              hamming = StereoCost.value(options, a, b, grayA, grayB, p, q, width);
+              hamming = StereoCost.cost(options, a, b, grayA, grayB, texturedA, texturedB, p, q, width, height);
               costs.set(base + k, hamming);
             }
           }
@@ -863,6 +890,78 @@ public final class CensusSgm {
     return covariance / Math.sqrt(Math.max(1e-12, varA * varB));
   }
 
+  /**
+   * Opt-in --disparity-edge-erosion: rejects valid disparities next to depth jumps, about radius
+   * pixels deep on both sides. A pixel is rejected when
+   *
+   * <ol>
+   *   <li>another valid disparity within its (2*radius+1)^2 square differs by more than jump, or
+   *   <li>it is within radius pixels of the end of its valid run along the row, and the valid pixel
+   *       across the following invalid gap differs by more than jump, the gap being no wider than
+   *       ceil(difference) + 2*radius. Rectified occlusions are horizontal gaps about one disparity
+   *       difference wide; fattened disparities border them rather than the other surface.
+   * </ol>
+   *
+   * Holes are never filled and values never moved. Decisions use the unmodified input only, so the
+   * result is independent of scan order and of row blocking (rule 2 reads one row, rule 1 radius
+   * rows above and below).
+   */
+  static long erodeDisparityEdges(
+      float[] d, int w, int h, int radius, double jump, byte[] reasons) {
+    if (radius <= 0) return 0;
+    boolean[] reject = edgeFlags(d, w, h, 0, h, radius, jump);
+    long rejected = 0;
+    for (int i = 0; i < d.length; i++)
+      if (reject[i]) {
+        d[i] = Float.NaN;
+        if (reasons != null) reasons[i] = 8;
+        rejected++;
+      }
+    return rejected;
+  }
+
+  /** Edge-erosion decisions for rows [from, to) of d (w x h); see erodeDisparityEdges. */
+  static boolean[] edgeFlags(
+      float[] d, int w, int h, int from, int to, int radius, double jump) {
+    boolean[] reject = new boolean[d.length];
+    StereoRows.rows(from, to, y -> {
+      int row = y * w;
+      for (int x = 0; x < w; x++) {
+        float v = d[row + x];
+        if (!Float.isFinite(v)) continue;
+        search:
+        for (int yy = Math.max(0, y - radius); yy <= Math.min(h - 1, y + radius); yy++)
+          for (int xx = Math.max(0, x - radius); xx <= Math.min(w - 1, x + radius); xx++) {
+            float u = d[yy * w + xx];
+            if (Float.isFinite(u) && Math.abs(u - v) > jump) {
+              reject[row + x] = true;
+              break search;
+            }
+          }
+      }
+      // Jumps across horizontal gaps (occlusions): flag radius pixels at both run ends.
+      int x = 0;
+      while (x < w && !Float.isFinite(d[row + x])) x++;
+      while (x < w) {
+        int end = x;
+        while (end + 1 < w && Float.isFinite(d[row + end + 1])) end++;
+        int next = end + 1;
+        while (next < w && !Float.isFinite(d[row + next])) next++;
+        if (next >= w) break;
+        double difference = Math.abs(d[row + next] - d[row + end]);
+        int gap = next - end - 1;
+        if (difference > jump && gap <= Math.ceil(difference) + 2 * radius) {
+          for (int k = Math.max(x, end - radius + 1); k <= end; k++) reject[row + k] = true;
+          int nextEnd = next;
+          while (nextEnd + 1 < w && Float.isFinite(d[row + nextEnd + 1])) nextEnd++;
+          for (int k = next; k <= Math.min(nextEnd, next + radius - 1); k++) reject[row + k] = true;
+        }
+        x = next;
+      }
+    });
+    return reject;
+  }
+
   /** Compatibility entry point for four-connected disparity components. */
   static long removeSpeckles(float[] a, int w, int h, int minimum, double range) {
     return removeSpeckles(a, w, h, minimum, range, 4);
@@ -901,6 +1000,10 @@ public final class CensusSgm {
   }
 
   public static final class Stats {
+    public long depthOutlierRejected;
+    /** --disparity-edge-erosion rejections (not part of the stereo-quality CSV). */
+    public long edgeErosionRejected;
+    public long[] depthOutlierReasons;
     public long lowerBoundaryRejected, fullIntervalPixels;
     public long coarseLowerBoundaryRejected, coarseUpperBoundaryRejected, coarseFullIntervalPixels;
     public long boundaryRejected,
