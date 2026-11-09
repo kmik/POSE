@@ -49,6 +49,8 @@ final class FeatureAlgorithms {
       List<MatOfDMatch> forward,
       Map<Integer, Integer> reverse,
       Consumer<String> progress) {
+    Integer resident = GpuHamming.reciprocal(o, a, b, forward, reverse, progress);
+    if (resident != null) return resident;
     DescriptorMatcher matcher = matcher(o, a);
     List<MatOfDMatch> backward = new ArrayList<>();
     Mat queries = new Mat();

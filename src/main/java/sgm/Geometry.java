@@ -9,6 +9,36 @@ import org.opencv.core.*;
 final class Geometry {
   private Geometry() {}
 
+  private static final ThreadLocal<TriangulationWorkspace> TRIANGULATION = new ThreadLocal<>();
+  private static final ThreadLocal<RegistrationWorkspace> REGISTRATION = new ThreadLocal<>();
+
+  static final class TriangulationWorkspace {
+    final Mat matrix = new Mat(4, 4, CvType.CV_64F), w = new Mat(), left = new Mat(), vt = new Mat();
+    final double[] pa = new double[12], pb = new double[12], data = new double[16], h = new double[4];
+    void release() { matrix.release(); w.release(); left.release(); vt.release(); }
+  }
+
+  private static final class RegistrationWorkspace {
+    final MatOfPoint3f points = new MatOfPoint3f();
+    final MatOfPoint2f pixels = new MatOfPoint2f();
+    final Mat k = new Mat(3, 3, CvType.CV_64F), r = new Mat(), t = new Mat(), inliers = new Mat();
+    final MatOfDouble d = new MatOfDouble();
+    void release() { points.release(); pixels.release(); k.release(); r.release(); t.release(); inliers.release(); d.release(); }
+  }
+
+  static TriangulationWorkspace triangulator() {
+    TriangulationWorkspace workspace = TRIANGULATION.get();
+    if (workspace == null) { workspace = new TriangulationWorkspace(); TRIANGULATION.set(workspace); }
+    return workspace;
+  }
+
+  static void releaseWorkspaces() {
+    var tri = TRIANGULATION.get();
+    if (tri != null) { tri.release(); TRIANGULATION.remove(); }
+    var pnp = REGISTRATION.get();
+    if (pnp != null) { pnp.release(); REGISTRATION.remove(); }
+  }
+
   static void reconstruct(List<ImageFrame> frames, FeatureTracks features, Options o) {
     try {
       reconstruct(frames, features, o, null);
@@ -20,6 +50,14 @@ final class Geometry {
   static void reconstruct(
       List<ImageFrame> frames, FeatureTracks features, Options o, Project project)
       throws IOException {
+    try { reconstructImpl(frames, features, o, project); }
+    finally { releaseWorkspaces(); }
+  }
+
+  private static void reconstructImpl(
+      List<ImageFrame> frames, FeatureTracks features, Options o, Project project)
+      throws IOException {
+    AlignmentMemory.checkGraph(frames, features.tracks, features.pairs, o);
     FeatureTracks.Pair seed =
         features.pairs.stream()
             .max(Comparator.comparingDouble(p -> seedScore(p, frames)))
@@ -348,12 +386,17 @@ final class Geometry {
       if (project != null) project.data.pnp(frame, usedTracks, uv, new int[0], null, null, false);
       return false;
     }
-    MatOfPoint3f points = new MatOfPoint3f();
+    RegistrationWorkspace workspace = REGISTRATION.get();
+    if (workspace == null) { workspace = new RegistrationWorkspace(); REGISTRATION.set(workspace); }
+    MatOfPoint3f points = workspace.points;
     points.fromList(xyz);
-    MatOfPoint2f pixels = new MatOfPoint2f();
+    MatOfPoint2f pixels = workspace.pixels;
     pixels.fromList(uv);
-    Mat k = frame.camera.intrinsic(), r = new Mat(), t = new Mat(), inliers = new Mat();
-    MatOfDouble d = new MatOfDouble();
+    Mat k = workspace.k, r = workspace.r, t = workspace.t, inliers = workspace.inliers;
+    k.put(0, 0, new double[] {frame.camera.fx, 0, frame.camera.cx, 0, frame.camera.fy, frame.camera.cy, 0, 0, 1});
+    // Failed solves must not expose a previous camera's outputs to diagnostics.
+    r.release(); t.release(); inliers.release();
+    MatOfDouble d = workspace.d;
     try {
       if (!Calib3d.solvePnPRansac(
               points,
@@ -412,7 +455,6 @@ final class Geometry {
             Json.object("image_id", frame.id, "reason", e.getMessage()));
       return false;
     } finally {
-      try {
         if (project != null) {
           int[] selected = new int[(int) inliers.total()];
           if (selected.length > 0) inliers.get(0, 0, selected);
@@ -425,15 +467,7 @@ final class Geometry {
               t.empty() ? null : Math3.array(t),
               frame.camera.registered);
         }
-      } finally {
-        points.release();
-        pixels.release();
-        k.release();
-        r.release();
-        t.release();
-        inliers.release();
-        d.release();
-      }
+      // Reuse native Mat headers across registrations. releaseWorkspaces() owns cleanup.
     }
   }
 
@@ -475,34 +509,29 @@ final class Geometry {
   }
 
   static double[] triangulate(Camera a, Camera b, Point u, Point v) {
-    Mat p = a.projection(),
-        q = b.projection(),
-        matrix = new Mat(4, 4, CvType.CV_64F),
-        w = new Mat(),
-        left = new Mat(),
-        vt = new Mat();
-    try {
-      double[] pa = Math3.array(p), pb = Math3.array(q), data = new double[16];
-      for (int j = 0; j < 4; j++) {
-        data[j] = u.x * pa[8 + j] - pa[j];
-        data[4 + j] = u.y * pa[8 + j] - pa[4 + j];
-        data[8 + j] = v.x * pb[8 + j] - pb[j];
-        data[12 + j] = v.y * pb[8 + j] - pb[4 + j];
-      }
-      matrix.put(0, 0, data);
-      Core.SVDecomp(matrix, w, left, vt);
-      double[] h = new double[4];
-      vt.get(3, 0, h);
-      if (Math.abs(h[3]) < 1e-12) return null;
-      double[] out = {h[0] / h[3], h[1] / h[3], h[2] / h[3]};
-      return Double.isFinite(out[0] + out[1] + out[2]) ? out : null;
-    } finally {
-      p.release();
-      q.release();
-      matrix.release();
-      w.release();
-      left.release();
-      vt.release();
+    TriangulationWorkspace workspace = triangulator();
+    double[] pa = workspace.pa, pb = workspace.pb, data = workspace.data;
+    projection(a, pa);
+    projection(b, pb);
+    for (int j = 0; j < 4; j++) {
+      data[j] = u.x * pa[8 + j] - pa[j];
+      data[4 + j] = u.y * pa[8 + j] - pa[4 + j];
+      data[8 + j] = v.x * pb[8 + j] - pb[j];
+      data[12 + j] = v.y * pb[8 + j] - pb[4 + j];
+    }
+    workspace.matrix.put(0, 0, data);
+    Core.SVDecomp(workspace.matrix, workspace.w, workspace.left, workspace.vt);
+    double[] h = workspace.h;
+    workspace.vt.get(3, 0, h);
+    if (Math.abs(h[3]) < 1e-12) return null;
+    double[] out = {h[0] / h[3], h[1] / h[3], h[2] / h[3]};
+    return Double.isFinite(out[0] + out[1] + out[2]) ? out : null;
+  }
+
+  private static void projection(Camera camera, double[] out) {
+    for (int i = 0; i < 3; i++) {
+      System.arraycopy(camera.rotation, 3 * i, out, 4 * i, 3);
+      out[4 * i + 3] = camera.translation[i];
     }
   }
 

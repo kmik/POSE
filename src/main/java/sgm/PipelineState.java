@@ -230,7 +230,10 @@ final class PipelineState {
             for (int k = 0; k < 3; k++) c.velocity[k] = in.readDouble();
           }
           f.keypointPixelScale = in.readDouble();
-          KeyPoint[] keys = new KeyPoint[in.readInt()];
+          int keyCount = in.readInt();
+          if (keyCount < 0) throw new IOException("Corrupt frames.bin keypoint count");
+          MemorySafety.requireHeap(128L * keyCount, options, "Restore image keypoints for " + path.getFileName());
+          KeyPoint[] keys = new KeyPoint[keyCount];
           for (int k = 0; k < keys.length; k++) {
             double x = in.readDouble(), y = in.readDouble();
             KeyPoint p =
@@ -289,9 +292,14 @@ final class PipelineState {
   }
 
   FeatureTracks readTracks() throws IOException {
+    return readTracks(null);
+  }
+
+  FeatureTracks readTracks(Options options) throws IOException {
     FeatureTracks features = new FeatureTracks();
     Path file = directory.resolve("tracks.bin");
     if (!Files.isRegularFile(file)) return features;
+    if (options != null) MemorySafety.requireHeap(trackGraphBytes(file), options, "Restore sparse tracks and pair matches");
     try (DataInputStream in =
         new DataInputStream(new BufferedInputStream(Files.newInputStream(file), 1 << 20))) {
       if (in.readLong() != TRACKS_MAGIC) throw new IOException("Corrupt tracks.bin");
@@ -312,6 +320,45 @@ final class PipelineState {
       }
     }
     return features;
+  }
+
+  /** Scan counts and skip numerical payload before creating millions of Java objects. */
+  static long trackGraphBytes(Path file) throws IOException {
+    try (var in = new DataInputStream(new BufferedInputStream(Files.newInputStream(file), 1 << 20))) {
+      if (in.readLong() != TRACKS_MAGIC) throw new IOException("Corrupt tracks.bin");
+      int tracks = count(in, "tracks");
+      long observations = 0, matches = 0;
+      for (int i = 0; i < tracks; i++) {
+        in.readInt();
+        if (in.readBoolean()) in.skipNBytes(24);
+        int n = count(in, "observations");
+        observations = Math.addExact(observations, n);
+        in.skipNBytes(8L * n);
+      }
+      int pairs = count(in, "pairs");
+      for (int i = 0; i < pairs; i++) matches = Math.addExact(matches, skipPair(in));
+      if (in.readBoolean() && in.readInt() < 0) matches = Math.addExact(matches, skipPair(in));
+      return AlignmentMemory.graphBytes(0, tracks, observations, pairs, matches);
+    } catch (ArithmeticException e) { throw new IOException("Sparse graph size overflow", e); }
+  }
+
+  private static int count(DataInputStream in, String name) throws IOException {
+    int n = in.readInt();
+    if (n < 0) throw new IOException("Corrupt sparse graph " + name + " count");
+    return n;
+  }
+
+  private static int skipPair(DataInputStream in) throws IOException {
+    in.skipNBytes(8);
+    int matches = count(in, "matches");
+    in.skipNBytes(8L * matches);
+    for (int i = 0; i < 3; i++) {
+      int n = in.readInt();
+      if (n < -1) throw new IOException("Corrupt sparse graph matrix length");
+      if (n >= 0) in.skipNBytes(8L * n);
+    }
+    if (in.readBoolean()) in.skipNBytes(in.readUnsignedShort()); // modified UTF-8 byte length
+    return matches;
   }
 
   private static void writePair(DataOutputStream out, FeatureTracks.Pair p) throws IOException {

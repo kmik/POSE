@@ -138,6 +138,7 @@ public final class Main {
         PointRecords.export(options.exportConfidence, options.outputCompression, options.cores);
         return 0;
       }
+      MemorySafety.validateHostHeap(options);
       nu.pattern.OpenCV.loadLocally();
       if (options.exportReport != null) {
         ProcessingReport.export(options);

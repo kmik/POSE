@@ -27,7 +27,10 @@ public final class SelfTest {
     nu.pattern.OpenCV.loadLocally();
     Core.setNumThreads(1);
     Core.setRNGSeed(1);
-    Path root = Files.createTempDirectory(Paths.get("target"), "self test ");
+    // A shorter artifact root avoids native OpenCV's Windows MAX_PATH limit in nested fixtures.
+    Path testRoot = Paths.get(System.getProperty("sgm.test.root", "target"));
+    Files.createDirectories(testRoot);
+    Path root = Files.createTempDirectory(testRoot, "self test ");
     testSgm();
     testGeometry();
     testLas(root);
@@ -60,6 +63,9 @@ public final class SelfTest {
     checks += BundleQualityRegression.run(root);
     checks += BundleSchurRegression.run(root);
     checks += SharedCalibrationRegression.run(root);
+    checks += AdaptiveCalibrationRegression.run(root.resolve("adaptive-calibration"));
+    checks += ThroughputRegression.run(root.resolve("throughput"));
+    checks += AlignmentMemoryRegression.run(root.resolve("alignment-memory"));
     checks += ConfidencePatchMatchRegression.run(root);
     checks += PatchMatchValidityRegression.run(root);
     checks += HybridSgmRegression.run(root);

@@ -22,6 +22,7 @@ final class SharedCalibration {
   final Point[][] observed;
   final boolean fixedPoses;
   final boolean[] active = new boolean[SIZE];
+  boolean adaptivePriors, dataOnly;
   double[] values;
   final double[] prior;
   // GPS-weighted adjustment priors: log focal (NaN = none) with log sigma; readout sigma (s).
@@ -48,6 +49,9 @@ final class SharedCalibration {
           0
         };
     prior = values.clone();
+    long measuredPoints = 0;
+    for (ImageFrame f : frames) measuredPoints += f.keypoints.length;
+    MemorySafety.requireHeap(measuredPoints * 48 + frames.size() * 32L, options, "Shared-calibration measured image points");
     observed = new Point[frames.size()][];
     for (ImageFrame f : frames) {
       observed[f.id] = new Point[f.keypoints.length];
@@ -223,11 +227,12 @@ final class SharedCalibration {
 
   /** Prior {target, sigma} of an active parameter, or null when it has none. */
   private double[] priorOf(int k) {
+    if (dataOnly) return null;
     if (k == READOUT) return new double[] {0, readoutSigma};
     if (k == TIME) return new double[] {0, GpsAdjustment.TIME_SIGMA};
     if (k >= LEVER) return new double[] {0, GpsAdjustment.LEVER_SIGMA};
     if (k == 0 && Double.isFinite(focalPrior)) return new double[] {focalPrior, focalPriorSigma};
-    return options.calibration != null && options.intrinsicsMode.equals("prior")
+    return adaptivePriors || options.calibration != null && options.intrinsicsMode.equals("prior")
         ? new double[] {prior[k], sigma(k)}
         : null;
   }
@@ -289,7 +294,7 @@ final class SharedCalibration {
   }
 
   boolean constrained(double[] sigma, double coverage) {
-    if (sigma == null || !Double.isFinite(coverage) || coverage < .55) return false;
+    if (sigma == null || !Double.isFinite(coverage) || coverage <= 0) return false;
     // Judge supported radial corrections over the measured P90 radius. Applying the same bound
     // at unobserved corners conflates fit identifiability with extrapolation. Full-image physical
     // checks still apply, and both observed and extrapolated uncertainty are exported separately.
@@ -299,6 +304,9 @@ final class SharedCalibration {
             * Math.pow(Math.min(1, coverage), 2);
     for (int k = 0; k < LENS; k++)
       if (active[k]) {
+        // Radial terms need measured image-radius coverage. Other parameters are judged by their
+        // marginalized information, so central coverage alone is not a blanket refusal.
+        if ((k == 1 || k == 2 || k == 7) && coverage < .55) return false;
         if (!Double.isFinite(sigma[k]) || sigma[k] < 0) return false;
         double effect =
             k == 0 || k == 3 || k == 4
@@ -349,18 +357,19 @@ final class SharedCalibration {
     Set<Integer> views = new HashSet<>();
     for (var t : train)
       for (var ob : t.observations) if (frames.get(ob.image).camera.registered) views.add(ob.image);
-    if (views.size() < 4 || train.size() < 80 || held.size() < 20 || second.size() < 20) {
+    if (views.size() < 2 || train.size() < 80 || held.size() < 20 || second.size() < 20) {
       Json.write(
           report,
           Json.object(
               "accepted",
               false,
               "reason",
-              "Need four registered views, 80 training and two groups of 20 held-out multi-view"
+              "Need a stereo baseline, 80 training and two groups of 20 held-out"
                   + " tracks"));
       return;
     }
     SharedCalibration lens = new SharedCalibration(frames);
+    lens.adaptivePriors = o.calibration == null;
     // A repeatable track split; validation points may move, but never influence cameras/lens.
     Set<String> selected = new HashSet<>(Arrays.asList(o.refineIntrinsics.split(",")));
     List<Object> stages = new ArrayList<>();
@@ -380,123 +389,154 @@ final class SharedCalibration {
       }
     Collections.sort(radii);
     double coverage = radii.isEmpty() ? 0 : radii.get((radii.size() - 1) * 9 / 10);
-    if (coverage < .55) {
-      Json.write(
-          report,
-          Json.object(
-              "accepted",
-              false,
-              "reason",
-              "Insufficient image-radius coverage",
-              "radial_coverage_p90_fraction",
-              coverage));
-      return;
-    }
     Path diagnostics = report.getParent().resolve("calibration_diagnostics");
     if (lens.options.diagnostics)
       CalibrationDiagnostics.residuals(diagnostics, "initial", lens, frames, train, held, second);
     double initialRms = lens.validationRms(frames, held);
-    for (int stage = 0; stage < 5; stage++) {
-      long stageStarted = System.nanoTime();
-      boolean added = false;
-      Arrays.fill(lens.active, false);
-      for (int k = 0; k < SIZE; k++) {
-        int group = group(k);
-        if (group <= stage && selected.contains(NAMES[k])) lens.active[k] = true;
-        if (group == stage && selected.contains(NAMES[k])) added = true;
-      }
-      if (!added) continue;
-      Camera[] saved = new Camera[frames.size()];
-      for (ImageFrame f : frames) saved[f.id] = f.camera.copy();
-      double[][] points = new double[tracks.size()][];
-      for (int i = 0; i < tracks.size(); i++) points[i] = tracks.get(i).point;
-      double[] beforeLens = lens.values.clone();
-      double before = lens.validationRms(frames, held);
-      double secondBefore = lens.validationRms(frames, second);
-      if (stage == 0 && lens.active[0])
-        lens.focalStarts(
-            frames, tracks, train, held, second, iterations, huber, anchor, scaleCamera);
-      else
-        BundleAdjuster.optimizeImpl(
-            frames, train, Math.max(12, iterations), huber, null, anchor, scaleCamera, lens);
-      double after = lens.validationRms(frames, held);
-      double secondAfter = lens.validationRms(frames, second);
-      if (lens.options.diagnostics)
-        CalibrationDiagnostics.residuals(
-            diagnostics, "stage-" + stage, lens, frames, train, held, second);
-      boolean improvement =
-          lens.physical()
-              && Double.isFinite(after)
-              && after < before * .995
-              && before - after > .002
-              && secondAfter < secondBefore * .995
-              && secondBefore - secondAfter > .002;
-      double[][] covariance =
-          improvement
-              ? BundleAdjuster.calibrationCovariance(
-                  frames, train, huber, lens, Math.max(.35, Math.max(after, secondAfter)))
-              : null;
-      double[] uncertainty = covariance == null ? null : new double[SIZE];
-      if (covariance != null)
-        for (int k = 0; k < SIZE; k++) uncertainty[k] = Math.sqrt(covariance[k][k]);
-      boolean constrained = lens.constrained(uncertainty, coverage);
-      boolean accept = improvement && constrained;
-      stages.add(
-          Json.object(
-              "parameters",
-              lens.parameters(),
-              "elapsed_seconds",
-              (System.nanoTime() - stageStarted) / 1e9,
-              "iteration_budget_per_trial",
-              Math.max(12, iterations),
-              "focal_start_scales",
-              stage == 0 && lens.active[0] ? new double[] {1, .9, 1.1} : new double[] {1},
-              "accepted",
-              accept,
-              "validation_rms_before_pixels",
-              before,
-              "validation_rms_after_pixels",
-              after,
-              "second_validation_rms_before_pixels",
-              secondBefore,
-              "second_validation_rms_after_pixels",
-              secondAfter,
-              "pixel_correction_uncertainty",
-              CalibrationDiagnostics.correctionUncertainty(lens, covariance, coverage),
-              "candidate",
-              lens.calibrationValues(),
-              "conditional_standard_deviations",
-              uncertainty,
-              "reason",
-              accept
-                  ? "Held-out improvement with constrained shared parameters"
-                  : improvement
-                      ? "Shared parameters poorly constrained after marginalizing poses and"
-                          + " structure"
-                      : "Retained preceding calibration; insufficient held-out improvement"));
-      if (accept) acceptedAny = true;
-      else {
-        lens.values = beforeLens;
-        for (ImageFrame f : frames) {
-          f.camera.rotation = saved[f.id].rotation;
-          f.camera.translation = saved[f.id].translation;
-          f.camera.fixed = saved[f.id].fixed;
+    double currentRms = initialRms, currentSecondRms = lens.validationRms(frames, second);
+    int modelVersion = 0, skippedUnchanged = 0;
+    int[] triedVersion = new int[LENS];
+    Arrays.fill(triedVersion, -1);
+    long firstObservations = held.stream().flatMap(t -> t.observations.stream())
+        .filter(ob -> frames.get(ob.image).camera.registered).count();
+    long secondObservations = second.stream().flatMap(t -> t.observations.stream())
+        .filter(ob -> frames.get(ob.image).camera.registered).count();
+    boolean[] retained = new boolean[SIZE];
+    int[] order = {0, 1, 2, 3, 4, 5, 6, 7};
+    // Revisit earlier parameters after other corrections have been supported. Every proposal
+    // adds exactly one parameter; a rejected focal estimate must not block a supported k1 fit.
+    for (int sweep = 0; sweep < 2; sweep++) {
+      boolean changed = false;
+      for (int parameter : order) {
+        if (!selected.contains(NAMES[parameter]) || retained[parameter]) continue;
+        // Retry low-order terms after principal-point/tangential corrections before permitting k3
+        // to explain their residual. A high-order term must earn its additional complexity.
+        if (sweep == 0 && parameter == 7 && selected.size() > 1) continue;
+        // Rejected fits restore the exact model, poses and points. Retrying that same
+        // proposal cannot add evidence; k3 still gets its first trial in sweep two.
+        // Focal is an exception: its first sweep selects among three starts, whereas
+        // the second tests the nominal start alone (a different proposal).
+        if (parameter != 0 && triedVersion[parameter] == modelVersion) {
+          skippedUnchanged++;
+          continue;
         }
-        for (int i = 0; i < tracks.size(); i++) tracks.get(i).point = points[i];
-        // Restore the preceding model; the next stage can retry earlier parameters jointly.
-        for (int k = 0; k < SIZE; k++) if ((group(k)) == stage) lens.active[k] = false;
+        triedVersion[parameter] = modelVersion;
+        long stageStarted = System.nanoTime();
+        System.arraycopy(retained, 0, lens.active, 0, SIZE);
+        lens.active[parameter] = true;
+        Camera[] saved = new Camera[frames.size()];
+        for (ImageFrame f : frames) saved[f.id] = f.camera.copy();
+        double[][] points = new double[tracks.size()][];
+        for (int i = 0; i < tracks.size(); i++) points[i] = tracks.get(i).point;
+        double[] beforeLens = lens.values.clone();
+        double before = currentRms;
+        double secondBefore = currentSecondRms;
+        if (sweep == 0 && parameter == 0)
+          lens.focalStarts(
+              frames, tracks, train, held, second, iterations, huber, anchor, scaleCamera);
+        else
+          BundleAdjuster.optimizeImpl(
+              frames, train, Math.max(12, iterations), huber, null, anchor, scaleCamera, lens);
+        double after = lens.validationRms(frames, held);
+        double secondAfter = lens.validationRms(frames, second);
+        if (lens.options.diagnostics)
+          CalibrationDiagnostics.residuals(
+              diagnostics, "sweep-" + sweep + "-" + NAMES[parameter], lens, frames, train, held, second);
+        boolean improvement =
+            lens.physical()
+                && Double.isFinite(after)
+                && after < before * .995
+                && before - after > .002
+                && secondAfter < secondBefore * .995
+                && secondBefore - secondAfter > .002;
+        double noise = Math.max(.35, Math.max(after, secondAfter));
+        boolean evidenceGain = validationEvidence(before, after, firstObservations, noise)
+            && validationEvidence(secondBefore, secondAfter, secondObservations, noise);
+        boolean bounded = true;
+        for (int k = 0; k < LENS; k++)
+          if (lens.active[k] && Math.abs(lens.values[k] - lens.prior[k]) > 4 * lens.sigma(k)) bounded = false;
+        CalibrationObservability.Assessment assessment =
+            improvement && evidenceGain && bounded && Double.isFinite(noise)
+                ? CalibrationObservability.assess(frames, train, huber, lens, noise)
+                : new CalibrationObservability.Assessment(null, 0,
+                    "Assessment skipped: candidate already failed validation or prior bounds");
+        double[][] covariance = assessment.covariance();
+        double[] uncertainty = assessment.sigma();
+        boolean constrained = lens.constrained(uncertainty, coverage);
+        boolean accept = improvement && evidenceGain && constrained && bounded;
+        stages.add(
+            Json.object(
+                "parameter",
+                NAMES[parameter],
+                "sweep",
+                sweep,
+                "parameters",
+                lens.parameters(),
+                "elapsed_seconds",
+                (System.nanoTime() - stageStarted) / 1e9,
+                "iteration_budget_per_trial",
+                Math.max(12, iterations),
+                "focal_start_scales",
+                sweep == 0 && parameter == 0 ? new double[] {1, .9, 1.1} : new double[] {1},
+                "accepted",
+                accept,
+                "validation_rms_before_pixels",
+                before,
+                "validation_rms_after_pixels",
+                after,
+                "second_validation_rms_before_pixels",
+                secondBefore,
+                "second_validation_rms_after_pixels",
+                secondAfter,
+                "pixel_correction_uncertainty",
+                CalibrationDiagnostics.correctionUncertainty(lens, covariance, coverage),
+                "candidate",
+                lens.calibrationValues(),
+                "data_only_standard_deviations",
+                uncertainty,
+                "minimum_relative_information",
+                assessment.minimumRelativeInformation(),
+                "validation_complexity_gain_passed",
+                evidenceGain,
+                "observability",
+                assessment.reason(),
+                "reason",
+                accept
+                    ? "Withheld-track improvement and data-supported bounded parameter"
+                    : !bounded ? "Parameter exceeds four prior standard deviations"
+                    : !constrained ? assessment.covariance() == null ? assessment.reason()
+                        : "Data uncertainty or parameter-specific image coverage is insufficient"
+                    : improvement && !evidenceGain ? "Withheld-track improvement does not justify additional model complexity"
+                    : "Retained preceding calibration; insufficient withheld-track improvement"));
+        if (accept) {
+          acceptedAny = changed = true;
+          retained[parameter] = true;
+          modelVersion++;
+          currentRms = after;
+          currentSecondRms = secondAfter;
+        } else {
+          lens.values = beforeLens;
+          for (ImageFrame f : frames) {
+            f.camera.rotation = saved[f.id].rotation;
+            f.camera.translation = saved[f.id].translation;
+            f.camera.fixed = saved[f.id].fixed;
+          }
+          for (int i = 0; i < tracks.size(); i++) tracks.get(i).point = points[i];
+          System.arraycopy(retained, 0, lens.active, 0, SIZE);
+        }
       }
+      if (!changed && (!selected.contains("k3") || selected.size() == 1)) break;
     }
+    System.arraycopy(retained, 0, lens.active, 0, SIZE);
     if (acceptedAny) {
-      // Finish held-out structure with the retained calibration, then update all pinhole
-      // coordinates.
-      lens.validationRms(frames, held, true);
-      lens.validationRms(frames, second, true);
+      // Fit all structure conditionally, including points omitted by the sampling cap. This is
+      // needed for fixed poses too, where no subsequent pose/point bundle is performed.
+      lens.validationRms(frames, tracks, true);
       Calibration result = lens.calibration();
       for (ImageFrame frame : frames) frame.applyCalibration(result);
       result.write(
           o.output.resolve("camera.txt"),
-          "Staged shared alignment calibration from full-block tie points");
+          "Adaptive shared calibration from data-supported bounded parameters");
       if (!o.orientationCalibrations.isEmpty()) {
         Map<String, Calibration> updated = new LinkedHashMap<>();
         for (ImageFrame f : frames) updated.put(f.path.getFileName().toString(), result);
@@ -515,6 +555,13 @@ final class SharedCalibration {
             "Shared Brown f,cx,cy,k1,k2,k3,p1,p2; fixed focal aspect ratio",
             "selected_parameters",
             o.refineIntrinsics,
+            "accepted_parameters",
+            lens.parameters(),
+            "selection_policy",
+            "One parameter added per trial; retry only after an accepted model change; data-only marginal information, physical map, four-sigma prior bound and two withheld-track validation groups with a noise-scaled complexity penalty",
+            "unchanged_model_trials_skipped", skippedUnchanged,
+            "fit_prior_sigmas",
+            Json.object("log_focal", o.focalSigma, "distortion", o.radialSigma, "principal_point_fraction", .02),
             "parameter_order",
             NAMES,
             "solver_parameter_units",
@@ -529,7 +576,7 @@ final class SharedCalibration {
               "dimensionless"
             },
             "uncertainty_scope",
-            "Damped local conditional diagnostics; excludes model error",
+            "Undamped data-only lens information after marginalizing structure and poses; scale gauge projected out. Excludes lens priors and model error; conditional on fixed parameters",
             "uncertainty_acceptance_radius",
             "Training observation P90 radius; radial/tangential effects below 0.02, log-focal sigma"
                 + " below 0.08, principal point fractions below 0.02. Uncovered image corners are"
@@ -565,9 +612,15 @@ final class SharedCalibration {
             .02));
     System.out.println(
         "Shared alignment calibration: "
-            + (acceptedAny ? "accepted staged refinement" : "retained initial calibration")
+            + (acceptedAny ? "accepted parameter-wise refinement" : "retained initial calibration")
             + "; "
             + report);
+  }
+
+  static boolean validationEvidence(double before, double after, long observations, double noise) {
+    return Double.isFinite(before) && Double.isFinite(after) && observations > 0
+        && (before * before - after * after) * observations
+            > noise * noise * Math.log(Math.max(2, observations));
   }
 
   private void focalStarts(
@@ -622,10 +675,6 @@ final class SharedCalibration {
     for (int i = 0; i < tracks.size(); i++) tracks.get(i).point = points[i];
   }
 
-  private static int group(int k) {
-    return k == 0 ? 0 : k == 1 ? 1 : k == 2 ? 2 : k == 7 ? 3 : k >= 8 ? 99 : 4;
-  }
-
   List<String> parameters() {
     List<String> names = new ArrayList<>();
     for (int k = 0; k < SIZE; k++) if (active[k]) names.add(NAMES[k]);
@@ -655,9 +704,32 @@ final class SharedCalibration {
   }
 
   double validationRms(List<ImageFrame> frames, List<FeatureTracks.Track> held, boolean commit) {
+    // Conditional point fits are independent. Keep the final observation additions in
+    // their original order: flat calibration directions are sensitive to rounding.
     double sum = 0;
     long n = 0;
-    for (var t : held) {
+    for (int begin = 0; begin < held.size(); ) {
+      int end = BundleAdjuster.linearizationBatchEnd(held, begin, BundleAdjuster.linearizationObservationLimit(options, true));
+      final int first = begin, size = end - begin;
+      double[][] residuals = new double[size][];
+      int chunks = Math.min(Math.max(1, options.cores), Math.max(1, size));
+      BundleAdjuster.parallel(chunks, chunk -> {
+        int from = (int) ((long) size * chunk / chunks);
+        int to = (int) ((long) size * (chunk + 1) / chunks);
+        for (int i = from; i < to; i++) residuals[i] = validationTrack(frames, held.get(first + i), commit);
+      });
+      for (double[] row : residuals) if (row != null)
+        for (double error : row) {
+          sum += error;
+          n++;
+        }
+      begin = end;
+    }
+    return Math.sqrt(sum / Math.max(1, n));
+  }
+
+  private double[] validationTrack(List<ImageFrame> frames, FeatureTracks.Track t, boolean commit) {
+      if (t.point == null) return null;
       double[] p = t.point.clone();
       for (int iter = 0; iter < 25; iter++) {
         double[][] h = new double[3][3];
@@ -667,7 +739,7 @@ final class SharedCalibration {
           if (!frame.camera.registered) continue;
           Point measured = observed[frame.id][ob.feature];
           double[] uv = project(frame, p, measured.y);
-          if (uv == null) return Double.POSITIVE_INFINITY;
+          if (uv == null) return new double[] {Double.POSITIVE_INFINITY};
           double[] r = {uv[0] - measured.x, uv[1] - measured.y};
           double weight = Math.min(1, 2 / Math.max(1e-12, Math.hypot(r[0], r[1])));
           double[][] jq = spatialJacobian(frame, p, measured.y), jp = new double[2][3];
@@ -698,17 +770,17 @@ final class SharedCalibration {
         if (!moved || Math3.norm(delta) * factor < 1e-9) break;
       }
       if (commit) t.point = p;
+      double[] errors = new double[t.observations.size()];
+      int n = 0;
       for (var ob : t.observations) {
         ImageFrame frame = frames.get(ob.image);
         if (!frame.camera.registered) continue;
         Point measured = observed[frame.id][ob.feature];
         double[] uv = project(frame, p, measured.y);
-        if (uv == null) return Double.POSITIVE_INFINITY;
-        sum += Math.pow(uv[0] - measured.x, 2) + Math.pow(uv[1] - measured.y, 2);
-        n++;
+        if (uv == null) return new double[] {Double.POSITIVE_INFINITY};
+        errors[n++] = Math.pow(uv[0] - measured.x, 2) + Math.pow(uv[1] - measured.y, 2);
       }
-    }
-    return Math.sqrt(sum / Math.max(1, n));
+      return n == errors.length ? errors : Arrays.copyOf(errors, n);
   }
 
   private double pointCost(List<ImageFrame> frames, FeatureTracks.Track t, double[] p) {

@@ -10,10 +10,10 @@ import org.opencv.core.*;
 final class AutomaticCalibration {
   static final double LOW = .12, HIGH = 4;
   static final String ASSUMPTIONS =
-      "Bootstrap: shared fixed-focus camera, square pixels, zero skew, centered principal point."
-          + " Guarded joint f,k1,k2 refinement follows focal initialization; p1,p2,k3 stay zero."
-          + " Rejected refinement retains initial focal and zero distortion; see"
-          + " refinement/result.json.";
+      "Bootstrap assumes a shared fixed-focus camera, square pixels, zero skew and centered principal point."
+          + " Parameter-wise constrained calibration follows initialization; only data-supported"
+          + " corrections improving two withheld track groups are retained. Inspect refinement/result.json"
+          + " and 04_geometry/bundle/shared_calibration.json for retained parameters and uncertainty.";
 
   static Calibration estimate(Options o, List<Path> paths, int width, int height, Project project)
       throws IOException {

@@ -35,36 +35,51 @@ final class MemoryLauncher {
         Math.floorDiv(Math.addExact(Math.multiplyExact(processingMiB, 100), 64), 65), 16);
   }
 
+  static long requestedRamLimit(String[] args) {
+    for (int i = args.length - 1; i >= 0; i--)
+      try {
+        if (args[i].startsWith("--ram-limit-mb=")) return Long.parseLong(args[i].substring(15));
+        if (args[i].equals("--ram-limit-mb") && i + 1 < args.length) return Long.parseLong(args[i + 1]);
+      } catch (NumberFormatException ignored) { return 0; }
+    return 0;
+  }
+
+  static long safeHeapMiB(MemorySafety.Limits limits, long heapUsed) {
+    long safe = Long.MAX_VALUE;
+    if (limits.total() >= 0) safe = limits.total() / 100 * 65;
+    if (limits.available() >= 0)
+      safe = Math.min(safe, heapUsed + limits.available() / 100 * 65);
+    return safe == Long.MAX_VALUE ? safe : safe / MemorySafety.MIB;
+  }
+
   static void main(String[] args) {
     int exit;
     try {
       // A continued pipeline step uses the memory budget saved by the first step.
-      long budget = requestedBudget(Main.launchArguments(args));
-      long target = budget > 0 ? heapMiB(budget) : 0;
+      String[] effective = Main.launchArguments(args);
+      if (Arrays.stream(effective).anyMatch(s -> Set.of("--help", "-h", "-help", "--list-gpus").contains(s))) {
+        System.exit(Main.run(args));
+        return;
+      }
+      long budget = requestedBudget(effective);
+      long current = Runtime.getRuntime().maxMemory() / MemorySafety.MIB;
+      long target = Math.max(current, budget > 0 ? heapMiB(budget) : 0);
       var memory = MemorySafety.snapshot();
-      if (target > 0 && memory.availableCommit() > 0) {
-        long safe =
-            Math.max(
-                256,
-                (memory.heapCommitted()
-                        + Math.max(
-                            0,
-                            memory.availableCommit()
-                                - Math.max(1024 * 1048576L, memory.availableCommit() / 8)))
-                    / 1048576L);
+      var limits = MemorySafety.limits(requestedRamLimit(effective));
+      long safe = safeHeapMiB(limits, memory.heapUsed());
+      if (!Boolean.getBoolean("sgm.heap.reexecuted")) {
         if (target > safe) {
           System.out.printf(
               Locale.ROOT,
-              "Memory: heap target capped from %,d to %,d MiB by available OS commit; effective"
-                  + " processing allowance will be smaller%n",
+              "Memory: heap target capped from %,d to %,d MiB by %s (35%% host/native headroom);"
+                  + " effective processing allowance will be smaller%n",
               target,
-              safe);
+              safe, limits.source());
           target = safe;
         }
-      }
-      if (target > Runtime.getRuntime().maxMemory() / 1048576L) {
-        if (Boolean.getBoolean("sgm.heap.reexecuted"))
-          throw new IllegalArgumentException("The JVM did not provide the requested heap");
+        if (target < 64) throw new IllegalArgumentException("Insufficient host/job RAM for a safe JVM heap");
+      } else target = current; // one relaunch only; runtime guards recheck remaining memory
+      if (target != current) {
         List<String> command = new ArrayList<>();
         command.add(
             Path.of(
@@ -75,7 +90,9 @@ final class MemoryLauncher {
                         : "java")
                 .toString());
         for (String option : ManagementFactory.getRuntimeMXBean().getInputArguments())
-          if (!option.startsWith("-Xmx") && !option.startsWith("-Dsgm.heap.reexecuted="))
+          if (!option.startsWith("-Xmx") && !option.startsWith("-Dsgm.heap.reexecuted=")
+              && !(target < current && (option.startsWith("-Xms")
+                  || option.startsWith("-XX:InitialHeapSize=") || option.startsWith("-XX:SoftMaxHeapSize="))))
             command.add(option);
         command.add("-Xmx" + target + "m");
         command.add("-Dsgm.heap.reexecuted=true");
@@ -85,8 +102,8 @@ final class MemoryLauncher {
         command.addAll(Arrays.asList(args));
         System.out.printf(
             Locale.ROOT,
-            "Memory: requested processing budget %,d MiB; starting JVM with %,d MiB heap (65%%"
-                + " processing allowance plus headroom)%n",
+            "Memory: requested processing budget %,d MiB; starting JVM with %,d MiB heap "
+                + "(processing allowance up to 65%% of heap; native memory separate)%n",
             budget,
             target);
         Process process = new ProcessBuilder(command).inheritIO().start();

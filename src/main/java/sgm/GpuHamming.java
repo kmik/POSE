@@ -25,10 +25,11 @@ final class GpuHamming {
       """
       // One work-item per query; train descriptors stream through local memory in index order.
       __kernel void knn2(__global const uint* query, int nq, __global const uint* train, int nt,
-          __global int* out, __local uint* tile) {
+          __global int* out, __global const int* queryIds, int indexed, __local uint* tile) {
         int gid = get_global_id(0), lid = get_local_id(0), ls = get_local_size(0);
+        int queryIndex = gid < nq ? (indexed ? queryIds[gid] : gid) : 0;
         uint q[WORDS];
-        for (int k = 0; k < WORDS; k++) q[k] = gid < nq ? query[(long) gid * WORDS + k] : 0u;
+        for (int k = 0; k < WORDS; k++) q[k] = gid < nq ? query[(long) queryIndex * WORDS + k] : 0u;
         int b1 = 0x7fffffff, i1 = -1, b2 = 0x7fffffff, i2 = -1;
         for (int base = 0; base < nt; base += ls) {
           int idx = base + lid;
@@ -56,10 +57,12 @@ final class GpuHamming {
   private final GpuSgm.Compute cl;
   private final MemorySegment kernel;
   private final int words;
+  private final int deviceIndex;
   long searches, queries, nanos;
 
   private GpuHamming(Options o, int words) {
     this.words = words;
+    deviceIndex = o.gpuDevice;
     cl = new GpuSgm.Compute(o, "#define WORDS " + words + "\n" + SOURCE, true);
     try {
       kernel = cl.kernel("knn2");
@@ -76,6 +79,7 @@ final class GpuHamming {
         && o.gpuFeatureMatching
         && a.depth() == CvType.CV_8U
         && b.depth() == CvType.CV_8U
+        && a.channels() == 1 && b.channels() == 1
         && a.cols() == b.cols()
         && a.cols() % 4 == 0
         && a.cols() > 0
@@ -93,7 +97,7 @@ final class GpuHamming {
     synchronized (GpuHamming.class) {
       if (disabled) return false;
       int words = query.cols() / 4;
-      if (instance != null && instance.words != words) close();
+      if (instance != null && (instance.words != words || instance.deviceIndex != o.gpuDevice)) close();
       if (instance == null) {
         try {
           instance = new GpuHamming(o, words);
@@ -143,7 +147,7 @@ final class GpuHamming {
         program.transfer(q, 0, bytes(arena, query), false);
         program.transfer(t, 0, bytes(arena, train), false);
         int group = program.group();
-        program.run(kernel, nq, q, nq, t, nt, r, new GpuSgm.Local(4L * words * group));
+        program.run(kernel, nq, q, nq, t, nt, r, r, 0, new GpuSgm.Local(4L * words * group));
         MemorySegment host = arena.allocate(16L * nq, 4);
         program.transfer(r, 0, host, true);
         int[] result = host.toArray(JAVA_INT);
@@ -153,6 +157,99 @@ final class GpuHamming {
         return result;
       } finally {
         program.releaseBuffers();
+      }
+    }
+  }
+
+  /** Both reciprocal directions reuse the same uploaded descriptors and result allocation. */
+  static Integer reciprocal(Options o, Mat a, Mat b, List<MatOfDMatch> forward,
+      Map<Integer, Integer> reverse, java.util.function.Consumer<String> progress) {
+    if (!eligible(o, a, b) || a.rows() < 2) return null;
+    // Keep initialization, first-use audit and teardown ordered with the legacy entry point.
+    synchronized (GpuHamming.class) {
+      if (disabled) return null;
+      try {
+        int words = a.cols() / 4;
+        if (instance != null && (instance.words != words || instance.deviceIndex != o.gpuDevice)) close();
+        if (instance == null) instance = new GpuHamming(o, words);
+        return instance.reciprocalImpl(o, a, b, forward, reverse, progress);
+      } catch (RuntimeException | Error failure) {
+        disable("GPU reciprocal feature matching unavailable; using CPU: " + failure.getMessage());
+        return null;
+      }
+    }
+  }
+
+  private synchronized int reciprocalImpl(Options o, Mat a, Mat b, List<MatOfDMatch> forward,
+      Map<Integer, Integer> reverse, java.util.function.Consumer<String> progress) {
+    long started = System.nanoTime();
+    try (Arena arena = Arena.ofConfined()) {
+      try {
+        int na = a.rows(), nb = b.rows(), group = cl.group();
+        MemorySegment da = cl.buffer(4L * words * na), db = cl.buffer(4L * words * nb);
+        MemorySegment out = cl.buffer(16L * Math.max(na, nb));
+        MemorySegment host = arena.allocate(16L * Math.max(na, nb), 4);
+        MemorySegment idsDevice = cl.buffer(4L * nb);
+        // Readback completes these uploads before arena memory can be released.
+        if (o.gpuQueuedUploads) {
+          cl.writeQueued(da, 0, bytes(arena, a));
+          cl.writeQueued(db, 0, bytes(arena, b));
+        } else {
+          cl.transfer(da, 0, bytes(arena, a), false);
+          cl.transfer(db, 0, bytes(arena, b), false);
+        }
+        progress.accept("GPU forward nearest neighbors; " + na + " queries");
+        cl.run(kernel, na, da, na, db, nb, out, idsDevice, 0, new GpuSgm.Local(4L * words * group));
+        cl.transfer(out, 0, host.asSlice(0, 16L * na), true);
+        int[] first = host.asSlice(0, 16L * na).toArray(JAVA_INT);
+        if (!verified) {
+          String problem = verify(a, b, first);
+          if (problem != null) throw new IllegalStateException("CPU forward audit: " + problem);
+        }
+        BitSet needed = new BitSet(nb);
+        for (int i = 0; i < na; i++)
+          if (first[4 * i + 1] < o.ratio * first[4 * i + 3]) needed.set(first[4 * i]);
+        int count = needed.cardinality();
+        boolean full = count * 5L >= nb * 4L;
+        int[] ids = full ? null : needed.stream().toArray();
+        int searched = full ? nb : count;
+        int[] second = new int[0];
+        if (searched > 0) {
+          if (!full) cl.transfer(idsDevice, 0, arena.allocateFrom(JAVA_INT, ids), false);
+          progress.accept("GPU reverse nearest neighbors; " + searched + "/" + nb + " queries (resident descriptors)");
+          cl.run(kernel, searched, db, searched, da, na, out, idsDevice, full ? 0 : 1,
+              new GpuSgm.Local(4L * words * group));
+          cl.transfer(out, 0, host.asSlice(0, 16L * searched), true);
+          second = host.asSlice(0, 16L * searched).toArray(JAVA_INT);
+          if (!verified) {
+            Mat sample = new Mat(searched, b.cols(), b.type());
+            try {
+              for (int i = 0; i < searched; i++) {
+                Mat src = b.row(full ? i : ids[i]), dst = sample.row(i);
+                try { src.copyTo(dst); } finally { src.release(); dst.release(); }
+              }
+              String problem = verify(sample, a, second);
+              if (problem != null) throw new IllegalStateException("CPU reverse audit: " + problem);
+            } finally { sample.release(); }
+          }
+        }
+        // Publish only after both searches and audits succeed; fallback sees untouched outputs.
+        List<MatOfDMatch> rows = new ArrayList<>();
+        for (int i = 0; i < na; i++)
+          rows.add(new MatOfDMatch(new DMatch(i, first[4 * i], 0, first[4 * i + 1]),
+              new DMatch(i, first[4 * i + 2], 0, first[4 * i + 3])));
+        for (int i = 0; i < searched; i++)
+          if (second[4 * i + 1] < o.ratio * second[4 * i + 3])
+            reverse.put(full ? i : ids[i], second[4 * i]);
+        forward.addAll(rows);
+        verified = true;
+        searches += searched > 0 ? 2 : 1;
+        queries += na + searched;
+        nanos += System.nanoTime() - started;
+        return searched;
+      } finally {
+        // Also finish on a kernel/driver error before freeing asynchronous source memory.
+        try { cl.finish(); } finally { cl.releaseBuffers(); }
       }
     }
   }
@@ -222,7 +319,15 @@ final class GpuHamming {
     if (instance == null) return;
     String s = summary();
     if (s != null && instance.searches > 0) System.out.println(s);
-    instance.cl.close();
-    instance = null;
+    try {
+      instance.cl.finish();
+      RunTelemetry.gpuProfile("GPU binary feature matching", instance.cl.profile());
+    } finally {
+      try { instance.cl.close(); }
+      finally {
+        instance = null;
+        verified = false;
+      }
+    }
   }
 }

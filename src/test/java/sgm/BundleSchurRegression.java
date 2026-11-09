@@ -66,14 +66,19 @@ final class BundleSchurRegression {
           check(
               Math.sqrt(err / norm) < 1e-6, "independent linear residual meets original tolerance");
         }
-        f.options.memoryMb = 0; // Internal stress injection; public CLI rejects this budget.
+        String previousWorkspace = System.getProperty("sgm.test.bundleDirectWorkspaceBytes");
+        System.setProperty("sgm.test.bundleDirectWorkspaceBytes", "0");
+        try {
         Object bounded = linearize(f, lens);
         Object fallback = method(bounded, "solve").invoke(bounded);
         check(
             fallback != null
                 && method(fallback, "method").invoke(fallback).equals("matrix_free_pcg"),
             "insufficient workspace retains matrix-free solve");
-        f.options.memoryMb = 4096;
+        } finally {
+          if (previousWorkspace == null) System.clearProperty("sgm.test.bundleDirectWorkspaceBytes");
+          else System.setProperty("sgm.test.bundleDirectWorkspaceBytes", previousWorkspace);
+        }
       }
     }
     // Default (no --bundle-iterations): iterate until converged, not for a fixed budget.

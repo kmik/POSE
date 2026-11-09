@@ -79,7 +79,9 @@ final class CalibrationDiagnostics {
           count = support[f.id][cell];
         }
       }
-      if (registered < 3) continue;
+      // Two-view tracks still constrain some lens parameters. Observability is assessed after
+      // eliminating their free 3D positions, rather than by excluding them here.
+      if (registered < 2) continue;
       support[chosen / 48][chosen % 48]++;
       cells.computeIfAbsent(chosen, k -> new ArrayList<>()).add(t);
     }

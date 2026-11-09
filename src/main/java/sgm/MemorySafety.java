@@ -6,11 +6,38 @@ import com.sun.management.HotSpotDiagnosticMXBean;
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.lang.management.ManagementFactory;
+import java.nio.file.*;
 import java.util.Locale;
 
 /** Prevent native commit failure before allocating; catch(OOME) cannot recover from it. */
 final class MemorySafety {
   static final long MIB = 1048576L;
+
+  record Limits(long total, long available, String source) {}
+
+  static Limits limits() {
+    if (System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("linux")) {
+      var linux = LinuxMemory.read(Path.of("/proc"), System.getenv());
+      return new Limits(linux.total(), linux.available(), linux.source());
+    }
+    long[] windows = Windows.read();
+    long total = -1, free = windows[1];
+    if (ManagementFactory.getOperatingSystemMXBean() instanceof com.sun.management.OperatingSystemMXBean mx) {
+      total = mx.getTotalMemorySize();
+      if (free < 0) free = mx.getFreeMemorySize();
+    }
+    return new Limits(total, LinuxMemory.minimum(windows[0], free), "Host physical/commit memory");
+  }
+
+  static Limits limits(long ramLimitMiB) {
+    Limits host = limits();
+    if (ramLimitMiB <= 0) return host;
+    long limit = Math.multiplyExact(ramLimitMiB, MIB);
+    long rss = RunTelemetry.residentBytes();
+    return new Limits(LinuxMemory.minimum(host.total(), limit),
+        rss > 0 ? LinuxMemory.minimum(host.available(), Math.max(0, limit - rss)) : host.available(),
+        host.source() + " + --ram-limit-mb");
+  }
 
   record Snapshot(
       long heapUsed,
@@ -38,6 +65,10 @@ final class MemorySafety {
   static Snapshot snapshot() {
     Runtime r = Runtime.getRuntime();
     long[] os = Windows.read();
+    if (System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("linux")) {
+      Limits linux = limits();
+      os = new long[] {linux.available(), linux.available()};
+    }
     long physical = os[1];
     if (physical <= 0
         && ManagementFactory.getOperatingSystemMXBean()
@@ -73,6 +104,46 @@ final class MemorySafety {
 
   static boolean admits(long bytes, long requested) {
     return bytes <= snapshot().allowance(requested);
+  }
+
+  /** Conservative admission, not a replacement for the scheduler's hard RSS limit. */
+  static void requireHeap(long bytes, Options options, String operation) {
+    if (bytes < 0) throw new IllegalArgumentException(operation + ": allocation estimate overflow");
+    Snapshot heap = snapshot();
+    Limits limits = limits(options.ramLimitMb);
+    long allowance = heapAllowance(heap, limits, options);
+    // At stage boundaries the previous graph may be unreachable but not collected.
+    // Retry admission once after collection; do not reject a fitting graph just because
+    // a large -Xmx delayed GC. This is not the native Mat lifetime fix.
+    if (bytes > allowance && bytes <= options.memoryMb * MIB
+        && bytes <= heap.heapMaximum() * 3 / 4 && heap.heapUsed() > heap.heapMaximum() / 3) {
+      System.gc();
+      heap = snapshot(); limits = limits(options.ramLimitMb);
+      allowance = heapAllowance(heap, limits, options);
+    }
+    if (bytes > allowance)
+      throw new IllegalArgumentException(String.format(Locale.ROOT,
+          "%s needs about %,d MiB additional heap/workspace; safe available allowance is %,d MiB "
+              + "(heap used %,d MiB, heap maximum %,d MiB; %s). Reduce features or process a smaller block, "
+              + "or request a larger job allocation. --memory-mb is not a total RAM limit.",
+          operation, bytes / MIB + (bytes % MIB == 0 ? 0 : 1), allowance / MIB,
+          heap.heapUsed() / MIB, heap.heapMaximum() / MIB, limits.source()));
+  }
+
+  private static long heapAllowance(Snapshot heap, Limits limits, Options options) {
+    long bytes = Math.min(options.memoryMb * MIB, Math.max(0, heap.heapMaximum() - heap.heapUsed()) * 3 / 4);
+    return limits.available() < 0 ? bytes : Math.min(bytes, limits.available() * 3 / 4);
+  }
+
+  static void validateHostHeap(Options options) {
+    var limit = limits(options.ramLimitMb);
+    long heap = Runtime.getRuntime().maxMemory();
+    if (limit.total() > 0 && heap > limit.total() / 100 * 65 + regionBytes())
+      throw new IllegalArgumentException(String.format(Locale.ROOT,
+          "JVM maximum heap %,d MiB leaves insufficient native headroom under %,d MiB RAM (%s). "
+              + "Restart through the photogrammetry launcher or set -Xmx to at most %,d MiB; "
+              + "an embedded Main.run call cannot resize its host JVM.",
+          heap / MIB, limit.total() / MIB, limit.source(), limit.total() / 100 * 65 / MIB));
   }
 
   private static final class Windows {

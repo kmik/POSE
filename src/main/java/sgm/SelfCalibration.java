@@ -211,25 +211,19 @@ final class SelfCalibration {
     Path dir = options.output.resolve("01_calibration/refinement");
     Files.createDirectories(dir);
     options.calibrationPoses = Collections.emptyMap();
-    if (project != null)
-      project.stage(
-          "01_calibration", "running", "Guarded joint focal/radial, pose and structure refinement");
-    String skip =
-        !options.selfCalibration
-            ? "Disabled by --no-self-calibration"
-            : options.rectified
-                ? "Already-rectified inputs do not retain the original lens distortion"
-                : paths.size() < 4
-                    ? "At least four overlapping views required for guarded radial self-calibration"
-                    : null;
+    String skip = !options.selfCalibration ? "Disabled by --no-self-calibration"
+        : options.rectified ? "Already-rectified inputs do not retain the original lens distortion"
+        : options.calibration != null && options.intrinsicsMode.equals("fixed")
+            ? "Supplied calibration is fixed" : null;
     if (skip != null) {
-      Json.write(
-          dir.resolve("result.json"),
-          Json.object("accepted", false, "reason", skip, "model", MODEL));
+      Json.write(dir.resolve("result.json"), Json.object("accepted", false, "reason", skip));
       return initial;
     }
     Options bootstrap = options.copy();
+    bootstrap.output = dir;
     bootstrap.seedPair = null;
+    bootstrap.alignmentCalibration = false;
+    bootstrap.alignmentCalibrationDone = false;
     int[] finalSize = options.alignmentOptions().processedSize(initial.width, initial.height);
     bootstrap.quality = "custom";
     bootstrap.maxDimension = Math.min(Math.max(finalSize[0], finalSize[1]), 1200);
@@ -244,104 +238,35 @@ final class SelfCalibration {
       if (options.poses != null) {
         PoseIO.read(options.poses, frames, true);
         Geometry.triangulateTracks(frames, features.tracks, bootstrap.reprojection * 2);
+        for (ImageFrame f : frames) {
+          f.camera.fixed = options.extrinsicsMode.equals("fixed");
+          if (options.extrinsicsMode.equals("prior")) {
+            f.camera.reference = f.camera.copy();
+            f.camera.positionSigma = options.positionSigma;
+            f.camera.rotationSigma = Math.toRadians(options.rotationSigma);
+          }
+        }
       } else Geometry.reconstruct(frames, features, bootstrap);
-      if (frames.stream().anyMatch(f -> !f.camera.registered))
-        throw new IllegalArgumentException(
-            "Incomplete calibration bootstrap; use the retained focal initialization for final"
-                + " reconstruction");
-      Data data =
-          new Data(initial, options.poses != null && options.extrinsicsMode.equals("fixed"));
-      data.controls = options.copy();
-      if (options.calibration == null) data.controls.intrinsicsMode = "initial";
-      data.priorLens = data.lens.clone();
-      for (ImageFrame f : frames) {
-        if (options.poses != null && options.extrinsicsMode.equals("prior")) {
-          f.camera.reference = f.camera.copy();
-          f.camera.positionSigma = options.positionSigma;
-          f.camera.rotationSigma = Math.toRadians(options.rotationSigma);
-        }
-        data.views.add(new View(f.camera, f.camera.fx / initial.fx, f.camera.fy / initial.fx));
-      }
-      List<FeatureTracks.Track> usable = new ArrayList<>();
-      for (FeatureTracks.Track t : features.tracks)
-        if (t.point != null && t.observations.size() >= 3) usable.add(t);
-      // Shuffle before capping, so selection does not privilege low keypoint IDs or image centers.
-      Collections.shuffle(usable, new Random(91571));
-      int id = 0;
-      for (FeatureTracks.Track t : usable.subList(0, Math.min(1800, usable.size()))) {
-        Sample sample = new Sample(t.id, t.point, id++ % 5 == 0);
-        for (FeatureTracks.Observation ob : t.observations) {
-          Point p = frames.get(ob.image).keypoints[ob.feature].pt;
-          Camera cam = frames.get(ob.image).camera;
-          double x = (p.x - cam.cx) / cam.fx, y = (p.y - cam.cy) / cam.fy, r = x * x + y * y;
-          double radial =
-              1
-                  + initial.distortion[0] * r
-                  + initial.distortion[1] * r * r
-                  + initial.distortion[4] * r * r * r;
-          double
-              xd =
-                  x * radial
-                      + 2 * initial.distortion[2] * x * y
-                      + initial.distortion[3] * (r + 2 * x * x),
-              yd =
-                  y * radial
-                      + initial.distortion[2] * (r + 2 * y * y)
-                      + 2 * initial.distortion[3] * x * y;
-          sample.seen.add(new Seen(ob.image, cam.fx * xd + cam.cx, cam.fy * yd + cam.cy));
-        }
-        data.samples.add(sample);
-      }
-      Result result = optimize(data, 50);
-      Json.write(dir.resolve("result.json"), result.report());
-      evidence(
-          dir,
-          result.evaluatedBaseline == null ? data : result.evaluatedBaseline,
-          result.fitted,
-          options.diagnostics);
-      if (!result.accepted) {
-        System.out.println("Self-calibration retained initial intrinsics: " + result.reason);
-        return initial;
-      }
-      double[] p = result.fitted.lens;
-      double f = Math.exp(p[0]);
-      Calibration calibrated =
-          new Calibration(
-              f,
-              f * initial.fy / initial.fx,
-              initial.cx,
-              initial.cy,
-              new double[] {
-                p[1], p[2], initial.distortion[2], initial.distortion[3], initial.distortion[4]
-              },
-              initial.width,
-              initial.height);
+      if (frames.stream().filter(f -> f.camera.registered).count() < 2)
+        throw new IllegalArgumentException("No registered stereo baseline for calibration");
+      bootstrap.alignmentCalibration = true;
+      // Use the same parameter-level policy for bootstrap and final alignment. No image-count
+      // switch changes which lens parameters are eligible.
+      BundleAdjuster.optimize(frames, features.tracks, bootstrap.iterations,
+          options.reprojection, null);
+      Path assessment = dir.resolve("04_geometry/bundle/shared_calibration.json");
+      Files.copy(assessment, dir.resolve("result.json"), StandardCopyOption.REPLACE_EXISTING);
+      Calibration result = frames.get(0).calibration;
+      if (SharedCalibration.same(initial, result)) return initial;
       options.calibrationPoses = new LinkedHashMap<>();
       for (ImageFrame frame : frames)
-        options.calibrationPoses.put(
-            frame.path.getFileName().toString(), result.fitted.views.get(frame.id).camera.copy());
-      calibrated.write(
-          options.output.resolve("camera.txt"),
-          "Accepted joint f,k1,k2 self-calibration; " + MODEL);
-      System.out.printf(
-          Locale.ROOT,
-          "Self-calibration accepted: f=%.3f px, k1=%.7f, k2=%.7f; held-out RMS %.4f -> %.4f px%n",
-          f,
-          p[1],
-          p[2],
-          result.before,
-          result.after);
-      return calibrated;
+        if (frame.camera.registered)
+          options.calibrationPoses.put(frame.path.getFileName().toString(), frame.camera.copy());
+      result.write(options.output.resolve("camera.txt"), "Adaptive parameter-wise bootstrap calibration");
+      return result;
     } catch (IllegalArgumentException e) {
-      Json.write(
-          dir.resolve("result.json"),
-          Json.object(
-              "accepted",
-              false,
-              "reason",
-              "Sparse bootstrap failed: " + e.getMessage(),
-              "model",
-              MODEL));
+      Json.write(dir.resolve("result.json"), Json.object("accepted", false,
+          "reason", "Sparse bootstrap failed: " + e.getMessage()));
       System.out.println("Self-calibration retained initial intrinsics: " + e.getMessage());
       return initial;
     } finally {

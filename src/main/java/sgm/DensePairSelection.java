@@ -7,7 +7,8 @@ import java.util.*;
 /** Experimental sparse-coverage selection. Unknown support always retains the original edge. */
 final class DensePairSelection {
   private record Candidate(
-      FeatureTracks.Pair pair, BitSet cells, double cost, int samples, boolean unknown) {}
+      FeatureTracks.Pair pair, BitSet cells, double cost, int samples, int useful,
+      double medianAngle, boolean unknown) {}
 
   static List<FeatureTracks.Pair> select(
       List<ImageFrame> frames,
@@ -24,6 +25,9 @@ final class DensePairSelection {
       double focal = Math.min(Math.min(a.fx, a.fy), Math.min(b.fx, b.fy));
       BitSet cells = new BitSet();
       List<Double> parallax = new ArrayList<>();
+      List<Double> angles = new ArrayList<>();
+      int useful = 0;
+      double[] centerA = a.center(), centerB = b.center();
       for (var track : tracks) {
         if (track.point == null) continue;
         boolean seenA = false, seenB = false;
@@ -37,27 +41,44 @@ final class DensePairSelection {
         cells.set(cell(pair.a, p, frames.get(pair.a)));
         cells.set(cell(pair.b, q, frames.get(pair.b)));
         double z = Math.min(a.view(track.point)[2], b.view(track.point)[2]);
+        if (!(z > 0) || !Double.isFinite(z)) continue;
+        double[] rayA = Math3.sub(track.point, centerA), rayB = Math3.sub(track.point, centerB);
+        double cosine = (rayA[0] * rayB[0] + rayA[1] * rayB[1] + rayA[2] * rayB[2])
+            / (Math3.norm(rayA) * Math3.norm(rayB));
+        double angle = Math.toDegrees(Math.acos(Math.clamp(cosine, -1, 1)));
+        if (!Double.isFinite(angle)) continue;
+        angles.add(angle);
+        if (angle >= options.minAngle) useful++;
         parallax.add(focal * baseline / z);
       }
       parallax.sort(Double::compare);
+      angles.sort(Double::compare);
       boolean unknown = parallax.size() < 12 || cells.cardinality() < 4;
       double cost =
           unknown
               ? Double.POSITIVE_INFINITY
-              : 32
+              : (32
                   + parallax.get((int) (parallax.size() * .95))
-                  - parallax.get((int) (parallax.size() * .05));
-      candidates.add(new Candidate(pair, cells, cost, parallax.size(), unknown));
+                  - parallax.get((int) (parallax.size() * .05)))
+                  / Math.max(.05, useful / (double) parallax.size());
+      candidates.add(new Candidate(pair, cells, cost, parallax.size(), useful,
+          angles.isEmpty() ? Double.NaN : angles.get(angles.size() / 2), unknown));
       required.or(cells);
     }
     boolean[] selected = new boolean[pairs.size()];
     int[] degree = new int[frames.size()], available = new int[frames.size()];
+    int[] cellCounts = new int[frames.size() * 64], cellTargets = new int[cellCounts.length];
+    for (var c : candidates)
+      for (int bit = c.cells.nextSetBit(0); bit >= 0; bit = c.cells.nextSetBit(bit + 1))
+        cellTargets[bit]++;
+    for (int bit = 0; bit < cellTargets.length; bit++)
+      cellTargets[bit] = Math.min(cellTargets[bit], Math.max(1, options.minViews - 1));
     BitSet covered = new BitSet();
     for (int i = 0; i < candidates.size(); i++) {
       var c = candidates.get(i);
       available[c.pair.a]++;
       available[c.pair.b]++;
-      if (c.unknown) take(i, candidates, selected, degree, covered);
+      if (c.unknown) take(i, candidates, selected, degree, covered, cellCounts, cellTargets);
     }
     for (; ; ) {
       int best = -1;
@@ -80,7 +101,7 @@ final class DensePairSelection {
           }
         }
       if (best < 0) break;
-      take(best, candidates, selected, degree, covered);
+      take(best, candidates, selected, degree, covered, cellCounts, cellTargets);
     }
     // Retain connectivity within every original component, including links between flight strips.
     int[] parent = new int[frames.size()];
@@ -93,7 +114,7 @@ final class DensePairSelection {
     for (int i : order) {
       var p = pairs.get(i);
       if (root(parent, p.a) != root(parent, p.b)) {
-        take(i, candidates, selected, degree, covered);
+        take(i, candidates, selected, degree, covered, cellCounts, cellTargets);
         join(parent, p.a, p.b);
       }
     }
@@ -114,6 +135,8 @@ final class DensePairSelection {
               c.unknown,
               "sparse_samples",
               c.samples,
+              "samples_above_min_angle", c.useful,
+              "median_triangulation_angle_degrees", c.medianAngle,
               "coverage_cells",
               c.cells.cardinality(),
               "predicted_range_cost",
@@ -134,10 +157,11 @@ final class DensePairSelection {
             required.cardinality(),
             "covered_sparse_cells",
             covered.cardinality(),
+            "required_pair_witnesses_per_cell", Math.max(1, options.minViews - 1),
             "pairs",
             report,
             "scope",
-            "Sparse grid coverage and original connectivity retained; not a guarantee of dense"
+            "Sparse grid coverage with distinct pair witnesses, angle-aware cost and original connectivity retained; not a guarantee of dense"
                 + " thin-structure completeness. Unknown pairs are retained."));
     return result;
   }
@@ -151,13 +175,15 @@ final class DensePairSelection {
   }
 
   private static void take(
-      int i, List<Candidate> candidates, boolean[] selected, int[] degree, BitSet covered) {
+      int i, List<Candidate> candidates, boolean[] selected, int[] degree, BitSet covered,
+      int[] cellCounts, int[] cellTargets) {
     if (selected[i]) return;
     selected[i] = true;
     var c = candidates.get(i);
     degree[c.pair.a]++;
     degree[c.pair.b]++;
-    covered.or(c.cells);
+    for (int bit = c.cells.nextSetBit(0); bit >= 0; bit = c.cells.nextSetBit(bit + 1))
+      if (++cellCounts[bit] >= cellTargets[bit]) covered.set(bit);
   }
 
   private static int root(int[] p, int i) {

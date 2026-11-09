@@ -87,6 +87,8 @@ final class GpuBandedStereo {
     private final int w, h, n, words;
     private final MemorySegment descriptorsLeft, descriptorsRight, maskLeft, maskRight, grayLeft, grayRight;
     private final MemorySegment low, count, offset, out, host;
+    private final MemorySegment bandHost;
+    private final boolean queuedUploads;
     private final MemorySegment[] cost = new MemorySegment[8], sum = new MemorySegment[8];
     private long capacity;
     private final long localMemory, bank, budget;
@@ -105,6 +107,7 @@ final class GpuBandedStereo {
         int h) {
       this.w = w;
       this.h = h;
+      queuedUploads = o.gpuQueuedUploads;
       n = w * h;
       words = a.length;
       GpuSgm.Device device = GpuSgm.selectedDevice(o);
@@ -124,6 +127,7 @@ final class GpuBandedStereo {
         offset = cl.buffer(4L * n);
         out = cl.buffer(24L * n);
         host = arena.allocate(24L * n);
+        bandHost = arena.allocate(12L * n, 4);
         costs = cl.kernel("bcosts");
         paths = cl.kernel("bpaths");
         winners = cl.kernel("bwinners");
@@ -142,8 +146,13 @@ final class GpuBandedStereo {
 
     private MemorySegment upload(MemorySegment data) {
       MemorySegment buffer = cl.buffer(Math.max(8, data.byteSize()));
-      if (data.byteSize() > 0) cl.transfer(buffer, 0, data, false);
+      if (data.byteSize() > 0) write(buffer, data);
       return buffer;
+    }
+
+    private void write(MemorySegment buffer, MemorySegment data) {
+      if (queuedUploads) cl.writeQueued(buffer, 0, data);
+      else cl.transfer(buffer, 0, data, false);
     }
 
     private static byte[] mask(boolean[] m) {
@@ -159,11 +168,13 @@ final class GpuBandedStereo {
         if (total > 8 * bank)
           throw new IllegalArgumentException(
               "Packed banded volume of " + total + " cells exceeds 8 allocation banks");
-        // 25% headroom so band-edge retries rarely reallocate, if banks and half the budget allow.
+        // 25% headroom only when the complete session (including images) fits.
         long grown = total + total / 4;
         capacity =
-            grown <= 8 * bank && grown * (2 + sumBytes) <= budget / 2 ? grown : total;
+            grown <= 8 * bank && deviceBytes(o, w, h, grown) <= budget ? grown : total;
         for (int i = 0; i < 8; i++) {
+          cl.releaseBuffer(cost[i]);
+          cl.releaseBuffer(sum[i]);
           long cells = Math.max(1, Math.min(bank, capacity - i * bank));
           cost[i] = cl.buffer(Math.max(8, cells * 2));
           sum[i] = cl.buffer(Math.max(8, cells * sumBytes));
@@ -172,11 +183,17 @@ final class GpuBandedStereo {
       List<Object> costArgs = new ArrayList<>(List.of((Object[]) cost)), sumArgs = new ArrayList<>(List.of((Object[]) sum));
       costArgs.add((int) bank);
       sumArgs.add((int) bank);
-      try (Arena call = Arena.ofConfined()) {
-        cl.transfer(low, 0, call.allocateFrom(JAVA_INT, bands.low), false);
-        cl.transfer(count, 0, call.allocateFrom(JAVA_INT, bands.count), false);
-        cl.transfer(offset, 0, call.allocateFrom(JAVA_INT, bands.offsets()), false);
-      }
+      // Persistent native staging survives queued uploads and is only overwritten
+      // after the previous blocking result read has completed the in-order queue.
+      MemorySegment lows = bandHost.asSlice(0, 4L * n),
+          counts = bandHost.asSlice(4L * n, 4L * n),
+          offsets = bandHost.asSlice(8L * n, 4L * n);
+      MemorySegment.copy(MemorySegment.ofArray(bands.low), 0, lows, 0, 4L * n);
+      MemorySegment.copy(MemorySegment.ofArray(bands.count), 0, counts, 0, 4L * n);
+      MemorySegment.copy(MemorySegment.ofArray(bands.offsets()), 0, offsets, 0, 4L * n);
+      write(low, lows);
+      write(count, counts);
+      write(offset, offsets);
       MemorySegment da = reverse ? descriptorsRight : descriptorsLeft,
           db = reverse ? descriptorsLeft : descriptorsRight,
           ma = reverse ? maskRight : maskLeft,
@@ -236,10 +253,10 @@ final class GpuBandedStereo {
     @Override
     public void close() {
       try {
+        cl.finish();
         RunTelemetry.gpuProfile("Banded SGM " + w + "x" + h, cl.profile());
-        cl.close();
       } finally {
-        arena.close();
+        try { cl.close(); } finally { arena.close(); }
       }
     }
   }

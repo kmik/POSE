@@ -27,6 +27,8 @@ public final class Options {
   public boolean stereoPipeline;
   public int fusionWindowMb;
   public int densePairNeighbors = 3;
+  // Image-fusion decoded candidate cache; -1 = bounded auto, 0 = reference replay.
+  public int imageFusionCacheMb = -1;
   public Path exportConfidence;
   public boolean disparitiesExplicit, minDisparityExplicit, selfCalibration = true;
   Map<String, Camera> calibrationPoses = Collections.emptyMap();
@@ -92,11 +94,13 @@ public final class Options {
   public boolean fusionPrecisionCheck = false;
   // Exact GPU brute-force Hamming k=2 search for binary feature descriptors (GpuHamming).
   public boolean gpuFeatureMatching = true;
+  public boolean gpuQueuedUploads = true;
   public double fusionSigmaK = 3, fusionSeedMinAngle = 0, fusionLocalSigma = 0;
   public int step = 2, cores = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
   public int boardColumns = 9, boardRows = 7;
   public double squareSize = .02, maxDepth = 10000;
   public long memoryMb = 2048;
+  public long ramLimitMb; // optional total host-RAM planning ceiling, separate from processing buffers
   public String format = "jpg,jpeg,png,tif,tiff,bmp";
   public String seedPair;
   public String censusMode = "gray";
@@ -575,6 +579,13 @@ public final class Options {
           break;
         case "--dense-pair-neighbors":
           o.densePairNeighbors = Integer.parseInt(v);
+          break;
+        case "--image-fusion-cache-mb":
+          o.imageFusionCacheMb = v.equalsIgnoreCase("auto") ? -1 : Integer.parseInt(v);
+          break;
+        case "--gpu-transfer-mode":
+          choice(v, "--gpu-transfer-mode", "queued", "blocking");
+          o.gpuQueuedUploads = v.equals("queued");
           break;
         case "--calibration-pipeline":
           o.calibrationPipeline = v.toLowerCase(Locale.ROOT);
@@ -1087,6 +1098,9 @@ public final class Options {
         case "--memory-mb":
           o.memoryMb = Long.parseLong(v);
           break;
+        case "--ram-limit-mb":
+          o.ramLimitMb = Long.parseLong(v);
+          break;
         case "--board-columns":
           o.boardColumns = Integer.parseInt(v);
           break;
@@ -1186,6 +1200,8 @@ public final class Options {
     if (o.diagnostics && !storageExplicit) o.storage = "debug";
     choice(o.storage, "--storage", "minimal", "standard", "debug");
     choice(o.densePairSelection, "--dense-pair-selection", "all", "coverage");
+    if (o.imageFusionCacheMb < -1)
+      throw new IllegalArgumentException("--image-fusion-cache-mb must be auto or nonnegative");
     choice(o.densePipeline, "--dense-pipeline", "standard", "aerial-tiled");
     choice(o.depthOutlierFilter, "--depth-outlier-filter", "off", "edge-aware");
     choice(o.disparityRefinement, "--disparity-refinement", "off", "multiview");
@@ -1500,6 +1516,8 @@ public final class Options {
         || o.step < 1
         || o.cores < 1
         || o.memoryMb < 16
+        || o.memoryMb > Long.MAX_VALUE / 1048576L
+        || o.ramLimitMb < 0 || o.ramLimitMb > Long.MAX_VALUE / 1048576L
         || o.boardColumns < 2
         || o.boardRows < 2
         || !(o.squareSize > 0))
@@ -1791,8 +1809,8 @@ Calibration and reconstruction modes:
       Focal length in millimetres; requires --s_w. Initializes focal in pixels.
   --s_w MM
       Physical sensor WIDTH in millimetres (not diagonal); requires --focal.
-      Without a calibration file, guarded f,k1,k2 bootstrap refinement follows
-      initialization. Full-block alignment can then refine f,k1,k2,k3,cx,cy,p1,p2.
+      Without a calibration file, constrained parameter-wise bootstrap refinement
+      follows initialization. Alignment uses the same data-support assessment.
   --no-self-calibration
       Disable bootstrap and alignment self-calibration; retain initialized or supplied intrinsics.
   --poses FILE
@@ -1823,10 +1841,18 @@ Resolution and memory planning:
   --memory-mb N
       Processing buffer budget in MiB (default: 2048; minimum: 16). An explicit
       value raises the CLI JVM heap when needed to ceil(N/0.65)+16 MiB, on Windows
-      and Linux, before creating a project. A larger existing heap is preserved.
+      and Linux, before creating a project. Heap sizing is capped by detected host,
+      Linux cgroup/Slurm and optional --ram-limit-mb limits, reserving native headroom.
+      An oversized existing CLI heap is reduced by relaunching too.
       Embedded Main.run calls cannot resize their host JVM and retain the 65% cap.
       Native images, GPU buffers and other state add memory; this is not a total
       process RAM limit. Effective heap and processing allowance are logged.
+  --ram-limit-mb N
+      Optional total host-RAM planning ceiling in MiB (0 = detect). Includes heap
+      and native-memory headroom. The CLI limits heap to at most 65% of this and
+      detected host/job RAM, and guards alignment allocations. This is not an OS
+      hard RSS cap; use the scheduler/cgroup limit for enforcement. Embedded callers
+      must start their JVM with a suitable -Xmx; Main.run cannot resize a live JVM.
   --cores N, -cores N
       OpenCV worker threads (default: half available processors, at least 1;
       this machine: @CORES@). Does not set the JVM heap or GPU execution.
@@ -2488,6 +2514,13 @@ Additional workflow controls:
       Default bootstrap retains guarded focal/radial initialization. Experimental
       joint uses a consistent EXIF focal as initialization and fits intrinsics in
       the main alignment track graph. Missing EXIF falls back to the bootstrap.
+  --image-fusion-cache-mb auto|N
+      Reuse decoded image-fusion candidates across cameras and passes. Default auto
+      uses at most a quarter of --memory-mb and available estimated heap headroom.
+      N is an additional upper limit; 0 restores uncached replay. Geometry is unchanged.
+  --gpu-transfer-mode queued|blocking
+      Default queued batches banded-stereo uploads on the in-order GPU queue;
+      host buffers remain alive until completion. Blocking is the comparison path.
   --fusion-emission pair|camera
       Default pair keeps existing sampling. Experimental camera groups accepted
       observations by owner-camera pixel and separate depth layers, retaining the
@@ -2547,9 +2580,13 @@ Additional workflow controls:
       and rotation uncertainties; initial refines without measurement penalties.
   --refine-intrinsics LIST
       Comma-separated subset of f,k1,k2,k3,cx,cy,p1,p2 (default: all eight).
-      Full-block alignment refines these in guarded stages; the bootstrap fits f,k1,k2.
+      Bootstrap and alignment assess these one parameter at a time, including with
+      two images. Requires image information after marginalizing poses/points and
+      improvement on two withheld-track groups; unsupported parameters stay fixed.
       f preserves supplied fx/fy ratio. Principal point priors use
       2% of source width/height; --radial-sigma also controls p1/p2 priors.
+      Adaptive fitting uses these priors and four-sigma bounds. Priors and LM
+      damping are excluded from the data-support assessment.
   --focal-sigma N
       Relative focal prior standard deviation (default: 0.05, approximately 5%).
   --radial-sigma N

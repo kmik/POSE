@@ -70,6 +70,7 @@ final class ReuseCache {
           SelfCalibration.class,
           BundleAdjuster.class,
           SharedCalibration.class,
+          CalibrationObservability.class,
           CalibrationDiagnostics.class,
           PointConfidence.class,
           PointRecords.class,

@@ -464,13 +464,14 @@ final class GpuSgm implements AutoCloseable {
 
     private MemorySegment program;
     private final List<MemorySegment> buffers = new ArrayList<>(), kernels = new ArrayList<>();
+    private final Map<MemorySegment, Long> bufferBytes = new HashMap<>();
     private final Map<MemorySegment, String> kernelNames = new HashMap<>();
 
     private record Event(MemorySegment id, String kernel) {}
 
     private final List<Event> events = new ArrayList<>();
     private final Map<String, Long> deviceNanos = new LinkedHashMap<>();
-    private long writeNanos, readNanos, writeBytes, readBytes;
+    private long writeNanos, readNanos, writeBytes, readBytes, queuedWriteNanos, queuedWriteBytes;
     private long argumentsSet, argumentsReused;
     private final Map<MemorySegment, Object[]> argumentValues = new HashMap<>();
     private final Arena argumentArena;
@@ -588,6 +589,7 @@ final class GpuSgm implements AutoCloseable {
         throw new IllegalArgumentException("OpenCL allocation exceeds device limit: " + bytes);
       try (Arena a = Arena.ofConfined()) {
         MemorySegment result = owner.buffer(bytes, MemorySegment.NULL, a, buffers);
+        bufferBytes.put(result, bytes);
         allocatedBytes += bytes;
         RunTelemetry.deviceAllocated(bytes);
         return result;
@@ -596,6 +598,17 @@ final class GpuSgm implements AutoCloseable {
 
     synchronized void transfer(
         MemorySegment buffer, long offset, MemorySegment data, boolean read) {
+      transfer(buffer, offset, data, read, true);
+    }
+
+    /** Caller owns native source memory until the next blocking read or finish, including errors. */
+    synchronized void writeQueued(MemorySegment buffer, long offset, MemorySegment data) {
+      if (!data.isNative()) throw new IllegalArgumentException("Queued writes require live native storage");
+      transfer(buffer, offset, data, false, false);
+    }
+
+    private void transfer(
+        MemorySegment buffer, long offset, MemorySegment data, boolean read, boolean blocking) {
       long started = System.nanoTime();
       check(
           (int)
@@ -608,7 +621,7 @@ final class GpuSgm implements AutoCloseable {
                   },
                   owner.queue,
                   buffer,
-                  1,
+                  blocking ? 1 : 0,
                   offset,
                   data.byteSize(),
                   data,
@@ -620,10 +633,30 @@ final class GpuSgm implements AutoCloseable {
         readNanos += System.nanoTime() - started;
         readBytes += data.byteSize();
         collect();
-      } else {
+      } else if (blocking) {
         writeNanos += System.nanoTime() - started;
         writeBytes += data.byteSize();
+      } else {
+        queuedWriteNanos += System.nanoTime() - started;
+        queuedWriteBytes += data.byteSize();
       }
+    }
+
+    synchronized void finish() {
+      check((int) invoke("clFinish", JAVA_INT, new MemoryLayout[] {ADDRESS}, owner.queue),
+          "OpenCL queue completion");
+      collect();
+    }
+
+    /** Release a completed buffer before replacing it; do not accumulate retry volumes. */
+    synchronized void releaseBuffer(MemorySegment buffer) {
+      if (buffer == null) return;
+      if (!buffers.remove(buffer)) throw new IllegalArgumentException("Buffer is not owned by this compute");
+      long bytes = bufferBytes.remove(buffer);
+      release("clReleaseMemObject", buffer);
+      allocatedBytes -= bytes;
+      RunTelemetry.deviceFreed(bytes);
+      argumentValues.clear();
     }
 
     synchronized void run(MemorySegment kernel, long count, Object... arguments) {
@@ -707,7 +740,9 @@ final class GpuSgm implements AutoCloseable {
           "blocking_read_nanoseconds",
           readNanos,
           "uploaded_bytes",
-          writeBytes,
+          writeBytes + queuedWriteBytes,
+          "queued_write_enqueue_nanoseconds", queuedWriteNanos,
+          "queued_uploaded_bytes", queuedWriteBytes,
           "downloaded_bytes",
           readBytes);
     }
@@ -717,6 +752,7 @@ final class GpuSgm implements AutoCloseable {
       collect();
       for (MemorySegment b : buffers) release("clReleaseMemObject", b);
       buffers.clear();
+      bufferBytes.clear();
       argumentValues.clear(); // cl_mem addresses can be reused after release.
       RunTelemetry.deviceFreed(allocatedBytes);
       allocatedBytes = 0;
@@ -732,6 +768,7 @@ final class GpuSgm implements AutoCloseable {
       kernels.clear();
       for (MemorySegment b : buffers) release("clReleaseMemObject", b);
       buffers.clear();
+      bufferBytes.clear();
       RunTelemetry.deviceFreed(allocatedBytes);
       allocatedBytes = 0;
       release("clReleaseProgram", program);

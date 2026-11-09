@@ -255,6 +255,8 @@ final class RunTelemetry implements AutoCloseable {
             List.of(
                 "blocking_write_nanoseconds",
                 "blocking_read_nanoseconds",
+                "queued_write_enqueue_nanoseconds",
+                "queued_uploaded_bytes",
                 "uploaded_bytes",
                 "downloaded_bytes"))
           if (values.get(key) instanceof Number n) t.gpuTotals.merge(key, n.longValue(), Long::sum);
@@ -290,6 +292,7 @@ final class RunTelemetry implements AutoCloseable {
 
   synchronized Map<String, Object> snapshot() {
     sample();
+    var limits = MemorySafety.limits(options.ramLimitMb);
     return Json.object(
         "schema",
         "collinea-processing-telemetry-1",
@@ -297,6 +300,9 @@ final class RunTelemetry implements AutoCloseable {
         ReuseCache.engineIdentifier(),
         "selected_opencl_device",
         selectedDeviceMetadata,
+        "host_memory_limits", Json.object("effective_total_limit_bytes", limits.total(),
+            "available_bytes", limits.available(), "source", limits.source(),
+            "requested_ram_limit_mib", options.ramLimitMb, "heap_ceiling_fraction", .65),
         "hardware",
         Json.object(
             "java_version",
@@ -353,7 +359,7 @@ final class RunTelemetry implements AutoCloseable {
         "opencl_profile_scope",
         "Measured program kernel durations, blocking transfers and bytes; totals include all"
             + " batches, first 2048 detailed profiles retained. Overlapping times are not hardware"
-            + " utilization.",
+            + " utilization. Queued-write nanoseconds measure host enqueue cost, not transfer duration.",
         "resource_scope",
         "Process resident/private samples where available; OpenCL tracks this program's allocated"
             + " buffers, not driver/display VRAM. Heap is included in process RAM; do not add them."
@@ -388,7 +394,7 @@ final class RunTelemetry implements AutoCloseable {
     if (previous == null && offsetSeconds == 0) return now;
     Map<String, Object> out = new LinkedHashMap<>(now);
     out.put("elapsed_wall_seconds", offsetSeconds + ((Number) now.get("elapsed_wall_seconds")).doubleValue());
-    for (String key : new String[] {"tasks", "resource_timeline", "active_tasks"}) {
+    for (String key : new String[] {"tasks", "resource_timeline", "active_tasks", "opencl_profiles"}) {
       List<Object> list = new ArrayList<>();
       if (previous != null && previous.get(key) instanceof List<?> old && !key.equals("active_tasks")) list.addAll(old);
       if (now.get(key) instanceof List<?> current)
@@ -405,6 +411,15 @@ final class RunTelemetry implements AutoCloseable {
         }
       out.put(key, list);
     }
+    // A later CPU-only pipeline step must not erase earlier GPU measurements.
+    Map<String, Object> totals = new TreeMap<>();
+    if (previous != null) totals.putAll(ProcessingReport.object(previous.get("opencl_profile_totals")));
+    for (var e : ProcessingReport.object(now.get("opencl_profile_totals")).entrySet())
+      if (e.getValue() instanceof Number current) {
+        Object old = totals.get(e.getKey());
+        totals.put(e.getKey(), current.longValue() + (old instanceof Number n ? n.longValue() : 0));
+      }
+    out.put("opencl_profile_totals", totals);
     if (previous != null)
       for (var e : previous.entrySet())
         if (e.getKey().startsWith("peak_") && e.getValue() instanceof Number old) {
@@ -439,6 +454,10 @@ final class RunTelemetry implements AutoCloseable {
     } catch (IOException | NumberFormatException ignored) {
     }
     return new long[] {rss, 0};
+  }
+
+  static long residentBytes() {
+    return processMemory()[0];
   }
 
   private static final class WindowsMemory {

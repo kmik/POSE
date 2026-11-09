@@ -616,10 +616,14 @@ final class DenseReconstruction {
               return t;
             });
     ArrayDeque<Future<PairCompute>> queue = new ArrayDeque<>();
+    // One bounded look-ahead task keeps a worker busy when another pair finishes
+    // out of publication order. The number of active GPU sessions stays inFlight.
+    int submissionWindow = pairSubmissionWindow(options, frames, inFlight);
+    System.out.printf(Locale.ROOT, "Dense pair submission window: %d (ordered output)%n", submissionWindow);
     int next = 0;
     try {
       for (int done = 0; done < work.size(); done++) {
-        while (next < work.size() && queue.size() < inFlight) {
+        while (next < work.size() && queue.size() < submissionWindow) {
           int[] item = work.get(next++);
           FeatureTracks.Pair pair = pairs.get(item[0]);
           int source = item[1];
@@ -720,7 +724,9 @@ final class DenseReconstruction {
         System.out.printf(Locale.ROOT, "Dense pair %d-%d: %,d candidates%n", pair.a, pair.b, n);
       }
     } finally {
-      workers.shutdownNow();
+      // Executor shutdown does not cancel queued FutureTasks by itself.
+      for (Runnable abandoned : workers.shutdownNow())
+        if (abandoned instanceof Future<?> future) future.cancel(false);
       for (Future<PairCompute> pending : queue)
         try {
           PairCompute c = pending.get();
@@ -735,6 +741,20 @@ final class DenseReconstruction {
     }
     pairIndex = pairs.size();
     return count;
+  }
+
+  static int pairSubmissionWindow(Options o, List<ImageFrame> frames, int inFlight) {
+    if (o.compute.equals("cpu") || inFlight < 2) return inFlight;
+    long side = 1;
+    for (ImageFrame f : frames) side = Math.max(side, Math.max(f.width, f.height));
+    long words = (o.census * o.census - 1L + 63) / 64;
+    if (o.censusMode.equals("color-distance")) words *= 3;
+    // Conservative rotated canvas and host descriptors/results, plus shared cache.
+    long pairBytes = 2 * side * side * (96 + 32 * words);
+    long allowance = Math.min(o.memoryMb * 1048576L,
+        (long) (Runtime.getRuntime().maxMemory() * .60));
+    return (inFlight + 1L) * pairBytes + RasterCache.limit(o) + (128L << 20) <= allowance
+        ? inFlight + 1 : inFlight;
   }
 
   private static PairCompute joinPair(Future<PairCompute> task) throws IOException {

@@ -36,6 +36,7 @@ final class LauncherRegression {
         new ProcessBuilder(
                 javaBin,
                 "--enable-native-access=ALL-UNNAMED",
+                "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"),
                 "-Xmx64m",
                 "-cp",
                 System.getProperty("java.class.path"),
@@ -69,6 +70,24 @@ final class LauncherRegression {
     if (budget != 128L * 1048576 || heap < 213L * 1048576 || heap >= 256L * 1048576)
       throw new AssertionError("Relaunched child did not retain its 128 MiB budget/213 MiB heap: " + plan);
     int checks = 2;
+    Path cappedProject = root.resolve("capped RAM project"), cappedLog = root.resolve("launcher-capped.log");
+    Process capped = new ProcessBuilder(javaBin, "--enable-native-access=ALL-UNNAMED",
+        "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-Xmx1g", "-Xms512m",
+        "-cp", System.getProperty("java.class.path"), "photogrammetry", "-i", images.toString(),
+        "-o", cappedProject.toString(), "--memory-mb", "128", "--ram-limit-mb", "512",
+        "--compute", "cpu", "--estimate-memory", "--max-dimension", "64")
+        .redirectErrorStream(true).redirectOutput(cappedLog.toFile()).start();
+    if (!capped.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)) {
+      capped.destroyForcibly(); throw new AssertionError("Heap reduction timed out");
+    }
+    String cappedText = Files.readString(cappedLog);
+    if (capped.exitValue() != 0 || !cappedText.contains("heap target capped"))
+      throw new AssertionError("Oversized heap was not safely reduced: " + cappedText);
+    Path cappedRun = ProjectRegression.latest(cappedProject, "latest_successful_run");
+    Map<String, Object> cappedPlan = JsonRead.object(JsonRead.read(cappedRun.resolve("00_inputs/resolution_plan.json")));
+    if (JsonRead.number(cappedPlan.get("jvm_max_heap_bytes")) > 336L * 1048576)
+      throw new AssertionError("Capped process did not reserve native headroom: " + cappedPlan);
+    checks += 2;
     Matcher keys =
         Pattern.compile("case \"(-{1,2}[A-Za-z0-9_-]+)\"")
             .matcher(Files.readString(Path.of("src/main/java/sgm/Options.java")));

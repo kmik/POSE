@@ -40,6 +40,7 @@ final class ImageFusion {
     long pixels, ambiguous, spikes, freeSpace, speckle, unsupported, visibility, uncertainty, twoView, notOwner, consumed, emitted, refined;
     long members, depthOutliers;
     long ambiguousKept, pairReads, bytesRead;
+    long cacheHits, cachePeakBytes, cacheLimitBytes;
     long edgeSupported,edgeFreeSpace,edgeUnknown;
     long patchSuspects,patchUnsupported,patchFreeSpace,uncertainAverageSkipped,averageReverted;
     long precisionRejected, narrowRejected, localSigmaRejected;
@@ -69,6 +70,9 @@ final class ImageFusion {
           "emitted", emitted,
           "pair_reads", pairReads,
           "candidate_bytes_read", bytesRead,
+          "candidate_cache_hits", cacheHits,
+          "candidate_cache_peak_bytes", cachePeakBytes,
+          "candidate_cache_limit_bytes", cacheLimitBytes,
           "edge_aware_camera_checks",edgeEnabled?Json.object(
               "version",3,"positive_support","Precise center measurement; uncertainty compatibility is neutral",
               "supported_checks",edgeSupported,"free_space_rejected_checks",edgeFreeSpace,
@@ -93,6 +97,10 @@ final class ImageFusion {
   private final int cameras, words, fields, record;
   private final Path candidates;
   private final long[] start;
+  private final LinkedHashMap<Integer, PairData> pairCache = new LinkedHashMap<>(16, .75f, true);
+  private final long cacheLimit;
+  private long cachedBytes;
+  private ByteBuffer readBuffer;
 
   private final ForkJoinPool pool;
   private final float[][] compact;
@@ -133,6 +141,12 @@ final class ImageFusion {
 
     double[] point(int i) {
       return new double[] {world[3 * i], world[3 * i + 1], world[3 * i + 2]};
+    }
+
+    long bytes() {
+      // Include array/object headers and the LRU entry conservatively.
+      return 256L + 8L * world.length + 4L * sinef.length
+          + (rgb == null ? 0 : 4L * rgb.length + 4L * pixel.length + 4L * evidence.length);
     }
   }
 
@@ -209,6 +223,11 @@ final class ImageFusion {
           "Image-space fusion needs about " + needed / 1048576 + " MiB heap (compact maps "
               + compactBytes / 1048576 + " MiB + largest camera " + worstCamera / 1048576
               + " MiB); raise PHOTOGRAMMETRY_HEAP/-Xmx or use --fusion-mode reference");
+    long requestedCache = o.memoryMb * 1048576 / 4;
+    if (o.imageFusionCacheMb >= 0)
+      requestedCache = Math.min(requestedCache, (long) o.imageFusionCacheMb * 1048576);
+    // Leave a further margin for output, normals and other live pipeline state.
+    cacheLimit = Math.max(0, Math.min(requestedCache, budget - needed - budget / 8));
     compact = new float[cameras][];
     neighbours = new int[cameras][];
     used = new long[cameras][];
@@ -230,6 +249,8 @@ final class ImageFusion {
     try {
       return f.fuse(output, diagnostics);
     } finally {
+      f.pairCache.clear();
+      f.readBuffer = null;
       f.pool.shutdown();
     }
   }
@@ -249,10 +270,27 @@ final class ImageFusion {
 
   /** Reads pair k's candidate records (big-endian, as DenseReconstruction writes them). */
   private PairData load(FileChannel channel, int k, boolean full, Counters counters) throws IOException {
+    PairData cached = pairCache.get(k);
+    if (cached != null) {
+      counters.cacheHits++;
+      return cached;
+    }
     long first = start[k];
     int n = Math.toIntExact(start[k + 1] - first);
+    long fullBytes = 256L + n * (36L + 4L * fields);
+    boolean retain = cacheLimit > 0 && fullBytes <= cacheLimit;
+    if (retain) {
+      // Evict before allocation: the memory limit covers the new entry too.
+      var entries = pairCache.entrySet().iterator();
+      while (cachedBytes + fullBytes > cacheLimit && entries.hasNext()) {
+        cachedBytes -= entries.next().getValue().bytes();
+        entries.remove();
+      }
+      full = true;
+    }
     PairData data = new PairData(k, n, fields, full);
-    ByteBuffer buffer = ByteBuffer.allocateDirect(record * 65536);
+    if (readBuffer == null) readBuffer = ByteBuffer.allocateDirect(record * 65536);
+    ByteBuffer buffer = readBuffer;
     long position = first * record;
     int i = 0;
     while (i < n) {
@@ -293,6 +331,11 @@ final class ImageFusion {
       double sine = denominator == 0 ? 0 : Math.min(1, Math.sqrt(x * x + y * y + z * z) / denominator);
       data.sinef[j] = (float) Math.max(1e-9, focal * sine);
     });
+    if (retain) {
+      pairCache.put(k, data);
+      cachedBytes += data.bytes();
+      counters.cachePeakBytes = Math.max(counters.cachePeakBytes, cachedBytes);
+    }
     return data;
   }
 
@@ -305,6 +348,7 @@ final class ImageFusion {
   private Counters fuse(FusionOutput output, TwoViewConfidence.Diagnostics diagnostics)
       throws IOException {
     Counters counters = new Counters();
+    counters.cacheLimitBytes = cacheLimit;
     counters.edgeEnabled=DepthOutlierFilter.enabled(o);
     counters.thinEnabled = o.thinSurfaceFusion();
     double[][] samples = new double[cameras][];

@@ -104,8 +104,12 @@ final class Pipeline {
       state.mark(step, "failed", e.toString());
       throw e;
     } finally {
-      for (ImageFrame f : frames) f.close();
-      frames.clear();
+      try { for (ImageFrame f : frames) f.close(); }
+      finally {
+        frames.clear();
+        features = null; // do not retain the previous graph while the next step restores it
+        Geometry.releaseWorkspaces();
+      }
     }
     state.mark(step, outcome, outcome.equals("waiting") ? state.string("gcp_waiting") : step.description);
     if (!outcome.equals("waiting")) state.snapshot(step);
@@ -407,7 +411,7 @@ final class Pipeline {
     features = new FeatureTracks();
     if (options.rectified) skipFeatures("Already-rectified stereo bypasses SIFT and SfM");
     else if (options.poses != null) {
-      boolean refineFixedIntrinsics = paths.size() >= 4 && SharedCalibration.enabled(alignment());
+      boolean refineFixedIntrinsics = SharedCalibration.enabled(alignment());
       if (options.extrinsicsMode.equals("fixed") && !refineFixedIntrinsics)
         skipFeatures("Supplied camera poses fixed");
       if (project != null) project.stage("04_geometry", "running", "Import supplied exterior orientations");
@@ -426,7 +430,7 @@ final class Pipeline {
     if (planningOnly()) return "skipped";
     images();
     loadFrames();
-    features = state.readTracks();
+    features = state.readTracks(options);
     String coordinates;
     if (options.rectified) {
       if (project != null) project.stage("04_geometry", "running", "Known rectified stereo exterior orientation");
@@ -439,7 +443,7 @@ final class Pipeline {
       features.pairs.add(new FeatureTracks.Pair(0, 1));
       coordinates = "Rectified left-camera frame; baseline=" + options.baseline + " in supplied output units";
     } else if (options.poses != null) {
-      boolean refineFixedIntrinsics = paths.size() >= 4 && SharedCalibration.enabled(alignment());
+      boolean refineFixedIntrinsics = SharedCalibration.enabled(alignment());
       // The match step read the supplied poses; they are the cameras as loaded.
       List<Camera> suppliedCameras = frames.stream().map(f -> f.camera.copy()).toList();
       if (!options.extrinsicsMode.equals("fixed") || refineFixedIntrinsics) {
@@ -529,7 +533,7 @@ final class Pipeline {
     if (planningOnly()) return "skipped";
     images();
     loadFrames();
-    features = state.readTracks();
+    features = state.readTracks(options);
     String coordinates = state.string("coordinates");
     Path finalConstraints = options.output.resolve("01_calibration/constraints.json");
     Georeference.Result georeference = Georeference.align(frames, features.tracks, options);
@@ -580,7 +584,7 @@ final class Pipeline {
     if (planningOnly() || options.gcp == null) return "skipped";
     images();
     loadFrames();
-    features = state.readTracks();
+    features = state.readTracks(options);
     Crs crs = crs();
     Path file = GroundControl.markersFile(options.output);
     GroundControl.Markers markers =
@@ -674,7 +678,7 @@ final class Pipeline {
     if (planningOnly()) return "skipped";
     images();
     loadFrames();
-    features = state.readTracks();
+    features = state.readTracks(options);
     Crs crs = crs();
     if (project != null)
       project.stage(
