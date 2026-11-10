@@ -39,7 +39,17 @@ final class GpuMemoryPool {
   static Reservation reserve(long bytes) {
     GpuMemoryPool pool = active;
     if (pool == null || bytes <= 0) return new Reservation(null, 0);
-    return pool.acquire(Math.min(bytes, pool.capacity));
+    long wanted = Math.min(bytes, pool.capacity);
+    long held = HELD.get().get();
+    if (held > 0) {
+      // Waiting while holding pool memory can deadlock (with other workers, or with itself).
+      Reservation now = pool.tryAcquire(wanted);
+      if (now != null) return now;
+      throw new IllegalStateException(
+          "GPU memory pool: this thread holds " + (held >> 20) + " MiB and would wait for "
+              + (wanted >> 20) + " MiB more");
+    }
+    return pool.acquire(wanted);
   }
 
   /** Pool bytes held by each thread (a thread holding pool memory must never wait for more). */
@@ -94,8 +104,24 @@ final class GpuMemoryPool {
   }
 
   private synchronized void release(long bytes) {
-    free += bytes;
+    free = Math.min(capacity, free + bytes);
     notifyAll();
+  }
+
+  /**
+   * After all pair workers have stopped (and the caller holds no reservation), any bytes still
+   * reserved were leaked by a failed worker; returns them so the caller cannot wait forever.
+   * Returns the number of reclaimed bytes.
+   */
+  static long reclaimAfterWorkersStopped() {
+    GpuMemoryPool pool = active;
+    if (pool == null) return 0;
+    synchronized (pool) {
+      long leaked = pool.capacity - pool.free;
+      pool.free = pool.capacity;
+      pool.notifyAll();
+      return leaked;
+    }
   }
 
   static final class Reservation implements AutoCloseable {

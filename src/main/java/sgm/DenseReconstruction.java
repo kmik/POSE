@@ -654,9 +654,12 @@ final class DenseReconstruction {
     int submissionWindow = pairSubmissionWindow(options, frames, inFlight);
     System.out.printf(Locale.ROOT, "Dense pair submission window: %d (ordered output)%n", submissionWindow);
     int next = 0;
+    // Set after a worker ran out of memory: the remaining pairs are computed one at a time on the
+    // coordinator, with no other pair in memory.
+    boolean serialFallback = false;
     try {
       for (int done = 0; done < work.size(); done++) {
-        while (next < work.size() && queue.size() < submissionWindow) {
+        while (!serialFallback && next < work.size() && queue.size() < submissionWindow) {
           int[] item = work.get(next++);
           FeatureTracks.Pair pair = pairs.get(item[0]);
           int source = item[1];
@@ -698,18 +701,33 @@ final class DenseReconstruction {
         attemptedPairs++;
         long n;
         try {
-          PairCompute computed;
-          try {
-            computed = joinPair(queue.poll());
-          } catch (RuntimeException | IOException | Error workerFailure) {
-            // compute() has no side effects: redo this pair serially on the coordinator.
-            System.err.printf(
-                Locale.ROOT,
-                "Warning: parallel compute of pair %d-%d failed (%s); retrying it serially%n",
-                pair.a,
-                pair.b,
-                workerFailure);
-            retriedPairs++;
+          PairCompute computed = null;
+          if (!serialFallback) {
+            try {
+              computed = joinPair(queue.poll());
+            } catch (RuntimeException | IOException | Error workerFailure) {
+              // compute() has no side effects: redo this pair serially on the coordinator.
+              System.err.printf(
+                  Locale.ROOT,
+                  "Warning: parallel compute of pair %d-%d failed (%s); retrying it serially%n",
+                  pair.a,
+                  pair.b,
+                  workerFailure);
+              retriedPairs++;
+              if (outOfMemory(workerFailure)) {
+                // The other pairs in flight still hold their memory, so a retry beside them fails
+                // the same way. Stop them, drop their (side-effect free) results and continue one
+                // pair at a time; the dropped pairs are recomputed with identical results.
+                serialFallback = true;
+                stopWorkers(workers, queue);
+                System.err.println(
+                    "Warning: out of heap with " + inFlight + " stereo pairs in flight; the"
+                        + " remaining pairs are computed one at a time (same results). Close other"
+                        + " programs or lower --quality to keep pairs in parallel.");
+              }
+            }
+          }
+          if (computed == null) {
             PairPixels pixels;
             synchronized (RasterCache.class) {
               pixels = new PairPixels(rectifyLocked(frames.get(pair.a), frames.get(pair.b), false, -1, false, false), options);
@@ -793,6 +811,9 @@ final class DenseReconstruction {
     long pairBytes = 2 * side * side * (96 + 32 * words);
     long allowance = Math.min(o.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .60));
     while (wanted > former && wanted * pairBytes > allowance) wanted--;
+    // The former default is deliberately not lowered further: with one pair the serial path may
+    // switch to the much slower windowed SGM on small heaps (city2 ultra, 3.9 GB heap: >40 min vs
+    // 130 s). If concurrent pairs run out of heap, parallelPairs finishes them one at a time.
     return wanted;
   }
 
@@ -808,6 +829,43 @@ final class DenseReconstruction {
         (long) (Runtime.getRuntime().maxMemory() * .60));
     return (inFlight + 1L) * pairBytes + RasterCache.limit(o) + (128L << 20) <= allowance
         ? inFlight + 1 : inFlight;
+  }
+
+  private static boolean outOfMemory(Throwable failure) {
+    for (Throwable t = failure; t != null; t = t.getCause()) if (t instanceof OutOfMemoryError) return true;
+    return false;
+  }
+
+  /**
+   * Stops all other pair workers and drops their results (compute() has no side effects; the
+   * pairs are recomputed later), so the coordinator continues with only one pair in memory.
+   */
+  private static void stopWorkers(ExecutorService workers, ArrayDeque<Future<PairCompute>> queue) {
+    // Tasks not started yet are cancelled; running ones are interrupted and finish (or fail) on
+    // their own, so a finished result can still be released below.
+    for (Runnable notStarted : workers.shutdownNow())
+      if (notStarted instanceof Future<?> future) future.cancel(false);
+    try {
+      if (!workers.awaitTermination(10, TimeUnit.MINUTES))
+        throw new IllegalStateException("Stereo pair workers did not stop after an out-of-memory failure");
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Interrupted while stopping stereo pair workers", e);
+    }
+    long leaked = GpuMemoryPool.reclaimAfterWorkersStopped();
+    if (leaked > 0)
+      System.err.printf(
+          Locale.ROOT, "Warning: reclaimed %d MiB of GPU pool memory left by failed pair workers%n",
+          leaked >> 20);
+    // Finished but unpublished results hold rectified rasters; release them.
+    for (Future<PairCompute> pending : queue)
+      if (!pending.isCancelled())
+        try {
+          PairCompute c = pending.get();
+          if (c != null) c.pixels().close();
+        } catch (Exception | Error ignored) {
+        }
+    queue.clear();
   }
 
   private static PairCompute joinPair(Future<PairCompute> task) throws IOException {

@@ -83,6 +83,17 @@ final class GpuDepthOutlierRegression {
         try (GpuMemoryPool.Reservation small = GpuMemoryPool.reserveAuxiliary(200)) {
           check(small != null && small.bytes == 200, "free auxiliary bytes must be granted");
         }
+        // A session reservation never waits while the thread holds pool memory (it would wait for
+        // itself): granted if free now, otherwise an error the caller turns into a CPU solve.
+        try (GpuMemoryPool.Reservation more = GpuMemoryPool.reserve(150)) {
+          check(more.bytes == 150, "free bytes are granted to a holding thread");
+        }
+        boolean refused = false;
+        try (GpuMemoryPool.Reservation more = GpuMemoryPool.reserve(300)) {
+        } catch (IllegalStateException expected) {
+          refused = true;
+        }
+        check(refused, "a holding thread must not wait for pool memory");
       }
       check(GpuMemoryPool.reserveAuxiliary(2000) == null, "auxiliary reservation above the pool");
       try (GpuMemoryPool.Reservation all = GpuMemoryPool.reserveAuxiliary(1000)) {

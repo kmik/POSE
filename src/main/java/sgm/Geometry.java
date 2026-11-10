@@ -135,13 +135,14 @@ final class Geometry {
       project.data.snapshot(
           "seed", frames, features.tracks, "seed-camera frame; baseline=" + o.baseline);
     }
+    // Per-image track lists and triangulated-track counts (see TrackIndex): same choices as the
+    // former whole-track scans per step, without images x tracks work per registration.
+    TrackIndex index = new TrackIndex(frames, features.tracks, o);
     while (true) {
       int best = -1, most = 0;
       for (ImageFrame f : frames)
         if (!f.camera.registered) {
-          int n = 0;
-          for (FeatureTracks.Track track : features.tracks)
-            if (track.point != null && observation(track, f.id) != null) n++;
+          int n = index.triangulated[f.id];
           if (n > most) {
             most = n;
             best = f.id;
@@ -149,19 +150,22 @@ final class Geometry {
         }
       if (best < 0 || most < Math.max(8, o.minMatches / 2)) break;
       ImageFrame next = frames.get(best);
-      if (!register(next, features.tracks, o, project)) {
+      int added = best;
+      if (!register(next, index, o, project)) {
         // Try all currently registerable views before declaring the graph disconnected.
         boolean registered = false;
         for (ImageFrame candidate : frames)
           if (!candidate.camera.registered
               && candidate.id != best
-              && register(candidate, features.tracks, o, project)) {
+              && register(candidate, index, o, project)) {
             registered = true;
+            added = candidate.id;
             break;
           }
         if (!registered) break;
       }
-      triangulateTracks(frames, features.tracks, o.reprojection);
+      // Only the new camera changed since the previous triangulation (no pose moved).
+      triangulateNew(frames, index, added, o.reprojection);
       if (project != null)
         project.data.snapshot(
             "registration_" + frames.stream().filter(f -> f.camera.registered).count(),
@@ -169,6 +173,7 @@ final class Geometry {
             features.tracks,
             "seed-camera frame");
     }
+    index = null; // released before the bundle adjustment
     long registered = frames.stream().filter(f -> f.camera.registered).count();
     if (registered != frames.size()) {
       List<String> missing = new ArrayList<>();
@@ -203,16 +208,24 @@ final class Geometry {
         frames, features.tracks, o.iterations, o.reprojection, project, seed.a, seed.b);
     SparseCleanup.run(frames, features.tracks, o, project, seed.a, seed.b);
     boolean recovered = false;
+    // Rebuilt after the bundle and cleanup (they edit observations and move poses): the first
+    // triangulation after them covers all tracks, later ones only the newly registered camera.
+    TrackIndex retry = null;
     for (int pass = 0; pass < frames.size(); pass++) {
       boolean changed = false;
-      for (ImageFrame frame : frames)
-        if (!frame.camera.registered && register(frame, features.tracks, o, project)) {
+      for (ImageFrame frame : frames) {
+        if (frame.camera.registered) continue;
+        if (retry == null) retry = new TrackIndex(frames, features.tracks, o);
+        if (register(frame, retry, o, project)) {
+          if (!recovered) triangulateAll(frames, retry, o.reprojection);
+          else triangulateNew(frames, retry, frame.id, o.reprojection);
           changed = true;
           recovered = true;
-          triangulateTracks(frames, features.tracks, o.reprojection);
         }
+      }
       if (!changed) break;
     }
+    retry = null;
     if (recovered) {
       BundleAdjuster.optimize(
           frames, features.tracks, o.iterations, o.reprojection, null, seed.a, seed.b);
@@ -286,6 +299,8 @@ final class Geometry {
     FeatureTracks.Pair best = fallback;
     double bestScore = -Double.MAX_VALUE;
     List<Object> audit = new ArrayList<>();
+    // Observations do not change between trials (only points and poses are reset).
+    TrackIndex trial = new TrackIndex(frames, features.tracks, o);
     try {
       for (var pair : candidates.subList(0, Math.min(8, candidates.size()))) {
         for (ImageFrame f : frames) {
@@ -296,18 +311,20 @@ final class Geometry {
           f.camera.fixed = false;
         }
         for (var t : features.tracks) t.point = null;
+        trial.recount();
         Camera a = frames.get(pair.a).camera, b = frames.get(pair.b).camera;
         a.registered = true;
         b.registered = true;
         b.rotation = pair.rotation.clone();
         b.translation = Math3.times(pair.translation, o.baseline / Math3.norm(pair.translation));
-        triangulateTracks(frames, features.tracks, o.reprojection);
+        triangulateAll(frames, trial, o.reprojection);
         for (int pass = 0; pass < frames.size(); pass++) {
           boolean changed = false;
           for (ImageFrame f : frames)
-            if (!f.camera.registered && register(f, features.tracks, o, null, true)) {
+            if (!f.camera.registered && register(f, features.tracks, trial, o, null, true)) {
               changed = true;
-              triangulateTracks(frames, features.tracks, o.reprojection);
+              // Only this camera changed since the previous triangulation (see triangulateNew).
+              triangulateNew(frames, trial, f.id, o.reprojection);
             }
           if (!changed) break;
         }
@@ -364,24 +381,42 @@ final class Geometry {
   private static boolean register(
       ImageFrame frame, List<FeatureTracks.Track> tracks, Options o, Project project)
       throws IOException {
-    return register(frame, tracks, o, project, false);
+    return register(frame, tracks, null, o, project, false);
   }
 
   private static boolean register(
-      ImageFrame frame, List<FeatureTracks.Track> tracks, Options o, Project project, boolean quiet)
+      ImageFrame frame, TrackIndex index, Options o, Project project) throws IOException {
+    return register(frame, index.tracks, index, o, project, false);
+  }
+
+  private static boolean register(
+      ImageFrame frame, List<FeatureTracks.Track> tracks, TrackIndex index, Options o,
+      Project project, boolean quiet)
       throws IOException {
     List<Point3> xyz = new ArrayList<>();
     List<Point> uv = new ArrayList<>();
     List<FeatureTracks.Track> usedTracks = new ArrayList<>();
-    for (FeatureTracks.Track track : tracks) {
-      FeatureTracks.Observation observation = observation(track, frame.id);
-      if (track.point != null && observation != null) {
+    if (index != null) {
+      // The image's own tracks, in the same (ascending) order as the full scan below.
+      for (int t : index.byImage[frame.id]) {
+        FeatureTracks.Track track = index.tracks.get(t);
+        if (track.point == null) continue;
+        FeatureTracks.Observation observation = observation(track, frame.id);
         double[] p = track.point;
         xyz.add(new Point3(p[0], p[1], p[2]));
         uv.add(frame.keypoints[observation.feature].pt);
         usedTracks.add(track);
       }
-    }
+    } else
+      for (FeatureTracks.Track track : tracks) {
+        FeatureTracks.Observation observation = observation(track, frame.id);
+        if (track.point != null && observation != null) {
+          double[] p = track.point;
+          xyz.add(new Point3(p[0], p[1], p[2]));
+          uv.add(frame.keypoints[observation.feature].pt);
+          usedTracks.add(track);
+        }
+      }
     if (xyz.size() < 8) {
       if (project != null) project.data.pnp(frame, usedTracks, uv, new int[0], null, null, false);
       return false;
@@ -416,9 +451,9 @@ final class Geometry {
       List<Point> good2 = new ArrayList<>();
       int[] indices = new int[(int) inliers.total()];
       inliers.get(0, 0, indices);
-      for (int index : indices) {
-        good3.add(xyz.get(index));
-        good2.add(uv.get(index));
+      for (int inlier : indices) {
+        good3.add(xyz.get(inlier));
+        good2.add(uv.get(inlier));
       }
       points.fromList(good3);
       pixels.fromList(good2);
@@ -471,6 +506,88 @@ final class Geometry {
     }
   }
 
+  /**
+   * Tracks observed by each image (ascending track order, each track once per image) and, for the
+   * incremental registration loops, how many of them are triangulated. Built from the current
+   * observations; it must be rebuilt after anything that edits observations (bundle cleanup).
+   *
+   * <p>It replaces whole-track-list scans per registration step (choosing the next camera scanned
+   * every unregistered image against every track: images^2 x tracks for a block) with the same
+   * decisions from per-image lists: identical counts, track order and tie-breaking.
+   */
+  static final class TrackIndex {
+    final List<FeatureTracks.Track> tracks;
+    final int[][] byImage;
+    final int[] triangulated;
+
+    TrackIndex(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, Options o) {
+      this.tracks = tracks;
+      int images = frames.size();
+      int[] sizes = new int[images];
+      long entries = 0;
+      for (FeatureTracks.Track track : tracks)
+        for (int i = 0; i < track.observations.size(); i++)
+          if (first(track, i)) {
+            sizes[track.observations.get(i).image]++;
+            entries++;
+          }
+      MemorySafety.requireHeap(
+          Math.addExact(Math.multiplyExact(entries, 4L), 40L * images), o, "Registration track index");
+      byImage = new int[images][];
+      for (int i = 0; i < images; i++) byImage[i] = new int[sizes[i]];
+      int[] fill = new int[images];
+      for (int t = 0; t < tracks.size(); t++) {
+        FeatureTracks.Track track = tracks.get(t);
+        for (int i = 0; i < track.observations.size(); i++)
+          if (first(track, i)) {
+            int image = track.observations.get(i).image;
+            byImage[image][fill[image]++] = t;
+          }
+      }
+      triangulated = new int[images];
+      for (FeatureTracks.Track track : tracks) if (track.point != null) added(track);
+    }
+
+    /** Whether observation i is the track's first observation of its image. */
+    private static boolean first(FeatureTracks.Track track, int i) {
+      int image = track.observations.get(i).image;
+      for (int j = 0; j < i; j++) if (track.observations.get(j).image == image) return false;
+      return true;
+    }
+
+    /** A track just received its point: one more triangulated track for each image observing it. */
+    void added(FeatureTracks.Track track) {
+      for (int i = 0; i < track.observations.size(); i++)
+        if (first(track, i)) triangulated[track.observations.get(i).image]++;
+    }
+
+    /** Points were cleared or restored outside the index: recount. */
+    void recount() {
+      java.util.Arrays.fill(triangulated, 0);
+      for (FeatureTracks.Track track : tracks) if (track.point != null) added(track);
+    }
+  }
+
+  /**
+   * triangulateTracks restricted to the tracks observed by a camera that was just registered,
+   * when no other pose or registration changed since the previous triangulation: a track not seen
+   * by that camera has the same registered observations and poses as before, so it fails again
+   * exactly as it did. Same per-track computation, same (ascending) order.
+   */
+  static void triangulateNew(
+      List<ImageFrame> frames, TrackIndex index, int image, double maxError) {
+    for (int t : index.byImage[image]) {
+      FeatureTracks.Track track = index.tracks.get(t);
+      if (track.point == null && triangulateTrack(frames, track, maxError)) index.added(track);
+    }
+  }
+
+  /** triangulateTracks over all tracks, keeping the index counts. */
+  static void triangulateAll(List<ImageFrame> frames, TrackIndex index, double maxError) {
+    for (FeatureTracks.Track track : index.tracks)
+      if (track.point == null && triangulateTrack(frames, track, maxError)) index.added(track);
+  }
+
   static FeatureTracks.Observation observation(FeatureTracks.Track track, int image) {
     for (FeatureTracks.Observation o : track.observations) if (o.image == image) return o;
     return null;
@@ -478,8 +595,14 @@ final class Geometry {
 
   static void triangulateTracks(
       List<ImageFrame> frames, List<FeatureTracks.Track> tracks, double maxError) {
-    for (FeatureTracks.Track track : tracks) {
-      if (track.point != null) continue;
+    for (FeatureTracks.Track track : tracks)
+      if (track.point == null) triangulateTrack(frames, track, maxError);
+  }
+
+  /** One track of triangulateTracks (point == null); true when it received a point. */
+  static boolean triangulateTrack(
+      List<ImageFrame> frames, FeatureTracks.Track track, double maxError) {
+    {
       FeatureTracks.Observation first = null, second = null;
       double baseline = 0;
       for (FeatureTracks.Observation a : track.observations)
@@ -497,14 +620,18 @@ final class Geometry {
                 second = b;
               }
             }
-      if (first == null) continue;
+      if (first == null) return false;
       ImageFrame fa = frames.get(first.image), fb = frames.get(second.image);
       Point ua = FeatureTracks.normalize(fa.camera, fa.keypoints[first.feature].pt),
           ub = FeatureTracks.normalize(fb.camera, fb.keypoints[second.feature].pt);
       double[] point = triangulate(fa.camera, fb.camera, ua, ub);
       if (point != null
           && baseline / Math.max(1e-9, Math3.norm(Math3.sub(point, fa.camera.center()))) > .002
-          && valid(frames, track, point, maxError)) track.point = point;
+          && valid(frames, track, point, maxError)) {
+        track.point = point;
+        return true;
+      }
+      return false;
     }
   }
 

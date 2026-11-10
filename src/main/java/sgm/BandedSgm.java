@@ -100,6 +100,13 @@ final class BandedSgm {
      */
     private int[] stripped(
         Options o, boolean reverse, DisparityBands bands, String[] backend, long cells, long limit) {
+      // Each strip opens its own session with its own pool reservation. Close this pair's whole-
+      // image session first (e.g. from the left solve): a thread must never wait for pool memory
+      // while holding some, or it waits for itself. Sessions do not affect results.
+      if (gpu != null) {
+        gpu.close();
+        gpu = null;
+      }
       long[] rows = bands.rowCells();
       int[] out = new int[w * h * 6];
       List<int[]> strips = new ArrayList<>();

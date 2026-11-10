@@ -56,6 +56,7 @@ public final class SelfTest {
     checks += GpuDepthOutlierRegression.run();
     checks += GpuRangeGuardRegression.run();
     checks += GpuTsgmRegression.run();
+    checks += HelpSearchRegression.run();
     checks += DepthEdgeRegression.run();
     checks += DepthOutlierRegression.run(root.resolve("depth-outlier"));
     checks += MultiViewDisparityRegression.run(root.resolve("multiview-disparity"));

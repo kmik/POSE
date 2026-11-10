@@ -70,7 +70,7 @@ public final class Options {
   // T1: off | report (default) | exclude flagged cameras from dense matching.
   public String cameraScreening = "report";
   // S1: stereo pairs computed concurrently; 1 = serial (default), 0 = auto.
-  public int stereoPairsInFlight = 0; // 0 = auto (up to 4, one per 4 cores); output equals serial
+  public int stereoPairsInFlight = 0; // 0 = auto (one per 3 cores, at most 6, memory-checked); output equals serial
   public double gpsSigma = 2;
   public double focal = Double.NaN, sensorWidth = Double.NaN, baseline = 1, scale = 1;
   public double p1 = 4, p2 = 24, ratio = .75, reprojection = 2, uniqueness = .03, voxel = 0;
@@ -128,6 +128,8 @@ public final class Options {
   double[] tsgmSeeds;
   /** Internal: lets small full-range SGM solves (the range guard) use the GPU under --compute auto. */
   boolean gpuSmallSolves;
+  /** --help TEXT: print only the help entries that mention TEXT (not a processing option). */
+  String helpTopic;
   public double censusWeight = .5;
   public int adTruncation = 30, gradientTruncation = 60, gpuStripRows = 64;
   public int gpuBankMb = 1024;
@@ -262,6 +264,9 @@ public final class Options {
         case "--help":
         case "-help":
           o.help = true;
+          // --help TEXT: only the option entries mentioning TEXT.
+          if (inline != null) o.helpTopic = inline;
+          else if (i + 1 < args.length && !args[i + 1].startsWith("-")) o.helpTopic = args[++i];
           continue;
         case "--verbose":
           o.verbose = true;
@@ -1781,6 +1786,33 @@ public final class Options {
     return out;
   }
 
+  /**
+   * The full help, or with a topic only the option entries (an option line and its indented
+   * description) whose text contains the topic, ignoring case.
+   */
+  static String help(String topic) {
+    String full = help();
+    if (topic == null || topic.isBlank()) return full;
+    String needle = topic.toLowerCase(Locale.ROOT);
+    StringBuilder out = new StringBuilder(), entry = new StringBuilder();
+    int found = 0;
+    for (String line : (full + "\n").split("\n", -1)) {
+      boolean start = line.startsWith("  -") || line.startsWith("  photogrammetry ");
+      boolean continuation = line.startsWith("      ") || line.startsWith("                ");
+      if ((start || !continuation) && entry.length() > 0) {
+        if (entry.toString().toLowerCase(Locale.ROOT).contains(needle)) {
+          out.append(entry);
+          found++;
+        }
+        entry.setLength(0);
+      }
+      if (start || (continuation && entry.length() > 0)) entry.append(line).append('\n');
+    }
+    return found == 0
+        ? "No option mentions \"" + topic + "\". Run with --help for the full list.\n"
+        : "Options mentioning \"" + topic + "\" (" + found + "; --help alone lists all):\n" + out;
+  }
+
   public static String help() {
     return String.join(
         "",
@@ -1789,6 +1821,7 @@ POSE - Photogrammetric Orientation and Surface Estimation (Java/OpenCL)
 Usage: photogrammetry -i IMAGE_DIR [-o PROJECT_DIR] [options]
        (pose.bat / pose.sh start the same program as photogrammetry.bat / .sh)
 Run with no arguments, -h, --help or -help to display this help and exit.
+--help TEXT shows only the options whose description mentions TEXT (e.g. --help census).
 Values accept --option VALUE or --option=VALUE. Quote paths containing spaces.
 Defaults below apply unless overridden; pixel units refer to processed images.
 
@@ -1893,7 +1926,7 @@ Resolution and memory planning:
       Native images, GPU buffers and other state add memory; this is not a total
       process RAM limit. Effective heap and processing allowance are logged.
   --ram-limit-mb N
-      Optional total host-RAM planning ceiling in MiB (0 = detect). Includes heap
+      Optional total host-RAM planning ceiling in MiB (default: 0 = detect). Includes heap
       and native-memory headroom. The CLI limits heap to at most 65% of this and
       detected host/job RAM, and guards alignment allocations. This is not an OS
       hard RSS cap; use the scheduler/cgroup limit for enforcement. Embedded callers
@@ -1942,7 +1975,8 @@ Dense stereo / SGM:
       Omit to estimate both bounds per pair from verified keypoints/sparse geometry,
       validate with a coarse whole-range probe, and expand either end when needed.
   --min-disparity N
-      Pin the lower search bound (signed values allowed). Without this option or
+      Pin the lower search bound (default: automatic per pair; signed values
+      allowed). Without this option or
       --disparities, estimate a nonnegative minimum automatically for each pair.
       Explicit --min-disparity 0 keeps a zero-based search with automatic upper
       estimation. Search ends at minimum + count - 1; positive depth is required.
@@ -2151,7 +2185,7 @@ Point filtering and multi-view fusion:
       Maximum coarse-map side (default 1024; 128..2048), full-resolution search margin
       (default 16; 4..256). Low coverage or boundary pressure restores the pair interval.
   --two-view-confidence-threshold T
-      Experimental opt-in SGM gate for points supported by exactly two cameras.
+      Experimental opt-in SGM gate for points supported by exactly two cameras (default: off).
       Require min(left matching confidence, corresponding right confidence) >= T;
       the existing 0.35 matching floor remains in force on both sides. Finite 0..1;
       try 0.5. Omit to retain the existing left-only gate and memory use.
@@ -2171,7 +2205,7 @@ Point filtering and multi-view fusion:
   --patchmatch-levels N
       Coarse-to-fine levels (default 3; 1..5).
   --patchmatch-min-depth N / --patchmatch-max-depth N
-      Positive camera-Z bounds in reconstruction units, specified together.
+      Positive camera-Z bounds in reconstruction units, specified together (default: inferred).
       Otherwise infer padded bounds from aligned tie points; fail if unavailable.
   --min-views N
       Minimum distinct supporting cameras (default: 3; minimum: 2), capped
@@ -2502,9 +2536,12 @@ Additional workflow controls:
       Maximum separated proposals retained per path (default: 2; 1..4).
       Planner may reduce this to fit memory. More proposals can reduce exact
       verification work but use more VRAM/compute. No confidence rule is relaxed.
-  --image-reader auto|windowed|opencv
   --windowed-mode off|auto|on
-                          Bounded disk-backed stereo rasters and continuous SGM paths (default off).
+      Bounded disk-backed stereo rasters and continuous SGM paths (default: off).
+      auto switches a pair to windowed stereo when its rasters do not fit the memory
+      allowance or the GPU disparity limit; on always uses it. Windowed pairs run
+      serially and are slower; results follow the same matching rules.
+  --image-reader auto|windowed|opencv
       Source decoding (default: auto). Sources above 64 MiB of RGB pixels and
       BigTIFF use source windows; other small sources retain the OpenCV reader.
       windowed always uses global area resampling over source windows. TIFF windows
@@ -2602,17 +2639,21 @@ Additional workflow controls:
       strongest unchanged point per layer. Requires --surface-consolidation none;
       does not remove pair evidence or invent additional supporting cameras.
   --fusion-evidence auto|pair|camera
-      Exact evidence layout, independent of output sampling. Auto packs per-camera
+      Exact evidence layout, independent of output sampling (default: auto). Auto packs per-camera
       sparse pair layers for blocks of 9+ cameras when this saves at least 20% and
       fits safe host/commit allowance. Pair uses the reference paged maps. Camera
       explicitly requires packing (maximum 32 incident pairs per camera).
   --fusion-gpu-evidence auto|resident|windowed
-                          Auto uses bounded regional GPU evidence when full evidence cannot fit.
+      GPU depth-evidence layout for fusion (default: auto). resident keeps all pair
+      evidence on the GPU; windowed uses bounded regional evidence windows (see
+      --fusion-window-mb); auto uses regional windows only when full evidence cannot fit.
   --stereo-pairs-in-flight N|auto
-      Compute N stereo pairs concurrently (default auto = up to 4, one per 4 cores;
-      1 = serial). Each pair gets its share of --cores and GPU memory and its own OpenCL
-      session; results are published strictly in pair order, so the output equals the
-      serial path. Windowed stereo, --diagnostics and PatchMatch stay serial.
+      Compute N stereo pairs concurrently (default: auto = one per 3 cores, at most 6,
+      when the per-pair memory estimate fits the heap allowance; never fewer than one per
+      4 cores, at most 4; 1 = serial). The pairs share --cores and the GPU memory budget;
+      results are published strictly in pair order, so the output equals the serial
+      path. If concurrent pairs run out of heap, the remaining pairs are computed one at
+      a time (same results). Windowed stereo, --diagnostics and PatchMatch stay serial.
   --stereo-pipeline on|off
       Bounded one-pair-ahead rectification/descriptor preparation (default off).
       Keeps OpenCL and evidence publication on the coordinator. Falls back to
@@ -2625,13 +2666,18 @@ Additional workflow controls:
       a shared visible reference camera and <=0.75 pixel anchored layer agreement;
       does not invent camera support. Requires --fusion-mode incremental.
   --fusion-mode reference|incremental|image
-                          Experimental provisional camera/pixel hypotheses; reference is default.
-                          image fuses per camera in image space: per-pixel consensus over the
-                          camera's pairs, 2D speckle filter, reciprocal cross-checks against the
-                          other cameras' merged maps, one owner camera per surface (see P2).
+      Depth-map fusion method (default: reference). reference corroborates each
+      pair's candidates against the other cameras' depth evidence. incremental is
+      experimental (provisional camera/pixel hypotheses). image fuses per camera in
+      image space: per-pixel consensus over the camera's pairs, 2D speckle filter,
+      reciprocal cross-checks against the other cameras' merged maps, one owner camera
+      per surface (see --fusion-strategy).
   --fusion-outliers reference|robust
-                          Robust requires independent contradictory cameras for 3+ view points.
-  --fusion-window-mb N     Regional evidence cap; 0 chooses at most half the GPU budget.
+      Outlier rule in fusion (default: reference). robust removes a 3+ view point only
+      when independent cameras contradict it (free space or a nearer surface).
+  --fusion-window-mb N
+      Cap in MiB for regional GPU fusion evidence (default: 0 = at most half the GPU
+      budget). Used by --fusion-gpu-evidence windowed/auto.
   --export-confidence RUN_DIRECTORY
       Export point-confidence.bin to point-confidence.csv.gz without reconstructing.
   --compatibility-copies
@@ -2718,11 +2764,12 @@ Additional workflow controls:
       Applies to every candidate edge, including sequential fallback edges, and
       again to dense pairs after registration. It can disconnect the image graph.
   --overlap-ground-z N
-      Explicit scene plane at world Z=N, in pose units. Otherwise use a sparse
+      Explicit scene plane at world Z=N, in pose units (default: automatic). Otherwise use a sparse
       scene plane only when registered geometry is sufficiently constrained.
       Footprints are planar approximations; strong relief/oblique views can be unknown.
   --flight-heading N
-      Flight heading in degrees clockwise from world +Y toward +X. Otherwise infer
+      Flight heading in degrees clockwise from world +Y toward +X (default:
+      inferred). Otherwise infer
       a coherent capture direction from registered camera centers. No direction
       means directional overlap is unknown; shared area may still be available.
   --overlap-unknown keep|reject
@@ -2832,7 +2879,7 @@ Orientation import/export (supported variants and conventions in ORIENTATIONS.md
   --orientation-component N
       Zero-based OpenSfM component or Metashape chunk index (default: 0).
   --orientation-rotation auto|world-to-camera|camera-to-world
-      Matrix direction override; auto uses world-to-camera for INPHO EXT_ORI,
+      Matrix direction override (default: auto); auto uses world-to-camera for INPHO EXT_ORI,
       camera-to-world for MicMac. Other formats use their specified conventions.
   --orientation-axes auto|opencv|photogrammetric
       INPHO camera-axis override (default auto: x right, y up, z backward).

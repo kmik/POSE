@@ -127,7 +127,7 @@ public final class Main {
       String[] effective = fresh && !c.branch() ? c.rest() : continued(c);
       Options options = Options.parse(effective);
       if (options.help) {
-        System.out.print(Options.help());
+        System.out.print(Options.help(options.helpTopic));
         return 0;
       }
       if (options.listGpus) {

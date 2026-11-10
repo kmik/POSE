@@ -162,8 +162,14 @@ final class GpuBandedStereo {
         costs = cl.kernel("bcosts");
         paths = cl.kernel("bpaths");
         winners = cl.kernel("bwinners");
-      } catch (RuntimeException e) {
-        close();
+      } catch (RuntimeException | Error e) {
+        // Also on OutOfMemoryError (heap or native buffers): otherwise the pool reservation leaks
+        // and every later session waits for it forever.
+        try {
+          close();
+        } catch (RuntimeException | Error suppressed) {
+          e.addSuppressed(suppressed);
+        }
         throw e;
       }
     }
