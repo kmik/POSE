@@ -30,6 +30,13 @@ final class Camera {
     return Math3.add(Math3.mv(rotation, p), translation);
   }
 
+  /** Same arithmetic/order as view(), with caller-owned scratch for streaming projections. */
+  void viewInto(double x, double y, double z, double[] out) {
+    out[0] = (rotation[0] * x + rotation[1] * y + rotation[2] * z) + translation[0];
+    out[1] = (rotation[3] * x + rotation[4] * y + rotation[5] * z) + translation[1];
+    out[2] = (rotation[6] * x + rotation[7] * y + rotation[8] * z) + translation[2];
+  }
+
   double[] project(double[] p) {
     double[] q = view(p);
     return projectView(q);

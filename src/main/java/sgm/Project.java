@@ -670,6 +670,8 @@ final class Project {
           }
         }
       }
+    // A run written with --ply off has no PLY: do not keep pointing at an earlier run's.
+    if (!Files.isRegularFile(run.resolve("07_results/dense.ply"))) aliases.remove("dense.ply");
     try (BufferedWriter writer = Files.newBufferedWriter(map)) {
       writer.write("filename,run_id,canonical_relative_path,sha256\n");
       for (List<String> row : aliases.values()) {

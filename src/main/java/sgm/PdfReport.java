@@ -419,7 +419,7 @@ final class PdfReport implements AutoCloseable {
   /** Per-step settings that matter (CLI names), stage times and software. */
   private static final String[][][] STEP_OPTIONS = {
     {{"inputs"}, {"quality", "--quality"}, {"maxDimension", "--max-dimension"}, {"calibration", "--calibration"}, {"focal", "--focal"}},
-    {{"calibrate"}, {"calibrationPipeline", "--calibration-pipeline"}, {"selfCalibration", "self calibration"}, {"intrinsicsMode", "--intrinsics-mode"}, {"refineIntrinsics", "--refine-intrinsics"}},
+    {{"calibrate"}, {"calibrationPipeline", "--calibration-pipeline"}, {"quickCalibration", "--quick-calibration"}, {"selfCalibration", "self calibration"}, {"intrinsicsMode", "--intrinsics-mode"}, {"refineIntrinsics", "--refine-intrinsics"}},
     {{"match"}, {"matchingAlgorithm", "--matching-algorithm"}, {"features", "--features"}, {"ratio", "--ratio"}, {"minMatches", "--min-matches"}, {"pairCandidates", "--pair-candidates"}},
     {{"align"}, {"iterations", "--bundle-iterations"}, {"reprojection", "--reprojection"}, {"trackMinViews", "--track-min-views"}, {"trackMaxError", "--track-max-error"}, {"cameraScreening", "--camera-screening"}},
     {{"georeference"}, {"crs", "--crs"}, {"gpsBundle", "--gps-bundle"}, {"gpsSigma", "--gps-sigma"}, {"gpsHeightSigma", "--gps-height-sigma"}, {"gpsIntrinsics", "--gps-intrinsics"}, {"gpsFocalPrior", "--gps-focal-prior"}, {"gpsTimeOffset", "--gps-time-offset"}, {"gpsLeverArm", "--gps-lever-arm"}, {"rollingShutter", "--rolling-shutter"}},

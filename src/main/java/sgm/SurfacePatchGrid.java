@@ -100,7 +100,13 @@ final class SurfacePatchGrid {
           if(Math.abs(det)<stride*stride)continue;
           double az=((q[j]-q[i])*vy-uy*(q[k]-q[i]))/det;
           double bz=(ux*(q[k]-q[i])-(q[j]-q[i])*vx)/det,cz=q[i]-az*x[i]-bz*y[i];
-          int count=0;for(int t=0;t<n;t++)if(!used[t]&&Math.abs(q[t]-az*x[t]-bz*y[t]-cz)<=tolerance)count++;
+          // Only a count above best matters: stop once it cannot get there (exact).
+          int count=0;
+          for(int t=0;t<n;) {
+            int end=Math.min(n,t+8);
+            for(;t<end;t++)count+=!used[t]&&Math.abs(q[t]-az*x[t]-bz*y[t]-cz)<=tolerance?1:0;
+            if(count+(n-t)<=best)break;
+          }
           if(count>best){best=count;a=az;b=bz;c=cz;}
         }
         if(best<Math.max(12,(int)Math.ceil(n*.25)))break;
@@ -153,12 +159,35 @@ final class SurfacePatchGrid {
 
   private static double cross(double[] a,double[] b,double[] c){return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);}
   private static double[] hull(List<double[]> points) {
-    points.sort(Comparator.<double[]>comparingDouble(p->p[0]).thenComparingDouble(p->p[1]));
+    sortByXY(points);
     double[][] h=new double[points.size()*2][];int n=0;
     for(double[] p:points){while(n>=2&&cross(h[n-2],h[n-1],p)<=0)n--;h[n++]=p;}
     int lower=n;
     for(int i=points.size()-2;i>=0;i--){double[] p=points.get(i);while(n>lower&&cross(h[n-2],h[n-1],p)<=0)n--;h[n++]=p;}
     if(n>1)n--;double[] out=new double[2*n];for(int i=0;i<n;i++){out[2*i]=h[i][0];out[2*i+1]=h[i][1];}return out;
+  }
+  /** Same order as sorting by x, then y: inliers are distinct non-negative integer pixel
+   * positions (grid samples), so packed (x, y) keys order them identically. Other inputs use the
+   * comparator. */
+  private static void sortByXY(List<double[]> points) {
+    int n=points.size();long[] keys=new long[n];
+    for(int i=0;i<n;i++) {
+      double[] p=points.get(i);
+      // Sign bit clear (excludes -0.0, which the comparator orders before 0.0), integral, < 2^23.
+      if(!(Double.doubleToRawLongBits(p[0])>=0&&Double.doubleToRawLongBits(p[1])>=0
+          &&p[0]<(1<<23)&&p[1]<(1<<23)&&p[0]==Math.rint(p[0])&&p[1]==Math.rint(p[1]))) {
+        points.sort(Comparator.<double[]>comparingDouble(q->q[0]).thenComparingDouble(q->q[1]));
+        return;
+      }
+      // x (23 bits), y (23 bits), original index (16 bits): ties keep insertion order, as the
+      // stable comparator sort does.
+      keys[i]=((long)p[0]<<23|(long)p[1])<<16|i;
+    }
+    if(n>=(1<<16)){points.sort(Comparator.<double[]>comparingDouble(q->q[0]).thenComparingDouble(q->q[1]));return;}
+    Arrays.sort(keys);
+    double[][] sorted=new double[n][];
+    for(int i=0;i<n;i++)sorted[i]=points.get((int)(keys[i]&0xFFFF));
+    for(int i=0;i<n;i++)points.set(i,sorted[i]);
   }
   private static boolean inside(double[] h,double x,double y) {
     for(int i=0;i<h.length;i+=2){int j=(i+2)%h.length;double cross=(h[j]-h[i])*(y-h[i+1])-(h[j+1]-h[i+1])*(x-h[i]);if(cross<0)return false;}return true;

@@ -16,8 +16,50 @@ final class PlyStream {
   final long count, header;
   final int bytes, x, y, z;
   final boolean xd, yd, zd;
+  // LAS mode (dense.las when --ply off): int32 X/Y/Z at record offsets 0/4/8, scaled.
+  final boolean las;
+  final double[] lasScale, lasOffset;
+
+  private PlyStream(Path file, long count, long header, int bytes, double[] scale, double[] offset) {
+    this.file = file;
+    this.count = count;
+    this.header = header;
+    this.bytes = bytes;
+    x = 0;
+    y = 4;
+    z = 8;
+    xd = yd = zd = false;
+    las = true;
+    lasScale = scale;
+    lasOffset = offset;
+  }
+
+  /** XYZ of a LAS 1.2-1.4 file (any point format), with the same scan interface. */
+  static PlyStream las(Path file) throws IOException {
+    try (FileChannel ch = FileChannel.open(file)) {
+      ByteBuffer h = ByteBuffer.allocate(375).order(ByteOrder.LITTLE_ENDIAN);
+      while (h.hasRemaining() && ch.read(h, h.position()) > 0) {}
+      if (h.position() < 227 || h.get(0) != 'L' || h.get(1) != 'A' || h.get(2) != 'S' || h.get(3) != 'F')
+        throw new IOException("Not a LAS file: " + file);
+      long offset = h.getInt(96) & 0xffffffffL, n = h.getInt(107) & 0xffffffffL;
+      int record = h.getShort(105) & 0xffff;
+      if (n == 0 && h.get(25) >= 4 && h.position() >= 255) n = h.getLong(247);
+      if (record < 12) throw new IOException("Unsupported LAS record length");
+      if (Files.size(file) < offset + Math.multiplyExact(n, record))
+        throw new EOFException("Truncated LAS points");
+      return new PlyStream(
+          file,
+          n,
+          offset,
+          record,
+          new double[] {h.getDouble(131), h.getDouble(139), h.getDouble(147)},
+          new double[] {h.getDouble(155), h.getDouble(163), h.getDouble(171)});
+    }
+  }
 
   PlyStream(Path file) throws IOException {
+    las = false;
+    lasScale = lasOffset = null;
     this.file = file;
     long h = 0, n = -1;
     int size = 0, ox = -1, oy = -1, oz = -1;
@@ -102,7 +144,12 @@ final class PlyStream {
         }
         for (int i = 0; i < n; i++) {
           int p = i * bytes;
-          consumer.point(
+          if (las)
+            consumer.point(
+                b.getInt(p) * lasScale[0] + lasOffset[0],
+                b.getInt(p + 4) * lasScale[1] + lasOffset[1],
+                b.getInt(p + 8) * lasScale[2] + lasOffset[2]);
+          else consumer.point(
               xd ? b.getDouble(p + x) : b.getFloat(p + x),
               yd ? b.getDouble(p + y) : b.getFloat(p + y),
               zd ? b.getDouble(p + z) : b.getFloat(p + z));

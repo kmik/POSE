@@ -19,17 +19,34 @@ final class DensePairSelection {
     if (options.densePairSelection.equals("all")) return pairs;
     List<Candidate> candidates = new ArrayList<>();
     BitSet required = new BitSet();
+    long observations = 0;
+    for (var track : tracks) if (track.point != null) observations += track.observations.size();
+    MemorySafety.requireHeap(Math.addExact(Math.multiplyExact(observations, 16L), 64L * frames.size()),
+        options, "Dense pair-selection observation index");
+    // Index once in original track order; avoid scanning the whole sparse graph for every edge.
+    List<List<FeatureTracks.Track>> byImage = new ArrayList<>();
+    for (int i = 0; i < frames.size(); i++) byImage.add(new ArrayList<>());
+    BitSet seen = new BitSet(frames.size());
+    for (var track : tracks) if (track.point != null) {
+      seen.clear();
+      for (var ob : track.observations) if (!seen.get(ob.image)) {
+        seen.set(ob.image);
+        byImage.get(ob.image).add(track);
+      }
+    }
     for (var pair : pairs) {
       Camera a = frames.get(pair.a).camera, b = frames.get(pair.b).camera;
       double baseline = Math3.norm(Math3.sub(a.center(), b.center()));
       double focal = Math.min(Math.min(a.fx, a.fy), Math.min(b.fx, b.fy));
       BitSet cells = new BitSet();
+      BitSet sampledCells = new BitSet();
       List<Double> parallax = new ArrayList<>();
       List<Double> angles = new ArrayList<>();
       int useful = 0;
       double[] centerA = a.center(), centerB = b.center();
-      for (var track : tracks) {
-        if (track.point == null) continue;
+      List<FeatureTracks.Track> local = byImage.get(pair.a).size() <= byImage.get(pair.b).size()
+          ? byImage.get(pair.a) : byImage.get(pair.b);
+      for (var track : local) {
         boolean seenA = false, seenB = false;
         for (var ob : track.observations) {
           seenA |= ob.image == pair.a;
@@ -38,8 +55,8 @@ final class DensePairSelection {
         if (!seenA || !seenB) continue;
         double[] p = a.project(track.point), q = b.project(track.point);
         if (!inside(p, frames.get(pair.a)) || !inside(q, frames.get(pair.b))) continue;
-        cells.set(cell(pair.a, p, frames.get(pair.a)));
-        cells.set(cell(pair.b, q, frames.get(pair.b)));
+        sampledCells.set(cell(pair.a, p, frames.get(pair.a)));
+        sampledCells.set(cell(pair.b, q, frames.get(pair.b)));
         double z = Math.min(a.view(track.point)[2], b.view(track.point)[2]);
         if (!(z > 0) || !Double.isFinite(z)) continue;
         double[] rayA = Math3.sub(track.point, centerA), rayB = Math3.sub(track.point, centerB);
@@ -48,12 +65,18 @@ final class DensePairSelection {
         double angle = Math.toDegrees(Math.acos(Math.clamp(cosine, -1, 1)));
         if (!Double.isFinite(angle)) continue;
         angles.add(angle);
-        if (angle >= options.minAngle) useful++;
+        if (angle >= options.minAngle) {
+          useful++;
+          cells.set(cell(pair.a, p, frames.get(pair.a)));
+          cells.set(cell(pair.b, q, frames.get(pair.b)));
+        }
         parallax.add(focal * baseline / z);
       }
       parallax.sort(Double::compare);
       angles.sort(Double::compare);
-      boolean unknown = parallax.size() < 12 || cells.cardinality() < 4;
+      boolean unknown = parallax.size() < 12 || sampledCells.cardinality() < 4;
+      // Missing geometric evidence keeps the original pair and its sampled coverage.
+      if (unknown) cells.or(sampledCells);
       double cost =
           unknown
               ? Double.POSITIVE_INFINITY
@@ -161,7 +184,7 @@ final class DensePairSelection {
             "pairs",
             report,
             "scope",
-            "Sparse grid coverage with distinct pair witnesses, angle-aware cost and original connectivity retained; not a guarantee of dense"
+            "Angle-qualified sparse grid coverage with distinct pair witnesses, angle-aware cost and original connectivity retained; not a guarantee of dense"
                 + " thin-structure completeness. Unknown pairs are retained."));
     return result;
   }

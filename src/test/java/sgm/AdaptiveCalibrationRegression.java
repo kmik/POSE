@@ -80,8 +80,15 @@ final class AdaptiveCalibrationRegression {
       tracks = scene(frames, fitted);
       Camera[] poses = frames.stream().map(f -> f.camera.copy()).toArray(Camera[]::new);
       double[][] points = tracks.stream().map(t -> t.point.clone()).toArray(double[][]::new);
+      o.calibrationTrialIterations = 0;
+      o.bundleIterationsExplicit = false;
       SharedCalibration.refine(frames, tracks, 15, 2, null, 0, 1);
       var unchanged = ProcessingReport.map(dir.resolve("04_geometry/bundle/shared_calibration.json"));
+      check(((List<?>) unchanged.get("stages")).stream().map(s -> (Map<?, ?>) s)
+          .allMatch(s -> s.get("iteration_budget_per_trial") == null
+              && "legacy automatic".equals(s.get("iteration_mode"))),
+          "Legacy automatic proposals report an unbounded iteration budget without unboxing null");
+      o.calibrationTrialIterations = 12;
       check(((Number) unchanged.get("unchanged_model_trials_skipped")).intValue() > 0,
           "A rejected model does not repeat identical parameter proposals");
       check(((List<?>) unchanged.get("stages")).size() < 15,

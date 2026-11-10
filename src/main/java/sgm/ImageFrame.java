@@ -234,6 +234,11 @@ final class ImageFrame implements AutoCloseable {
     } finally {
       kp.release();
       mask.release();
+      // OpenCV's Java wrappers delete their native object in finalize(), and detectAndCompute
+      // passes only the native handle, so without this fence the GC may finalize the detector
+      // while the native SIFT is still running (use-after-free; SIGSEGV seen on Linux at ~1,400
+      // of 3,000 images).
+      java.lang.ref.Reference.reachabilityFence(sift);
     }
   }
 

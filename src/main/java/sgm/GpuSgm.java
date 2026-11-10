@@ -273,7 +273,8 @@ final class GpuSgm implements AutoCloseable {
 
   static boolean use(int w, int h, Options o) {
     if (o.compute.equals("cpu")
-        || o.compute.equals("auto") && (long) w * h * o.disparities < 1000000) return false;
+        || o.compute.equals("auto") && !o.gpuSmallSolves && (long) w * h * o.disparities < 1000000)
+      return false;
     int limit = disparityLimit(w, h, o);
     if (o.disparities <= limit) return true;
     if (o.compute.equals("gpu"))

@@ -146,14 +146,35 @@ final class DisparityRange {
       // Concurrent native SIFT (--stereo-pairs-in-flight) occasionally throws OpenCV's "unknown
       // exception" (forest_10, 1 of 333 pairs). These 640 px detections take milliseconds, so
       // they are serialized across pair workers; results are unchanged.
+      // It still happened in about one pair per city2 run, and a failed pair was then recomputed
+      // serially by the coordinator while the workers waited. Detection is deterministic, so a
+      // failed call is retried here with a fresh detector (same keypoints and descriptors).
       synchronized (DisparityRange.class) {
-        sift.detectAndCompute(a, ma, ka, da);
-        sift.detectAndCompute(b, mb, kb, db);
+        for (int attempt = 0; ; attempt++) {
+          try {
+            sift.detectAndCompute(a, ma, ka, da);
+            sift.detectAndCompute(b, mb, kb, db);
+            break;
+          } catch (Exception e) {
+            if (attempt >= 2) throw e;
+            System.err.println("Warning: preview feature detection failed (" + e.getMessage()
+                + "); retrying it");
+            sift = FeatureAlgorithms.detector(o, 2500);
+          } finally {
+            // Keeps the detector from being finalized (native object deleted) while the native
+            // detection runs; see ImageFrame.extract. This use-after-free is the likely cause of
+            // the occasional "unknown exception" above.
+            java.lang.ref.Reference.reachabilityFence(sift);
+          }
+        }
       }
       if (da.rows() >= 2 && db.rows() >= 2) {
         matcher = FeatureAlgorithms.matcher(o, da);
-        matcher.knnMatch(da, db, fw, 2);
-        matcher.knnMatch(db, da, bw, 2);
+        // Matching the few preview features is also serialized (milliseconds).
+        synchronized (DisparityRange.class) {
+          matcher.knnMatch(da, db, fw, 2);
+          matcher.knnMatch(db, da, bw, 2);
+        }
         Map<Integer, Integer> reverse = new HashMap<>();
         for (MatOfDMatch row : bw) {
           DMatch[] m = row.toArray();
@@ -487,7 +508,7 @@ final class DisparityRange {
       mb.get(0, 0, bm);
       System.out.printf(
           Locale.ROOT, "Disparity range validation: %dx%d whole-domain probe%n", pw, ph);
-      var result = new CensusSgm(o).compute(av, bv, null, null, pw, ph, am, bm);
+      var result = guardSolve(o, av, bv, pw, ph, am, bm);
       int stride = Math.max(1, (int) Math.ceil(Math.sqrt(result.stats.valid / 512.)));
       List<Sample> outside = new ArrayList<>();
       int checked = 0;
@@ -576,6 +597,51 @@ final class DisparityRange {
       ma.release();
       mb.release();
     }
+  }
+
+  private static volatile boolean guardGpuDisabled, guardGpuVerified;
+
+  /**
+   * The guard's whole-domain probe solve. Its volume (about 0.7 M cells) is below the size at which
+   * --compute auto uses the GPU, so it used to run on the CPU (~0.1 s per direction, competing with
+   * the other pair workers). The full-range GPU SGM gives the same disparities and statistics as the
+   * CPU code; it is used here with its own CPU fallback (GPU failure, pool memory not available
+   * without waiting while holding some). The first GPU solve in a process is compared with the CPU
+   * solve; a difference disables the GPU guard and the CPU result is used.
+   */
+  static CensusSgm.Result guardSolve(
+      Options o, byte[] a, byte[] b, int w, int h, byte[] maskA, byte[] maskB) {
+    if (o.compute.equals("cpu") || guardGpuDisabled || Boolean.getBoolean("sgm.cpuRangeGuard"))
+      return new CensusSgm(o).compute(a, b, null, null, w, h, maskA, maskB);
+    Options gpu = o.copy();
+    gpu.gpuSmallSolves = true;
+    CensusSgm.Result result;
+    try (GpuMemoryPool.Reservation reservation =
+        GpuMemoryPool.reserveAuxiliary(
+            GpuBandedStereo.deviceBytes(gpu, w, h, (long) w * h * gpu.disparities))) {
+      if (reservation == null) return new CensusSgm(o).compute(a, b, null, null, w, h, maskA, maskB);
+      result = new CensusSgm(gpu).compute(a, b, null, null, w, h, maskA, maskB);
+    }
+    if (guardGpuVerified) return result;
+    CensusSgm.Result cpu = new CensusSgm(o).compute(a, b, null, null, w, h, maskA, maskB);
+    int differ = 0;
+    for (int i = 0; i < cpu.disparity.length; i++)
+      if (Float.floatToRawIntBits(cpu.disparity[i]) != Float.floatToRawIntBits(result.disparity[i]))
+        differ++;
+    if (differ > 0 || !cpu.stats.csv().equals(result.stats.csv())) {
+      if (!guardGpuDisabled)
+        System.out.println(
+            "WARNING: GPU disparity-range probe differs from the CPU solve (" + differ
+                + " pixels); using the CPU for range probes (same results as before)");
+      guardGpuDisabled = true;
+      return cpu;
+    }
+    if (!guardGpuVerified)
+      System.out.println(
+          "GPU disparity-range probe: " + w + "x" + h + " solve identical to the CPU solve ("
+              + cpu.stats.valid + " valid pixels)");
+    guardGpuVerified = true;
+    return result;
   }
 
   static DisparityRange fromSamples(List<Double> input, int width, Options o) {

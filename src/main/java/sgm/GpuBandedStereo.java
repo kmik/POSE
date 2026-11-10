@@ -16,6 +16,9 @@ import java.util.*;
 final class GpuBandedStereo {
   private GpuBandedStereo() {}
 
+  /** Small (coarse TSGM) solves: disabled after a failed self-check; verified after the first. */
+  static volatile boolean smallDisabled, smallVerified;
+
   static long deviceBytes(Options o, int w, int h, long cells) {
     long n = (long) w * h, words = (o.census * o.census - 1 + 63) / 64;
     if (o.censusMode.equals("color-distance")) words *= 3;
@@ -25,7 +28,10 @@ final class GpuBandedStereo {
   static boolean use(Options o, int w, int h, DisparityBands bands) {
     if (o.compute.equals("cpu")) return false;
     // Banded solves are cheap to launch; small coarse levels still beat the serial CPU reference.
-    if (o.compute.equals("auto") && bands.total() < 200_000) return false;
+    // TSGM coarse levels (gpuSmallSolves) use the GPU at any size: launches are cheap next to the
+    // CPU reference, and the results are identical (first small solve checked, BandedSgm.whole).
+    if (o.compute.equals("auto") && bands.total() < 200_000 && (!o.gpuSmallSolves || smallDisabled))
+      return false;
     try {
       GpuSgm.Device device = GpuSgm.selectedDevice(o);
       int group = GpuSgm.selectedGroup(o);
@@ -86,13 +92,15 @@ final class GpuBandedStereo {
     private final Arena arena = Arena.ofConfined();
     private final int w, h, n, words;
     private final MemorySegment descriptorsLeft, descriptorsRight, maskLeft, maskRight, grayLeft, grayRight;
-    private final MemorySegment low, count, offset, out, host;
+    private final MemorySegment metadata, out, host;
     private final MemorySegment bandHost;
-    private final boolean queuedUploads;
+    private final boolean queuedUploads, packed;
     private final MemorySegment[] cost = new MemorySegment[8], sum = new MemorySegment[8];
     private long capacity;
     private final long localMemory, bank, budget;
     private final MemorySegment costs, paths, winners;
+    private final GpuMemoryPool.Reservation reservation;
+    private int[] summaryBuffer;
 
     /** Uploads the left/right inputs; a and b are left and right in the forward direction. */
     Session(
@@ -105,16 +113,41 @@ final class GpuBandedStereo {
         boolean[] tb,
         int w,
         int h) {
+      this(o, a, b, grayA, grayB, ta, tb, w, h, 0);
+    }
+
+    /**
+     * As above, first reserving {@code reserveBytes} of the shared pair-worker GPU pool (if one is
+     * installed; see {@link GpuMemoryPool}). The reservation is released by close().
+     */
+    Session(
+        Options o,
+        long[][] a,
+        long[][] b,
+        byte[] grayA,
+        byte[] grayB,
+        boolean[] ta,
+        boolean[] tb,
+        int w,
+        int h,
+        long reserveBytes) {
+      reservation = GpuMemoryPool.reserve(reserveBytes);
       this.w = w;
       this.h = h;
       queuedUploads = o.gpuQueuedUploads;
+      packed = o.gpuPackedSummaries && o.disparities < (1 << 28);
       n = w * h;
       words = a.length;
       GpuSgm.Device device = GpuSgm.selectedDevice(o);
       localMemory = device.localMemory();
       bank = bankCells(o, device);
       budget = GpuSgm.budget(device, o);
-      cl = new GpuSgm.Compute(o, source(o.matchingCost.equals("zncc"), StereoCost.aggregateBytes(o), StereoCost.gpuSource(o)));
+      try {
+        cl = new GpuSgm.Compute(o, source(o.matchingCost.equals("zncc"), StereoCost.aggregateBytes(o), StereoCost.gpuSource(o)));
+      } catch (RuntimeException | Error e) {
+        reservation.close();
+        throw e;
+      }
       try {
         descriptorsLeft = descriptors(a);
         descriptorsRight = descriptors(b);
@@ -122,11 +155,9 @@ final class GpuBandedStereo {
         maskRight = upload(arena.allocateFrom(JAVA_BYTE, mask(tb)));
         grayLeft = upload(arena.allocateFrom(JAVA_BYTE, grayA));
         grayRight = upload(arena.allocateFrom(JAVA_BYTE, grayB));
-        low = cl.buffer(4L * n);
-        count = cl.buffer(4L * n);
-        offset = cl.buffer(4L * n);
-        out = cl.buffer(24L * n);
-        host = arena.allocate(24L * n);
+        metadata = cl.buffer(12L * n);
+        out = cl.buffer((packed ? 20L : 24L) * n);
+        host = arena.allocate((packed ? 20L : 24L) * n);
         bandHost = arena.allocate(12L * n, 4);
         costs = cl.kernel("bcosts");
         paths = cl.kernel("bpaths");
@@ -191,16 +222,14 @@ final class GpuBandedStereo {
       MemorySegment.copy(MemorySegment.ofArray(bands.low), 0, lows, 0, 4L * n);
       MemorySegment.copy(MemorySegment.ofArray(bands.count), 0, counts, 0, 4L * n);
       MemorySegment.copy(MemorySegment.ofArray(bands.offsets()), 0, offsets, 0, 4L * n);
-      write(low, lows);
-      write(count, counts);
-      write(offset, offsets);
+      write(metadata, bandHost);
       MemorySegment da = reverse ? descriptorsRight : descriptorsLeft,
           db = reverse ? descriptorsLeft : descriptorsRight,
           ma = reverse ? maskRight : maskLeft,
           mb = reverse ? maskLeft : maskRight,
           ga = reverse ? grayRight : grayLeft,
           gb = reverse ? grayLeft : grayRight;
-      List<Object> args = new ArrayList<>(List.of(da, db, ma, mb, ga, gb, low, count, offset));
+      List<Object> args = new ArrayList<>(List.of(da, db, ma, mb, ga, gb, metadata));
       args.addAll(costArgs);
       Collections.addAll(
           args, w, h, o.minDisparity, reverse ? 1 : 0, o.census / 2, words, StereoCost.code(o),
@@ -215,7 +244,7 @@ final class GpuBandedStereo {
         args = new ArrayList<>(costArgs);
         args.addAll(sumArgs);
         Collections.addAll(
-            args, low, count, offset, ma, ga, w, h, dx, dy, StereoCost.penalty(o.p1, o),
+            args, metadata, ma, ga, w, h, dx, dy, StereoCost.penalty(o.p1, o),
             StereoCost.p2(o), o.sgmEdgeScale, direction == 0 ? 1 : 0, cap, lanes, lines,
             new GpuSgm.Local(4L * (2L * cap * per + 2L * per)));
         cl.run(paths, groups * group, args.toArray());
@@ -223,12 +252,26 @@ final class GpuBandedStereo {
       args = new ArrayList<>(costArgs);
       args.addAll(sumArgs);
       Collections.addAll(
-          args, low, count, offset, out, mb, w, h, o.disparities, o.census / 2, o.minDisparity,
-          reverse ? 1 : 0);
+          args, metadata, out, mb, w, h, o.disparities, o.census / 2, o.minDisparity,
+          reverse ? 1 : 0, packed ? 1 : 0);
       cl.run(winners, n, args.toArray());
-      int[] summary = new int[n * 6];
+      // One summary array per session (54 MB at 1125x2000), fully overwritten by every solve
+      // below. Callers use a summary only until their next solve on this pair.
+      if (summaryBuffer == null) summaryBuffer = new int[n * 6];
+      int[] summary = summaryBuffer;
       cl.transfer(out, 0, host, true);
-      MemorySegment.copy(host, 0, MemorySegment.ofArray(summary), 0, 24L * n);
+      if (packed) {
+        // Winner index and three flag bits share a word. Costs remain full-width integers.
+        // Bulk-copy once, then expand backwards in place. Per-field native reads are
+        // substantially slower and would erase the transfer saving on fast PCIe devices.
+        MemorySegment.copy(host, 0, MemorySegment.ofArray(summary), 0, 20L * n);
+        for (int p = n - 1; p >= 0; p--) {
+          int at = 5 * p, tag = summary[at], target = 6 * p;
+          summary[target + 5] = tag & 7;
+          for (int k = 4; k >= 1; k--) summary[target + k] = summary[at + k];
+          summary[target] = (tag >>> 3) - 1;
+        }
+      } else MemorySegment.copy(host, 0, MemorySegment.ofArray(summary), 0, 24L * n);
       return summary;
     }
 
@@ -250,15 +293,41 @@ final class GpuBandedStereo {
       return cl.profile();
     }
 
+    /** Packed cells the allocated volume holds without growing. */
+    long capacity() {
+      return capacity;
+    }
+
     @Override
     public void close() {
       try {
         cl.finish();
         RunTelemetry.gpuProfile("Banded SGM " + w + "x" + h, cl.profile());
       } finally {
-        try { cl.close(); } finally { arena.close(); }
+        try {
+          cl.close();
+        } finally {
+          try {
+            arena.close();
+          } finally {
+            reservation.close();
+          }
+        }
       }
     }
+  }
+
+  /**
+   * Device bytes a new session holds after its first solve of {@code total} packed cells: the
+   * same capacity rule as Session.summary (25% headroom when the whole session fits the budget).
+   */
+  static long plannedBytes(Options o, int w, int h, long total) {
+    GpuSgm.Device device = GpuSgm.selectedDevice(o);
+    long bank = bankCells(o, device), budget = GpuSgm.budget(device, o);
+    total = Math.max(1, total);
+    long grown = total + total / 4;
+    long capacity = grown <= 8 * bank && deviceBytes(o, w, h, grown) <= budget ? grown : total;
+    return deviceBytes(o, w, h, capacity);
   }
 
   static String source(boolean zncc, int sumBytes) {
@@ -286,8 +355,9 @@ void cset(int i,int v,CP){int b=i/CBK;i-=b*CBK;switch(b){case 0:c0[i]=(ushort)v;
 int sget(int i,SP){int b=i/SBK;i-=b*SBK;switch(b){case 0:return s0[i];case 1:return s1[i];case 2:return s2[i];case 3:return s3[i];case 4:return s4[i];case 5:return s5[i];case 6:return s6[i];default:return s7[i];}}
 void sset(int i,int v,SP){int b=i/SBK;i-=b*SBK;switch(b){case 0:s0[i]=(SUM)v;break;case 1:s1[i]=(SUM)v;break;case 2:s2[i]=(SUM)v;break;case 3:s3[i]=(SUM)v;break;case 4:s4[i]=(SUM)v;break;case 5:s5[i]=(SUM)v;break;case 6:s6[i]=(SUM)v;break;default:s7[i]=(SUM)v;}}
 __kernel void bcosts(__global const ulong *a,__global const ulong *b,__global const uchar *ta,__global const uchar *tb,
- __global const uchar *ga,__global const uchar *gb,__global const int *low,__global const int *count,__global const int *offset,
+ __global const uchar *ga,__global const uchar *gb,__global const int *bands,
  CP,int w,int h,int md,int reverse,int r,int words,int mode,int weight,int adcap,int gradcap) {
+  __global const int *low=bands,*count=bands+w*h,*offset=bands+2*w*h;
   int p=get_global_id(0),N=w*h;if(p>=N)return;int n=count[p];if(n==0)return;
   int x=p%w,y=p/w,at=offset[p],lo=low[p];size_t sn=(size_t)N;
   for(int j=0;j<n;j++){
@@ -329,8 +399,9 @@ int blength(int line,int lines,int w,int h,int dx,int dy){
   if(dx>0)n=min(n,w-x);if(dx<0)n=min(n,x+1);if(dy>0)n=min(n,h-y);if(dy<0)n=min(n,y+1);return n;
 }
 // S lanes per path line, G/S lines per work-group; every line keeps its own continuous state.
-__kernel void bpaths(CP,SP,__global const int *low,__global const int *count,__global const int *offset,
+__kernel void bpaths(CP,SP,__global const int *bands,
  __global const uchar *valid,__global const uchar *gray,int w,int h,int dx,int dy,int p1,int p2,int edgeScale,int clear,int cap,int S,int lines,__local int *state) {
+  __global const int *low=bands,*count=bands+w*h,*offset=bands+2*w*h;
   int tid=get_local_id(0),G=get_local_size(0),lane=tid%S,slot=tid/S,per=G/S,line=get_group_id(0)*per+slot,x=0,y=0;
   int steps=0;for(int s=0;s<per;s++)steps=max(steps,blength(get_group_id(0)*per+s,lines,w,h,dx,dy));
   int length=blength(line,lines,w,h,dx,dy);if(length>0)bstart(line,w,h,dx,dy,&x,&y);
@@ -356,8 +427,9 @@ __kernel void bpaths(CP,SP,__global const int *low,__global const int *count,__g
   }
 }
 int bmatch(__global const uchar *tb,int w,int r,int x,int y,int disp,int reverse){long target=(long)x+(reverse?(long)disp:-(long)disp);return target>=r&&target<w-r&&tb[y*w+(int)target];}
-__kernel void bwinners(CP,SP,__global const int *low,__global const int *count,__global const int *offset,
- __global int *out,__global const uchar *tb,int w,int h,int D,int r,int md,int reverse) {
+__kernel void bwinners(CP,SP,__global const int *bands,
+ __global int *out,__global const uchar *tb,int w,int h,int D,int r,int md,int reverse,int packed) {
+  __global const int *low=bands,*count=bands+w*h,*offset=bands+2*w*h;
   int p=get_global_id(0);if(p>=w*h)return;
   int best=-1,value=2147483647,second=2147483647,before=-1,after=-1,x=p%w,y=p/w,lo=low[p],n=count[p],at=offset[p];
   if(x>=r&&x<w-r&&y>=r&&y<h-r&&n>0){
@@ -368,7 +440,9 @@ __kernel void bwinners(CP,SP,__global const int *low,__global const int *count,_
   }
   int edge=best>=0&&((best==0&&lo>0&&bmatch(tb,w,r,x,y,md+lo-1,reverse))||(best==n-1&&lo+n<D&&bmatch(tb,w,r,x,y,md+lo+n,reverse)));
   int flags=(n>0&&lo==0&&cget(at,CA)!=512?1:0)|(n>0&&lo+n==D&&cget(at+n-1,CA)!=512?2:0)|(edge?4:0);
-  size_t o=(size_t)p*6;out[o]=best<0?-1:lo+best;out[o+1]=value;out[o+2]=second;out[o+3]=before;out[o+4]=after;out[o+5]=flags;
+  int winner=best<0?-1:lo+best;
+  size_t o=(size_t)p*(packed?5:6);out[o]=packed?((winner+1)<<3)|flags:winner;
+  out[o+1]=value;out[o+2]=second;out[o+3]=before;out[o+4]=after;if(!packed)out[o+5]=flags;
 }
 """;
 }

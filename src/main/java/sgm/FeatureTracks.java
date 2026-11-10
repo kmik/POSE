@@ -57,6 +57,63 @@ final class FeatureTracks {
     }
   }
 
+  /**
+   * Extracts (or reuses cached) features for these frames, a few images at a time. OpenCV's SIFT
+   * uses only a few cores per image, and detection is deterministic per image, so the keypoints
+   * and descriptors equal the serial loop's. Everything order-dependent (colours, exports,
+   * descriptor-cache accounting, counts) stays in the caller's ordered loop. A frame whose
+   * concurrent extraction failed is marked false and extracted again serially by the caller.
+   */
+  static boolean[] extractConcurrently(List<ImageFrame> frames, Options o) {
+    boolean[] done = new boolean[frames.size()];
+    int threads = Math.max(1, Math.min(frames.size(), Math.min(4, o.cores / 3)));
+    if (threads < 2) return done;
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(
+            threads,
+            r -> {
+              Thread t = new Thread(r, "feature-extraction");
+              t.setDaemon(true);
+              return t;
+            });
+    try {
+      List<java.util.concurrent.Future<?>> tasks = new ArrayList<>();
+      for (int k = 0; k < frames.size(); k++) {
+        int index = k;
+        tasks.add(
+            pool.submit(
+                () -> {
+                  ImageFrame f = frames.get(index);
+                  try (WorkProgress work =
+                      WorkProgress.start("Feature extraction " + f.path.getFileName(), 0, "keypoints")) {
+                    ReuseCache.features(f, o);
+                    work.done();
+                  }
+                  done[index] = true;
+                  return null;
+                }));
+      }
+      for (int k = 0; k < tasks.size(); k++)
+        try {
+          tasks.get(k).get();
+        } catch (java.util.concurrent.ExecutionException e) {
+          done[k] = false;
+          System.err.println(
+              "Warning: concurrent feature extraction of "
+                  + frames.get(k).path.getFileName()
+                  + " failed ("
+                  + e.getCause()
+                  + "); extracting it serially");
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("Feature extraction interrupted", e);
+        }
+    } finally {
+      pool.shutdownNow();
+    }
+    return done;
+  }
+
   void build(List<ImageFrame> frames, Options o, Project project) throws IOException {
     if (project != null)
       project.stage(
@@ -65,6 +122,7 @@ final class FeatureTracks {
           o.matchingAlgorithm + " extraction on processed undistorted images");
     int[] offset = new int[frames.size() + 1];
     int chunk = Math.max(1, o.cores);
+    boolean[] extracted = null;
     WorkProgress extraction = WorkProgress.start("Feature extraction", frames.size(), "images");
     for (int i = 0; i < frames.size(); i++) {
       extraction.update(i);
@@ -76,13 +134,15 @@ final class FeatureTracks {
             RasterCache.preload(frames.subList(i, Math.min(frames.size(), i + chunk)), chunk);
         if (decoded > 0)
           RunTelemetry.record("Parallel feature image preload (" + decoded + ")", preloadStarted);
+        extracted = extractConcurrently(frames.subList(i, Math.min(frames.size(), i + chunk)), o);
       }
-      try (WorkProgress work =
-          WorkProgress.start(
-              "Feature extraction " + frames.get(i).path.getFileName(), 0, "keypoints")) {
-        ReuseCache.features(frames.get(i), o);
-        work.done();
-      }
+      if (extracted == null || !extracted[i % chunk])
+        try (WorkProgress work =
+            WorkProgress.start(
+                "Feature extraction " + frames.get(i).path.getFileName(), 0, "keypoints")) {
+          ReuseCache.features(frames.get(i), o);
+          work.done();
+        }
       frames.get(i).captureFeatureColors();
       if (project != null) project.data.features(frames.get(i));
       DescriptorCache.retain(frames.get(i));

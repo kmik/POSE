@@ -99,6 +99,7 @@ final class ImageFusion {
   private final long[] start;
   private final LinkedHashMap<Integer, PairData> pairCache = new LinkedHashMap<>(16, .75f, true);
   private final long cacheLimit;
+  private final int passOneCameras;
   private long cachedBytes;
   private ByteBuffer readBuffer;
 
@@ -226,8 +227,14 @@ final class ImageFusion {
     long requestedCache = o.memoryMb * 1048576 / 4;
     if (o.imageFusionCacheMb >= 0)
       requestedCache = Math.min(requestedCache, (long) o.imageFusionCacheMb * 1048576);
+    // Pass 1 may work on several cameras at once: each extra camera needs another worst-case
+    // camera workspace. At most half of the remaining headroom is used for that; the pair cache
+    // gets what is left. Neither changes any result.
+    long headroom = Math.max(0, budget - needed - budget / 8);
+    passOneCameras =
+        (int) Math.max(1, Math.min(Math.max(1, o.cores / 2), 1 + headroom / 2 / Math.max(1, worstCamera)));
     // Leave a further margin for output, normals and other live pipeline state.
-    cacheLimit = Math.max(0, Math.min(requestedCache, budget - needed - budget / 8));
+    cacheLimit = Math.max(0, Math.min(requestedCache, headroom - (passOneCameras - 1) * worstCamera));
     compact = new float[cameras][];
     neighbours = new int[cameras][];
     used = new long[cameras][];
@@ -270,6 +277,14 @@ final class ImageFusion {
 
   /** Reads pair k's candidate records (big-endian, as DenseReconstruction writes them). */
   private PairData load(FileChannel channel, int k, boolean full, Counters counters) throws IOException {
+    // Pass 1 runs several cameras at once: the shared channel position, read buffer and cache are
+    // used under one lock. Cached data is immutable once published.
+    synchronized (pairCache) {
+      return loadLocked(channel, k, full, counters);
+    }
+  }
+
+  private PairData loadLocked(FileChannel channel, int k, boolean full, Counters counters) throws IOException {
     PairData cached = pairCache.get(k);
     if (cached != null) {
       counters.cacheHits++;
@@ -355,26 +370,88 @@ final class ImageFusion {
     long splatNanos = 0, mergeNanos = 0, speckleNanos = 0;
     try (FileChannel channel = FileChannel.open(candidates, StandardOpenOption.READ)) {
       WorkProgress progress = WorkProgress.start("Image fusion cameras", 2L * cameras, "camera passes");
-      // Pass 1: filtered merged depth per camera, plus sample points for overlap detection.
+      // Pass 1: filtered merged depth per camera, plus sample points for overlap detection. A
+      // camera's pass 1 reads only its own pairs and writes only its own maps, so several cameras
+      // run at once (bounded by heap; see passOneCameras). Counts are added in camera order.
+      long[][] times = new long[cameras][3];
+      Counters[] perCamera = new Counters[cameras];
+      int concurrent = Math.max(1, Math.min(passOneCameras, cameras));
+      ExecutorService cameraWorkers =
+          concurrent > 1
+              ? Executors.newFixedThreadPool(
+                  concurrent,
+                  r -> {
+                    Thread t = new Thread(r, "fusion-camera");
+                    t.setDaemon(true);
+                    return t;
+                  })
+              : null;
+      try {
+        List<Future<?>> tasks = new ArrayList<>();
+        for (int c = 0; c < cameras; c++) {
+          if (pairsOf.get(c).isEmpty()) continue;
+          final int camera = c;
+          Callable<Void> task =
+              () -> {
+                Counters own = new Counters();
+                long clock = System.nanoTime();
+                Splat[] splats = splat(channel, camera, false, counters);
+                times[camera][0] = System.nanoTime() - clock;
+                clock = System.nanoTime();
+                Merged m = merge(camera, splats, own);
+                times[camera][1] = System.nanoTime() - clock;
+                clock = System.nanoTime();
+                own.spikes += spikes(m, fusion.camera(camera));
+                own.speckle += speckles(m, fusion.camera(camera));
+                if (o.fusionDepthOutliers) own.depthOutliers += depthOutliers(m.z);
+                times[camera][2] = System.nanoTime() - clock;
+                for (float z : m.z) if (z > 0) own.pixels++;
+                compact[camera] = m.z;
+                if (storeWeights) compactWeight[camera] = m.wsum;
+                if (localSigma > 0) localBest[camera] = localMinimumSigma(m.z, m.wsum, m.w, m.h, 4);
+                samples[camera] = sample(camera, m, splats);
+                perCamera[camera] = own;
+                return null;
+              };
+          if (cameraWorkers == null) {
+            progress.update(c);
+            try {
+              task.call();
+            } catch (IOException | RuntimeException | Error e) {
+              throw e;
+            } catch (Exception e) {
+              throw new IOException(e);
+            }
+          } else tasks.add(cameraWorkers.submit(task));
+        }
+        int finished = 0;
+        for (Future<?> task : tasks) {
+          try {
+            task.get();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Image fusion interrupted", e);
+          } catch (ExecutionException e) {
+            if (e.getCause() instanceof IOException io) throw io;
+            if (e.getCause() instanceof RuntimeException r) throw r;
+            if (e.getCause() instanceof Error error) throw error;
+            throw new IOException(e.getCause());
+          }
+          progress.update(++finished);
+        }
+      } finally {
+        if (cameraWorkers != null) cameraWorkers.shutdownNow();
+      }
       for (int c = 0; c < cameras; c++) {
-        progress.update(c);
-        if (pairsOf.get(c).isEmpty()) continue;
-        long clock = System.nanoTime();
-        Splat[] splats = splat(channel, c, false, counters);
-        splatNanos += System.nanoTime() - clock;
-        clock = System.nanoTime();
-        Merged m = merge(c, splats, counters);
-        mergeNanos += System.nanoTime() - clock;
-        clock = System.nanoTime();
-        counters.spikes += spikes(m, fusion.camera(c));
-        counters.speckle += speckles(m, fusion.camera(c));
-        if (o.fusionDepthOutliers) counters.depthOutliers += depthOutliers(m.z);
-        speckleNanos += System.nanoTime() - clock;
-        for (float z : m.z) if (z > 0) counters.pixels++;
-        compact[c] = m.z;
-        if (storeWeights) compactWeight[c] = m.wsum;
-        if (localSigma > 0) localBest[c] = localMinimumSigma(m.z, m.wsum, m.w, m.h, 4);
-        samples[c] = sample(c, m, splats);
+        if (perCamera[c] == null) continue;
+        counters.ambiguousKept += perCamera[c].ambiguousKept;
+        counters.spikes += perCamera[c].spikes;
+        counters.speckle += perCamera[c].speckle;
+        counters.depthOutliers += perCamera[c].depthOutliers;
+        counters.pixels += perCamera[c].pixels;
+        splatNanos += times[c][0];
+        mergeNanos += times[c][1];
+        speckleNanos += times[c][2];
       }
       RunTelemetry.recordTotal("Image fusion: pass 1 splats (pair reads)", splatNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: pass 1 per-camera merge", mergeNanos, cameras);
@@ -392,6 +469,19 @@ final class ImageFusion {
       long remergeNanos = 0, checkNanos = 0, outputNanos = 0;
       // Pass 2: re-merge one camera at a time (identical), cross-check, own and emit.
       // --fusion-seed-order precision repeats it per precision tier (precise seeds first).
+      // Ownership marks (used/emitted) are applied here before the next camera is checked, since
+      // later cameras read them. Appending the emitted points to the output only has to keep
+      // their order, so one writer thread does it in camera order, overlapping the next camera's
+      // cross-check; at most two cameras' emissions wait for it.
+      ExecutorService writer =
+          Executors.newSingleThreadExecutor(
+              r -> {
+                Thread t = new Thread(r, "fusion-output");
+                t.setDaemon(true);
+                return t;
+              });
+      ArrayDeque<Future<Long>> pending = new ArrayDeque<>();
+      try {
       for (int tier = 0; tier < tierCount; tier++)
       for (int c = 0; c < cameras; c++) {
         progress.update(cameras + c);
@@ -406,15 +496,11 @@ final class ImageFusion {
         clock = System.nanoTime();
         Emission[][] rows = crossCheck(c, m, splats, counters, tier);
         checkNanos += System.nanoTime() - clock;
-        clock = System.nanoTime();
         for (Emission[] row : rows)
           if (row != null)
             for (Emission e : row) {
-              if (e == null) continue;
-              diagnostics.record(e.result);
-              if (!e.result.accepted()) continue;
+              if (e == null || !e.result.accepted()) continue;
               if (e.result.shift > 1e-8) counters.refined++;
-              output.add(e.candidate, e.pair, e.pixel, e.rgb, e.result, e.geometry);
               counters.emitted++;
               if (e.agreements() != null && o.fusionStrategy.equals("graph-average")) {
                 // Members were averaged into this point: exactly those pixels are used.
@@ -426,7 +512,25 @@ final class ImageFusion {
                 emitted[c][e.cameraPixel() >>> 6] |= 1L << (e.cameraPixel() & 63);
               }
             }
-        outputNanos += System.nanoTime() - clock;
+        while (pending.size() >= 2) outputNanos += awaitOutput(pending.poll());
+        pending.add(
+            writer.submit(
+                () -> {
+                  long started = System.nanoTime();
+                  for (Emission[] row : rows)
+                    if (row != null)
+                      for (Emission e : row) {
+                        if (e == null) continue;
+                        diagnostics.record(e.result);
+                        if (!e.result.accepted()) continue;
+                        output.add(e.candidate, e.pair, e.pixel, e.rgb, e.result, e.geometry);
+                      }
+                  return System.nanoTime() - started;
+                }));
+      }
+      while (!pending.isEmpty()) outputNanos += awaitOutput(pending.poll());
+      } finally {
+        writer.shutdownNow();
       }
       RunTelemetry.recordTotal("Image fusion: pass 2 pair reads and re-merge", remergeNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: cross-check, ownership, normals", checkNanos, cameras);
@@ -435,6 +539,20 @@ final class ImageFusion {
       progress.close();
     }
     return counters;
+  }
+
+  private static long awaitOutput(Future<Long> task) throws IOException {
+    try {
+      return task.get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Image fusion output interrupted", e);
+    } catch (ExecutionException e) {
+      if (e.getCause() instanceof IOException io) throw io;
+      if (e.getCause() instanceof RuntimeException r) throw r;
+      if (e.getCause() instanceof Error error) throw error;
+      throw new IOException(e.getCause());
+    }
   }
 
   /**
@@ -470,16 +588,21 @@ final class ImageFusion {
     Splat[] out = new Splat[pairs.size()];
     Camera cam = fusion.camera(c);
     int w = fusion.width(c), h = fusion.height(c);
-    for (int s = 0; s < out.length; s++) {
+    PairData[] loaded = new PairData[out.length];
+    for (int s = 0; s < out.length; s++) loaded[s] = load(channel, pairs.get(s), full, counters);
+    // Each pair's splat is independent (its own arrays, filled serially in candidate order), so
+    // the pairs are splatted concurrently with identical results.
+    parallel(out.length, s -> {
       int k = pairs.get(s);
-      PairData data = load(channel, k, full, counters);
+      PairData data = loaded[s];
       int other = fusion.pairCamera(k, false) == c ? fusion.pairCamera(k, true) : fusion.pairCamera(k, false);
       int[] sample = new int[w * h];
       float[] z = new float[w * h], du = new float[w * h], dv = new float[w * h];
       Arrays.fill(sample, -1);
+      double[] v = new double[3];
       // Serial, in candidate order: the nearest depth wins and equal depths keep the first.
       for (int i = 0; i < data.count; i++) {
-        double[] v = cam.view(data.point(i));
+        cam.viewInto(data.world[3 * i], data.world[3 * i + 1], data.world[3 * i + 2], v);
         if (v[2] <= 0) continue;
         double u = cam.fx * v[0] / v[2] + cam.cx, t = cam.fy * v[1] / v[2] + cam.cy;
         int x = (int) Math.round(u), y = (int) Math.round(t);
@@ -493,7 +616,7 @@ final class ImageFusion {
         }
       }
       out[s] = new Splat(data, other, sample, z, du, dv);
-    }
+    });
     return out;
   }
 
@@ -710,6 +833,9 @@ final class ImageFusion {
         if (n < 12) continue;
         Arrays.sort(values, 0, n);
         float median = n % 2 == 1 ? values[n / 2] : .5f * (values[n / 2 - 1] + values[n / 2]);
+        // limit >= 2 footprints: within that the pixel is kept whatever the spread is (identical
+        // decision without the second sort).
+        if (Math.abs(centre - median) <= 2 * (median / focal)) continue;
         for (int i = 0; i < n; i++) deviations[i] = Math.abs(values[i] - median);
         Arrays.sort(deviations, 0, n);
         double spread = 1.4826 * (n % 2 == 1 ? deviations[n / 2] : .5 * (deviations[n / 2 - 1] + deviations[n / 2]));
@@ -825,6 +951,7 @@ final class ImageFusion {
       long[] views = new long[words], confirmed = new long[words];
       long[] agreeAt = new long[near.length];
       float[] agreeDepth = new float[near.length];
+      double[] vj = new double[3];
       for (int x = 0; x < w; x++) {
         int p = y * w + x;
         float mz = m.z[p];
@@ -861,7 +988,7 @@ final class ImageFusion {
           float[] other = compact[j];
           Camera oc = fusion.camera(j);
           int ow = fusion.width(j), oh = fusion.height(j);
-          double[] vj = oc.view(X);
+          oc.viewInto(X[0], X[1], X[2], vj);
           if (vj[2] <= 0) continue;
           double uj = oc.fx * vj[0] / vj[2] + oc.cx, wj = oc.fy * vj[1] / vj[2] + oc.cy;
           int xj = (int) Math.round(uj), yj = (int) Math.round(wj);
@@ -884,7 +1011,7 @@ final class ImageFusion {
               double weight=compactWeight[j]==null?0:compactWeight[j][yj*ow+xj];
               double otherSigma=weight>0?1/Math.sqrt(weight):footprint;
               int vote=DepthOutlierFilter.cameraVote(vj[2],zj,low,high,count,
-                  Math.hypot(sourceSigma,otherSigma),footprint,o.fusionRelative);
+                  sourceSigma,otherSigma,footprint,o.fusionRelative);
               preciseAgreement=vote==1;
               if(j!=fusion.pairCamera(pair,false) && j!=fusion.pairCamera(pair,true)) {
                 if(vote==0) {
@@ -1208,13 +1335,24 @@ final class ImageFusion {
   }
 
   /** Plane fit on the owner's merged map; mirrors DepthFusion.surfaceSample. */
+  private static final class NormalScratch {
+    final double[][] pool = new double[49][3], neighbors = new double[49][];
+    final double[] residuals = new double[49];
+  }
+
+  private static final ThreadLocal<NormalScratch> NORMAL_SCRATCH =
+      ThreadLocal.withInitial(NormalScratch::new);
+
   private DepthFusion.SurfaceSample surfaceSample(int c, Merged m, double[] p, double mz, int x, int y, double[] points) {
     Camera camera = fusion.camera(c);
     double[] rotationT = Math3.transpose(camera.rotation), center = camera.center();
     double footprint = mz / Math.min(camera.fx, camera.fy);
     double sigma = footprint * .1;
+    // Per-thread scratch for the neighbour coordinates (copied from the back-projection cache;
+    // nothing below retains them). Same values as freshly allocated arrays.
+    NormalScratch scratch = NORMAL_SCRATCH.get();
     for (int stride : new int[] {1, 2, 4}) {
-      double[][] neighbors = new double[49][];
+      double[][] neighbors = scratch.neighbors;
       int n = 0;
       for (int dy = -3; dy <= 3; dy++)
         for (int dx = -3; dx <= 3; dx++) {
@@ -1223,10 +1361,13 @@ final class ImageFusion {
           int at = yy * m.w + xx;
           double z = m.z[at];
           if (z <= 0 || Math.abs(z - mz) > o.fusionRelative * Math.min(z, mz)) continue;
-          neighbors[n++] =
-              points != null
-                  ? new double[] {points[3 * at], points[3 * at + 1], points[3 * at + 2]}
-                  : backProject(camera, rotationT, xx + m.du[at], yy + m.dv[at], z);
+          if (points != null) {
+            double[] q = scratch.pool[n];
+            q[0] = points[3 * at];
+            q[1] = points[3 * at + 1];
+            q[2] = points[3 * at + 2];
+            neighbors[n++] = q;
+          } else neighbors[n++] = backProject(camera, rotationT, xx + m.du[at], yy + m.dv[at], z);
         }
       SurfaceGeometry.Plane plane = SurfaceGeometry.plane(neighbors, n);
       if (plane == null
@@ -1234,10 +1375,10 @@ final class ImageFusion {
           || plane.middle() < footprint * footprint * .2
           || plane.smallest() > .12 * plane.middle()) continue;
       double[] normal = plane.normal();
-      double[] residuals = new double[n];
+      double[] residuals = scratch.residuals;
       for (int i = 0; i < n; i++)
         residuals[i] = Math.abs(SurfaceGeometry.distance(neighbors[i], plane.center(), normal));
-      Arrays.sort(residuals);
+      Arrays.sort(residuals, 0, n);
       double band = Math.max(footprint * .5, 3 * 1.4826 * residuals[n / 2]);
       int kept = 0;
       for (int i = 0; i < n; i++)

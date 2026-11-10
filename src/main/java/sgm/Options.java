@@ -31,6 +31,11 @@ public final class Options {
   public int imageFusionCacheMb = -1;
   public Path exportConfidence;
   public boolean disparitiesExplicit, minDisparityExplicit, selfCalibration = true;
+  // --quick-calibration: EXIF/XMP focal initialization (joint pipeline, no bootstrap) and one GPS
+  // focal start. Changes the calibration path and therefore the geometry; opt-in.
+  public boolean quickCalibration;
+  // --ply off / --point-confidence off: skip writing dense.ply / 07_results/point-confidence.bin.
+  public boolean writePly = true, writePointConfidence = true;
   Map<String, Camera> calibrationPoses = Collections.emptyMap();
   public String crs = "EPSG:3067";
   public double gpsThreshold = 10;
@@ -42,7 +47,7 @@ public final class Options {
   public double gpsFocalSigma = .03;
   public String gpsTimeOffset = "estimate", gpsLeverArm = "estimate", rollingShutter = "estimate";
   public int gpsAdjustmentRounds = 3;
-  // Without --bundle-iterations every bundle fit runs until it stops improving meaningfully.
+  // Final bundles converge automatically; model-selection proposals have a separate hard cap.
   public boolean bundleIterationsExplicit;
   // C1: ground classification of the final cloud (opt-in) and its tuning.
   public boolean classifyGround;
@@ -95,6 +100,8 @@ public final class Options {
   // Exact GPU brute-force Hamming k=2 search for binary feature descriptors (GpuHamming).
   public boolean gpuFeatureMatching = true;
   public boolean gpuQueuedUploads = true;
+  public boolean gpuPackedSummaries;
+  public int calibrationTrialIterations = 12;
   public double fusionSigmaK = 3, fusionSeedMinAngle = 0, fusionLocalSigma = 0;
   public int step = 2, cores = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
   public int boardColumns = 9, boardRows = 7;
@@ -119,6 +126,8 @@ public final class Options {
   public int tsgmLevels = 3, tsgmMargin = 3;
   /** Packed (x, y, disparity) sparse range samples for the current pair; tsgm band seeds. */
   double[] tsgmSeeds;
+  /** Internal: lets small full-range SGM solves (the range guard) use the GPU under --compute auto. */
+  boolean gpuSmallSolves;
   public double censusWeight = .5;
   public int adTruncation = 30, gradientTruncation = 60, gpuStripRows = 64;
   public int gpuBankMb = 1024;
@@ -320,6 +329,9 @@ public final class Options {
           continue;
         case "--no-self-calibration":
           o.selfCalibration = false;
+          continue;
+        case "--quick-calibration":
+          o.quickCalibration = true;
           continue;
         case "--no-depth-refinement":
           o.depthRefinement = false;
@@ -587,6 +599,13 @@ public final class Options {
           choice(v, "--gpu-transfer-mode", "queued", "blocking");
           o.gpuQueuedUploads = v.equals("queued");
           break;
+        case "--gpu-summary-format":
+          choice(v, "--gpu-summary-format", "packed", "full");
+          o.gpuPackedSummaries = v.equals("packed");
+          break;
+        case "--calibration-trial-iterations":
+          o.calibrationTrialIterations = Integer.parseInt(v);
+          break;
         case "--calibration-pipeline":
           o.calibrationPipeline = v.toLowerCase(Locale.ROOT);
           break;
@@ -598,6 +617,12 @@ public final class Options {
           break;
         case "--fusion-mode":
           o.fusionMode = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--ply":
+          o.writePly = onOff(v, "--ply");
+          break;
+        case "--point-confidence":
+          o.writePointConfidence = onOff(v, "--point-confidence");
           break;
         case "--stereo-pipeline":
           o.stereoPipeline = switch (v.toLowerCase(Locale.ROOT)) {
@@ -1257,6 +1282,16 @@ public final class Options {
               + " reference, --fusion-emission pair, --surface-consolidation none,"
               + " --fusion-strategy owner, --voxel 0 and --windowed-mode off|auto. It uses bounded"
               + " block fusion, not image/incremental fusion or global consolidation.");
+    if (o.quickCalibration) o.calibrationPipeline = "joint";
+    // The ground step reads point-confidence.bin (camera support for free-space checks, pair ids for
+    // ground sheets); --diagnostics converts it to CSV. Keep it in those cases.
+    if (!o.writePointConfidence
+        && (o.classifyGround || o.groundPairCorrection || o.groundAwareFusion || o.diagnostics)) {
+      o.writePointConfidence = true;
+      System.out.println(
+          "Note: --point-confidence off ignored; ground classification/correction and --diagnostics"
+              + " need 07_results/point-confidence.bin");
+    }
     choice(o.calibrationPipeline, "--calibration-pipeline", "bootstrap", "joint");
     choice(o.fusionEmission, "--fusion-emission", "pair", "camera");
     choice(o.fusionEvidence, "--fusion-evidence", "pair", "camera", "auto");
@@ -1513,6 +1548,7 @@ public final class Options {
         || o.minMatches < 8
         || o.neighbors < 1
         || o.iterations < 0
+        || o.calibrationTrialIterations < 0
         || o.step < 1
         || o.cores < 1
         || o.memoryMb < 16
@@ -1600,6 +1636,14 @@ public final class Options {
       throw new IllegalArgumentException("--ground-max-object must be 1..500 metres");
     if (o.gpsAdjustmentRounds < 1 || o.gpsAdjustmentRounds > 20)
       throw new IllegalArgumentException("--gps-adjustment-rounds must be 1..20");
+  }
+
+  private static boolean onOff(String v, String name) {
+    return switch (v.toLowerCase(Locale.ROOT)) {
+      case "on" -> true;
+      case "off" -> false;
+      default -> throw new IllegalArgumentException(name + " requires on|off");
+    };
   }
 
   private static double number(String s) {
@@ -1727,6 +1771,7 @@ public final class Options {
     out.gpuHostReserve = gpuHostReserve;
     out.stereoSelection = stereoSelection;
     out.tsgmSeeds = tsgmSeeds;
+    out.gpuSmallSolves = gpuSmallSolves;
     try {
       for (java.lang.reflect.Field field : Options.class.getFields())
         field.set(out, field.get(this));
@@ -1877,13 +1922,19 @@ Feature matching and final bundle adjustment:
       (default: 2; positive). Final sparse track rejection uses twice this value.
   --bundle-iterations N
       Fixed accepted LM iteration budget per pose/point fit. Default (option omitted):
-      every fit iterates until two successive iterations each improve the robust
-      objective by less than 1e-6 relative, up to 100 iterations. With N, shared lens
-      calibration uses staged fits and three focal starts, each with at least 12
-      iterations; progress labels identify each fit. 0 skips pose-only iterations;
+      pose/point fit iterates until two successive iterations each improve the robust
+      objective by less than 1e-6 relative, up to 100 iterations. Shared lens proposal
+      fits use --calibration-trial-iterations independently. 0 skips pose-only iterations;
       --no-self-calibration separately disables lens refinement. The first pose
       and baseline norm anchor image-only geometry; pose priors anchor supplied
       refinement. Fixed supplied poses and rectified mode preserve their controls.
+  --calibration-trial-iterations N
+      Hard LM iteration cap per intrinsic-parameter proposal/focal start (default 12).
+      Promising bounded proposals receive a convergence fit and repeat both holdout
+      checks before acceptance; rejected proposals restore the preceding model.
+      Final pose/point and GPS bundles keep their own convergence controls. 0 restores
+      legacy proposal budgets (automatic convergence unless --bundle-iterations is set).
+      Short proposals can change model selection; validate calibration and geometry.
 
 Dense stereo / SGM:
   --disparities N
@@ -2506,7 +2557,8 @@ Additional workflow controls:
       standard SGM path; windowed, aerial-tiled and PatchMatch paths do not export it.
   --dense-pair-selection all|coverage
       Default all preserves all verified pairs. Experimental coverage ranks pairs
-      by sparse coverage and predicted range cost; unknown coverage keeps all pairs.
+      by angle-qualified sparse coverage and predicted range cost; unknown coverage
+      keeps all pairs. Camera degree and original-component connectivity are retained.
   --dense-pair-neighbors N
       Coverage-mode minimum degree target per camera (default 3; 1..16).
       Sparse coverage cannot guarantee dense branch completeness; compare quality.
@@ -2514,6 +2566,25 @@ Additional workflow controls:
       Default bootstrap retains guarded focal/radial initialization. Experimental
       joint uses a consistent EXIF focal as initialization and fits intrinsics in
       the main alignment track graph. Missing EXIF falls back to the bootstrap.
+  --ply on|off
+      Default on writes 07_results/dense.ply next to dense.las (same points; double
+      coordinates). off skips it: less disk and write time. The report DSM then reads
+      dense.las; --analyze-run needs the PLY.
+  --point-confidence on|off
+      Default on writes 07_results/point-confidence.bin (lossless per-point metadata in
+      cloud order, about 200 bytes per point). off skips it; the cloud is unchanged.
+      Kept on when ground classification/correction or --diagnostics is requested (they
+      read it); --export-confidence needs it.
+  --quick-calibration
+      Faster alternative calibration path (opt-in; changes the solved cameras and
+      therefore the cloud): the focal length is initialized from EXIF/XMP and the
+      focal/distortion bootstrap is skipped (as --calibration-pipeline joint);
+      intrinsics are still fitted parameter-wise during alignment, the
+      GPS-weighted adjustment uses one focal start instead of up to two, and
+      converging bundle adjustments stop when two successive iterations each
+      improve the objective by less than 1e-4 (default 1e-6). Without
+      a consistent EXIF focal it falls back to the bootstrap. Give it with the
+      first step (inputs/calibrate); see QUICK_CALIBRATION.md.
   --image-fusion-cache-mb auto|N
       Reuse decoded image-fusion candidates across cameras and passes. Default auto
       uses at most a quarter of --memory-mb and available estimated heap headroom.
@@ -2521,6 +2592,10 @@ Additional workflow controls:
   --gpu-transfer-mode queued|blocking
       Default queued batches banded-stereo uploads on the in-order GPU queue;
       host buffers remain alive until completion. Blocking is the comparison path.
+  --gpu-summary-format packed|full
+      Default full retains the six-word summary without host unpacking. Experimental
+      packed transfers five words per banded-SGM pixel, losslessly packing winner/flags.
+      It saves transfer bytes but may cost more CPU time on fast GPU interconnects.
   --fusion-emission pair|camera
       Default pair keeps existing sampling. Experimental camera groups accepted
       observations by owner-camera pixel and separate depth layers, retaining the

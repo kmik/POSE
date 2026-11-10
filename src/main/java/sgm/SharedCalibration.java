@@ -262,6 +262,13 @@ final class SharedCalibration {
     }
   }
 
+  private boolean withinPriorBounds() {
+    for (int k = 0; k < LENS; k++)
+      if (active[k] && (!Double.isFinite(values[k]) || Math.abs(values[k] - prior[k]) > 4 * sigma(k)))
+        return false;
+    return true;
+  }
+
   boolean physical() {
     for (double x : values) if (!Double.isFinite(x)) return false;
     if (Math.abs(values[0] - prior[0]) > Math.log(2)
@@ -435,10 +442,27 @@ final class SharedCalibration {
           lens.focalStarts(
               frames, tracks, train, held, second, iterations, huber, anchor, scaleCamera);
         else
-          BundleAdjuster.optimizeImpl(
-              frames, train, Math.max(12, iterations), huber, null, anchor, scaleCamera, lens);
+          BundleAdjuster.optimizeTrial(
+              frames, train, iterations, huber, anchor, scaleCamera, lens);
         double after = lens.validationRms(frames, held);
         double secondAfter = lens.validationRms(frames, second);
+        double proposalAfter = after, proposalSecondAfter = secondAfter;
+        double proposalNoise = Math.max(.35, Math.max(after, secondAfter));
+        // Spend a full convergence solve only on a promising, bounded short proposal.
+        // Acceptance is always reassessed after this solve, including both holdouts and
+        // data-only observability. Held-out tracks still never fit poses or intrinsics.
+        boolean polished = o.calibrationTrialIterations > 0 && lens.physical()
+            && after < before * .995 && before - after > .002
+            && secondAfter < secondBefore * .995 && secondBefore - secondAfter > .002
+            && lens.withinPriorBounds()
+            && validationEvidence(before, after, firstObservations, proposalNoise)
+            && validationEvidence(secondBefore, secondAfter, secondObservations, proposalNoise);
+        if (polished) {
+          BundleAdjuster.optimizeImpl(frames, train, Math.max(12, iterations), huber,
+              null, anchor, scaleCamera, lens);
+          after = lens.validationRms(frames, held);
+          secondAfter = lens.validationRms(frames, second);
+        }
         if (lens.options.diagnostics)
           CalibrationDiagnostics.residuals(
               diagnostics, "sweep-" + sweep + "-" + NAMES[parameter], lens, frames, train, held, second);
@@ -452,9 +476,7 @@ final class SharedCalibration {
         double noise = Math.max(.35, Math.max(after, secondAfter));
         boolean evidenceGain = validationEvidence(before, after, firstObservations, noise)
             && validationEvidence(secondBefore, secondAfter, secondObservations, noise);
-        boolean bounded = true;
-        for (int k = 0; k < LENS; k++)
-          if (lens.active[k] && Math.abs(lens.values[k] - lens.prior[k]) > 4 * lens.sigma(k)) bounded = false;
+        boolean bounded = lens.withinPriorBounds();
         CalibrationObservability.Assessment assessment =
             improvement && evidenceGain && bounded && Double.isFinite(noise)
                 ? CalibrationObservability.assess(frames, train, huber, lens, noise)
@@ -464,6 +486,9 @@ final class SharedCalibration {
         double[] uncertainty = assessment.sigma();
         boolean constrained = lens.constrained(uncertainty, coverage);
         boolean accept = improvement && evidenceGain && constrained && bounded;
+        Integer trialBudget = null;
+        if (o.calibrationTrialIterations > 0) trialBudget = o.calibrationTrialIterations;
+        else if (o.bundleIterationsExplicit) trialBudget = Math.max(12, iterations);
         stages.add(
             Json.object(
                 "parameter",
@@ -475,7 +500,12 @@ final class SharedCalibration {
                 "elapsed_seconds",
                 (System.nanoTime() - stageStarted) / 1e9,
                 "iteration_budget_per_trial",
-                Math.max(12, iterations),
+                trialBudget,
+                "iteration_mode", o.calibrationTrialIterations > 0 ? "hard trial cap"
+                    : o.bundleIterationsExplicit ? "legacy fixed budget" : "legacy automatic",
+                "final_refinement_performed", polished,
+                "proposal_validation_rms_pixels", proposalAfter,
+                "proposal_second_validation_rms_pixels", proposalSecondAfter,
                 "focal_start_scales",
                 sweep == 0 && parameter == 0 ? new double[] {1, .9, 1.1} : new double[] {1},
                 "accepted",
@@ -646,8 +676,8 @@ final class SharedCalibration {
         values = originalLens.clone();
         values[0] += Math.log(scale);
         restore(frames, tracks, original, originalPoints);
-        BundleAdjuster.optimizeImpl(
-            frames, train, Math.max(12, iterations), huber, null, anchor, scaleCamera, this);
+        BundleAdjuster.optimizeTrial(
+            frames, train, iterations, huber, anchor, scaleCamera, this);
         double score = validationRms(frames, first) + validationRms(frames, second);
         if (physical() && score < bestScore) {
           bestScore = score;

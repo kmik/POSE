@@ -117,6 +117,7 @@ final class TsgmSearch {
         level.matchingCost = "census";
         level.censusMode = "gray";
         level.stereoSelection = null;
+        level.gpuSmallSolves = true;
         long[][] da = CensusSgm.census(grayA[l], lw, lh, o.census),
             db = CensusSgm.census(grayB[l], lw, lh, o.census);
         BandedSgm.Outcome forward, reverse;
@@ -211,6 +212,24 @@ final class TsgmSearch {
       int lmin,
       int radius,
       boolean reverse) {
+    // Same bands on the GPU (GpuTsgm, self-checked against deriveCpu on first use); -1: not applied.
+    if (radius == 1) {
+      long full = GpuTsgm.derive(o, parent, pw, ph, bands, valid, lmin, reverse);
+      if (full >= 0) return full;
+    }
+    return deriveCpu(o, parent, pw, ph, bands, valid, lmin, radius, reverse);
+  }
+
+  static long deriveCpu(
+      Options o,
+      float[] parent,
+      int pw,
+      int ph,
+      DisparityBands bands,
+      boolean[] valid,
+      int lmin,
+      int radius,
+      boolean reverse) {
     int w = bands.width, h = bands.height, D = bands.labels, k = o.tsgmMargin;
     // Windowed min/max of valid parent disparities for each fallback radius, computed once.
     // A 129x129 parent window comes before the full range: with ranges of 1000+ disparities, full
@@ -273,10 +292,13 @@ final class TsgmSearch {
       sliding(parent, y * pw, 1, pw, radius, false, rowMax, g, h);
     });
     float[] min = new float[parent.length], max = new float[parent.length];
-    StereoRows.rows(0, pw, x -> {
-      float[] g = new float[ph + 2 * radius], h = new float[ph + 2 * radius];
-      sliding(rowMin, x, pw, ph, radius, true, min, g, h);
-      sliding(rowMax, x, pw, ph, radius, false, max, g, h);
+    // Column pass in row order over blocks of columns (cache friendly); per element the same
+    // prefix/suffix min/max operations as sliding(), so identical values.
+    int block = 64;
+    StereoRows.rows(0, (pw + block - 1) / block, b -> {
+      int x0 = b * block, x1 = Math.min(pw, x0 + block);
+      columns(rowMin, pw, ph, x0, x1, radius, true, min);
+      columns(rowMax, pw, ph, x0, x1, radius, false, max);
     });
     for (int p = 0; p < min.length; p++)
       if (!(min[p] <= max[p])) {
@@ -295,11 +317,12 @@ final class TsgmSearch {
       float[] in, int from, int stride, int n, int radius, boolean minimum, float[] out, float[] g, float[] h) {
     int k = 2 * radius + 1, length = n + 2 * radius;
     float empty = minimum ? Float.POSITIVE_INFINITY : Float.NEGATIVE_INFINITY;
-    for (int i = 0; i < length; i++) {
+    // Block boundaries tracked with a counter instead of a modulo per element (same boundaries).
+    for (int i = 0, phase = 0; i < length; i++, phase = phase + 1 == k ? 0 : phase + 1) {
       int j = i - radius;
       float v = j >= 0 && j < n ? in[from + j * stride] : empty;
       if (!Float.isFinite(v)) v = empty;
-      g[i] = i % k == 0 ? v : minimum ? Math.min(g[i - 1], v) : Math.max(g[i - 1], v);
+      g[i] = phase == 0 ? v : minimum ? Math.min(g[i - 1], v) : Math.max(g[i - 1], v);
     }
     for (int i = length - 1; i >= 0; i--) {
       int j = i - radius;
@@ -310,6 +333,49 @@ final class TsgmSearch {
     for (int x = 0; x < n; x++) {
       float a = h[x], b = g[x + 2 * radius];
       out[from + x * stride] = minimum ? Math.min(a, b) : Math.max(a, b);
+    }
+  }
+
+  /**
+   * sliding() down columns x0..x1-1 of a pw-wide raster with ph rows, all columns of the block
+   * processed together row by row. Element for element the same operations as sliding().
+   */
+  private static final ThreadLocal<float[][]> COLUMN_BUFFERS =
+      ThreadLocal.withInitial(() -> new float[][] {new float[0], new float[0]});
+
+  static void columns(
+      float[] in, int pw, int ph, int x0, int x1, int radius, boolean minimum, float[] out) {
+    int k = 2 * radius + 1, length = ph + 2 * radius, bw = x1 - x0;
+    float empty = minimum ? Float.POSITIVE_INFINITY : Float.NEGATIVE_INFINITY;
+    // Per-thread buffers: every element read below is written first in this call.
+    float[][] buffers = COLUMN_BUFFERS.get();
+    if (buffers[0].length < length * bw) {
+      buffers[0] = new float[length * bw];
+      buffers[1] = new float[length * bw];
+    }
+    float[] g = buffers[0], h = buffers[1];
+    for (int i = 0; i < length; i++) {
+      int j = i - radius, at = i * bw;
+      boolean start = i % k == 0, inside = j >= 0 && j < ph;
+      for (int c = 0; c < bw; c++) {
+        float v = inside ? in[j * pw + x0 + c] : empty;
+        if (!Float.isFinite(v)) v = empty;
+        g[at + c] = start ? v : minimum ? Math.min(g[at - bw + c], v) : Math.max(g[at - bw + c], v);
+      }
+    }
+    for (int i = length - 1; i >= 0; i--) {
+      int j = i - radius, at = i * bw;
+      boolean start = i == length - 1 || (i + 1) % k == 0, inside = j >= 0 && j < ph;
+      for (int c = 0; c < bw; c++) {
+        float v = inside ? in[j * pw + x0 + c] : empty;
+        if (!Float.isFinite(v)) v = empty;
+        h[at + c] = start ? v : minimum ? Math.min(h[at + bw + c], v) : Math.max(h[at + bw + c], v);
+      }
+    }
+    for (int y = 0; y < ph; y++) {
+      int a = y * bw, b = (y + 2 * radius) * bw;
+      for (int c = 0; c < bw; c++)
+        out[y * pw + x0 + c] = minimum ? Math.min(h[a + c], g[b + c]) : Math.max(h[a + c], g[b + c]);
     }
   }
 

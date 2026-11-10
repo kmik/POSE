@@ -273,7 +273,19 @@ public final class PerformanceRegression {
           for (int i = 0; i < 4; i++) t.observations.add(new FeatureTracks.Observation(i, 0));
           tracks.add(t);
         }
+      o.minAngle = 179;
+      DensePairSelection.select(frames, pairs, tracks, o);
+      var weak = ProcessingReport.map(o.output.resolve("05_stereo/dense_pair_selection.json"));
+      check(((Number) weak.get("required_sparse_cells")).intValue() == 0,
+          "Known samples below the angle threshold cannot earn coverage");
+      check(((List<?>) weak.get("pairs")).stream().map(p -> (Map<?, ?>) p)
+          .noneMatch(p -> Boolean.TRUE.equals(p.get("unknown_keep"))),
+          "Known weak geometry is not misclassified as unknown evidence");
+      o.minAngle = 1;
       var selected = DensePairSelection.select(frames, pairs, tracks, o);
+      var qualified = ProcessingReport.map(o.output.resolve("05_stereo/dense_pair_selection.json"));
+      check(((Number) qualified.get("required_sparse_cells")).intValue() > 0,
+          "Coverage fixture has nonempty angle-qualified witness targets");
       int[] degree = new int[4];
       for (var p : selected) {
         degree[p.a]++;

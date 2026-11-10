@@ -110,12 +110,15 @@ final class DenseReconstruction {
         options.fusionMode.equals("incremental") ? new IncrementalFusion(options, fusion) : null) {
       if (incremental != null)
         preparedResults = Files.createTempFile(options.output, "prepared-fusion-", ".bin");
+      // A large buffer: about 64 MB of candidate records per pair are written on the serial
+      // publication path, and 8 KB system calls dominated it (same bytes).
       try (DataOutputStream out =
           new DataOutputStream(
               new BufferedOutputStream(
                   incremental == null
                       ? Files.newOutputStream(candidates)
-                      : incremental.stream()))) {
+                      : incremental.stream(),
+                  4 << 20))) {
         if (options.denseMethod.equals("patchmatch"))
           count =
               new PatchMatchReconstruction(
@@ -557,7 +560,7 @@ final class DenseReconstruction {
    */
   private int pairsInFlight(List<FeatureTracks.Pair> pairs) {
     int requested =
-        options.stereoPairsInFlight > 0 ? options.stereoPairsInFlight : Math.max(1, Math.min(4, options.cores / 4));
+        options.stereoPairsInFlight > 0 ? options.stereoPairsInFlight : autoPairsInFlight(options, frames);
     if (requested <= 1 || options.diagnostics || options.cores < 2) return 1;
     for (FeatureTracks.Pair pair : pairs)
       if (windowed(frames.get(pair.a), frames.get(pair.b))) return 1;
@@ -586,18 +589,48 @@ final class DenseReconstruction {
     }
     Options base = options.copy();
     base.cores = Math.max(1, options.cores / inFlight);
+    // --stereo-pipeline halves the row workers to leave room for the serial path's one-pair-ahead
+    // preparation, which concurrent pairs do not use; here it only idled half of each worker's
+    // cores. Row results do not depend on the number of row workers.
+    base.stereoPipeline = false;
+    // Every worker sees the whole GPU budget (the same GPU/CPU decisions as one pair at a time);
+    // banded sessions reserve their bytes from a shared pool instead of a fixed 1/N share, so a
+    // large pair no longer falls back to the much slower CPU solve.
+    GpuMemoryPool.Scope gpuPool = null;
     try {
       long budget = GpuSgm.budget(GpuSgm.selectedDevice(options), options);
-      base.gpuMemoryMb = (int) Math.max(64, budget / 1048576 / inFlight);
+      if (!options.compute.equals("cpu")) {
+        base.gpuMemoryMb = (int) Math.max(64, budget / 1048576);
+        gpuPool = GpuMemoryPool.install(GpuSgm.budget(GpuSgm.selectedDevice(base), base));
+      }
     } catch (RuntimeException noGpu) {
       // CPU only: nothing to share.
     }
     System.out.printf(
         Locale.ROOT,
-        "Dense matching: %d pairs in flight (%d cores and %d MiB GPU memory each)%n",
+        "Dense matching: %d pairs in flight (%d cores each%s)%n",
         inFlight,
         base.cores,
-        base.gpuMemoryMb);
+        gpuPool == null ? "" : "; " + base.gpuMemoryMb + " MiB GPU memory shared");
+    try {
+      return parallelPairs(pairs, out, progress, count, inFlight, work, base);
+    } finally {
+      if (gpuPool != null) {
+        System.out.println(gpuPool.summary());
+        gpuPool.close();
+      }
+    }
+  }
+
+  private long parallelPairs(
+      List<FeatureTracks.Pair> pairs,
+      DataOutputStream out,
+      WorkProgress progress,
+      long count,
+      int inFlight,
+      List<int[]> work,
+      Options base)
+      throws IOException {
     ExecutorService workers =
         Executors.newFixedThreadPool(
             inFlight,
@@ -741,6 +774,26 @@ final class DenseReconstruction {
     }
     pairIndex = pairs.size();
     return count;
+  }
+
+  /**
+   * auto: one pair per 3 cores (at most 6), when the conservative per-pair host estimate of
+   * pairSubmissionWindow fits the processing allowance for all of them; never fewer than the
+   * former one-per-4-cores default (at most 4). With the shared GPU pool, more pairs in flight
+   * keep the CPU stages busy (city2: 3 -> 4 pairs, stereo 55 -> 49 s). Results do not depend on it.
+   */
+  static int autoPairsInFlight(Options o, List<ImageFrame> frames) {
+    int former = Math.max(1, Math.min(4, o.cores / 4));
+    int wanted = Math.max(former, Math.min(6, o.cores / 3));
+    if (o.compute.equals("cpu")) return former;
+    long side = 1;
+    for (ImageFrame f : frames) side = Math.max(side, Math.max(f.width, f.height));
+    long words = (o.census * o.census - 1L + 63) / 64;
+    if (o.censusMode.equals("color-distance")) words *= 3;
+    long pairBytes = 2 * side * side * (96 + 32 * words);
+    long allowance = Math.min(o.memoryMb * 1048576L, (long) (Runtime.getRuntime().maxMemory() * .60));
+    while (wanted > former && wanted * pairBytes > allowance) wanted--;
+    return wanted;
   }
 
   static int pairSubmissionWindow(Options o, List<ImageFrame> frames, int inFlight) {

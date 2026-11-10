@@ -39,12 +39,14 @@ final class FusionOutput implements AutoCloseable {
     cloud =
         new CloudWriter(
             options.output, options.scale, crs, options.pointAttributes.equals("surface"));
+    cloud.writePly(options.writePly);
     BufferedWriter openedDecisions = null;
     PointRecords.Writer openedRecords = null;
     SurfaceConsolidator openedSurface = null;
     CameraEmission openedCamera = null;
     try {
-      openedRecords = new PointRecords.Writer(file.resolveSibling("point-confidence.bin"));
+      if (options.writePointConfidence)
+        openedRecords = new PointRecords.Writer(file.resolveSibling("point-confidence.bin"));
       if (options.fusionEmission.equals("camera"))
         openedCamera = new CameraEmission(options, fusion);
       openedSurface =
@@ -182,20 +184,22 @@ final class FusionOutput implements AutoCloseable {
                 surfaceDecisions.write(p.id + ",-1,isolated_off_surface_removed,0\n");
             }
           });
-    records.flush();
+    if (records != null) records.flush();
     Json.write(
         options.output.resolve("06_fusion/confidence.json"),
         Json.object(
             "model",
             PointConfidence.MODEL,
             "point_metadata",
-            "07_results/point-confidence.bin; version 2, lossless, in cloud order",
+            records == null
+                ? "not written (--point-confidence off)"
+                : "07_results/point-confidence.bin; version 2, lossless, in cloud order",
             "diagnostic_csv_enabled",
             options.diagnostics,
             "binary_write_nanoseconds",
-            records.nanos,
+            records == null ? 0 : records.nanos,
             "binary_record_bytes",
-            records.bytes,
+            records == null ? 0 : records.bytes,
             "cloud_staging_nanoseconds",
             cloudWriteNanos,
             "threshold",
@@ -259,7 +263,7 @@ final class FusionOutput implements AutoCloseable {
       surfaceDecisions.write(
           p.id + "," + p.id + ",representative," + (p.surfaceShift * options.scale) + "\n");
     int r = p.rgb >>> 16, g = p.rgb >>> 8 & 255, b = p.rgb & 255;
-    records.point(cloud.count(), p, options.scale, score);
+    if (records != null) records.point(cloud.count(), p, options.scale, score);
     long cloudStarted = System.nanoTime();
     cloud.point(p.point[0], p.point[1], p.point[2], r, g, b, p.normal, p.attributes);
     cloudWriteNanos += System.nanoTime() - cloudStarted;

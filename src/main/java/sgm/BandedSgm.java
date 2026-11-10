@@ -170,9 +170,23 @@ final class BandedSgm {
     private int[] whole(Options o, boolean reverse, DisparityBands bands, String[] backend) {
       if (!gpuFailed && GpuBandedStereo.use(o, w, h, bands)) {
         try {
-          if (gpu == null) gpu = new GpuBandedStereo.Session(o, a, b, grayA, grayB, ta, tb, w, h);
+          long total = Math.max(1, bands.total());
+          // With the shared pair-worker pool, a session holds a fixed reservation: one that would
+          // have to grow is closed first and re-created with a new reservation (never waiting
+          // while holding memory). Volume capacity does not affect results.
+          if (gpu != null && GpuMemoryPool.enabled() && total > gpu.capacity()) {
+            gpu.close();
+            gpu = null;
+          }
+          if (gpu == null)
+            gpu =
+                new GpuBandedStereo.Session(
+                    o, a, b, grayA, grayB, ta, tb, w, h,
+                    GpuMemoryPool.enabled() ? GpuBandedStereo.plannedBytes(o, w, h, total) : 0);
           int[] result = gpu.summary(o, reverse, bands);
           backend[0] = "gpu";
+          if (o.gpuSmallSolves && total < 200_000 && !GpuBandedStereo.smallVerified)
+            return verifySmall(o, reverse, bands, result, backend);
           return result;
         } catch (RuntimeException e) {
           gpuFailed = true;
@@ -193,6 +207,35 @@ final class BandedSgm {
       return reverse
           ? cpuSummary(o, b, a, grayB, grayA, tb, ta, w, h, true, bands)
           : cpuSummary(o, a, b, grayA, grayB, ta, tb, w, h, false, bands);
+    }
+
+    /**
+     * First small (coarse TSGM) GPU solve in a process: compared with the CPU reference; a
+     * difference disables small GPU solves and the CPU summary is used.
+     */
+    private int[] verifySmall(
+        Options o, boolean reverse, DisparityBands bands, int[] result, String[] backend) {
+      int[] cpu =
+          reverse
+              ? cpuSummary(o, b, a, grayB, grayA, tb, ta, w, h, true, bands)
+              : cpuSummary(o, a, b, grayA, grayB, ta, tb, w, h, false, bands);
+      synchronized (GpuBandedStereo.class) {
+        if (!Arrays.equals(cpu, result)) {
+          if (!GpuBandedStereo.smallDisabled)
+            System.out.println(
+                "WARNING: small GPU banded solve differs from the CPU reference; coarse TSGM levels"
+                    + " below 200,000 cells use the CPU (same results as before)");
+          GpuBandedStereo.smallDisabled = true;
+          backend[0] = "cpu";
+          return cpu;
+        }
+        if (!GpuBandedStereo.smallVerified)
+          System.out.println(
+              "GPU banded SGM: small coarse-level solve (" + w + "x" + h + ", " + bands.total()
+                  + " cells) identical to the CPU reference");
+        GpuBandedStereo.smallVerified = true;
+      }
+      return result;
     }
 
     @Override
@@ -239,7 +282,7 @@ final class BandedSgm {
     float[] result = new float[n];
     Arrays.fill(result, Float.NaN);
     GpuStereo.select(
-        MemorySegment.ofArray(summary), 0, n, o.disparities, o, result, stats, reasons, boundary);
+        summary, 0, 0, n, o.disparities, o, result, stats, reasons, boundary, null, 0, Integer.MAX_VALUE);
     return new Outcome(result, bands, retried, edgeRejected, backend[0]);
   }
 

@@ -801,6 +801,12 @@ final class Pipeline {
     if (!(options.classifyGround || options.groundPairCorrection || options.groundAwareFusion)) return "skipped";
     images();
     loadFrames();
+    if (!Files.isRegularFile(options.output.resolve("07_results/point-confidence.bin")))
+      System.err.println(
+          "Warning: 07_results/point-confidence.bin is missing (dense step ran with"
+              + " --point-confidence off): ground classification runs without camera-support"
+              + " free-space checks and ground sheets are skipped. Re-run dense with it on for"
+              + " full ground processing.");
     GroundClassification.run(options, frames, crs());
     return "complete";
   }

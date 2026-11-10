@@ -290,7 +290,8 @@ final class GpuStereo {
       MemorySegment costs = cl.kernel("costs"),
           paths = cl.kernel("paths"),
           winners = cl.kernel("winners");
-      System.out.printf(
+      // Small range-guard solves (one per pair) are not reported individually.
+      if (!o.gpuSmallSolves) System.out.printf(
           Locale.ROOT,
           "GPU SGM storage: %s; %d-row working set, %.1f MiB device; cost=%s; P1/P2=%d/%d%n",
           plan.streamed
@@ -687,17 +688,43 @@ final class GpuStereo {
       int[] slots,
       int low,
       int high) {
+    // Element-wise VarHandle reads of a segment cost more than the selection itself; copy the
+    // summary into a Java array in bounded chunks and select from that (same values, same order).
+    int chunk = Math.max(1, Math.min(count, 1 << 16));
+    int[] words = new int[6 * chunk];
+    for (int done = 0; done < count; done += chunk) {
+      int part = Math.min(chunk, count - done);
+      MemorySegment.copy(host, JAVA_INT, done * 24L, words, 0, 6 * part);
+      select(words, 0, first + done, part, D, o, result, stats, reasons, boundary, slots, low, high);
+    }
+  }
+
+  /** Summary words in a Java array: 6 ints per pixel, pixel j of the batch at {@code base0 + 6j}. */
+  static void select(
+      int[] host,
+      int base0,
+      int first,
+      int count,
+      int D,
+      Options o,
+      float[] result,
+      CensusSgm.Stats stats,
+      byte[] reasons,
+      byte[] boundary,
+      int[] slots,
+      int low,
+      int high) {
     for (int j = 0; j < count; j++) {
       if (slots != null && (slots[first + j] < low || slots[first + j] >= high)) continue;
-      long base = j * 24L;
+      int base = base0 + 6 * j;
       int p = first + j,
-          best = host.get(JAVA_INT, base),
-          value = host.get(JAVA_INT, base + 4),
-          second = host.get(JAVA_INT, base + 8),
-          before = host.get(JAVA_INT, base + 12),
-          after = host.get(JAVA_INT, base + 16);
+          best = host[base],
+          value = host[base + 1],
+          second = host[base + 2],
+          before = host[base + 3],
+          after = host[base + 4];
       if (best < 0) continue;
-      boolean full = host.get(JAVA_INT, base + 20) == 3;
+      boolean full = host[base + 5] == 3;
       if (full) {
         stats.fullIntervalPixels++;
         if (boundary != null) boundary[p] = 4;

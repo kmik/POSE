@@ -242,12 +242,21 @@ final class GpsAdjustment {
         best = save(frames, tracks, lens, m);
         bestLens = lens;
       }
+      // --quick-calibration: keep the first (current-lens) start only.
       if (trial == 0
+          && !o.quickCalibration
           && lens != null
           && lens.active[0]
           && Double.isFinite(focalPrior)
           && Math.abs(lens.values[0] - Math.log(focalPrior)) > 2 * o.gpsFocalSigma)
         starts.add(focalPrior / currentFocal);
+      else if (trial == 0
+          && o.quickCalibration
+          && lens != null
+          && lens.active[0]
+          && Double.isFinite(focalPrior)
+          && Math.abs(lens.values[0] - Math.log(focalPrior)) > 2 * o.gpsFocalSigma)
+        notes.add("--quick-calibration: second focal start (at the EXIF/XMP prior) skipped");
     }
     boolean accepted = best != null;
     double rmsAfter = Double.NaN, gpsAfter = Double.NaN;

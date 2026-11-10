@@ -25,8 +25,15 @@ public final class CloudWriter implements AutoCloseable {
   private final boolean attributes;
   private final ByteBuffer extraRecord =
       ByteBuffer.allocate(SurfaceAttributes.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+  private final ByteBuffer spoolRecord;
   private long count;
   private boolean closed;
+  private boolean ply = true;
+
+  /** false: write only dense.las (--ply off). The LAS bytes do not depend on it. */
+  void writePly(boolean write) {
+    ply = write;
+  }
 
   public CloudWriter(Path directory, double scale) throws IOException {
     this(directory, scale, null);
@@ -38,6 +45,7 @@ public final class CloudWriter implements AutoCloseable {
 
   CloudWriter(Path directory, double scale, Crs crs, boolean attributes) throws IOException {
     this.attributes = attributes;
+    spoolRecord = ByteBuffer.allocate(27 + (attributes ? SurfaceAttributes.BYTES : 0));
     if (crs != null && scale != 1)
       throw new IllegalArgumentException("A CRS-tagged cloud requires scale 1");
     this.directory = directory;
@@ -45,7 +53,7 @@ public final class CloudWriter implements AutoCloseable {
     this.crs = crs;
     Files.createDirectories(directory);
     spool = Files.createTempFile(directory, "cloud-", ".bin");
-    data = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(spool)));
+    data = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(spool), 1 << 20));
   }
 
   public void point(double x, double y, double z, int red, int green, int blue) throws IOException {
@@ -63,22 +71,20 @@ public final class CloudWriter implements AutoCloseable {
       SurfaceAttributes surface)
       throws IOException {
     if (closed) throw new IOException("Cloud writer is closed");
-    double[] v = {x * scale, y * scale, z * scale};
-    if (!Double.isFinite(v[0] + v[1] + v[2])) throw new IOException("Non-finite cloud point");
+    x *= scale; y *= scale; z *= scale;
+    if (!Double.isFinite(x + y + z)) throw new IOException("Non-finite cloud point");
     if (count == 0xffffffffL) throw new IOException("LAS 1.2 point-count limit exceeded");
-    for (int i = 0; i < 3; i++) {
-      data.writeDouble(v[i]);
-      min[i] = Math.min(min[i], v[i]);
-      max[i] = Math.max(max[i], v[i]);
-    }
-    data.writeByte(red);
-    data.writeByte(green);
-    data.writeByte(blue);
+    spoolRecord.clear();
+    spoolRecord.putDouble(x).putDouble(y).putDouble(z).put((byte) red).put((byte) green).put((byte) blue);
+    min[0] = Math.min(min[0], x); max[0] = Math.max(max[0], x);
+    min[1] = Math.min(min[1], y); max[1] = Math.max(max[1], y);
+    min[2] = Math.min(min[2], z); max[2] = Math.max(max[2], z);
     if (attributes) {
       extraRecord.clear();
       surface.binary(extraRecord, normal, scale);
-      data.write(extraRecord.array());
+      spoolRecord.put(extraRecord.array());
     }
+    data.write(spoolRecord.array());
     count++;
   }
 
@@ -111,8 +117,11 @@ public final class CloudWriter implements AutoCloseable {
       for (int i = 0; i < 3; i++) offsets[i] = min[i] + (max[i] - min[i]) / 2;
       Path las = directory.resolve("dense.las.part"), ply = directory.resolve("dense.ply.part");
       try (WorkProgress work = WorkProgress.start("Final LAS/PLY export", count, "points");
-          OutputStream lasOut = new BufferedOutputStream(Files.newOutputStream(las));
-          OutputStream plyOut = new BufferedOutputStream(Files.newOutputStream(ply));
+          OutputStream lasOut = new BufferedOutputStream(Files.newOutputStream(las), 1 << 20);
+          OutputStream plyOut =
+              this.ply
+                  ? new BufferedOutputStream(Files.newOutputStream(ply), 1 << 20)
+                  : OutputStream.nullOutputStream();
           DataInputStream in =
               new DataInputStream(new BufferedInputStream(Files.newInputStream(spool)))) {
         byte[] vlrs = crs == null ? new byte[0] : projectionVlr(crs.epsg);
@@ -182,15 +191,18 @@ public final class CloudWriter implements AutoCloseable {
           if (attributes) in.readFully(extra);
           record.put(extra);
           lasOut.write(record.array());
-          vertex.clear();
-          vertex.putDouble(x).putDouble(y).putDouble(z).put((byte) r).put((byte) g).put((byte) b);
-          vertex.put(extra);
-          plyOut.write(vertex.array());
+          if (this.ply) {
+            vertex.clear();
+            vertex.putDouble(x).putDouble(y).putDouble(z).put((byte) r).put((byte) g).put((byte) b);
+            vertex.put(extra);
+            plyOut.write(vertex.array());
+          }
         }
         work.done();
       }
       publish(las, directory.resolve("dense.las"));
-      publish(ply, directory.resolve("dense.ply"));
+      if (this.ply) publish(ply, directory.resolve("dense.ply"));
+      else Files.deleteIfExists(directory.resolve("dense.ply"));
     } finally {
       Files.deleteIfExists(spool);
     }

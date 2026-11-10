@@ -847,6 +847,7 @@ final class ReuseCache {
                     "baseline",
                     "seedPair",
                     "cleanupPasses",
+                    "quickCalibration",
                     "trackMinViews",
                     "trackMaxError",
                     "trackMinAngle",
@@ -856,6 +857,7 @@ final class ReuseCache {
                     "intrinsicsMode",
                     "refineIntrinsics",
                     "selfCalibration",
+                    "calibrationTrialIterations",
                     "focalSigma",
                     "radialSigma"));
     if (o.poses != null) b.append(hash(o.poses));
@@ -876,6 +878,7 @@ final class ReuseCache {
                 "sensorWidth",
                 "selfCalibration",
                 "calibrationPipeline",
+                "calibrationTrialIterations",
                 "matchingAlgorithm",
                 "descriptorMatcher",
                 "features",

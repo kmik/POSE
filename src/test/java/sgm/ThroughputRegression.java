@@ -29,8 +29,15 @@ public final class ThroughputRegression {
     Options parsed = Options.parse(new String[] {"-i", ".", "--image-fusion-cache-mb", "0",
         "--gpu-transfer-mode", "blocking"});
     check(parsed.imageFusionCacheMb == 0 && !parsed.gpuQueuedUploads, "Reference controls parse");
+    check(!parsed.gpuPackedSummaries && parsed.calibrationTrialIterations == 12,
+        "Fast full transfers and independently bounded calibration proposals are defaults");
+    Options referenceOptions = Options.parse(new String[] {"-i", ".", "--gpu-summary-format", "full",
+        "--calibration-trial-iterations", "0"});
+    check(!referenceOptions.gpuPackedSummaries && referenceOptions.calibrationTrialIterations == 0,
+        "Legacy calibration and transfer comparison controls parse");
     for (String[] args : new String[][] {{"--image-fusion-cache-mb", "-2"},
-        {"--gpu-transfer-mode", "invalid"}}) {
+        {"--gpu-transfer-mode", "invalid"}, {"--gpu-summary-format", "bad"},
+        {"--calibration-trial-iterations", "-1"}}) {
       boolean rejected = false;
       try { Options.parse(new String[] {"-i", ".", args[0], args[1]}); }
       catch (IllegalArgumentException expected) { rejected = true; }
@@ -38,6 +45,7 @@ public final class ThroughputRegression {
     }
     validation(root.resolve("validation"));
     telemetry(root.resolve("telemetry"));
+    provenance(root.resolve("provenance.bin"));
     for (String strategy : List.of("owner", "owner-consume", "graph-average")) {
       byte[][] reference = fusion(root.resolve(strategy + "-off"), strategy, 0);
       for (int cache : new int[] {1, -1, 1024}) {
@@ -81,6 +89,38 @@ public final class ThroughputRegression {
         "Step continuation preserves queued-transfer measurements");
   }
 
+  private static void provenance(Path file) throws Exception {
+    var p = new SurfaceConsolidator.Sample();
+    p.point = new double[] {1.25, -2.5, 3.75};
+    List<BitSet> sets = new ArrayList<>();
+    List<byte[]> expected = new ArrayList<>();
+    Random random = new Random(4191);
+    try (var writer = new PointRecords.Writer(file)) {
+      for (int bits : new int[] {0, 1, 8, 9, 63, 64, 65, 4097, 2, 0}) {
+        BitSet set = new BitSet();
+        for (int bit = 0; bit < bits; bit++) if (random.nextBoolean()) set.set(bit);
+        if (bits > 0) set.set(bits - 1);
+        sets.add(set); expected.add(set.toByteArray()); p.supportingCameras = set;
+        writer.point(sets.size() - 1, p, 2, .75);
+      }
+    }
+    byte[] raw = Files.readAllBytes(file);
+    int offset = 8;
+    try (var reader = new PointRecords.Reader(file)) {
+      for (int i = 0; i < sets.size(); i++) {
+        var row = reader.next();
+        check(row.id() == i && row.sample().supportingCameras.equals(sets.get(i)),
+            "Provenance survives bitmap growth, shrinkage and byte boundaries");
+        check(Arrays.equals(Arrays.copyOfRange(raw, offset + 206, offset + 206 + expected.get(i).length),
+            expected.get(i)), "Reused bitmap storage retains the exact BitSet byte format");
+        check(row.sample().point[2] == 7.5, "Buffered record retains coordinate scaling");
+        offset += 206 + expected.get(i).length;
+      }
+      check(reader.next() == null && raw.length == offset + 1 && raw[offset] == 0,
+          "Buffered provenance preserves footer without stale bytes from larger bitmaps");
+    }
+  }
+
   private static void validation(Path root) throws Exception {
     Files.createDirectories(root);
     Options o = TestSupport.options();
@@ -107,6 +147,39 @@ public final class ThroughputRegression {
       o.memoryMb = 128;
       check(DenseReconstruction.pairSubmissionWindow(o, frames, 3) == 3,
           "Low-memory execution does not add look-ahead results");
+      // A trial must obey its own cap even when the normal solver is in automatic mode.
+      o.compute = "cpu";
+      o.memoryMb = 512;
+      o.bundleIterationsExplicit = false;
+      o.calibrationTrialIterations = 2;
+      lens.active[1] = true;
+      Camera[] before = frames.stream().map(f -> f.camera.copy()).toArray(Camera[]::new);
+      double[][] original = tracks.stream().map(t -> t.point).toArray(double[][]::new);
+      double[] initial = lens.values.clone();
+      BundleAdjuster.optimizeTrial(frames, tracks, 100, 2, 0, 1, lens);
+      Camera[] trial = frames.stream().map(f -> f.camera.copy()).toArray(Camera[]::new);
+      double[][] trialPoints = tracks.stream().map(t -> t.point).toArray(double[][]::new);
+      double[] trialLens = lens.values.clone();
+      for (int i = 0; i < frames.size(); i++) {
+        frames.get(i).camera.rotation = before[i].rotation;
+        frames.get(i).camera.translation = before[i].translation;
+      }
+      for (int i = 0; i < tracks.size(); i++) tracks.get(i).point = original[i];
+      lens.values = initial;
+      o.bundleIterationsExplicit = true;
+      BundleAdjuster.optimizeImpl(frames, tracks, 2, 2, null, 0, 1, lens);
+      check(Arrays.equals(trialLens, lens.values), "Proposal cap matches an explicit two-iteration reference");
+      for (int i = 0; i < frames.size(); i++) {
+        check(Arrays.equals(trial[i].rotation, frames.get(i).camera.rotation)
+            && Arrays.equals(trial[i].translation, frames.get(i).camera.translation),
+            "Proposal cap preserves the exact explicit-reference camera state");
+        Camera cam = frames.get(i).camera;
+        double[] p = {.123, -.456, 7.89}, scratch = new double[3];
+        cam.viewInto(p[0], p[1], p[2], scratch);
+        check(Arrays.equals(cam.view(p), scratch), "Scratch projection retains floating-point order");
+      }
+      for (int i = 0; i < tracks.size(); i++)
+        check(Arrays.equals(trialPoints[i], tracks.get(i).point), "Proposal cap preserves reference structure");
     } finally { for (var f : frames) f.close(); }
   }
 
@@ -214,10 +287,12 @@ public final class ThroughputRegression {
       }
     }
     GpuHamming.close();
-    for (boolean queued : new boolean[] {false, true}) {
+    for (boolean queued : new boolean[] {false, true})
+    for (boolean packed : new boolean[] {false, true}) {
       Options o = TsgmRegression.options("gpu", "census", 8, "16");
       o.gpuDevice = device;
       o.gpuQueuedUploads = queued;
+      o.gpuPackedSummaries = packed;
       int w = 120, h = 72;
       byte[][] images = TsgmRegression.scene(w, h, 11, new float[w * h]);
       long[][] a = CensusSgm.census(images[0], w, h, o.census),
@@ -228,10 +303,17 @@ public final class ThroughputRegression {
         for (int labels : new int[] {4, 10, 40, 8, 40}) {
           o.disparities = labels;
           var bands = DisparityBands.full(w, h, labels, ta);
-          int[] expected = BandedSgm.cpuSummary(o, a, b, images[0], images[1], ta, tb, w, h, false, bands);
-          check(Arrays.equals(expected, session.summary(o, false, bands)),
-              "Queued/blocking uploads and growing/reused volumes match the CPU exactly");
+          for (boolean reverse : new boolean[] {false, true}) {
+            int[] expected = reverse
+                ? BandedSgm.cpuSummary(o, b, a, images[1], images[0], tb, ta, w, h, true, bands)
+                : BandedSgm.cpuSummary(o, a, b, images[0], images[1], ta, tb, w, h, false, bands);
+            check(Arrays.equals(expected, session.summary(o, reverse, bands)),
+                "Packed/full queued/blocking growing volumes and both directions match CPU");
+          }
         }
+        var profile = (Map<?, ?>) session.profile();
+        check(((Number) profile.get("downloaded_bytes")).longValue() == 10L * w * h * (packed ? 20 : 24),
+            "Packed transfer reduces measured summary downloads by exactly one sixth");
       }
     }
     GpuSgm.closeSession();

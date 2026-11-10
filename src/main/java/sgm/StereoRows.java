@@ -31,7 +31,10 @@ final class StereoRows {
       return;
     }
     var tasks = new ArrayList<Future<?>>();
-    int chunk = Math.max(1, (to - from + scope.cores - 1) / scope.cores);
+    // Four chunks per worker balance rows of unequal cost; rows are independent, so the chunking
+    // never changes results.
+    int parts = scope.cores * 4;
+    int chunk = Math.max(8, (to - from + parts - 1) / parts);
     for (int start = from; start < to; start += chunk) {
       int a = start, b = Math.min(to, start + chunk);
       tasks.add(scope.workers.submit(() -> { for (int y = a; y < b; y++) action.accept(y); }));

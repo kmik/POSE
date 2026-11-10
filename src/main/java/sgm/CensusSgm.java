@@ -759,15 +759,24 @@ public final class CensusSgm {
     boolean[] mask = new boolean[w * h];
     int r = window / 2;
     StereoRows.rows(r, h - r, y -> {
-
+      // Separable window extrema (column, then row): the same minimum and maximum.
+      int[] columnLow = new int[w], columnHigh = new int[w];
+      for (int x = 0; x < w; x++) {
+        int low = 255, high = 0;
+        for (int yy = -r; yy <= r; yy++) {
+          int v = input[(y + yy) * w + x] & 255;
+          low = Math.min(low, v);
+          high = Math.max(high, v);
+        }
+        columnLow[x] = low;
+        columnHigh[x] = high;
+      }
       for (int x = r; x < w - r; x++) {
         int low = 255, high = 0;
-        for (int yy = -r; yy <= r; yy++)
-          for (int xx = -r; xx <= r; xx++) {
-            int v = input[(y + yy) * w + x + xx] & 255;
-            low = Math.min(low, v);
-            high = Math.max(high, v);
-          }
+        for (int xx = -r; xx <= r; xx++) {
+          low = Math.min(low, columnLow[x + xx]);
+          high = Math.max(high, columnHigh[x + xx]);
+        }
         mask[y * w + x] = high - low >= 4;
       }
     });
@@ -778,16 +787,24 @@ public final class CensusSgm {
     int r = window / 2;
     long[][] descriptors = new long[words(window)][w * h];
     StereoRows.rows(r, h - r, y -> {
-
+      // Same bits as setting descriptors[bit / 64][p] per neighbour, accumulated per word.
       for (int x = r; x < w - r; x++) {
         int p = y * w + x, bit = 0, center = input[p] & 255;
-        for (int yy = -r; yy <= r; yy++)
+        long word = 0;
+        for (int yy = -r; yy <= r; yy++) {
+          int row = (y + yy) * w + x;
           for (int xx = -r; xx <= r; xx++) {
             if (xx == 0 && yy == 0) continue;
-            if ((input[(y + yy) * w + x + xx] & 255) < center)
-              descriptors[bit / 64][p] |= 1L << (bit % 64);
+            // Branch-free "neighbour < center": the sign bit of the difference.
+            word |= (long) (((input[row + xx] & 255) - center) >>> 31) << (bit & 63);
             bit++;
+            if ((bit & 63) == 0) {
+              descriptors[(bit >>> 6) - 1][p] = word;
+              word = 0;
+            }
           }
+        }
+        if ((bit & 63) != 0) descriptors[bit >>> 6][p] = word;
       }
     });
     return descriptors;

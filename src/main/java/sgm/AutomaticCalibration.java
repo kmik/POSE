@@ -108,6 +108,7 @@ final class AutomaticCalibration {
       try (WorkProgress extraction =
           WorkProgress.start("Focal bootstrap features", paths.size(), "images")) {
         int chunk = Math.max(1, o.cores);
+        Set<ImageFrame> extractedEarly = Collections.newSetFromMap(new IdentityHashMap<>());
         for (Path p : paths) {
           extraction.detail(p.getFileName().toString());
           if (frames.size() % chunk == 0 && chunk > 1) {
@@ -122,6 +123,9 @@ final class AutomaticCalibration {
             if (decoded > 0)
               RunTelemetry.record(
                   "Parallel calibration image preload (" + decoded + ")", preloadStarted);
+            // Same features as the serial loop (see FeatureTracks.extractConcurrently).
+            boolean[] done = FeatureTracks.extractConcurrently(next, next.get(0).options);
+            for (int k = 0; k < done.length; k++) if (done[k]) extractedEarly.add(next.get(k));
           }
           ImageFrame f =
               frames.size() < preloaded.size()
@@ -129,7 +133,7 @@ final class AutomaticCalibration {
                   : new ImageFrame(frames.size(), p, initial, o.alignmentOptions(), true);
           frames.add(f);
           if (project != null) project.data.source(f.id, p, f.sourceWidth, f.sourceHeight, f.gps);
-          ReuseCache.features(f, f.options);
+          if (!extractedEarly.contains(f)) ReuseCache.features(f, f.options);
           DescriptorCache.retain(f);
           extraction.update(frames.size());
           System.out.println(

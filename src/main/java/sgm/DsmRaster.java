@@ -23,9 +23,16 @@ final class DsmRaster {
               + " meaningful");
     Path path = run.resolve("07_results/dense.ply");
     if (!Files.isRegularFile(path)) path = run.resolve("dense.ply");
-    if (!Files.isRegularFile(path))
-      return Json.object("status", "unavailable", "reason", "No final PLY cloud");
-    PlyStream cloud = new PlyStream(path);
+    PlyStream cloud;
+    if (Files.isRegularFile(path)) cloud = new PlyStream(path);
+    else {
+      // --ply off: the LAS cloud (same points, coordinates quantized to the LAS scale).
+      Path las = run.resolve("07_results/dense.las");
+      if (!Files.isRegularFile(las)) las = run.resolve("dense.las");
+      if (!Files.isRegularFile(las))
+        return Json.object("status", "unavailable", "reason", "No final PLY/LAS cloud");
+      cloud = PlyStream.las(las);
+    }
     double[] bounds = {
       Double.POSITIVE_INFINITY,
       Double.POSITIVE_INFINITY,

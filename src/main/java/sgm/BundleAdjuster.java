@@ -83,7 +83,23 @@ final class BundleAdjuster {
       throws IOException {
     String label = lens == null ? "poses/points" : "shared " + String.join(",", lens.parameters());
     try (WorkProgress work = WorkProgress.start("Bundle fit " + label, 0, "iterations")) {
-      optimizeFit(frames, tracks, iterations, huber, project, anchor, scaleCamera, lens, work);
+      optimizeFit(frames, tracks, iterations, huber, project, anchor, scaleCamera, lens, work, false);
+      work.done();
+    }
+  }
+
+  /** Model-selection proposals have a separate hard cap; final bundles retain convergence mode. */
+  static void optimizeTrial(List<ImageFrame> frames, List<FeatureTracks.Track> tracks,
+      int iterations, double huber, int anchor, int scaleCamera, SharedCalibration lens)
+      throws IOException {
+    int cap = frames.get(0).options.calibrationTrialIterations;
+    if (cap == 0) {
+      optimizeImpl(frames, tracks, Math.max(12, iterations), huber, null, anchor, scaleCamera, lens);
+      return;
+    }
+    try (WorkProgress work = WorkProgress.start("Calibration trial " + String.join(",", lens.parameters()),
+        cap, "iterations")) {
+      optimizeFit(frames, tracks, cap, huber, null, anchor, scaleCamera, lens, work, true);
       work.done();
     }
   }
@@ -97,7 +113,7 @@ final class BundleAdjuster {
       int anchor,
       int scaleCamera,
       SharedCalibration lens,
-      WorkProgress work)
+      WorkProgress work, boolean hardCap)
       throws IOException {
     double[] origin = frames.get(anchor).camera.center();
     double baseline = Math3.norm(Math3.sub(frames.get(scaleCamera).camera.center(), origin));
@@ -137,7 +153,7 @@ final class BundleAdjuster {
               "iteration_mode",
               frames.get(0).options.bundleIterationsExplicit
                   ? "fixed budget (--bundle-iterations)"
-                  : "until two successive gains < 1e-6 relative, at most " + AUTO_LIMIT,
+                  : "until two successive gains < " + (frames.get(0).options.quickCalibration ? "1e-4" : "1e-6") + " relative, at most " + AUTO_LIMIT,
               "huber_pixels",
               huber,
               "intrinsics_fixed",
@@ -170,7 +186,7 @@ final class BundleAdjuster {
     }
     // Without --bundle-iterations: iterate until two successive accepted iterations each gain
     // less than CONVERGED (relative), capped at AUTO_LIMIT.
-    boolean converge = !frames.get(0).options.bundleIterationsExplicit;
+    boolean converge = !hardCap && !frames.get(0).options.bundleIterationsExplicit;
     int limit = converge ? Math.max(iterations, AUTO_LIMIT) : iterations, small = 0;
     for (int iteration = 0; iteration < limit; iteration++) {
       boolean accepted = false;
@@ -298,7 +314,7 @@ final class BundleAdjuster {
           system.points.size());
       work.update(iteration + 1);
       if (converge) {
-        small = before - after < CONVERGED * Math.max(1, before) ? small + 1 : 0;
+        small = before - after < converged(frames.get(0).options) * Math.max(1, before) ? small + 1 : 0;
         if (small >= 2) {
           System.out.printf(
               Locale.ROOT, "Bundle converged after %d iterations.%n", iteration + 1);
@@ -316,6 +332,13 @@ final class BundleAdjuster {
 
   static final int AUTO_LIMIT = 100;
   static final double CONVERGED = 1e-6;
+  // --quick-calibration: stop once two successive iterations each gain < 1e-4 (relative). The
+  // default crawls along flat focal/height directions for up to 100 iterations of < 0.01%.
+  static final double QUICK_CONVERGED = 1e-4;
+
+  static double converged(Options o) {
+    return o.quickCalibration ? QUICK_CONVERGED : CONVERGED;
+  }
 
   static double error(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, double huber) {
     return error(frames, tracks, huber, null);
@@ -600,10 +623,26 @@ final class BundleAdjuster {
       // One task per destination row (6 per camera, one per lens parameter).
       // One task per camera (its 6 rows, one pass) and one per lens row (the heaviest destination).
       int[] touched = java.util.stream.IntStream.range(0, count).filter(c -> byCamera.get(c) != null).toArray();
+      // Lens rows read every observation: flat copies of the lens Jacobian rows, residuals and
+      // weights make that a sequential stream. Each lens row fills its upper-triangle part only;
+      // element (y, x) receives exactly the same products in the same order as (x, y), so the
+      // mirrored lower triangle (below) is bit-identical to accumulating it.
+      final int L = SharedCalibration.SIZE;
+      final double[] lensJ = lens != null ? new double[all.size() * 2 * L] : null,
+          lensRW = lens != null ? new double[all.size() * 3] : null;
+      if (lens != null)
+        for (int i = 0; i < all.size(); i++) {
+          ObservationTerms o = all.get(i);
+          System.arraycopy(o.jl()[0], 0, lensJ, i * 2 * L, L);
+          System.arraycopy(o.jl()[1], 0, lensJ, i * 2 * L + L, L);
+          lensRW[3 * i] = o.residual()[0];
+          lensRW[3 * i + 1] = o.residual()[1];
+          lensRW[3 * i + 2] = o.weight();
+        }
       parallel(touched.length + (lens != null ? SharedCalibration.SIZE : 0), task -> {
         if (task >= touched.length) {
           int x = task - touched.length;
-          for (ObservationTerms o : all) accumulateRow(s.lensNormal, s.lensRhs, o.jl(), o.residual(), o.weight(), x);
+          lensUpperRow(s.lensNormal, s.lensRhs, lensJ, lensRW, x);
           return;
         }
         int c = touched[task];
@@ -618,6 +657,11 @@ final class BundleAdjuster {
       });
       begin = end;
     } // per-observation Jacobians become collectible before the next bounded batch
+    if (lens != null) {
+      int L = SharedCalibration.SIZE;
+      for (int x = 0; x < L; x++)
+        for (int y = 0; y < x; y++) s.lensNormal[x * L + y] = s.lensNormal[y * L + x];
+    }
     boolean antenna = lens != null && lens.antennaModel();
     for (ImageFrame f : frames)
       if (antenna && f.camera.registered) antennaPriorNormal(f.camera, index[f.id], s, lens);
@@ -815,11 +859,20 @@ final class BundleAdjuster {
     }
   }
 
-  /** Row x of accumulate (rows are independent; same per-element arithmetic). */
-  private static void accumulateRow(double[] a, double[] b, double[][] j, double[] r, double w, int x) {
-    int n = b.length;
-    b[x] -= w * (j[0][x] * r[0] + j[1][x] * r[1]);
-    for (int y = 0; y < n; y++) a[x * n + y] += w * (j[0][x] * j[0][y] + j[1][x] * j[1][y]);
+  /**
+   * accumulateRow for lens row x over a batch's flat lens Jacobians (2 rows of SIZE per
+   * observation) and residual/weight triples, columns y >= x only: the same expressions, in
+   * observation order.
+   */
+  private static void lensUpperRow(double[] a, double[] b, double[] j, double[] rw, int x) {
+    int n = b.length, observations = rw.length / 3;
+    for (int i = 0; i < observations; i++) {
+      int base = i * 2 * n;
+      double r0 = rw[3 * i], r1 = rw[3 * i + 1], w = rw[3 * i + 2];
+      double j0x = j[base + x], j1x = j[base + n + x];
+      b[x] -= w * (j0x * r0 + j1x * r1);
+      for (int y = x; y < n; y++) a[x * n + y] += w * (j0x * j[base + y] + j1x * j[base + n + y]);
+    }
   }
 
   private static void damp(double[] a, int n, double lambda) {
@@ -924,15 +977,41 @@ final class BundleAdjuster {
       // Point eliminations, parallel by destination rows: each camera's (and the lens') rows are
       // written by one task that visits the points in their original order, so every element
       // receives the same subtractions in the same order as the serial loop (bit-identical).
+      // Lens rows are partitioned by destination columns: one task owns lens rows x lens columns
+      // (all points in order); each camera task also owns lens rows x its 6 columns, visiting its
+      // (point, edge) list in point/edge order. Every element receives the same subtractions, with
+      // the same values, in the same order as one task per lens row over all points (which made
+      // 13 tasks traverse every point and edge).
       List<List<int[]>> byCamera = edgesByCamera();
-      parallel(count + (shared ? SharedCalibration.SIZE : 0), task -> {
+      final int L = SharedCalibration.SIZE, off = count * 6;
+      parallel(count + (shared ? 1 : 0), task -> {
         if (task >= count) {
-          for (Block b : points) subtractRow(h, n, b, b.lensCross, count * 6, task - count);
+          double[] v = new double[3];
+          for (Block b : points)
+            for (int j = 0; j < L; j++) {
+              lensRowTimesInverse(b, j, v);
+              int row = (off + j) * n + off;
+              for (int k = 0; k < L; k++)
+                h[row + k] -= v[0] * b.lensCross[k * 3] + v[1] * b.lensCross[k * 3 + 1] + v[2] * b.lensCross[k * 3 + 2];
+            }
           return;
         }
         for (int[] pe : byCamera.get(task)) {
           Block b = points.get(pe[0]);
           subtractRows(h, n, b, b.edges.get(pe[1]).cross, task * 6, 6);
+        }
+        if (shared) {
+          double[] v = new double[3];
+          for (int[] pe : byCamera.get(task)) {
+            Block b = points.get(pe[0]);
+            double[] cross = b.edges.get(pe[1]).cross;
+            for (int j = 0; j < L; j++) {
+              lensRowTimesInverse(b, j, v);
+              int row = (off + j) * n + task * 6;
+              for (int k = 0; k < 6; k++)
+                h[row + k] -= v[0] * cross[k * 3] + v[1] * cross[k * 3 + 1] + v[2] * cross[k * 3 + 2];
+            }
+          }
         }
       });
       // The mathematical Schur matrix is symmetric. Remove only round-off asymmetry.
@@ -963,12 +1042,16 @@ final class BundleAdjuster {
      */
     private void scatter(double[] target, double[] w) {
       List<List<int[]>> byCamera = edgesByCamera();
-      parallel(count + (shared ? SharedCalibration.SIZE : 0), task -> {
+      // All lens rows in one pass over the points: each lens row element still receives its
+      // subtractions in point order, then k order (identical to one task per lens row).
+      parallel(count + (shared ? 1 : 0), task -> {
         if (task >= count) {
-          int j = task - count, row = count * 6 + j;
           for (int p = 0; p < points.size(); p++) {
             Block b = points.get(p);
-            for (int k = 0; k < 3; k++) target[row] -= b.lensCross[j * 3 + k] * w[3 * p + k];
+            for (int j = 0; j < SharedCalibration.SIZE; j++) {
+              int row = count * 6 + j;
+              for (int k = 0; k < 3; k++) target[row] -= b.lensCross[j * 3 + k] * w[3 * p + k];
+            }
           }
           return;
         }
@@ -978,6 +1061,20 @@ final class BundleAdjuster {
             for (int k = 0; k < 3; k++) target[task * 6 + j] -= e.cross[j * 3 + k] * w[3 * pe[0] + k];
         }
       });
+    }
+
+    /** v = (lens row j of the point's lens cross) * inverse, as subtractRow computes it. */
+    private static void lensRowTimesInverse(Block b, int j, double[] v) {
+      double v0 = 0, v1 = 0, v2 = 0;
+      double[] left = b.lensCross;
+      for (int k = 0; k < 3; k++) {
+        v0 += left[j * 3 + k] * b.inverse[k * 3];
+        v1 += left[j * 3 + k] * b.inverse[k * 3 + 1];
+        v2 += left[j * 3 + k] * b.inverse[k * 3 + 2];
+      }
+      v[0] = v0;
+      v[1] = v1;
+      v[2] = v2;
     }
 
     private void subtractRows(double[] h, int n, Block b, double[] left, int offset, int rows) {

@@ -84,11 +84,13 @@ final class PointRecords {
 
     // One buffer per record (the same big-endian bytes as DataOutputStream, without a stream call
     // per field).
-    private final java.nio.ByteBuffer record = java.nio.ByteBuffer.allocate(206);
+    private java.nio.ByteBuffer record = java.nio.ByteBuffer.allocate(256);
 
     void point(long id, SurfaceConsolidator.Sample p, double scale, double score)
         throws IOException {
       long started = System.nanoTime();
+      int idBytes = p.supportingCameras == null ? 0 : (p.supportingCameras.length() + 7) / 8;
+      if (record.capacity() < 206 + idBytes) record = java.nio.ByteBuffer.allocate(206 + idBytes);
       java.nio.ByteBuffer b = record.clear();
       b.put((byte) 1);
       b.putLong(id);
@@ -118,11 +120,18 @@ final class PointRecords {
       b.putDouble(p.costSharpness);
       b.putDouble(p.photometric);
       b.putDouble(p.lrError);
-      byte[] ids = p.supportingCameras == null ? new byte[0] : p.supportingCameras.toByteArray();
-      b.putInt(ids.length);
+      b.putInt(idBytes);
+      // Reuse record storage for the little-endian BitSet bytes; no per-point bitmap array.
+      int start = b.position();
+      for (int i = 0; i < idBytes; i++) b.put((byte) 0);
+      if (p.supportingCameras != null)
+        for (int bit = p.supportingCameras.nextSetBit(0); bit >= 0;
+            bit = p.supportingCameras.nextSetBit(bit + 1)) {
+          int at = start + (bit >>> 3);
+          b.put(at, (byte) (b.get(at) | (1 << (bit & 7))));
+        }
       out.write(b.array(), 0, b.position());
-      out.write(ids);
-      bytes += 206L + ids.length;
+      bytes += 206L + idBytes;
       nanos += System.nanoTime() - started;
     }
 
