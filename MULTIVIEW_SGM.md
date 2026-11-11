@@ -350,3 +350,28 @@ otherwise):
 Not done yet: mvsgm at `--quality high` on these frames (15,760 x 6,720, 106 Mpx) needs a tiled
 mode; each neighbour canvas would exceed the GPU's single-allocation limit and the CPU fallback
 would be very slow. Use `--dense-method sgm` (windowed stereo) for such frames until then.
+
+## Next: large frames (100+ Mpx per image) - plan, not started
+
+Target: the 4-image large-format block (31,520 x 13,440 frames; 15,760 x 6,720 = 106 Mpx per
+image at `--quality high`). Today mvsgm runs it at `--quality low` only.
+
+What has to change (in this order):
+
+1. **Check pair SGM first**: run the block at high with `--dense-method sgm`. Windowed stereo
+   handles the pairs, but image fusion's per-camera working set (merge, splats, candidates; about
+   100-200 bytes per pixel) is 10-20 GB per 106 Mpx camera, so fusion probably fails there too.
+2. **Fusion in tiles within a camera** (needed by both methods for such frames): pass 1 and pass 2
+   per camera tile with an overlap that covers every neighbourhood operation (5x5 spike window,
+   7x7 stride-4 normals = +-12 px, agreement radius); per-tile marks. The speckle filter's connected
+   components are not local: label components per tile and join them across tile borders
+   (union-find on border pixels) so the result stays identical to the untiled filter.
+3. **mvsgm in tiles**: per reference tile (about 2,048 x 2,048 plus a 64-px overlap, as
+   BandedSgm strips), resample each neighbour only over the region the tile can reach (the canvas
+   rule in `MultiViewSgm.warp`, applied to the tile's corners), solve the bands, select, and write
+   the tile core into the camera's map files by row ranges. Median filtering is local (overlap
+   suffices); speckle removal as in 2. Phase-2 consistency reads neighbour maps through
+   memory-mapped files instead of whole arrays.
+4. Test on the large-format block at high, then at ultra; identity checks for untiled sizes.
+
+Rough size: 2 and 3 are each about one working session.

@@ -127,7 +127,11 @@ final class ImageFusion {
   // Memory plan and resident set (FUSION_MEMORY.md). A camera's maps (compact, compactWeight,
   // localBest, used, emitted, surfaceContext) are either resident in those arrays or spilled to
   // spillDirectory; hasMap says whether the camera has a map at all.
-  static final int BAND_PIXELS = 1 << 18;
+  static final int BAND_PIXELS = 1 << 18, MIN_BAND_PIXELS = 1 << 14;
+  private final int bandPixels;
+  // Surface-patch cache cells per camera (SurfacePatchGrid.cacheCells, or the whole grid).
+  private int gridCells;
+  private final long workingBytes;
   static final long EMISSION_BYTES = 640;
   private final boolean[] hasMap, spilledMaps;
   private final long mapBudget;
@@ -231,6 +235,7 @@ final class ImageFusion {
     // resident (no temporary files; the fastest path). Otherwise maps are spilled to files under
     // 06_fusion and only the camera being fused and its overlapping cameras are resident; the
     // operating system's file cache then uses whatever RAM is free. Neither changes any result.
+    gridCells = SurfacePatchGrid.cacheCells(o, cameras);
     long worstCamera = 0, worstPixels = 0;
     for (int c = 0; c < cameras; c++) {
       long pixels = (long) fusion.width(c) * fusion.height(c), pairBytes = 0;
@@ -243,49 +248,69 @@ final class ImageFusion {
     }
     boolean surfaceAttributes = o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal");
     long normalBytes = surfaceAttributes && 24L * worstPixels <= 512L << 20 ? 24L * worstPixels : 0;
-    long working = worstCamera + normalBytes + 3L * BAND_PIXELS * EMISSION_BYTES;
     long budget = (long) (Runtime.getRuntime().maxMemory() * .75);
     long forced = Long.getLong("sgm.fusion.mapBudgetMb", -1L);
     long requestedCache = o.memoryMb * 1048576 / 4;
     if (o.imageFusionCacheMb >= 0)
       requestedCache = Math.min(requestedCache, (long) o.imageFusionCacheMb * 1048576);
-    long needed = allMapBytes + working;
-    if (forced < 0 && needed <= budget - budget / 8) {
+    long avail = budget - budget / 8, base = worstCamera + normalBytes;
+    long minEmit = 3L * MIN_BAND_PIXELS * EMISSION_BYTES;
+    long needed = allMapBytes + base + minEmit;
+    if (forced < 0 && needed <= avail) {
       mapBudget = Long.MAX_VALUE;
       normalCache = true;
+      // Emission bands get up to half of what is left (full bands when there is room).
+      // Spare heap first lets every surface-patch grid cache its whole image (no model is built
+      // twice; models are deterministic), keeping one more camera's work in reserve.
+      if (DepthOutlierFilter.enabled(o)) {
+        int full = 16;
+        for (int c = 0; c < cameras; c++)
+          full = Math.max(full, Math.ceilDiv(fusion.width(c), 16) * Math.ceilDiv(fusion.height(c), 16));
+        long extra = 4096L * Math.max(0, full - gridCells) * cameras;
+        if (extra > 0 && allMapBytes + extra + base + minEmit + worstCamera <= avail) {
+          gridCells = full;
+          allMapBytes += extra;
+        }
+      }
+      bandPixels = bandFor((avail - allMapBytes - base) / 2);
+      long working = base + 3L * bandPixels * EMISSION_BYTES;
       // Pass 1 may work on several cameras at once: each extra camera needs another worst-case
       // camera workspace. At most half of the remaining headroom is used for that; the pair cache
       // gets what is left. Neither changes any result.
-      long headroom = Math.max(0, budget - needed - budget / 8);
+      long headroom = Math.max(0, avail - allMapBytes - working);
       passOneCameras =
           (int) Math.max(1, Math.min(Math.max(1, o.cores / 2), 1 + headroom / 2 / Math.max(1, worstCamera)));
       cacheLimit = Math.max(0, Math.min(requestedCache, headroom - (passOneCameras - 1) * worstCamera));
+      workingBytes = working;
     } else {
       // Spilled maps: one camera at a time; maps get what one camera's work leaves (at least two
       // cameras' worth, checked again once the overlap is known), the pair cache the rest.
       passOneCameras = 1;
-      long free = budget - budget / 8 - worstCamera - 3L * BAND_PIXELS * EMISSION_BYTES;
-      normalCache = normalBytes > 0 && free - normalBytes >= 4 * worstMap;
-      if (normalCache) free -= normalBytes;
-      mapBudget = forced >= 0 ? forced << 20 : Math.max(2 * worstMap, free * 3 / 4);
-      cacheLimit = Math.max(0, Math.min(requestedCache, free - mapBudget));
+      long free = avail - worstCamera - minEmit;
       if (free < 2 * worstMap)
         throw new IllegalArgumentException(
             "Image-space fusion needs at least about "
-                + (budget / 8 + working + 2 * worstMap) * 4 / 3 / 1048576
+                + (budget / 8 + worstCamera + minEmit + 2 * worstMap) * 4 / 3 / 1048576
                 + " MiB heap even with depth maps on disk (largest camera's work "
                 + worstCamera / 1048576 + " MiB, maps " + worstMap / 1048576
                 + " MiB per camera); raise PHOTOGRAMMETRY_HEAP/-Xmx or lower --quality");
+      normalCache = normalBytes > 0 && free - normalBytes >= 4 * worstMap;
+      if (normalCache) free -= normalBytes;
+      bandPixels = bandFor(free / 4 + minEmit);
+      free -= 3L * bandPixels * EMISSION_BYTES - minEmit;
+      mapBudget = forced >= 0 ? forced << 20 : Math.max(2 * worstMap, free * 3 / 4);
+      cacheLimit = Math.max(0, Math.min(requestedCache, free - mapBudget));
+      workingBytes = worstCamera + (normalCache ? normalBytes : 0) + 3L * bandPixels * EMISSION_BYTES;
       spillDirectory = o.output.resolve("06_fusion/map-spill");
     }
     plan = String.format(
         Locale.ROOT,
         "Image fusion memory plan: heap budget %,d MiB; depth maps %,d MiB for %d cameras (%s);"
             + " largest camera's work %,d MiB; %d camera(s) at once in pass 1; candidate cache %,d MiB;"
-            + " normal cache %s",
+            + " normal cache %s; row bands of %,d pixels",
         budget >> 20, allMapBytes >> 20, cameras,
         mapBudget == Long.MAX_VALUE ? "all resident" : "spilled to disk, " + (mapBudget >> 20) + " MiB resident",
-        working >> 20, passOneCameras, cacheLimit >> 20, normalCache ? "on" : "off");
+        workingBytes >> 20, passOneCameras, cacheLimit >> 20, normalCache ? "on" : "off", bandPixels);
     System.out.println(plan);
     compact = new float[cameras][];
     neighbours = new int[cameras][];
@@ -327,6 +352,12 @@ final class ImageFusion {
   // ---------------------------------------------------------------------------------------------
   // Resident set of per-camera maps
 
+  /** Row-band size whose emissions (three bands alive: one checked, two queued) fit the bytes. */
+  static int bandFor(long bytes) {
+    long pixels = bytes / (3 * EMISSION_BYTES);
+    return (int) Math.max(MIN_BAND_PIXELS, Math.min(BAND_PIXELS, pixels));
+  }
+
   /** Heap bytes of camera c's resident maps (depth, weights, local sigma, marks, patch cache). */
   private long mapBytes(int c) {
     long pixels = (long) fusion.width(c) * fusion.height(c);
@@ -335,7 +366,7 @@ final class ImageFusion {
     if (localSigma > 0) bytes += 4 * pixels;
     if (o.fusionStrategy.equals("owner-consume") || o.fusionStrategy.equals("graph-average")) bytes += pixels / 8 + 64;
     if (o.fusionStrategy.equals("owner-consume")) bytes += pixels / 8 + 64;
-    if (DepthOutlierFilter.enabled(o)) bytes += 4096L * SurfacePatchGrid.cacheCells(o, cameras);
+    if (DepthOutlierFilter.enabled(o)) bytes += 4096L * gridCells;
     return bytes;
   }
 
@@ -355,7 +386,7 @@ final class ImageFusion {
     if (surfaceContext == null || compact[c] == null) return;
     final float[] raster = compact[c];
     surfaceContext[c] =
-        new SurfacePatchGrid(fusion.width(c), fusion.height(c), p -> raster[p], o.fusionRelative, SurfacePatchGrid.cacheCells(o, cameras));
+        new SurfacePatchGrid(fusion.width(c), fusion.height(c), p -> raster[p], o.fusionRelative, gridCells);
   }
 
   /** Pass 2: camera c and the cameras it cross-checks become resident; others may be spilled. */
@@ -773,7 +804,7 @@ final class ImageFusion {
         for (int p = 0; p < kept.length; p++) if (kept[p] <= 0) m.z[p] = 0;
         remergeNanos += System.nanoTime() - clock;
         double[] points = pointCache(c, m);
-        int w = m.w, bandRows = Math.max(1, BAND_PIXELS / Math.max(1, w));
+        int w = m.w, bandRows = Math.max(1, bandPixels / Math.max(1, w));
         for (int y0 = 0; y0 < m.h; y0 += bandRows) {
           clock = System.nanoTime();
           Emission[][] rows = crossCheck(c, m, splats, counters, tier, points, y0, Math.min(m.h, y0 + bandRows));
@@ -1092,6 +1123,61 @@ final class ImageFusion {
    * depend on order or threads.
    */
 
+  /**
+   * The k-th smallest of a[0..n) (0-based), as Arrays.sort(a, 0, n) would leave at a[k];
+   * reorders a[0..n) so that a[0..k) <= a[k] <= a[k+1..n). For the finite, non-negative values
+   * used here the numeric order equals Arrays.sort's order.
+   */
+  static float select(float[] a, int n, int k) {
+    int lo = 0, hi = n - 1;
+    while (hi > lo) {
+      float pivot = a[(lo + hi) >>> 1];
+      int i = lo, j = hi;
+      while (i <= j) {
+        while (a[i] < pivot) i++;
+        while (a[j] > pivot) j--;
+        if (i <= j) {
+          float t = a[i];
+          a[i++] = a[j];
+          a[j--] = t;
+        }
+      }
+      if (k <= j) hi = j;
+      else if (k >= i) lo = i;
+      else break;
+    }
+    return a[k];
+  }
+
+  /** The largest of a[0..k) (after select(a, n, k): the (k-1)-th smallest). */
+  static float maxBelow(float[] a, int k) {
+    float m = a[0];
+    for (int i = 1; i < k; i++) m = Math.max(m, a[i]);
+    return m;
+  }
+
+  /** Double version of {@link #select(float[], int, int)}. */
+  static double select(double[] a, int n, int k) {
+    int lo = 0, hi = n - 1;
+    while (hi > lo) {
+      double pivot = a[(lo + hi) >>> 1];
+      int i = lo, j = hi;
+      while (i <= j) {
+        while (a[i] < pivot) i++;
+        while (a[j] > pivot) j--;
+        if (i <= j) {
+          double t = a[i];
+          a[i++] = a[j];
+          a[j--] = t;
+        }
+      }
+      if (k <= j) hi = j;
+      else if (k >= i) lo = i;
+      else break;
+    }
+    return a[k];
+  }
+
   private long spikes(Merged m, Camera camera) {
     if (!o.fusionSpikeFilter) return 0;
     int w = m.w, h = m.h, r = 2;
@@ -1114,8 +1200,10 @@ final class ImageFusion {
             if (v > 0) values[n++] = v;
           }
         if (n < 12) continue;
-        Arrays.sort(values, 0, n);
-        float median = n % 2 == 1 ? values[n / 2] : .5f * (values[n / 2 - 1] + values[n / 2]);
+        // The median by selection: the same order statistic(s) as after Arrays.sort; the later
+        // loops over values do not depend on their order.
+        float upper = select(values, n, n / 2);
+        float median = n % 2 == 1 ? upper : .5f * (maxBelow(values, n / 2) + upper);
         // limit >= 2 footprints: within that the pixel is kept whatever the spread is (identical
         // decision without the second sort).
         if (Math.abs(centre - median) <= 2 * (median / focal)) continue;
@@ -1673,8 +1761,8 @@ final class ImageFusion {
       double[] residuals = scratch.residuals;
       for (int i = 0; i < n; i++)
         residuals[i] = Math.abs(SurfaceGeometry.distance(neighbors[i], plane.center(), normal));
-      Arrays.sort(residuals, 0, n);
-      double band = Math.max(footprint * .5, 3 * 1.4826 * residuals[n / 2]);
+      // The median residual by selection: the same order statistic as after Arrays.sort.
+      double band = Math.max(footprint * .5, 3 * 1.4826 * select(residuals, n, n / 2));
       int kept = 0;
       for (int i = 0; i < n; i++)
         if (Math.abs(SurfaceGeometry.distance(neighbors[i], plane.center(), normal)) <= band)

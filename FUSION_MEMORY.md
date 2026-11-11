@@ -124,3 +124,44 @@ Measured on city2, mvsgm, `--quality ultra`, fusion 71 s: cross-check 35.4 s, ou
    after 1. FP64 and hypot decisions need the float-with-margin pre-test used for GpuDepthOutlier.
 
 Order: profile first (about 10 minutes), then 1-4, then decide on 5.
+
+## Follow-up (11 November 2026): adaptive row bands, evidence tiles on failure
+
+- **Row-band size is now part of the plan.** The first plan reserved emissions for three full
+  262,144-pixel bands (about 500 MB, assuming every pixel emits) and therefore refused a 1.5 GB
+  heap on city2 at high quality that the earlier code had handled. Bands now get up to half of what
+  is left (full bands when there is room) and shrink to 16,384 pixels when the heap is tight; the
+  refusal threshold uses the smallest band. Bands never change results.
+  city2 high, 1.5 GB heap (`--memory-mb 900`): spilled maps (95 MiB resident, 13 loads), bands of
+  39,583 pixels, fusion 37.5 s (24-25 s with a 6 GB heap), output identical to the reference.
+  1.0 GB heap: refused at once ("needs at least about 1194 MiB"); the earlier code refused too.
+- **Dense evidence tiles are deleted when fusion fails or is refused** (they were kept only on
+  success; nothing reads them afterwards). City2 high refusal at 1.0 GB: earlier code left 1.7 GB in
+  `06_fusion/storage`, now nothing. `--diagnostics --storage debug` still keeps them. A cleanup
+  problem prints a warning and never hides the original failure.
+
+## Fusion speed, first round (11 November 2026)
+
+Profile (JFR, mvsgm on city2 at high quality, fusion 18.7 s; samples within fusion):
+cross-check's own code 29% (lines reading the neighbour camera's 3x3 depth window for the camera
+vote dominate: memory reads into other cameras' maps), surface-patch model building 11% (all from
+`SurfacePatchGrid.predict`: the per-camera cache held about 5,400 of 8,900 cells, so models were
+rebuilt), per-point normal sampling about 18% (`surfaceSample`: two plane fits, a residual sort,
+`StrictMath.hypot` inside `SurfaceGeometry.plane`), spike filter's 5x5 median sort about 7%,
+per-camera merge 6%.
+
+Done (results identical):
+- **Medians by selection** instead of a full sort in the spike filter and in the normal
+  sampling's residual median (`ImageFusion.select`, `maxBelow`; the same order statistics; checked
+  against `Arrays.sort` on 900,000 random cases with duplicates and zeros).
+- **Whole-grid surface-patch caches when the all-resident plan has room** (one camera's work kept
+  in reserve); otherwise the previous `SurfacePatchGrid.cacheCells` size. Models are
+  deterministic, so the cache size never changes results.
+
+Measured back to back (mvsgm, city2 high, 3.8 GB heap because little RAM was free): fusion
+21.4 -> 19.8 s (-7%), LAS byte-identical; pair SGM identity check SAME.
+
+Still open from the plan above: parallel speckle filter (matters when only one camera fits in
+pass 1, e.g. ultra: 10 s), mvsgm map hand-off to fusion (skips the candidate file), candidate cache
+policy, and the cross-check itself (memory-bound neighbour reads and the normal fits; the GPU port
+remains the large step).

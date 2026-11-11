@@ -496,8 +496,18 @@ final class DenseReconstruction {
       } finally {
         try {
           fusion.close();
-          if (completed && !(options.diagnostics && options.storage.equals("debug")))
-            fusion.discardStorage();
+          if (!(options.diagnostics && options.storage.equals("debug"))) {
+            if (completed) fusion.discardStorage();
+            else
+              // A failed or refused fusion used to leave these temporary evidence tiles behind
+              // (several GB at --quality ultra). Nothing reads them afterwards; a cleanup problem
+              // must not hide the original failure.
+              try {
+                fusion.discardStorage();
+              } catch (IOException | RuntimeException cleanup) {
+                System.err.println("Warning: could not delete dense evidence tiles: " + cleanup);
+              }
+          }
         } finally {
           try {
             if (windowedStore != null) windowedStore.close();
