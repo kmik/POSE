@@ -939,7 +939,27 @@ final class MultiViewSgm {
   // Driver
 
   /** Phase-1 facts phase 2 needs: neighbours (best first) and the inverse-depth label step. */
-  record CameraInfo(int camera, int[] neighbours, double step) {}
+  record CameraInfo(int camera, int[] neighbours, double step, double near, double far) {}
+
+  /** --export-disparity-images or --diagnostics: per-camera depth previews (PFM + PNG + JSON). */
+  boolean exportImages() {
+    return o.exportDisparityImages || o.diagnostics;
+  }
+
+  /**
+   * Writes 05_stereo/mvsgm/image_<id>_<name>/<kind>.pfm (depth in scene units, NaN = none),
+   * <kind>.png (linear grayscale over the camera's depth range: near dark, far bright; 0 = none)
+   * and <kind>.json, as the pair path's disparity export. With {@code keep}, only pixels whose
+   * keep value is not NaN (the consistent ones) are written.
+   */
+  void exportDepth(ImageFrame f, String kind, float[] z, float[] keep, double near, double far) throws IOException {
+    float[] values = new float[z.length];
+    for (int p = 0; p < z.length; p++)
+      values[p] = z[p] > 0 && (keep == null || !Float.isNaN(keep[p])) ? z[p] : Float.NaN;
+    String stem = f.path.getFileName().toString().replaceFirst("[.][^.]*$", "").replaceAll("[^A-Za-z0-9_.-]", "_");
+    ProjectArtifacts.scalar(
+        o.output.resolve("05_stereo/mvsgm/image_" + f.id + "_" + stem), kind, values, f.width, f.height, near, far);
+  }
 
   final Map<Integer, CameraInfo> info = new TreeMap<>();
   final Map<String, Object> phaseTwo = new LinkedHashMap<>();
@@ -1071,6 +1091,7 @@ final class MultiViewSgm {
               out.writeFloat((float) value);
             count++;
           }
+        if (exportImages()) exportDepth(rf, "consistent_depth", z, lr, ci.near(), ci.far());
         System.out.printf(Locale.ROOT, "mvsgm image %d: %,d of %,d depths consistent with %d+ neighbour maps%n",
             c, camKept, camConsidered, minViews);
       }
@@ -1196,7 +1217,9 @@ final class MultiViewSgm {
         DepthMapFile.write(dir.resolve("camera_" + c + ".sharp"), rf.camera, rf.width, rf.height, map.sharpness());
         DepthMapFile.write(dir.resolve("camera_" + c + ".photo"), rf.camera, rf.width, rf.height, map.photometric());
         int[] ids = plan.neighbours.stream().mapToInt(Neighbor::id).toArray();
-        info.put(c, new CameraInfo(c, ids, plan.labels.step()));
+        double near = 1 / plan.labels.q(plan.labels.count() - 1), far = 1 / plan.labels.low();
+        info.put(c, new CameraInfo(c, ids, plan.labels.step(), near, far));
+        if (exportImages()) exportDepth(rf, "depth", map.depth(), null, near, far);
         List<Object> nb = new ArrayList<>();
         for (Neighbor x : plan.neighbours)
           nb.add(Json.object("image", x.id(), "score", x.score(), "shared_points", x.shared(), "median_angle_deg", x.medianAngle()));

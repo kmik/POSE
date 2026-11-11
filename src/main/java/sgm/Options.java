@@ -2701,6 +2701,10 @@ Additional workflow controls:
       05_stereo/pair_<a>_<b>/disparity.pfm (numeric, NaN = invalid), disparity.png
       (grayscale preview over the searched range) and disparity.json. Applies to the
       standard SGM path; windowed, aerial-tiled and PatchMatch paths do not export it.
+      With --dense-method mvsgm (also with --diagnostics): per image
+      05_stereo/mvsgm/image_<id>_<name>/depth.* (the SGM depth map) and
+      consistent_depth.* (what passes the multi-view check), each .pfm (depth, NaN =
+      none), .png (grayscale over the image's depth range, near dark) and .json.
   --dense-pair-selection all|coverage
       Default all preserves all verified pairs. Experimental coverage ranks pairs
       by angle-qualified sparse coverage and predicted range cost; unknown coverage

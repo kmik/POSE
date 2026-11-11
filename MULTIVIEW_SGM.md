@@ -375,3 +375,12 @@ What has to change (in this order):
 4. Test on the large-format block at high, then at ultra; identity checks for untiled sizes.
 
 Rough size: 2 and 3 are each about one working session.
+
+## Depth previews (11 November 2026)
+
+With `--export-disparity-images` or `--diagnostics`, mvsgm writes per image
+`05_stereo/mvsgm/image_<id>_<name>/`: `depth.*` (the SGM depth map after selection and filters)
+and `consistent_depth.*` (the depths that pass the multi-view consistency check, i.e. what goes to
+fusion). Each is `.pfm` (depth in scene units, NaN = none), `.png` (linear grayscale over that
+image's label depth range, near dark, far bright, 0 = none) and `.json`, written with the same
+helper as the pair path's `disparity.*`. Without either option nothing extra is written.
