@@ -165,3 +165,7 @@ Still open from the plan above: parallel speckle filter (matters when only one c
 pass 1, e.g. ultra: 10 s), mvsgm map hand-off to fusion (skips the candidate file), candidate cache
 policy, and the cross-check itself (memory-bound neighbour reads and the normal fits; the GPU port
 remains the large step).
+
+Update (11 November 2026): the mvsgm map hand-off (item 2 of the speed plan, without skipping
+the pass-1 filters, so the output stays byte-identical) and fusion in row strips for cameras whose
+work does not fit the heap are done; see STREAMED_PROCESSING.md.

@@ -120,6 +120,31 @@ final class ImageFusionAgreementRegression {
               Files.readAllBytes(latest.resolve("07_results/dense.ply"))),
           "Spilled " + spilled[i][1] + " fusion is byte-identical to the resident one");
     }
+    // Fusion in strips (STREAMED_PROCESSING.md): 37-row strips with memory-mapped maps and marks;
+    // speckle components joined across strips; identical output.
+    for (int i = 0; i < spilled.length; i++) {
+      List<String> args = new ArrayList<>(common);
+      args.addAll(List.of("--fusion-agreement-radius", spilled[i][0], "--fusion-strategy", spilled[i][1],
+          "--resume", "--rerun-from", "fusion"));
+      System.setProperty("sgm.fusion.tileRows", "37");
+      try {
+        check(Main.run(args.toArray(String[]::new)) == 0, "Fusion in strips " + spilled[i][1]);
+      } finally {
+        System.clearProperty("sgm.fusion.tileRows");
+      }
+      Path latest;
+      try (var dirs = Files.list(project.resolve("runs"))) {
+        latest = dirs.sorted(Comparator.reverseOrder()).findFirst().orElseThrow();
+      }
+      check(Files.readString(latest.resolve("06_fusion/image_fusion.json")).contains("fusion in strips of 37 rows"),
+          "Fusion ran in strips: " + spilled[i][1]);
+      check(!Files.exists(latest.resolve("06_fusion/map-spill")), "Strip map files removed: " + spilled[i][1]);
+      check(
+          Arrays.equals(
+              Files.readAllBytes(r.get(same[i]).resolve("07_results/dense.ply")),
+              Files.readAllBytes(latest.resolve("07_results/dense.ply"))),
+          "Fusion in strips (" + spilled[i][1] + ") is byte-identical to the untiled one");
+    }
     return checks;
   }
 

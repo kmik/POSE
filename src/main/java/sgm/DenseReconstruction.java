@@ -141,7 +141,14 @@ final class DenseReconstruction {
                       options, frames, tracks, fusion, project == null ? null : project.data)
                   .run(pairs, out);
         else if (options.denseMethod.equals("mvsgm"))
-          count = new MultiViewSgm(options).run(frames, tracks, fusion, out, pairStarts);
+        {
+          MultiViewSgm mvs = new MultiViewSgm(options);
+          try {
+            count = mvs.run(frames, tracks, fusion, out, pairStarts);
+          } finally {
+            mvsgmMaps = mvs.handoff;
+          }
+        }
         else {
           // Decode the non-windowed pairs' images in parallel up front (identical rasters).
           List<ImageFrame> needed = new ArrayList<>();
@@ -321,7 +328,7 @@ final class DenseReconstruction {
           for (int k = 0; k < starts.length; k++)
             starts[k] = k < pairStarts.size() ? pairStarts.get(k) : count;
           ImageFusion.Counters c =
-              ImageFusion.run(options, fusion, candidates, starts, output, twoViewDiagnostics);
+              ImageFusion.run(options, fusion, candidates, starts, output, twoViewDiagnostics, mvsgmMaps);
           fusionWork.done();
           long finishStarted = System.nanoTime();
           output.finish();
@@ -514,11 +521,20 @@ final class DenseReconstruction {
           } finally {
             Files.deleteIfExists(candidates);
             if (preparedResults != null) Files.deleteIfExists(preparedResults);
+            if (mvsgmMaps != null)
+              try {
+                mvsgmMaps.close();
+              } catch (IOException | RuntimeException cleanup) {
+                System.err.println("Warning: could not delete mvsgm depth maps: " + cleanup);
+              }
           }
         }
       }
     }
   }
+
+  // --dense-method mvsgm: the depth and evidence maps handed to image fusion (deleted after it).
+  private MvsgmMaps mvsgmMaps;
 
   private String aerialSummary;
 

@@ -34,6 +34,32 @@ final class DepthMapFile {
     }
   }
 
+  static final int HEADER = 12 + 128;
+
+  /** A full-size map file of zeros (filled later region by region with {@link #writeRegion}). */
+  static void create(Path path, Camera camera, int width, int height) throws IOException {
+    write(path, camera, width, height, new float[0]);
+    try (RandomAccessFile f = new RandomAccessFile(path.toFile(), "rw")) {
+      f.setLength(HEADER + 4L * width * height);
+    }
+  }
+
+  /** Writes src rows [sy0, sy0 + rows) x [sx0, sx0 + cols) (src row length sw) at (x0, y0). */
+  static void writeRegion(
+      Path path, int width, int x0, int y0, int cols, int rows, float[] src, int sw, int sx0, int sy0)
+      throws IOException {
+    ByteBuffer b = ByteBuffer.allocate(4 * cols).order(ByteOrder.LITTLE_ENDIAN);
+    try (FileChannel ch = FileChannel.open(path, StandardOpenOption.WRITE)) {
+      for (int r = 0; r < rows; r++) {
+        b.clear();
+        b.asFloatBuffer().put(src, (sy0 + r) * sw + sx0, cols);
+        b.limit(4 * cols);
+        long at = HEADER + 4L * ((long) (y0 + r) * width + x0);
+        while (b.hasRemaining()) at += ch.write(b, at);
+      }
+    }
+  }
+
   static Map read(Path path) throws IOException {
     ByteBuffer b = ByteBuffer.wrap(Files.readAllBytes(path)).order(ByteOrder.LITTLE_ENDIAN);
     if (b.get() != 'P' || b.get() != 'D' || b.get() != 'M' || b.get() != '1')

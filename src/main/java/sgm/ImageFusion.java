@@ -106,23 +106,101 @@ final class ImageFusion {
   private long cachedBytes;
   private ByteBuffer readBuffer;
 
+  /**
+   * A per-camera float map indexed by pixel: a heap array, or (fusion in strips) a memory-mapped
+   * file read and written in place.
+   */
+  static final class Raster {
+    final float[] a;
+    final java.lang.foreign.MemorySegment s;
+
+    Raster(float[] a) {
+      this.a = a;
+      s = null;
+    }
+
+    Raster(java.lang.foreign.MemorySegment s) {
+      a = null;
+      this.s = s;
+    }
+
+    float get(long i) {
+      return a != null ? a[(int) i] : s.getAtIndex(MappedFiles.FLOAT, i);
+    }
+
+    void set(long i, float v) {
+      if (a != null) a[(int) i] = v;
+      else s.setAtIndex(MappedFiles.FLOAT, i, v);
+    }
+
+    /** Copies count values from offset into dst[at..]. */
+    void read(long offset, float[] dst, int at, int count) {
+      if (a != null) System.arraycopy(a, (int) offset, dst, at, count);
+      else java.lang.foreign.MemorySegment.copy(s, MappedFiles.FLOAT, 4 * offset, dst, at, count);
+    }
+
+    /** Copies src[at..at + count) to offset. */
+    void write(long offset, float[] src, int at, int count) {
+      if (a != null) System.arraycopy(src, at, a, (int) offset, count);
+      else java.lang.foreign.MemorySegment.copy(src, at, s, MappedFiles.FLOAT, 4 * offset, count);
+    }
+  }
+
+  /** Per-pixel marks: a heap bit set, or (fusion in strips) a memory-mapped one. */
+  static final class Bits {
+    final long[] a;
+    final java.lang.foreign.MemorySegment s;
+
+    Bits(long[] a) {
+      this.a = a;
+      s = null;
+    }
+
+    Bits(java.lang.foreign.MemorySegment s) {
+      a = null;
+      this.s = s;
+    }
+
+    boolean get(int q) {
+      long word = a != null ? a[q >>> 6] : s.getAtIndex(MappedFiles.LONG, q >>> 6);
+      return (word & 1L << (q & 63)) != 0;
+    }
+
+    void set(int q) {
+      if (a != null) a[q >>> 6] |= 1L << (q & 63);
+      else s.setAtIndex(MappedFiles.LONG, q >>> 6, s.getAtIndex(MappedFiles.LONG, q >>> 6) | 1L << (q & 63));
+    }
+  }
+
   private final ForkJoinPool pool;
-  private final float[][] compact;
+  private final Raster[] compact;
   private SurfacePatchGrid[] surfaceContext;
   private final int[][] neighbours;
   // owner-consume / graph-average: per camera, merged pixels already represented by an emitted point.
-  private final long[][] used;
+  private final Bits[] used;
   // owner-consume: per camera, pixels whose own point was emitted.
-  private final long[][] emitted;
+  private final Bits[] emitted;
   // graph-average: per camera, the merged pixels' inverse-variance weight sums.
-  private final float[][] compactWeight;
+  private final Raster[] compactWeight;
   private final List<List<Integer>> pairsOf = new ArrayList<>();
   // --thin-surfaces parts (all off: identical to the previous output).
   private final boolean sigmaTolerance, precisionCheck, storeWeights;
   private final int tierCount;
   private final double sigmaK, seedMinSine, localSigma;
   // --fusion-local-sigma: per camera, the smallest merged sigma (depth units) within 4 pixels.
-  private final float[][] localBest;
+  private final Raster[] localBest;
+
+  // Fusion in row strips (STREAMED_PROCESSING.md): when one camera's work does not fit the heap
+  // (or --streamed-processing on, or -Dsgm.fusion.tileRows=N), each camera is processed in strips
+  // of stripRows rows plus a halo covering every neighbourhood operation, and every camera's
+  // maps (depth, weights, local sigma, marks) live in memory-mapped files under 06_fusion/map-spill.
+  // The result is identical to the untiled path.
+  private final boolean tiled;
+  private final int stripRows;
+  private MappedFiles tileFiles;
+  // Halo rows: pass 1 spike filter (5x5 window: 2), pass 2 normals (7x7 at stride 4: 12); +1 for
+  // the merge's 3x3 search, which makes a region's outermost row inexact.
+  static final int PASS_ONE_HALO = 3, PASS_TWO_HALO = 13, SIGMA_HALO = 4, MIN_STRIP_ROWS = 32;
 
   // Memory plan and resident set (FUSION_MEMORY.md). A camera's maps (compact, compactWeight,
   // localBest, used, emitted, surfaceContext) are either resident in those arrays or spilled to
@@ -150,6 +228,8 @@ final class ImageFusion {
     final int[] rgb, pixel;
     // --fusion-seed-min-angle: sinef below this is a narrow-pair candidate.
     double narrowSinef;
+    // Pair-local index of element 0 (a row range of an mvsgm camera's candidates; 0 otherwise).
+    long first;
 
     PairData(int pair, int count, int fields, boolean full) {
       this.pair = pair;
@@ -172,9 +252,14 @@ final class ImageFusion {
     }
   }
 
-  /** Merged per-camera depth: 0 = invalid. Offsets are the representative's subpixel position. */
+  /**
+   * Merged per-camera depth: 0 = invalid. Offsets are the representative's subpixel position.
+   * Covers image rows [row0, row0 + h) (the whole image unless fusing in strips); arrays are
+   * indexed by local pixel (y - row0) * w + x.
+   */
   private static final class Merged {
     final int w, h, words;
+    int row0;
     final float[] z, wsum, du, dv;
     final int[] repPair, repIndex;
     final byte[] support;
@@ -205,11 +290,15 @@ final class ImageFusion {
   /** One camera's splat of one pair: the winning candidate (pair-local index) and depth per pixel. */
   private record Splat(PairData data, int other, int[] sample, float[] z, float[] du, float[] dv) {}
 
-  private ImageFusion(Options o, DepthFusion fusion, Path candidates, long[] start) {
+  // --dense-method mvsgm: candidates come from the cameras' maps instead of the candidate file.
+  private final MvsgmMaps maps;
+
+  private ImageFusion(Options o, DepthFusion fusion, Path candidates, long[] start, MvsgmMaps maps) {
     this.o = o;
     this.fusion = fusion;
     this.candidates = candidates;
     this.start = start;
+    this.maps = maps;
     sigmaTolerance = o.fusionTolerance.equals("sigma");
     precisionCheck = o.fusionPrecisionCheck;
     sigmaK = o.fusionSigmaK;
@@ -256,7 +345,47 @@ final class ImageFusion {
     long avail = budget - budget / 8, base = worstCamera + normalBytes;
     long minEmit = 3L * MIN_BAND_PIXELS * EMISSION_BYTES;
     long needed = allMapBytes + base + minEmit;
-    if (forced < 0 && needed <= avail) {
+    // Strips: forced by a test property or --streamed-processing on; with auto only when even the
+    // spilled plan cannot hold one camera's work.
+    int forcedRows = Integer.getInteger("sgm.fusion.tileRows", 0);
+    boolean wantTiles = forcedRows > 0 || o.streamedProcessing.equals("on");
+    boolean spillFits = avail - worstCamera - minEmit >= 2 * worstMap;
+    tiled = wantTiles || !(forced < 0 && needed <= avail) && !spillFits && !o.streamedProcessing.equals("off");
+    if (tiled) {
+      // One camera at a time, strip by strip; maps are memory-mapped files, so the heap holds
+      // one strip's work (merge, splats, candidates, normal cache), emission bands and the
+      // surface-patch caches. Pairs of the candidate file are read whole for every strip.
+      passOneCameras = 1;
+      cacheLimit = 0;
+      mapBudget = Long.MAX_VALUE;
+      normalCache = surfaceAttributes;
+      int widest = 1, tallest = 1, pairsMax = 1;
+      long pairData = 0;
+      for (int c = 0; c < cameras; c++) {
+        widest = Math.max(widest, fusion.width(c));
+        tallest = Math.max(tallest, fusion.height(c));
+        pairsMax = Math.max(pairsMax, pairsOf.get(c).size());
+        long bytes = 0;
+        for (int k : pairsOf.get(c)) bytes += (start[k + 1] - start[k]) * (36L + 4L * fields);
+        pairData = Math.max(pairData, bytes);
+      }
+      long perPixel = 27 + 8L * words + 16L * pairsMax + 1 + (maps != null ? 36 + 4L * fields : 0) + (normalCache ? 24 : 0);
+      long fixed = (DepthOutlierFilter.enabled(o) ? 4096L * gridCells * cameras : 0) + (maps == null ? pairData : 0);
+      long left = avail - fixed;
+      bandPixels = bandFor(left / 4);
+      left -= 3L * bandPixels * EMISSION_BYTES;
+      long rows = left / 2 / (perPixel * widest) - 2L * PASS_TWO_HALO;
+      if (forcedRows <= 0 && rows < MIN_STRIP_ROWS)
+        throw new IllegalArgumentException(
+            "Image-space fusion needs at least about "
+                + (fixed + minEmit + 2 * perPixel * widest * (MIN_STRIP_ROWS + 2L * PASS_TWO_HALO)) * 8 / 7 * 4 / 3 / 1048576
+                + " MiB heap even in strips (" + perPixel + " bytes per pixel of a strip, " + fixed / 1048576
+                + " MiB fixed); raise PHOTOGRAMMETRY_HEAP/-Xmx or lower --quality");
+      stripRows = (int) Math.max(1, Math.min(tallest, forcedRows > 0 ? forcedRows : rows));
+      workingBytes = perPixel * widest * (stripRows + 2L * PASS_TWO_HALO) + 3L * bandPixels * EMISSION_BYTES + fixed;
+      spillDirectory = o.output.resolve("06_fusion/map-spill");
+    } else if (forced < 0 && needed <= avail) {
+      stripRows = 0;
       mapBudget = Long.MAX_VALUE;
       normalCache = true;
       // Emission bands get up to half of what is left (full bands when there is room).
@@ -285,6 +414,7 @@ final class ImageFusion {
     } else {
       // Spilled maps: one camera at a time; maps get what one camera's work leaves (at least two
       // cameras' worth, checked again once the overlap is known), the pair cache the rest.
+      stripRows = 0;
       passOneCameras = 1;
       long free = avail - worstCamera - minEmit;
       if (free < 2 * worstMap)
@@ -293,7 +423,8 @@ final class ImageFusion {
                 + (budget / 8 + worstCamera + minEmit + 2 * worstMap) * 4 / 3 / 1048576
                 + " MiB heap even with depth maps on disk (largest camera's work "
                 + worstCamera / 1048576 + " MiB, maps " + worstMap / 1048576
-                + " MiB per camera); raise PHOTOGRAMMETRY_HEAP/-Xmx or lower --quality");
+                + " MiB per camera); raise PHOTOGRAMMETRY_HEAP/-Xmx, lower --quality or use"
+                + " --streamed-processing auto (fusion in strips)");
       normalCache = normalBytes > 0 && free - normalBytes >= 4 * worstMap;
       if (normalCache) free -= normalBytes;
       bandPixels = bandFor(free / 4 + minEmit);
@@ -309,15 +440,16 @@ final class ImageFusion {
             + " largest camera's work %,d MiB; %d camera(s) at once in pass 1; candidate cache %,d MiB;"
             + " normal cache %s; row bands of %,d pixels",
         budget >> 20, allMapBytes >> 20, cameras,
-        mapBudget == Long.MAX_VALUE ? "all resident" : "spilled to disk, " + (mapBudget >> 20) + " MiB resident",
+        tiled ? "memory-mapped files; fusion in strips of " + stripRows + " rows"
+            : mapBudget == Long.MAX_VALUE ? "all resident" : "spilled to disk, " + (mapBudget >> 20) + " MiB resident",
         workingBytes >> 20, passOneCameras, cacheLimit >> 20, normalCache ? "on" : "off", bandPixels);
     System.out.println(plan);
-    compact = new float[cameras][];
+    compact = new Raster[cameras];
     neighbours = new int[cameras][];
-    used = new long[cameras][];
-    emitted = new long[cameras][];
-    compactWeight = new float[cameras][];
-    localBest = new float[cameras][];
+    used = new Bits[cameras];
+    emitted = new Bits[cameras];
+    compactWeight = new Raster[cameras];
+    localBest = new Raster[cameras];
     hasMap = new boolean[cameras];
     spilledMaps = new boolean[cameras];
     pool = new ForkJoinPool(Math.max(1, o.cores));
@@ -331,13 +463,30 @@ final class ImageFusion {
       FusionOutput output,
       TwoViewConfidence.Diagnostics diagnostics)
       throws IOException {
-    ImageFusion f = new ImageFusion(o, fusion, candidates, pairStarts);
+    return run(o, fusion, candidates, pairStarts, output, diagnostics, null);
+  }
+
+  /** maps: the mvsgm hand-off (each camera's maps as its single-view pair), or null. */
+  static Counters run(
+      Options o,
+      DepthFusion fusion,
+      Path candidates,
+      long[] pairStarts,
+      FusionOutput output,
+      TwoViewConfidence.Diagnostics diagnostics,
+      MvsgmMaps maps)
+      throws IOException {
+    ImageFusion f = new ImageFusion(o, fusion, candidates, pairStarts, maps);
     try {
       Counters c = f.fuse(output, diagnostics);
       c.memory = Json.object(
           "plan", f.plan, "map_loads", f.mapLoads, "map_evictions", f.mapEvictions,
-          "spill_bytes_written", f.spillWritten, "spill_bytes_read", f.spillRead);
-      if (f.spillDirectory != null)
+          "spill_bytes_written", f.spillWritten, "spill_bytes_read", f.spillRead,
+          "strip_rows", f.stripRows, "mapped_bytes", f.tileFiles == null ? 0 : f.tileFiles.mappedBytes());
+      if (f.tiled)
+        System.out.printf(Locale.ROOT, "Image fusion in strips of %,d rows: %,d MiB of memory-mapped maps%n",
+            f.stripRows, f.tileFiles == null ? 0 : f.tileFiles.mappedBytes() >> 20);
+      else if (f.spillDirectory != null)
         System.out.printf(Locale.ROOT, "Image fusion depth maps on disk: %,d loads, %,d evictions, %,d MiB written, %,d MiB read%n",
             f.mapLoads, f.mapEvictions, f.spillWritten >> 20, f.spillRead >> 20);
       return c;
@@ -371,11 +520,13 @@ final class ImageFusion {
   }
 
   /** Pass 1: camera c's maps are complete; record them, spilling others if over the plan. */
-  private synchronized void admit(int c, float[] z, float[] weight, float[] best) throws IOException {
+  private synchronized void admit(int c, Raster z, Raster weight, Raster best) throws IOException {
     compact[c] = z;
     compactWeight[c] = weight;
     localBest[c] = best;
     hasMap[c] = true;
+    // Strips: every map is a memory-mapped file; nothing is resident on the heap.
+    if (tiled) return;
     resident.put(c, mapBytes(c));
     residentBytes += mapBytes(c);
     evictBeyond(mapBudget, Set.of(c));
@@ -384,13 +535,15 @@ final class ImageFusion {
   /** The camera's surface-patch grid over its resident depth map (models are deterministic). */
   private void grid(int c) {
     if (surfaceContext == null || compact[c] == null) return;
-    final float[] raster = compact[c];
-    surfaceContext[c] =
-        new SurfacePatchGrid(fusion.width(c), fusion.height(c), p -> raster[p], o.fusionRelative, gridCells);
+    final float[] array = compact[c].a;
+    final java.lang.foreign.MemorySegment mapped = compact[c].s;
+    surfaceContext[c] = new SurfacePatchGrid(fusion.width(c), fusion.height(c),
+        array != null ? p -> array[p] : p -> mapped.getAtIndex(MappedFiles.FLOAT, p), o.fusionRelative, gridCells);
   }
 
   /** Pass 2: camera c and the cameras it cross-checks become resident; others may be spilled. */
   private synchronized void residentFor(int c) throws IOException {
+    if (tiled) return;
     Set<Integer> needed = new HashSet<>();
     needed.add(c);
     for (int j : neighbours[c]) needed.add(j);
@@ -404,7 +557,7 @@ final class ImageFusion {
 
   /** Spilled mode needs one camera plus all of its overlapping cameras resident at once. */
   private void checkWorkingSet() {
-    if (spillDirectory == null) return;
+    if (spillDirectory == null || tiled) return;
     long most = 0;
     int widest = 0;
     for (int c = 0; c < cameras; c++) {
@@ -449,9 +602,9 @@ final class ImageFusion {
     Files.createDirectories(spillDirectory);
     if (!spilledMaps[j]) {
       try (FileChannel ch = FileChannel.open(mapFile(j), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-        writeFloats(ch, compact[j]);
-        if (compactWeight[j] != null) writeFloats(ch, compactWeight[j]);
-        if (localBest[j] != null) writeFloats(ch, localBest[j]);
+        writeFloats(ch, compact[j].a);
+        if (compactWeight[j] != null) writeFloats(ch, compactWeight[j].a);
+        if (localBest[j] != null) writeFloats(ch, localBest[j].a);
       }
       spilledMaps[j] = true;
     }
@@ -460,8 +613,8 @@ final class ImageFusion {
         ByteBuffer head = ByteBuffer.allocate(2).put((byte) (used[j] != null ? 1 : 0)).put((byte) (emitted[j] != null ? 1 : 0)).flip();
         while (head.hasRemaining()) ch.write(head);
         spillWritten += 2;
-        if (used[j] != null) writeLongs(ch, used[j]);
-        if (emitted[j] != null) writeLongs(ch, emitted[j]);
+        if (used[j] != null) writeLongs(ch, used[j].a);
+        if (emitted[j] != null) writeLongs(ch, emitted[j].a);
       }
     compact[j] = null;
     compactWeight[j] = null;
@@ -474,9 +627,9 @@ final class ImageFusion {
   private void load(int j) throws IOException {
     int n = fusion.width(j) * fusion.height(j);
     try (FileChannel ch = FileChannel.open(mapFile(j), StandardOpenOption.READ)) {
-      compact[j] = readFloats(ch, n);
-      if (storeWeights) compactWeight[j] = readFloats(ch, n);
-      if (localSigma > 0) localBest[j] = readFloats(ch, n);
+      compact[j] = new Raster(readFloats(ch, n));
+      if (storeWeights) compactWeight[j] = new Raster(readFloats(ch, n));
+      if (localSigma > 0) localBest[j] = new Raster(readFloats(ch, n));
     }
     if (Files.exists(bitsFile(j)))
       try (FileChannel ch = FileChannel.open(bitsFile(j), StandardOpenOption.READ)) {
@@ -485,8 +638,8 @@ final class ImageFusion {
         head.flip();
         boolean u = head.get() != 0, e = head.get() != 0;
         int words = (n + 63) / 64;
-        if (u) used[j] = readLongs(ch, words);
-        if (e) emitted[j] = readLongs(ch, words);
+        if (u) used[j] = new Bits(readLongs(ch, words));
+        if (e) emitted[j] = new Bits(readLongs(ch, words));
       }
     grid(j);
     resident.put(j, mapBytes(j));
@@ -552,12 +705,34 @@ final class ImageFusion {
     return a;
   }
 
+  static final String[] TILE_KINDS = {"z", "w", "best", "used", "emitted"};
+
+  /** Strips: camera c's memory-mapped map file of the given kind (TILE_KINDS). */
+  private Path tileFile(int c, String kind) {
+    return spillDirectory.resolve("camera_" + c + "." + kind);
+  }
+
+  /** A new zero map file of camera c, memory-mapped read-write. */
+  private java.lang.foreign.MemorySegment tileMap(int c, String kind, long bytes) throws IOException {
+    if (tileFiles == null) tileFiles = new MappedFiles();
+    return tileFiles.create(tileFile(c, kind), bytes);
+  }
+
+  /** used/emitted marks of camera j, created on first use (memory-mapped in strips). */
+  private Bits newBits(int j, String kind) throws IOException {
+    long words = ((long) fusion.width(j) * fusion.height(j) + 63) / 64;
+    return tiled ? new Bits(tileMap(j, kind, 8 * words)) : new Bits(new long[(int) words]);
+  }
+
   private void deleteSpill() {
+    if (tileFiles != null) tileFiles.close();
+    tileFiles = null;
     if (spillDirectory == null || !Files.isDirectory(spillDirectory)) return;
     for (int c = 0; c < cameras; c++)
       try {
         Files.deleteIfExists(mapFile(c));
         Files.deleteIfExists(bitsFile(c));
+        for (String kind : TILE_KINDS) Files.deleteIfExists(tileFile(c, kind));
       } catch (IOException ignored) {
         // Temporary files; a later run overwrites them.
       }
@@ -638,24 +813,99 @@ final class ImageFusion {
     }
     counters.pairReads++;
     counters.bytesRead += (long) n * record;
-    // f * sin(triangulation angle): DepthFusion.weight without the depth term.
-    int a = fusion.pairCamera(k, false), b = fusion.pairCamera(k, true);
+    sines(data);
+    if (retain) {
+      pairCache.put(k, data);
+      cachedBytes += data.bytes();
+      counters.cachePeakBytes = Math.max(counters.cachePeakBytes, cachedBytes);
+    }
+    return data;
+  }
+
+  /** f * sin(triangulation angle) per candidate: DepthFusion.weight without the depth term. */
+  private void sines(PairData data) {
+    int a = fusion.pairCamera(data.pair, false), b = fusion.pairCamera(data.pair, true);
     Camera ca = fusion.camera(a), cb = fusion.camera(b);
     double[] centerA = ca.center(), centerB = cb.center();
     double focal = Math.min(Math.min(ca.fx, ca.fy), Math.min(cb.fx, cb.fy));
     data.narrowSinef = focal * seedMinSine;
-    parallel(n, j -> {
+    parallel(data.count, j -> {
       double[] p = data.point(j), u = Math3.sub(p, centerA), v = Math3.sub(p, centerB);
       double denominator = Math3.norm(u) * Math3.norm(v);
       double x = u[1] * v[2] - u[2] * v[1], y = u[2] * v[0] - u[0] * v[2], z = u[0] * v[1] - u[1] * v[0];
       double sine = denominator == 0 ? 0 : Math.min(1, Math.sqrt(x * x + y * y + z * z) / denominator);
       data.sinef[j] = (float) Math.max(1e-9, focal * sine);
     });
-    if (retain) {
-      pairCache.put(k, data);
-      cachedBytes += data.bytes();
-      counters.cachePeakBytes = Math.max(counters.cachePeakBytes, cachedBytes);
-    }
+  }
+
+  /**
+   * --dense-method mvsgm: the candidates of rows [r0, r1) of pair k's camera, read from its maps
+   * (MvsgmMaps) with the arithmetic the former candidate file used (world point from the map
+   * depth in FP64; evidence as floats; colour packed), in raster order. Element 0 is candidate
+   * {@code first} of the pair, so candidate ids are unchanged.
+   */
+  private PairData mapPair(int k, int r0, int r1, boolean full, Counters counters) throws IOException {
+    int c = fusion.pairCamera(k, false);
+    MvsgmMaps.Camera mc = maps.camera(c);
+    if (mc == null || mc.pair() != k) throw new IllegalStateException("No mvsgm maps for fusion pair " + k);
+    int w = mc.width();
+    long[] rowStart = mc.rowStart();
+    long first = rowStart[r0];
+    PairData data = new PairData(k, Math.toIntExact(rowStart[r1] - first), fields, full);
+    data.first = first;
+    var z = maps.segment(c, MvsgmMaps.DEPTH);
+    var lr = maps.segment(c, MvsgmMaps.LR);
+    var margin = full ? maps.segment(c, MvsgmMaps.MARGIN) : null;
+    var sharp = full ? maps.segment(c, MvsgmMaps.SHARP) : null;
+    var photo = full ? maps.segment(c, MvsgmMaps.PHOTO) : null;
+    var rgb = full ? maps.segment(c, MvsgmMaps.RGB) : null;
+    Camera cam = fusion.camera(c);
+    double[] rt = Math3.transpose(cam.rotation);
+    // Rows are copied out of the mapped files in bulk (one copy per map and row).
+    ThreadLocal<float[][]> rows = ThreadLocal.withInitial(() -> new float[5][w]);
+    ThreadLocal<int[]> colours = ThreadLocal.withInitial(() -> new int[w]);
+    parallel(r1 - r0, row -> {
+      int y = r0 + row, i = (int) (rowStart[y] - first);
+      if (rowStart[y + 1] == rowStart[y]) return;
+      long at = (long) y * w;
+      float[][] v = rows.get();
+      float[] zr = v[0], lrr = v[1], mr = v[2], sr = v[3], pr = v[4];
+      int[] cr = colours.get();
+      java.lang.foreign.MemorySegment.copy(z, MappedFiles.FLOAT, 4 * at, zr, 0, w);
+      java.lang.foreign.MemorySegment.copy(lr, MappedFiles.FLOAT, 4 * at, lrr, 0, w);
+      if (full) {
+        java.lang.foreign.MemorySegment.copy(margin, MappedFiles.FLOAT, 4 * at, mr, 0, w);
+        java.lang.foreign.MemorySegment.copy(sharp, MappedFiles.FLOAT, 4 * at, sr, 0, w);
+        java.lang.foreign.MemorySegment.copy(photo, MappedFiles.FLOAT, 4 * at, pr, 0, w);
+        java.lang.foreign.MemorySegment.copy(rgb, MappedFiles.INT, 4 * at, cr, 0, w);
+      }
+      for (int x = 0; x < w; x++) {
+        float zp = zr[x];
+        if (zp <= 0) continue;
+        float l = lrr[x];
+        if (Float.isNaN(l)) continue;
+        double[] X = MultiViewSgm.world(cam, rt, x, y, zp);
+        data.world[3 * i] = X[0];
+        data.world[3 * i + 1] = X[1];
+        data.world[3 * i + 2] = X[2];
+        if (full) {
+          float mg = mr[x], sh = sr[x], ph = pr[x];
+          data.rgb[i] = cr[x];
+          data.pixel[i] = (int) (at + x);
+          int e = i * fields;
+          data.evidence[e] = (float) PointConfidence.score(ph, mg, sh, l);
+          data.evidence[e + 1] = mg;
+          data.evidence[e + 2] = sh;
+          data.evidence[e + 3] = ph;
+          data.evidence[e + 4] = l;
+          if (fields == 6) data.evidence[e + 5] = Float.NaN;
+        }
+        i++;
+      }
+    });
+    counters.pairReads++;
+    counters.bytesRead += (long) (r1 - r0) * w * (full ? 24 : 8);
+    sines(data);
     return data;
   }
 
@@ -699,14 +949,20 @@ final class ImageFusion {
           Callable<Void> task =
               () -> {
                 Counters own = new Counters();
+                if (tiled) {
+                  passOneTiled(channel, camera, own, times[camera], samples, counters);
+                  perCamera[camera] = own;
+                  return null;
+                }
+                int h = fusion.height(camera);
                 long clock = System.nanoTime();
-                Splat[] splats = splat(channel, camera, false, counters);
+                Splat[] splats = splat(channel, camera, false, counters, 0, h);
                 times[camera][0] = System.nanoTime() - clock;
                 clock = System.nanoTime();
-                Merged m = merge(camera, splats, own);
+                Merged m = merge(camera, splats, own, 0, h, 0, h);
                 times[camera][1] = System.nanoTime() - clock;
                 clock = System.nanoTime();
-                own.spikes += spikes(m, fusion.camera(camera));
+                own.spikes += spikes(m, fusion.camera(camera), 0, h);
                 own.speckle += speckles(m, fusion.camera(camera));
                 if (o.fusionDepthOutliers) own.depthOutliers += depthOutliers(m.z);
                 times[camera][2] = System.nanoTime() - clock;
@@ -718,8 +974,8 @@ final class ImageFusion {
                   DepthMapFile.write(
                       o.output.resolve("06_fusion/merged_maps/camera_" + camera + ".depth"),
                       fusion.camera(camera), fusion.width(camera), fusion.height(camera), m.z);
-                admit(camera, m.z, storeWeights ? m.wsum : null,
-                    localSigma > 0 ? localMinimumSigma(m.z, m.wsum, m.w, m.h, 4) : null);
+                admit(camera, new Raster(m.z), storeWeights ? new Raster(m.wsum) : null,
+                    localSigma > 0 ? new Raster(localMinimumSigma(m.z, m.wsum, m.w, m.h, 4)) : null);
                 perCamera[camera] = own;
                 return null;
               };
@@ -795,19 +1051,25 @@ final class ImageFusion {
       for (int c = 0; c < cameras; c++) {
         progress.update(cameras + c);
         if (!hasMap[c]) continue;
-        clock = System.nanoTime();
         residentFor(c);
-        Splat[] splats = splat(channel, c, true, counters);
-        Merged m = merge(c, splats, null);
+        // The whole image at once, or (fusion in strips) strip by strip with a halo covering the
+        // normal fits (+-12 rows) and the merge's 3x3 search. Bands and strips never change results.
+        int h = fusion.height(c), strip = tiled ? stripRows : h, halo = tiled ? PASS_TWO_HALO : 0;
+        for (int s0 = 0; s0 < h; s0 += strip) {
+        int s1 = Math.min(h, s0 + strip), r0 = Math.max(0, s0 - halo), r1 = Math.min(h, s1 + halo);
+        clock = System.nanoTime();
+        Splat[] splats = splat(channel, c, true, counters, r0, r1 - r0);
+        Merged m = merge(c, splats, null, r0, r1 - r0, 0, 0);
         // Pass 1's speckle decisions, without recounting.
-        float[] kept = compact[c];
-        for (int p = 0; p < kept.length; p++) if (kept[p] <= 0) m.z[p] = 0;
+        Raster kept = compact[c];
+        long base = (long) r0 * m.w;
+        for (int p = 0; p < m.z.length; p++) if (kept.get(base + p) <= 0) m.z[p] = 0;
         remergeNanos += System.nanoTime() - clock;
         double[] points = pointCache(c, m);
         int w = m.w, bandRows = Math.max(1, bandPixels / Math.max(1, w));
-        for (int y0 = 0; y0 < m.h; y0 += bandRows) {
+        for (int y0 = s0; y0 < s1; y0 += bandRows) {
           clock = System.nanoTime();
-          Emission[][] rows = crossCheck(c, m, splats, counters, tier, points, y0, Math.min(m.h, y0 + bandRows));
+          Emission[][] rows = crossCheck(c, m, splats, counters, tier, points, y0, Math.min(s1, y0 + bandRows));
           checkNanos += System.nanoTime() - clock;
           for (Emission[] row : rows)
             if (row != null)
@@ -821,8 +1083,8 @@ final class ImageFusion {
                   counters.members += e.agreements().length;
                 } else if (e.agreements() != null) {
                   markUsed(e, agreementRadius(o));
-                  if (emitted[c] == null) emitted[c] = new long[(fusion.width(c) * fusion.height(c) + 63) / 64];
-                  emitted[c][e.cameraPixel() >>> 6] |= 1L << (e.cameraPixel() & 63);
+                  if (emitted[c] == null) emitted[c] = newBits(c, "emitted");
+                  emitted[c].set(e.cameraPixel());
                 }
               }
           while (pending.size() >= 2) outputNanos += awaitOutput(pending.poll());
@@ -840,6 +1102,7 @@ final class ImageFusion {
                         }
                     return System.nanoTime() - started;
                   }));
+        }
         }
       }
       while (!pending.isEmpty()) outputNanos += awaitOutput(pending.poll());
@@ -876,34 +1139,42 @@ final class ImageFusion {
    * averaged member pixel. Marks only affect other cameras and are unions, so results do not depend
    * on row scheduling.
    */
-  private void markUsed(Emission e, int radius) {
+  private void markUsed(Emission e, int radius) throws IOException {
     double tol = o.fusionRelative;
     for (int k = 0; k < e.agreements().length; k++) {
       long a = e.agreements()[k];
       int j = (int) (a >>> 42), y = (int) (a >>> 21 & 0x1FFFFF), x = (int) (a & 0x1FFFFF);
       double d = e.agreementDepths()[k];
-      float[] z = compact[j];
+      Raster z = compact[j];
       int w = fusion.width(j), h = fusion.height(j);
-      if (used[j] == null) used[j] = new long[(w * h + 63) / 64];
+      if (used[j] == null) used[j] = newBits(j, "used");
+      Bits marks = used[j];
       for (int dy = -radius; dy <= radius; dy++)
         for (int dx = -radius; dx <= radius; dx++) {
           int xx = x + dx, yy = y + dy;
           if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
           int q = yy * w + xx;
-          if (z[q] > 0 && Math.abs(z[q] - d) <= tol * Math.min(z[q], d))
-            used[j][q >>> 6] |= 1L << (q & 63);
+          float zq = z.get(q);
+          if (zq > 0 && Math.abs(zq - d) <= tol * Math.min(zq, d)) marks.set(q);
         }
     }
   }
 
-  /** Splats each of camera c's pairs into c. */
-  private Splat[] splat(FileChannel channel, int c, boolean full, Counters counters) throws IOException {
+  /**
+   * Splats each of camera c's pairs into c's rows [r0, r0 + rows) (the whole image unless fusing
+   * in strips; splat arrays are indexed by local pixel). mvsgm pairs read only the rows that can
+   * land there (one more on each side).
+   */
+  private Splat[] splat(FileChannel channel, int c, boolean full, Counters counters, int r0, int rows) throws IOException {
     List<Integer> pairs = pairsOf.get(c);
     Splat[] out = new Splat[pairs.size()];
     Camera cam = fusion.camera(c);
-    int w = fusion.width(c), h = fusion.height(c);
+    int w = fusion.width(c), h = rows, H = fusion.height(c);
     PairData[] loaded = new PairData[out.length];
-    for (int s = 0; s < out.length; s++) loaded[s] = load(channel, pairs.get(s), full, counters);
+    for (int s = 0; s < out.length; s++)
+      loaded[s] = maps != null
+          ? mapPair(pairs.get(s), Math.max(0, r0 - 1), Math.min(H, r0 + rows + 1), full, counters)
+          : load(channel, pairs.get(s), full, counters);
     // Each pair's splat is independent (its own arrays, filled serially in candidate order), so
     // the pairs are splatted concurrently with identical results.
     parallel(out.length, s -> {
@@ -920,8 +1191,8 @@ final class ImageFusion {
         if (v[2] <= 0) continue;
         double u = cam.fx * v[0] / v[2] + cam.cx, t = cam.fy * v[1] / v[2] + cam.cy;
         int x = (int) Math.round(u), y = (int) Math.round(t);
-        if (x < 0 || x >= w || y < 0 || y >= h) continue;
-        int at = y * w + x;
+        if (x < 0 || x >= w || y < r0 || y >= r0 + h) continue;
+        int at = (y - r0) * w + x;
         if (sample[at] < 0 || v[2] < z[at]) {
           sample[at] = i;
           z[at] = (float) v[2];
@@ -934,10 +1205,14 @@ final class ImageFusion {
     return out;
   }
 
-  /** Reference depth-mode merge per pixel; ambiguous pixels keep the nearer cluster, flagged. */
-  private Merged merge(int c, Splat[] splats, Counters counters) {
-    int w = fusion.width(c), h = fusion.height(c);
+  /**
+   * Reference depth-mode merge per pixel; ambiguous pixels keep the nearer cluster, flagged. The
+   * splats cover rows [r0, r0 + rows); ambiguous pixels are counted in local rows [countFrom, countTo).
+   */
+  private Merged merge(int c, Splat[] splats, Counters counters, int r0, int rows, int countFrom, int countTo) {
+    int w = fusion.width(c), h = rows;
     Merged m = new Merged(w, h, words);
+    m.row0 = r0;
     double limit = o.fusionPixels * o.fusionPixels;
     double focal = Math.min(fusion.camera(c).fx, fusion.camera(c).fy);
     long[] ambiguous = new long[h];
@@ -1035,7 +1310,7 @@ final class ImageFusion {
         m.dv[p] = (float) offsetY[chosen];
       }
     });
-    if (counters != null) for (long a : ambiguous) counters.ambiguousKept += a;
+    if (counters != null) for (int y = countFrom; y < countTo; y++) counters.ambiguousKept += ambiguous[y];
     return m;
   }
 
@@ -1108,6 +1383,251 @@ final class ImageFusion {
     return removed;
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Fusion in strips (STREAMED_PROCESSING.md). Every step below gives the untiled result: the
+  // halos cover each neighbourhood operation, the speckle filter's components are joined across
+  // strip borders, and the global steps (depth percentiles, overlap samples) read the whole
+  // memory-mapped map in the same order as the untiled code.
+
+  /**
+   * Pass 1 of camera c in strips: merge and spike filter per strip (halo PASS_ONE_HALO), then the
+   * speckle filter, depth outliers, overlap samples and local sigma over the camera's
+   * memory-mapped map files.
+   */
+  private void passOneTiled(FileChannel channel, int c, Counters own, long[] times, double[][] samples, Counters counters)
+      throws IOException {
+    int w = fusion.width(c), h = fusion.height(c);
+    long n = (long) w * h;
+    Camera cam = fusion.camera(c);
+    Raster z = new Raster(tileMap(c, "z", 4 * n));
+    Raster weight = storeWeights || localSigma > 0 ? new Raster(tileMap(c, "w", 4 * n)) : null;
+    for (int y0 = 0; y0 < h; y0 += stripRows) {
+      int y1 = Math.min(h, y0 + stripRows), r0 = Math.max(0, y0 - PASS_ONE_HALO), r1 = Math.min(h, y1 + PASS_ONE_HALO);
+      long clock = System.nanoTime();
+      Splat[] splats = splat(channel, c, false, counters, r0, r1 - r0);
+      times[0] += System.nanoTime() - clock;
+      clock = System.nanoTime();
+      Merged m = merge(c, splats, own, r0, r1 - r0, y0 - r0, y1 - r0);
+      times[1] += System.nanoTime() - clock;
+      clock = System.nanoTime();
+      own.spikes += spikes(m, cam, y0 - r0, y1 - r0);
+      int at = (y0 - r0) * w, count = (y1 - y0) * w;
+      z.write((long) y0 * w, m.z, at, count);
+      if (weight != null) weight.write((long) y0 * w, m.wsum, at, count);
+      times[2] += System.nanoTime() - clock;
+    }
+    long clock = System.nanoTime();
+    own.speckle += stripSpeckles(z, w, h, cam);
+    if (o.fusionDepthOutliers) own.depthOutliers += depthOutliers(z, n);
+    times[2] += System.nanoTime() - clock;
+    long valid = 0;
+    for (long p = 0; p < n; p++) if (z.get(p) > 0) valid++;
+    own.pixels += valid;
+    clock = System.nanoTime();
+    samples[c] = sampleTiled(channel, c, z, valid, counters);
+    times[0] += System.nanoTime() - clock;
+    if (Boolean.getBoolean("sgm.dumpMergedMaps")) {
+      Path file = o.output.resolve("06_fusion/merged_maps/camera_" + c + ".depth");
+      DepthMapFile.create(file, cam, w, h);
+      float[] rows = new float[stripRows * w];
+      for (int y0 = 0; y0 < h; y0 += stripRows) {
+        int nr = Math.min(stripRows, h - y0);
+        z.read((long) y0 * w, rows, 0, nr * w);
+        DepthMapFile.writeRegion(file, w, 0, y0, w, nr, rows, w, 0, 0);
+      }
+    }
+    admit(c, z, storeWeights ? weight : null, localSigma > 0 ? localBestTiled(c, z, weight) : null);
+  }
+
+  /** depthOutliers over a memory-mapped map of length pixels (same samples and decisions). */
+  private static long depthOutliers(Raster z, long length) {
+    long count = 0;
+    for (long p = 0; p < length; p++) if (z.get(p) > 0) count++;
+    if (count < 100) return 0;
+    int valid = Math.toIntExact(count);
+    int stride = Math.max(1, valid / 1_000_000), n = 0, seen = 0;
+    float[] sample = new float[valid / stride + 1];
+    for (long p = 0; p < length; p++) {
+      float v = z.get(p);
+      if (v > 0 && seen++ % stride == 0) sample[n++] = v;
+    }
+    Arrays.sort(sample, 0, n);
+    double low = .5 * sample[(int) (.005 * (n - 1))], high = 1.5 * sample[(int) Math.ceil(.995 * (n - 1))];
+    long removed = 0;
+    for (long p = 0; p < length; p++) {
+      float v = z.get(p);
+      if (v > 0 && (v > high || v < low)) {
+        z.set(p, 0);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * sample() in strips: the same evenly spread valid pixels, back-projected with the subpixel
+   * offsets of a re-merge of each strip (halo 1 for the merge's 3x3 search).
+   */
+  private double[] sampleTiled(FileChannel channel, int c, Raster z, long count, Counters counters) throws IOException {
+    if (count == 0) return new double[0];
+    int w = fusion.width(c), h = fusion.height(c), valid = Math.toIntExact(count);
+    int stride = Math.max(1, valid / 4096), seen = 0, n = 0;
+    double[] out = new double[3 * Math.min(valid, 4096 + 1)];
+    Camera cam = fusion.camera(c);
+    double[] rotationT = Math3.transpose(cam.rotation);
+    for (int y0 = 0; y0 < h && n < out.length / 3; y0 += stripRows) {
+      int y1 = Math.min(h, y0 + stripRows), r0 = Math.max(0, y0 - 1), r1 = Math.min(h, y1 + 1);
+      Merged m = merge(c, splat(channel, c, false, counters, r0, r1 - r0), null, r0, r1 - r0, 0, 0);
+      for (int y = y0; y < y1 && n < out.length / 3; y++)
+        for (int x = 0; x < w && n < out.length / 3; x++) {
+          float zp = z.get((long) y * w + x);
+          if (zp <= 0 || seen++ % stride != 0) continue;
+          int q = (y - r0) * w + x;
+          double[] X = backProject(cam, rotationT, x + m.du[q], y + m.dv[q], zp);
+          out[3 * n] = X[0];
+          out[3 * n + 1] = X[1];
+          out[3 * n + 2] = X[2];
+          n++;
+        }
+    }
+    return Arrays.copyOf(out, 3 * n);
+  }
+
+  /** localMinimumSigma in strips (halo SIGMA_HALO rows), written to camera c's "best" map file. */
+  private Raster localBestTiled(int c, Raster z, Raster weight) throws IOException {
+    int w = fusion.width(c), h = fusion.height(c);
+    Raster best = new Raster(tileMap(c, "best", 4L * w * h));
+    for (int y0 = 0; y0 < h; y0 += stripRows) {
+      int y1 = Math.min(h, y0 + stripRows), r0 = Math.max(0, y0 - SIGMA_HALO), r1 = Math.min(h, y1 + SIGMA_HALO);
+      int cells = (r1 - r0) * w;
+      float[] zs = new float[cells], ws = new float[cells];
+      z.read((long) r0 * w, zs, 0, cells);
+      weight.read((long) r0 * w, ws, 0, cells);
+      best.write((long) y0 * w, localMinimumSigma(zs, ws, w, r1 - r0, 4), (y0 - r0) * w, (y1 - y0) * w);
+    }
+    return best;
+  }
+
+  /**
+   * The 2D speckle filter (speckles()) over a memory-mapped map, strip by strip. Components are
+   * labelled per strip with the same connection rule; a component touching a strip's first or last
+   * row may continue in the next strip and becomes a union-find node, joined across each strip
+   * border where the two border pixels connect, with its size summed at the root. A second sweep
+   * relabels each strip identically and removes components smaller than --speckle-size. Component
+   * membership does not depend on the split, so the result equals the untiled filter (for
+   * --speckle-size up to 65,536, the untiled filter's member buffer).
+   */
+  private long stripSpeckles(Raster z, int w, int h, Camera camera) {
+    if (o.speckleSize <= 0) return 0;
+    double limit = Math.max(o.fusionRelative, 2 / Math.min(camera.fx, camera.fy));
+    int rows = Math.max(1, Math.min(h, stripRows)), strips = Math.ceilDiv(h, rows), cells = rows * w;
+    float[] zs = new float[cells];
+    int[] label = new int[cells], stack = new int[cells], size = new int[cells + 1], node = new int[cells + 1];
+    boolean[] edge = new boolean[cells + 1];
+    int[] parent = new int[1 << 12];
+    long[] total = new long[1 << 12];
+    int nodes = 0;
+    int[] firstNode = new int[strips], prevNode = new int[w];
+    float[] prevZ = new float[w];
+    for (int s = 0; s < strips; s++) {
+      int y0 = s * rows, nr = Math.min(rows, h - y0);
+      z.read((long) y0 * w, zs, 0, nr * w);
+      int k = components(zs, w, nr, limit, label, stack, size, edge);
+      firstNode[s] = nodes;
+      for (int i = 1; i <= k; i++) {
+        if (!edge[i]) continue;
+        if (nodes == parent.length) {
+          parent = Arrays.copyOf(parent, 2 * nodes);
+          total = Arrays.copyOf(total, 2 * nodes);
+        }
+        parent[nodes] = nodes;
+        total[nodes] = size[i];
+        node[i] = nodes++;
+      }
+      if (s > 0)
+        for (int x = 0; x < w; x++) {
+          float a = prevZ[x], b = zs[x];
+          if (prevNode[x] < 0 || b <= 0) continue;
+          double near = Math.min(a, b);
+          if (Math.abs(b - a) > limit * near) continue;
+          int ra = find(parent, prevNode[x]), rb = find(parent, node[label[x]]);
+          if (ra == rb) continue;
+          parent[rb] = ra;
+          total[ra] += total[rb];
+        }
+      int last = (nr - 1) * w;
+      for (int x = 0; x < w; x++) {
+        prevZ[x] = zs[last + x];
+        prevNode[x] = zs[last + x] > 0 ? node[label[last + x]] : -1;
+      }
+    }
+    long removed = 0;
+    for (int s = 0; s < strips; s++) {
+      int y0 = s * rows, nr = Math.min(rows, h - y0);
+      z.read((long) y0 * w, zs, 0, nr * w);
+      int k = components(zs, w, nr, limit, label, stack, size, edge);
+      int next = firstNode[s];
+      for (int i = 1; i <= k; i++) node[i] = edge[i] ? next++ : -1;
+      boolean changed = false;
+      for (int p = 0; p < nr * w; p++) {
+        int l = label[p];
+        if (l == 0) continue;
+        long components = node[l] < 0 ? size[l] : total[find(parent, node[l])];
+        if (components < o.speckleSize) {
+          zs[p] = 0;
+          removed++;
+          changed = true;
+        }
+      }
+      if (changed) z.write((long) y0 * w, zs, 0, nr * w);
+    }
+    return removed;
+  }
+
+  private static int find(int[] parent, int i) {
+    while (parent[i] != i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  }
+
+  /**
+   * 4-connected components of a strip (w x rows) under speckles()' connection rule: label[p] =
+   * 1..k (0 = no depth), size[k], edge[k] = the component touches the strip's first or last row.
+   */
+  private static int components(float[] zs, int w, int rows, double limit, int[] label, int[] stack, int[] size, boolean[] edge) {
+    Arrays.fill(label, 0, w * rows, 0);
+    int next = 0;
+    for (int start = 0; start < w * rows; start++) {
+      if (zs[start] <= 0 || label[start] != 0) continue;
+      next++;
+      int top = 0, count = 0;
+      boolean touches = false;
+      stack[top++] = start;
+      label[start] = next;
+      while (top > 0) {
+        int p = stack[--top];
+        count++;
+        int x = p % w, y = p / w;
+        if (y == 0 || y == rows - 1) touches = true;
+        for (int d = 0; d < 4; d++) {
+          int xx = x + (d == 0 ? 1 : d == 1 ? -1 : 0), yy = y + (d == 2 ? 1 : d == 3 ? -1 : 0);
+          if (xx < 0 || yy < 0 || xx >= w || yy >= rows) continue;
+          int q = yy * w + xx;
+          if (label[q] != 0 || zs[q] <= 0) continue;
+          double near = Math.min(zs[p], zs[q]);
+          if (Math.abs(zs[q] - zs[p]) > limit * near) continue;
+          label[q] = next;
+          stack[top++] = q;
+        }
+      }
+      size[next] = count;
+      edge[next] = touches;
+    }
+    return next;
+  }
+
   /** Removes 4-connected components smaller than the speckle size; returns removed pixels.
    * Neighbours connect within the relative fusion tolerance or two pixel footprints (z / f), so
    * slanted surfaces at coarse resolution are not fragmented. */
@@ -1178,14 +1698,16 @@ final class ImageFusion {
     return a[k];
   }
 
-  private long spikes(Merged m, Camera camera) {
+  /** Spike filter decisions for local rows [from, to) of m (all rows of m are read). */
+  private long spikes(Merged m, Camera camera, int from, int to) {
     if (!o.fusionSpikeFilter) return 0;
     int w = m.w, h = m.h, r = 2;
     double focal = Math.min(camera.fx, camera.fy);
     float[] z = m.z;
     boolean[] spike = new boolean[w * h];
     long[] counts = new long[h];
-    parallel(h, y -> {
+    parallel(to - from, row -> {
+      int y = from + row;
       float[] values = new float[(2 * r + 1) * (2 * r + 1)], deviations = new float[values.length];
       for (int x = 0; x < w; x++) {
         int p = y * w + x;
@@ -1296,7 +1818,7 @@ final class ImageFusion {
       for (int x = 0; x < w; x++) {
         int at = y * w + x;
         if (m.z[at] <= 0) continue;
-        double[] q = backProject(cam, rotationT, x + m.du[at], y + m.dv[at], m.z[at]);
+        double[] q = backProject(cam, rotationT, x + m.du[at], (y + m.row0) + m.dv[at], m.z[at]);
         System.arraycopy(q, 0, points, 3 * at, 3);
       }
     });
@@ -1306,6 +1828,8 @@ final class ImageFusion {
   /** Cross-check, ownership and emission for rows [y0, y1) of camera c, row-parallel and row-ordered. */
   private Emission[][] crossCheck(int c, Merged m, Splat[] splats, Counters counters, int tier, double[] points, int y0, int y1) {
     int w = m.w, h = m.h, required = fusion.requiredViews();
+    // p: image pixel (marks, local sigma, emission); q: pixel in m (rows from m.row0).
+    int base = m.row0 * w;
     Camera cam = fusion.camera(c);
     double[] rotationT = Math3.transpose(cam.rotation);
     double tol = o.fusionRelative;
@@ -1320,8 +1844,8 @@ final class ImageFusion {
     // confirmed point onto the precise depths that confirmed it).
     boolean average = graph || precisionCheck;
     double focal = Math.min(cam.fx, cam.fy);
-    float[] best = localBest[c];
-    long[] taken = consume || graph ? used[c] : null;
+    Raster best = localBest[c];
+    Bits taken = consume || graph ? used[c] : null;
     Map<Integer, PairData> byPair = new HashMap<>();
     for (Splat s : splats) byPair.put(s.data().pair, s.data());
     Emission[][] rows = new Emission[y1 - y0][];
@@ -1335,39 +1859,42 @@ final class ImageFusion {
       float[] agreeDepth = new float[near.length];
       double[] vj = new double[3];
       for (int x = 0; x < w; x++) {
-        int p = y * w + x;
-        float mz = m.z[p];
+        int p = y * w + x, q = p - base;
+        float mz = m.z[q];
         if (mz <= 0) continue;
-        if (tierCount > 1 && tier(m, p, focal) != tier) continue;
-        if (taken != null && (taken[p >>> 6] & 1L << (p & 63)) != 0) {
+        if (tierCount > 1 && tier(m, q, focal) != tier) continue;
+        if (taken != null && taken.get(p)) {
           t[6]++;
           continue;
         }
         int agreed = 0;
         boolean duplicate = false;
-        PairData data = byPair.get(m.repPair[p]);
-        int rep = m.repIndex[p];
+        PairData data = byPair.get(m.repPair[q]);
+        int rep = m.repIndex[q];
         // FP64 back-projection along the representative's ray at the merged depth.
-        double u = x + m.du[p], v = y + m.dv[p];
+        double u = x + m.du[q], v = y + m.dv[q];
         double[] X = backProject(cam, rotationT, u, v, mz);
         // graph-average: inverse-variance sums of depths along this pixel's ray. dX/dz is the ray
         // direction per unit of this camera's depth; another camera's depth is linear along it.
-        double sumW = average ? m.wsum[p] : 0, sumWZ = average ? m.wsum[p] * (double) mz : 0;
+        double sumW = average ? m.wsum[q] : 0, sumWZ = average ? m.wsum[q] * (double) mz : 0;
         double[] ray = average ? Math3.mv(rotationT, new double[] {(u - cam.cx) / cam.fx, (v - cam.cy) / cam.fy, 1}) : null;
         Arrays.fill(confirmed, 0);
-        for (int k = 0; k < words; k++) views[k] = m.partners.length > 0 ? m.partners[p * words + k] : 0;
+        for (int k = 0; k < words; k++) views[k] = m.partners.length > 0 ? m.partners[q * words + k] : 0;
         views[c >>> 6] |= 1L << (c & 63);
-        long independent = m.support[p];
+        long independent = m.support[q];
         int contradictions = 0, closeViews = 0, seeThrough = 0;
         int edgeSupport=0,edgeThrough=0;
         var ownPatch=surfaceContext==null?SurfacePatchGrid.Prediction.UNKNOWN:surfaceContext[c].predict(u,v,mz);
         boolean patchSuspect=ownPatch.kind()==2||ownPatch.kind()==3;
         boolean outsideSupport = false;
-        double seedWeight = m.wsum[p];
+        double seedWeight = m.wsum[q];
         int preciseConfirm = 0, preciseDisagree = 0, outsideConfirm = 0;
-        boolean narrowSeed = seedMinSine > 0 && m.narrow[p];
+        boolean narrowSeed = seedMinSine > 0 && m.narrow[q];
         for (int j : near) {
-          float[] other = compact[j];
+          // Neighbour maps in locals: an array (resident) or a mapped file (strips); see at().
+          float[] oa = compact[j].a, wa = compactWeight[j] == null ? null : compactWeight[j].a;
+          java.lang.foreign.MemorySegment os = compact[j].s, ws = compactWeight[j] == null ? null : compactWeight[j].s;
+          boolean hasWeights = compactWeight[j] != null;
           Camera oc = fusion.camera(j);
           int ow = fusion.width(j), oh = fusion.height(j);
           oc.viewInto(X[0], X[1], X[2], vj);
@@ -1375,7 +1902,7 @@ final class ImageFusion {
           double uj = oc.fx * vj[0] / vj[2] + oc.cx, wj = oc.fy * vj[1] / vj[2] + oc.cy;
           int xj = (int) Math.round(uj), yj = (int) Math.round(wj);
           if (xj < 1 || yj < 1 || xj >= ow - 1 || yj >= oh - 1) continue;
-          double zj = other[yj * ow + xj];
+          double zj = at(oa, os, yj * ow + xj);
           boolean preciseAgreement=false;
           if(DepthOutlierFilter.enabled(o)) {
             // The merged map is one vote per camera. Source-pair cameras cannot independently
@@ -1385,12 +1912,12 @@ final class ImageFusion {
             {
               double low=Double.POSITIVE_INFINITY,high=0;int count=0;
               for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
-                double z=other[(yj+dy)*ow+xj+dx];
+                double z=at(oa, os, (yj+dy)*ow+xj+dx);
                 if(z>0){low=Math.min(low,z);high=Math.max(high,z);count++;}
               }
               double footprint=vj[2]/Math.min(oc.fx,oc.fy);
-              double sourceSigma=vj[2]/Math.sqrt(Math.max(1e-30,m.wsum[p]))/mz;
-              double weight=compactWeight[j]==null?0:compactWeight[j][yj*ow+xj];
+              double sourceSigma=vj[2]/Math.sqrt(Math.max(1e-30,m.wsum[q]))/mz;
+              double weight=hasWeights?at(wa,ws,yj*ow+xj):0;
               double otherSigma=weight>0?1/Math.sqrt(weight):footprint;
               int vote=DepthOutlierFilter.cameraVote(vj[2],zj,low,high,count,
                   sourceSigma,otherSigma,footprint,o.fusionRelative);
@@ -1414,23 +1941,23 @@ final class ImageFusion {
           // uses the centre pixel only. Without this, two copies of one surface that miss each
           // other's samples are both "unconfirmed", both own themselves and both emit.
           // --fusion-tolerance sigma: the seed's sigma moved to j's depth scale.
-          float[] weightsJ = compactWeight[j];
+
           double focalJ = Math.min(oc.fx, oc.fy);
           double seedJ = seedWeight * ((double) mz / vj[2]) * ((double) mz / vj[2]);
-          boolean agrees = zj > 0 && agree(zj, vj[2], weightsJ == null ? 0 : weightsJ[yj * ow + xj], seedJ, focalJ);
+          boolean agrees = zj > 0 && agree(zj, vj[2], hasWeights ? at(wa, ws, yj * ow + xj) : 0, seedJ, focalJ);
           int ax = xj, ay = yj;
           for (int dy = -agreementRadius; !agrees && dy <= agreementRadius; dy++)
             for (int dx = -agreementRadius; !agrees && dx <= agreementRadius; dx++) {
               int xx = xj + dx, yy = yj + dy;
               if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
-              double zn = other[yy * ow + xx];
-              agrees = zn > 0 && agree(zn, vj[2], weightsJ == null ? 0 : weightsJ[yy * ow + xx], seedJ, focalJ);
+              double zn = at(oa, os, yy * ow + xx);
+              agrees = zn > 0 && agree(zn, vj[2], hasWeights ? at(wa, ws, yy * ow + xx) : 0, seedJ, focalJ);
               if (agrees) {
                 ax = xx;
                 ay = yy;
               }
             }
-          if (precisionCheck && zj > 0 && weightsJ != null && weightsJ[yj * ow + xj] > 4 * seedJ) {
+          if (precisionCheck && zj > 0 && hasWeights && at(wa, ws, yj * ow + xj) > 4 * seedJ) {
             // Camera j is at least 2x more precise here. Confirmation at its precision, or a near
             // miss: the same surface within the relative band but outside K sigma (occluders and
             // other layers lie beyond the band and stay neutral).
@@ -1439,13 +1966,13 @@ final class ImageFusion {
               for (int dx = -agreementRadius; !tight && dx <= agreementRadius; dx++) {
                 int xx = xj + dx, yy = yj + dy;
                 if (xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
-                double zn = other[yy * ow + xx], wn = weightsJ[yy * ow + xx];
+                double zn = at(oa, os, yy * ow + xx), wn = at(wa, ws, yy * ow + xx);
                 tight = zn > 0 && wn > 0 && agreeSigma(zn, vj[2], wn, seedJ, focalJ);
               }
             if (tight) preciseConfirm++;
-            else if (Math.abs(zj - vj[2]) <= tol * Math.min(zj, vj[2]) && reliable(other, ow, xj, yj)) preciseDisagree++;
+            else if (Math.abs(zj - vj[2]) <= tol * Math.min(zj, vj[2]) && reliable(oa, os, ow, xj, yj)) preciseDisagree++;
           }
-          if (agrees && (m.partners.length == 0 || (m.partners[p * words + (j >>> 6)] & 1L << (j & 63)) == 0))
+          if (agrees && (m.partners.length == 0 || (m.partners[q * words + (j >>> 6)] & 1L << (j & 63)) == 0))
             outsideConfirm++;
           if(agrees && DepthOutlierFilter.enabled(o) && !preciseAgreement)t[14]++;
           // Sigma agreement is already precise; the coherent-patch vote is only needed for the
@@ -1463,7 +1990,7 @@ final class ImageFusion {
             // The member's depth along j's ray at (ax, ay), moved to this pixel's ray: depth in j
             // changes by slope per unit of this camera's depth. Grazing members are not averaged.
             double slope = oc.rotation[6] * ray[0] + oc.rotation[7] * ray[1] + oc.rotation[8] * ray[2];
-            double zm = other[ay * ow + ax], wm = compactWeight[j][ay * ow + ax];
+            double zm = at(oa, os, ay * ow + ax), wm = at(wa, ws, ay * ow + ax);
             if (slope > .2 && wm > 0) {
               sumW += wm;
               sumWZ += wm * (mz + (zm - vj[2]) / slope);
@@ -1484,11 +2011,11 @@ final class ImageFusion {
               for (int dx = -agreementRadius; !close && dx <= agreementRadius; dx++) {
                 int xx = xj + dx, yy = yj + dy;
                 if (xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
-                double zn = other[yy * ow + xx];
+                double zn = at(oa, os, yy * ow + xx);
                 close = zn > 0 && Math.abs(zn - vj[2]) <= margin;
               }
             if (close) closeViews++;
-            else if (zj > 0 && vj[2] < zj - margin && !(vj[2] < zj * (1 - 3 * tol)) && reliable(other, ow, xj, yj)) seeThrough++;
+            else if (zj > 0 && vj[2] < zj - margin && !(vj[2] < zj * (1 - 3 * tol)) && reliable(oa, os, ow, xj, yj)) seeThrough++;
           }
           if (!agrees && zj <= 0) continue;
           if (agrees) {
@@ -1496,7 +2023,7 @@ final class ImageFusion {
             views[j >>> 6] |= 1L << (j & 63);
             confirmed[j >>> 6] |= 1L << (j & 63);
             independent++;
-          } else if (vj[2] < zj * (1 - 3 * tol) && reliable(other, ow, xj, yj)) contradictions++;
+          } else if (vj[2] < zj * (1 - 3 * tol) && reliable(oa, os, ow, xj, yj)) contradictions++;
         }
         int viewCount = 0;
         for (long word : views) viewCount += Long.bitCount(word);
@@ -1507,7 +2034,7 @@ final class ImageFusion {
           if(DepthOutlierFilter.cameraReject(edgeSupport,edgeThrough))t[9]++;
           else if(edgeSupport>0)t[8]++;else t[10]++;
         }
-        double sigma = 1 / Math.sqrt(Math.max(1e-30, m.wsum[p])) / mz;
+        double sigma = 1 / Math.sqrt(Math.max(1e-30, m.wsum[q])) / mz;
         if (DepthOutlierFilter.enabled(o) && DepthOutlierFilter.cameraReject(edgeSupport,edgeThrough)) status="free_space_rejected";
         else if (patchSuspect && edgeSupport==0) {status="independent_support_rejected";t[12]++;}
         else if (contradictions >= needed) status = "visibility_contradiction_rejected";
@@ -1515,7 +2042,7 @@ final class ImageFusion {
         // footprints, beyond depth noise) see through it; when more of them do than confirm it, it
         // floats in front of the surface (a mismatch the relative tolerance let through).
         else if (seeThrough >= 2 && seeThrough > closeViews) status = "free_space_rejected";
-        else if (m.ambiguous[p] && !outsideSupport) status = "depth_consensus_rejected";
+        else if (m.ambiguous[q] && !outsideSupport) status = "depth_consensus_rejected";
         else if (viewCount < required) status = "independent_support_rejected";
         else if (sigma > o.maxDepthUncertainty) status = "depth_uncertainty_rejected";
         // --fusion-precision-check: more precise cameras see this surface elsewhere than they confirm.
@@ -1565,15 +2092,15 @@ final class ImageFusion {
           double zf = sumWZ / sumW;
           if(surfaceContext!=null && ownPatch.kind()==1) {
             int after=surfaceContext[c].predict(u,v,zf).kind();
-            if(after==2||after==3){zf=mz;sumW=m.wsum[p];t[15]++;}
+            if(after==2||after==3){zf=mz;sumW=m.wsum[q];t[15]++;}
           }
           X = backProject(cam, rotationT, u, v, zf);
           sigma = 1 / Math.sqrt(sumW) / zf;
         }
         // --fusion-local-sigma: precise evidence nearby that this point did not join.
         if (best != null) {
-          double own = 1 / Math.sqrt(Math.max(1e-30, average && sumW > 0 ? sumW : m.wsum[p]));
-          if (best[p] > 0 && own > localSigma * best[p]) {
+          double own = 1 / Math.sqrt(Math.max(1e-30, average && sumW > 0 ? sumW : m.wsum[q]));
+          if (best.get(p) > 0 && own > localSigma * best.get(p)) {
             t[18]++;
             continue;
           }
@@ -1591,11 +2118,11 @@ final class ImageFusion {
         r.confidence = PointConfidence.finalScore(r.matchingConfidence, r.relativeSigma);
         if (!r.accepted()) t[5]++;
         DepthFusion.SurfaceSample geometry =
-            surface && r.accepted() ? surfaceSample(c, m, X, mz, x, y, points) : null;
+            surface && r.accepted() ? surfaceSample(c, m, X, mz, x, y - m.row0, points) : null;
         if (list == null) list = new ArrayList<>();
         list.add(
             new Emission(
-                start[data.pair] + rep,
+                start[data.pair] + data.first + rep,
                 data.pair,
                 data.pixel[rep],
                 data.rgb[rep],
@@ -1628,8 +2155,8 @@ final class ImageFusion {
 
   /** Whether camera j emitted a point within radius of (x, y) at a depth agreeing with d. */
   private boolean emittedNear(int j, int x, int y, double d, int radius) {
-    long[] bits = emitted[j];
-    float[] z = compact[j];
+    Bits bits = emitted[j];
+    Raster z = compact[j];
     int w = fusion.width(j), h = fusion.height(j);
     double tol = o.fusionRelative;
     for (int dy = -radius; dy <= radius; dy++)
@@ -1637,7 +2164,7 @@ final class ImageFusion {
         int xx = x + dx, yy = y + dy;
         if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
         int q = yy * w + xx;
-        if ((bits[q >>> 6] & 1L << (q & 63)) != 0 && z[q] > 0 && Math.abs(z[q] - d) <= tol * Math.min(z[q], d))
+        if (bits.get(q) && z.get(q) > 0 && Math.abs(z.get(q) - d) <= tol * Math.min(z.get(q), d))
           return true;
       }
     return false;
@@ -1703,12 +2230,20 @@ final class ImageFusion {
   }
 
   /** A coherent, densely observed 3x3 patch (as the reference visibility test requires). */
-  private boolean reliable(float[] z, int w, int x, int y) {
+  /**
+   * A map value in the cross-check's hot loop: the array (resident maps) or the mapped file
+   * (strips), with both held in locals by the caller so the resident path reads the array directly.
+   */
+  private static float at(float[] a, java.lang.foreign.MemorySegment s, int i) {
+    return a != null ? a[i] : s.getAtIndex(MappedFiles.FLOAT, i);
+  }
+
+  private boolean reliable(float[] a, java.lang.foreign.MemorySegment s, int w, int x, int y) {
     int valid = 0;
     double lo = Double.POSITIVE_INFINITY, hi = 0;
     for (int dy = -1; dy <= 1; dy++)
       for (int dx = -1; dx <= 1; dx++) {
-        double value = z[(y + dy) * w + x + dx];
+        double value = at(a, s, (y + dy) * w + x + dx);
         if (value <= 0) continue;
         valid++;
         lo = Math.min(lo, value);
@@ -1750,7 +2285,7 @@ final class ImageFusion {
             q[1] = points[3 * at + 1];
             q[2] = points[3 * at + 2];
             neighbors[n++] = q;
-          } else neighbors[n++] = backProject(camera, rotationT, xx + m.du[at], yy + m.dv[at], z);
+          } else neighbors[n++] = backProject(camera, rotationT, xx + m.du[at], (yy + m.row0) + m.dv[at], z);
         }
       SurfaceGeometry.Plane plane = SurfaceGeometry.plane(neighbors, n);
       if (plane == null

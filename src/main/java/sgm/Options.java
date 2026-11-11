@@ -29,6 +29,8 @@ public final class Options {
   public int densePairNeighbors = 3;
   // Image-fusion decoded candidate cache; -1 = bounded auto, 0 = reference replay.
   public int imageFusionCacheMb = -1;
+  // --streamed-processing (STREAMED_PROCESSING.md): low-memory paths only when needed (auto).
+  public String streamedProcessing = "auto";
   public Path exportConfidence;
   public boolean disparitiesExplicit, minDisparityExplicit, selfCalibration = true;
   // --quick-calibration: EXIF/XMP focal initialization (joint pipeline, no bootstrap) and one GPS
@@ -603,6 +605,9 @@ public final class Options {
           break;
         case "--dense-pair-neighbors":
           o.densePairNeighbors = Integer.parseInt(v);
+          break;
+        case "--streamed-processing":
+          o.streamedProcessing = v.toLowerCase(Locale.ROOT);
           break;
         case "--image-fusion-cache-mb":
           o.imageFusionCacheMb = v.equalsIgnoreCase("auto") ? -1 : Integer.parseInt(v);
@@ -1399,6 +1404,7 @@ public final class Options {
     choice(o.gpuAggregate, "--gpu-aggregate", "auto", "ram", "disk", "recompute");
     choice(o.imageReader, "--image-reader", "auto", "windowed", "opencv");
     choice(o.windowedMode, "--windowed-mode", "auto", "on", "off");
+    choice(o.streamedProcessing, "--streamed-processing", "auto", "on", "off");
     if (o.windowedMode.equals("on") && o.pyramidLevels != 1)
       throw new IllegalArgumentException("--windowed-mode on requires --pyramid-levels 1");
     if (o.imageWindow < 64
@@ -2735,6 +2741,12 @@ Additional workflow controls:
       improve the objective by less than 1e-4 (default 1e-6). Without
       a consistent EXIF focal it falls back to the bootstrap. Give it with the
       first step (inputs/calibrate); see QUICK_CALIBRATION.md.
+  --streamed-processing off|auto|on
+      Low-memory processing for large images (default: auto). auto engages it only
+      when the memory plan shows the normal path cannot run in the heap; with enough
+      RAM nothing changes. Today: image fusion in row strips with memory-mapped depth
+      maps when one camera does not fit (same points as the untiled path, slower).
+      on always uses it; off never does (fusion then stops with the heap it needs).
   --image-fusion-cache-mb auto|N
       Reuse decoded image-fusion candidates across cameras and passes. Default auto
       uses at most a quarter of --memory-mb and available estimated heap headroom.

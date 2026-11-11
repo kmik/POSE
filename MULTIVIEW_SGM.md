@@ -351,7 +351,12 @@ Not done yet: mvsgm at `--quality high` on these frames (15,760 x 6,720, 106 Mpx
 mode; each neighbour canvas would exceed the GPU's single-allocation limit and the CPU fallback
 would be very slow. Use `--dense-method sgm` (windowed stereo) for such frames until then.
 
-## Next: large frames (100+ Mpx per image) - plan, not started
+## Large frames (100+ Mpx per image)
+
+Status (11 November 2026): items 2 and 3 below are done; see STREAMED_PROCESSING.md (mvsgm
+depth maps in tiles, maps handed to fusion without a candidate file, image fusion in row strips
+with memory-mapped maps, `--streamed-processing off|auto|on`, the 4-image block end to end at
+`--quality high`). The plan as written before:
 
 Target: the 4-image large-format block (31,520 x 13,440 frames; 15,760 x 6,720 = 106 Mpx per
 image at `--quality high`). Today mvsgm runs it at `--quality low` only.
