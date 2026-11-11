@@ -58,6 +58,7 @@ public final class SelfTest {
     checks += GpuTsgmRegression.run();
     checks += MultiViewSgmRegression.run();
     checks += LargeFormatRegression.run();
+    checks += SpeckleFilterRegression.run();
     checks += HelpSearchRegression.run();
     checks += BlockProcessingRegression.run(root.resolve("block-processing"));
     checks += DepthEdgeRegression.run();

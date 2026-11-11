@@ -207,6 +207,8 @@ final class ImageFusion {
   // spillDirectory; hasMap says whether the camera has a map at all.
   static final int BAND_PIXELS = 1 << 18, MIN_BAND_PIXELS = 1 << 14;
   private final int bandPixels;
+  // Heap the speckle filter may use on the strip path (SpeckleFilter.threadsFor).
+  private final long speckleBudget;
   // Surface-patch cache cells per camera (SurfacePatchGrid.cacheCells, or the whole grid).
   private int gridCells;
   private final long workingBytes;
@@ -325,15 +327,20 @@ final class ImageFusion {
     // 06_fusion and only the camera being fused and its overlapping cameras are resident; the
     // operating system's file cache then uses whatever RAM is free. Neither changes any result.
     gridCells = SurfacePatchGrid.cacheCells(o, cameras);
-    long worstCamera = 0, worstPixels = 0;
+    long worstCamera = 0, worstPixels = 0, speckleWork = 0, speckleLimit = Long.MAX_VALUE;
+    int threads = Math.max(1, o.cores), speckleThreads = threads;
     for (int c = 0; c < cameras; c++) {
       long pixels = (long) fusion.width(c) * fusion.height(c), pairBytes = 0;
       allMapBytes += mapBytes(c);
       worstMap = Math.max(worstMap, mapBytes(c));
       worstPixels = Math.max(worstPixels, pixels);
       for (int k : pairsOf.get(c)) pairBytes += (start[k + 1] - start[k]) * (24L + 12 + 4L * fields) + 20 * pixels;
-      // + speckle/spike temporaries (9 bytes per pixel).
-      worstCamera = Math.max(worstCamera, pairBytes + pixels * (34L + 8L * words + 9));
+      // + spike marks (1 byte per pixel) and the speckle filter's strip buffers and border nodes.
+      long speckle =
+          SpeckleFilter.workingBytes(
+              fusion.width(c), fusion.height(c), SpeckleFilter.rows(fusion.height(c), threads), threads);
+      speckleWork = Math.max(speckleWork, speckle);
+      worstCamera = Math.max(worstCamera, pairBytes + pixels * (34L + 8L * words + 1) + speckle);
     }
     boolean surfaceAttributes = o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal");
     long normalBytes = surfaceAttributes && 24L * worstPixels <= 512L << 20 ? 24L * worstPixels : 0;
@@ -382,6 +389,16 @@ final class ImageFusion {
                 + " MiB heap even in strips (" + perPixel + " bytes per pixel of a strip, " + fixed / 1048576
                 + " MiB fixed); raise PHOTOGRAMMETRY_HEAP/-Xmx or lower --quality");
       stripRows = (int) Math.max(1, Math.min(tallest, forcedRows > 0 ? forcedRows : rows));
+      // The speckle filter runs over a camera's mapped map when no strip is in work: it gets the
+      // strips' share of the heap, on as many threads as fit (at least one).
+      speckleLimit = Math.max(1, left / 2);
+      speckleWork = 0;
+      for (int c = 0; c < cameras; c++) {
+        int sw = fusion.width(c), sh = fusion.height(c);
+        int t = SpeckleFilter.threadsFor(sw, sh, threads, speckleLimit);
+        speckleThreads = Math.min(speckleThreads, t);
+        speckleWork = Math.max(speckleWork, SpeckleFilter.workingBytes(sw, sh, SpeckleFilter.rows(sh, t), t));
+      }
       workingBytes = perPixel * widest * (stripRows + 2L * PASS_TWO_HALO) + 3L * bandPixels * EMISSION_BYTES + fixed;
       spillDirectory = o.output.resolve("06_fusion/map-spill");
     } else if (forced < 0 && needed <= avail) {
@@ -438,11 +455,13 @@ final class ImageFusion {
         Locale.ROOT,
         "Image fusion memory plan: heap budget %,d MiB; depth maps %,d MiB for %d cameras (%s);"
             + " largest camera's work %,d MiB; %d camera(s) at once in pass 1; candidate cache %,d MiB;"
-            + " normal cache %s; row bands of %,d pixels",
+            + " normal cache %s; row bands of %,d pixels; speckle filter %,d MiB on up to %d thread(s)",
         budget >> 20, allMapBytes >> 20, cameras,
         tiled ? "memory-mapped files; fusion in strips of " + stripRows + " rows"
             : mapBudget == Long.MAX_VALUE ? "all resident" : "spilled to disk, " + (mapBudget >> 20) + " MiB resident",
-        workingBytes >> 20, passOneCameras, cacheLimit >> 20, normalCache ? "on" : "off", bandPixels);
+        workingBytes >> 20, passOneCameras, cacheLimit >> 20, normalCache ? "on" : "off", bandPixels,
+        speckleWork + 1048575 >> 20, speckleThreads);
+    speckleBudget = speckleLimit;
     System.out.println(plan);
     compact = new Raster[cameras];
     neighbours = new int[cameras][];
@@ -922,13 +941,13 @@ final class ImageFusion {
     counters.edgeEnabled=DepthOutlierFilter.enabled(o);
     counters.thinEnabled = o.thinSurfaceFusion();
     double[][] samples = new double[cameras][];
-    long splatNanos = 0, mergeNanos = 0, speckleNanos = 0;
+    long splatNanos = 0, mergeNanos = 0, speckleNanos = 0, componentNanos = 0;
     try (FileChannel channel = FileChannel.open(candidates, StandardOpenOption.READ)) {
       WorkProgress progress = WorkProgress.start("Image fusion cameras", 2L * cameras, "camera passes");
       // Pass 1: filtered merged depth per camera, plus sample points for overlap detection. A
       // camera's pass 1 reads only its own pairs and writes only its own maps, so several cameras
       // run at once (bounded by heap; see passOneCameras). Counts are added in camera order.
-      long[][] times = new long[cameras][3];
+      long[][] times = new long[cameras][4];
       Counters[] perCamera = new Counters[cameras];
       int concurrent = Math.max(1, Math.min(passOneCameras, cameras));
       ExecutorService cameraWorkers =
@@ -963,7 +982,9 @@ final class ImageFusion {
                 times[camera][1] = System.nanoTime() - clock;
                 clock = System.nanoTime();
                 own.spikes += spikes(m, fusion.camera(camera), 0, h);
+                long componentClock = System.nanoTime();
                 own.speckle += speckles(m, fusion.camera(camera));
+                times[camera][3] = System.nanoTime() - componentClock;
                 if (o.fusionDepthOutliers) own.depthOutliers += depthOutliers(m.z);
                 times[camera][2] = System.nanoTime() - clock;
                 for (float z : m.z) if (z > 0) own.pixels++;
@@ -1018,10 +1039,13 @@ final class ImageFusion {
         splatNanos += times[c][0];
         mergeNanos += times[c][1];
         speckleNanos += times[c][2];
+        componentNanos += times[c][3];
       }
       RunTelemetry.recordTotal("Image fusion: pass 1 splats (pair reads)", splatNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: pass 1 per-camera merge", mergeNanos, cameras);
+      // Spike filter, speckle filter and depth sanity together; then the speckle filter alone.
       RunTelemetry.recordTotal("Image fusion: pass 1 2D speckle filter", speckleNanos, cameras);
+      RunTelemetry.recordTotal("Image fusion: pass 1 speckle components (within the filter time)", componentNanos, cameras);
       long clock = System.nanoTime();
       if (DepthOutlierFilter.enabled(o)) surfaceContext = new SurfacePatchGrid[cameras];
       for (int c = 0; c < cameras; c++) if (compact[c] != null) grid(c);
@@ -1418,6 +1442,7 @@ final class ImageFusion {
     }
     long clock = System.nanoTime();
     own.speckle += stripSpeckles(z, w, h, cam);
+    times[3] += System.nanoTime() - clock;
     if (o.fusionDepthOutliers) own.depthOutliers += depthOutliers(z, n);
     times[2] += System.nanoTime() - clock;
     long valid = 0;
@@ -1509,128 +1534,17 @@ final class ImageFusion {
   }
 
   /**
-   * The 2D speckle filter (speckles()) over a memory-mapped map, strip by strip. Components are
-   * labelled per strip with the same connection rule; a component touching a strip's first or last
-   * row may continue in the next strip and becomes a union-find node, joined across each strip
-   * border where the two border pixels connect, with its size summed at the root. A second sweep
-   * relabels each strip identically and removes components smaller than --speckle-size. Component
-   * membership does not depend on the split, so the result equals the untiled filter (for
-   * --speckle-size up to 65,536, the untiled filter's member buffer).
+   * The 2D speckle filter over a memory-mapped map (fusion in strips): the same SpeckleFilter as
+   * speckles(), on as many threads as the plan's speckle budget allows. The result does not
+   * depend on the strips or threads, so it equals the untiled filter.
    */
   private long stripSpeckles(Raster z, int w, int h, Camera camera) {
     if (o.speckleSize <= 0) return 0;
     double limit = Math.max(o.fusionRelative, 2 / Math.min(camera.fx, camera.fy));
-    int rows = Math.max(1, Math.min(h, stripRows)), strips = Math.ceilDiv(h, rows), cells = rows * w;
-    float[] zs = new float[cells];
-    int[] label = new int[cells], stack = new int[cells], size = new int[cells + 1], node = new int[cells + 1];
-    boolean[] edge = new boolean[cells + 1];
-    int[] parent = new int[1 << 12];
-    long[] total = new long[1 << 12];
-    int nodes = 0;
-    int[] firstNode = new int[strips], prevNode = new int[w];
-    float[] prevZ = new float[w];
-    for (int s = 0; s < strips; s++) {
-      int y0 = s * rows, nr = Math.min(rows, h - y0);
-      z.read((long) y0 * w, zs, 0, nr * w);
-      int k = components(zs, w, nr, limit, label, stack, size, edge);
-      firstNode[s] = nodes;
-      for (int i = 1; i <= k; i++) {
-        if (!edge[i]) continue;
-        if (nodes == parent.length) {
-          parent = Arrays.copyOf(parent, 2 * nodes);
-          total = Arrays.copyOf(total, 2 * nodes);
-        }
-        parent[nodes] = nodes;
-        total[nodes] = size[i];
-        node[i] = nodes++;
-      }
-      if (s > 0)
-        for (int x = 0; x < w; x++) {
-          float a = prevZ[x], b = zs[x];
-          if (prevNode[x] < 0 || b <= 0) continue;
-          double near = Math.min(a, b);
-          if (Math.abs(b - a) > limit * near) continue;
-          int ra = find(parent, prevNode[x]), rb = find(parent, node[label[x]]);
-          if (ra == rb) continue;
-          parent[rb] = ra;
-          total[ra] += total[rb];
-        }
-      int last = (nr - 1) * w;
-      for (int x = 0; x < w; x++) {
-        prevZ[x] = zs[last + x];
-        prevNode[x] = zs[last + x] > 0 ? node[label[last + x]] : -1;
-      }
-    }
-    long removed = 0;
-    for (int s = 0; s < strips; s++) {
-      int y0 = s * rows, nr = Math.min(rows, h - y0);
-      z.read((long) y0 * w, zs, 0, nr * w);
-      int k = components(zs, w, nr, limit, label, stack, size, edge);
-      int next = firstNode[s];
-      for (int i = 1; i <= k; i++) node[i] = edge[i] ? next++ : -1;
-      boolean changed = false;
-      for (int p = 0; p < nr * w; p++) {
-        int l = label[p];
-        if (l == 0) continue;
-        long components = node[l] < 0 ? size[l] : total[find(parent, node[l])];
-        if (components < o.speckleSize) {
-          zs[p] = 0;
-          removed++;
-          changed = true;
-        }
-      }
-      if (changed) z.write((long) y0 * w, zs, 0, nr * w);
-    }
-    return removed;
+    int threads = SpeckleFilter.threadsFor(w, h, Math.max(1, o.cores), speckleBudget);
+    return SpeckleFilter.filter(z, w, h, limit, o.speckleSize, SpeckleFilter.rows(h, threads), threads, pool);
   }
 
-  private static int find(int[] parent, int i) {
-    while (parent[i] != i) {
-      parent[i] = parent[parent[i]];
-      i = parent[i];
-    }
-    return i;
-  }
-
-  /**
-   * 4-connected components of a strip (w x rows) under speckles()' connection rule: label[p] =
-   * 1..k (0 = no depth), size[k], edge[k] = the component touches the strip's first or last row.
-   */
-  private static int components(float[] zs, int w, int rows, double limit, int[] label, int[] stack, int[] size, boolean[] edge) {
-    Arrays.fill(label, 0, w * rows, 0);
-    int next = 0;
-    for (int start = 0; start < w * rows; start++) {
-      if (zs[start] <= 0 || label[start] != 0) continue;
-      next++;
-      int top = 0, count = 0;
-      boolean touches = false;
-      stack[top++] = start;
-      label[start] = next;
-      while (top > 0) {
-        int p = stack[--top];
-        count++;
-        int x = p % w, y = p / w;
-        if (y == 0 || y == rows - 1) touches = true;
-        for (int d = 0; d < 4; d++) {
-          int xx = x + (d == 0 ? 1 : d == 1 ? -1 : 0), yy = y + (d == 2 ? 1 : d == 3 ? -1 : 0);
-          if (xx < 0 || yy < 0 || xx >= w || yy >= rows) continue;
-          int q = yy * w + xx;
-          if (label[q] != 0 || zs[q] <= 0) continue;
-          double near = Math.min(zs[p], zs[q]);
-          if (Math.abs(zs[q] - zs[p]) > limit * near) continue;
-          label[q] = next;
-          stack[top++] = q;
-        }
-      }
-      size[next] = count;
-      edge[next] = touches;
-    }
-    return next;
-  }
-
-  /** Removes 4-connected components smaller than the speckle size; returns removed pixels.
-   * Neighbours connect within the relative fusion tolerance or two pixel footprints (z / f), so
-   * slanted surfaces at coarse resolution are not fragmented. */
   /**
    * Impulse ("salt and pepper") filter on a merged depth map: a pixel whose depth stands out from
    * a coherent 5 x 5 neighbourhood is a spike, not a surface. Coherent: at least 12 of the 24
@@ -1750,44 +1664,20 @@ final class ImageFusion {
     return removed;
   }
 
+  /**
+   * Removes 4-connected components smaller than --speckle-size from the merged depth map; returns
+   * removed pixels. Neighbours connect within the relative fusion tolerance or two pixel
+   * footprints (z / f), so slanted surfaces at coarse resolution are not fragmented.
+   * SpeckleFilter: row strips labelled in parallel and joined at the strip borders, with
+   * per-thread strip buffers only.
+   */
   private long speckles(Merged m, Camera camera) {
     if (o.speckleSize <= 0) return 0;
-    double slope = 2 / Math.min(camera.fx, camera.fy);
-    int w = m.w, h = m.h;
-    int[] label = new int[w * h], stack = new int[w * h];
-    long removed = 0;
-    int next = 0;
-    double tol = o.fusionRelative;
-    int[] members = new int[Math.min(o.speckleSize, 1 << 16)];
-    for (int start = 0; start < w * h; start++) {
-      if (m.z[start] <= 0 || label[start] != 0) continue;
-      next++;
-      int top = 0, size = 0, stored = 0;
-      stack[top++] = start;
-      label[start] = next;
-      while (top > 0) {
-        int p = stack[--top];
-        if (stored < members.length) members[stored++] = p;
-        size++;
-        int x = p % w, y = p / w;
-        for (int d = 0; d < 4; d++) {
-          int xx = x + (d == 0 ? 1 : d == 1 ? -1 : 0), yy = y + (d == 2 ? 1 : d == 3 ? -1 : 0);
-          if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
-          int q = yy * w + xx;
-          if (label[q] != 0 || m.z[q] <= 0) continue;
-          double near = Math.min(m.z[p], m.z[q]);
-          if (Math.abs(m.z[q] - m.z[p]) > Math.max(tol, slope) * near) continue;
-          label[q] = next;
-          stack[top++] = q;
-        }
-      }
-      if (size < o.speckleSize)
-        for (int i = 0; i < stored; i++) {
-          m.z[members[i]] = 0;
-          removed++;
-        }
-    }
-    return removed;
+    double limit = Math.max(o.fusionRelative, 2 / Math.min(camera.fx, camera.fy));
+    // Cameras running pass 1 at once share the pool's threads.
+    int threads = Math.max(1, Math.max(1, o.cores) / Math.max(1, Math.min(passOneCameras, cameras)));
+    return SpeckleFilter.filter(
+        new Raster(m.z), m.w, m.h, limit, o.speckleSize, SpeckleFilter.rows(m.h, threads), threads, pool);
   }
 
   private record Emission(

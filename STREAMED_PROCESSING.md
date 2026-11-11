@@ -215,6 +215,11 @@ Speckle sizes above 65,536 pixels: the untiled filter removes at most 65,536 mem
 small component (its member buffer); the strip filter removes all. Only matters for
 `--speckle-size` > 65,536.
 
+Update (11 November 2026, later): both paths now use one parallel filter (`SpeckleFilter`; see
+"Parallel speckle filter" in FUSION_MEMORY.md). It labels its own row strips in parallel,
+independent of the fusion strips, labels no strip twice, and removes whole components for every
+`--speckle-size` on both paths.
+
 ## Step 3d done (11 November 2026): previews of tiled images, regression tests
 
 - **Previews** (`--export-disparity-images` or `--diagnostics`) for tiled mvsgm images
