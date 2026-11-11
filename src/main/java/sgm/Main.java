@@ -115,6 +115,24 @@ public final class Main {
       System.err.println("photogrammetry: " + e.getMessage());
       return 2;
     }
+    // Opt-in block processing (default off: this whole branch is skipped).
+    if (!BlockProcessing.mode(c.rest()).equals("off")) {
+      if (!c.steps().isEmpty()) {
+        System.err.println("photogrammetry: --block-processing runs the whole pipeline; give it on the"
+            + " whole-run command (-i IMAGES -o PROJECT) without step names");
+        return 2;
+      }
+      try {
+        Integer code = BlockProcessing.run(c.rest());
+        if (code != null) return code;
+      } catch (IllegalArgumentException | IOException e) {
+        System.err.println("photogrammetry: block processing: " + e.getMessage());
+        return 1;
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return 1;
+      }
+    }
     boolean chain = c.steps().isEmpty();
     boolean fresh = chain || c.steps().get(0) == Pipeline.Step.INPUTS || c.branch();
     Project project = null;
@@ -247,6 +265,8 @@ public final class Main {
 
   private static int status(Command c) throws IOException {
     Path root = projectRoot(c.rest());
+    if (BlockProcessing.isBlockProject(root) && !Files.isRegularFile(root.resolve("project.properties")))
+      return BlockProcessing.status(root);
     String id = c.runId() == null ? latestRun(root) : c.runId();
     Path run = root.resolve("runs").resolve(id);
     if (!PipelineState.exists(run)) {

@@ -92,6 +92,34 @@ final class ImageFusionAgreementRegression {
             Files.readAllBytes(r.get(3).resolve("07_results/dense.ply")),
             Files.readAllBytes(r.get(4).resolve("07_results/dense.ply"))),
         "Repeated graph-average fusion is byte-identical");
+    // Depth maps spilled to disk (FUSION_MEMORY.md): a 1 MiB resident budget evicts every camera
+    // not being fused; used/emitted marks and maps round-trip through the spill files.
+    String[][] spilled = {{"auto", "graph-average"}, {"auto", "owner-consume"}};
+    int[] same = {3, 2};
+    for (int i = 0; i < spilled.length; i++) {
+      List<String> args = new ArrayList<>(common);
+      args.addAll(List.of("--fusion-agreement-radius", spilled[i][0], "--fusion-strategy", spilled[i][1],
+          "--resume", "--rerun-from", "fusion"));
+      System.setProperty("sgm.fusion.mapBudgetMb", "1");
+      try {
+        check(Main.run(args.toArray(String[]::new)) == 0, "Spilled fusion run " + spilled[i][1]);
+      } finally {
+        System.clearProperty("sgm.fusion.mapBudgetMb");
+      }
+      Path latest;
+      try (var dirs = Files.list(project.resolve("runs"))) {
+        latest = dirs.sorted(Comparator.reverseOrder()).findFirst().orElseThrow();
+      }
+      String json = Files.readString(latest.resolve("06_fusion/image_fusion.json"));
+      check(json.contains("spilled to disk") && !json.contains("\"map_evictions\":0"),
+          "Fusion spilled depth maps: " + spilled[i][1]);
+      check(!Files.exists(latest.resolve("06_fusion/map-spill")), "Spill files removed: " + spilled[i][1]);
+      check(
+          Arrays.equals(
+              Files.readAllBytes(r.get(same[i]).resolve("07_results/dense.ply")),
+              Files.readAllBytes(latest.resolve("07_results/dense.ply"))),
+          "Spilled " + spilled[i][1] + " fusion is byte-identical to the resident one");
+    }
     return checks;
   }
 

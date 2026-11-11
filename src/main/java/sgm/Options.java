@@ -130,6 +130,13 @@ public final class Options {
   boolean gpuSmallSolves;
   /** --help TEXT: print only the help entries that mention TEXT (not a processing option). */
   String helpTopic;
+  /** --block-processing off|auto|on, --block-images N (0 = forecast), --block-overlap F (footprints). */
+  String blockProcessing = "off";
+  int blockImages;
+  double blockOverlap = 1;
+  /** --dense-method mvsgm settings (MULTIVIEW_SGM.md); recorded in 05_stereo/mvsgm.json. */
+  int mvsgmNeighbors = 6, mvsgmBestK = 3, mvsgmCensus = 5, mvsgmLevels = -1, mvsgmConsistentViews = 1;
+  double mvsgmConsistencyLabels = 1;
   public double censusWeight = .5;
   public int adTruncation = 30, gradientTruncation = 60, gpuStripRows = 64;
   public int gpuBankMb = 1024;
@@ -704,6 +711,33 @@ public final class Options {
         case "--alignment-max-dimension":
           o.alignmentMaxDimension = Integer.parseInt(v);
           break;
+        case "--block-processing":
+          o.blockProcessing = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--block-images":
+          o.blockImages = Integer.parseInt(v);
+          break;
+        case "--mvsgm-neighbors":
+          o.mvsgmNeighbors = Integer.parseInt(v);
+          break;
+        case "--mvsgm-best-k":
+          o.mvsgmBestK = Integer.parseInt(v);
+          break;
+        case "--mvsgm-census-window":
+          o.mvsgmCensus = Integer.parseInt(v);
+          break;
+        case "--mvsgm-levels":
+          o.mvsgmLevels = Integer.parseInt(v);
+          break;
+        case "--mvsgm-consistent-views":
+          o.mvsgmConsistentViews = Integer.parseInt(v);
+          break;
+        case "--mvsgm-consistency-labels":
+          o.mvsgmConsistencyLabels = number(v);
+          break;
+        case "--block-overlap":
+          o.blockOverlap = number(v);
+          break;
         case "--intrinsics-mode":
           o.intrinsicsMode = v.toLowerCase(Locale.ROOT);
           break;
@@ -1234,6 +1268,11 @@ public final class Options {
       throw new IllegalArgumentException("--image-fusion-cache-mb must be auto or nonnegative");
     choice(o.densePipeline, "--dense-pipeline", "standard", "aerial-tiled");
     choice(o.depthOutlierFilter, "--depth-outlier-filter", "off", "edge-aware");
+    choice(o.blockProcessing, "--block-processing", "off", "auto", "on");
+    if (o.blockImages < 0 || o.blockImages == 1)
+      throw new IllegalArgumentException("--block-images must be 0 (forecast) or at least 2");
+    if (!(o.blockOverlap >= 0) || o.blockOverlap > 20)
+      throw new IllegalArgumentException("--block-overlap must be 0..20 image footprints");
     choice(o.disparityRefinement, "--disparity-refinement", "off", "multiview");
     if (!Double.isFinite(o.disparityAnchorAngle)
         || o.disparityAnchorAngle <= 0
@@ -1263,9 +1302,9 @@ public final class Options {
       throw new IllegalArgumentException(
           "Depth outlier settings require radius 2..8,"
               + " deviation >0..32 disparity pixels, edge threshold 0..255");
-    if (!o.depthOutlierFilter.equals("off") && !o.denseMethod.equals("sgm"))
+    if (!o.depthOutlierFilter.equals("off") && o.denseMethod.equals("patchmatch"))
       throw new IllegalArgumentException(
-          "--depth-outlier-filter edge-aware currently requires --dense-method sgm");
+          "--depth-outlier-filter edge-aware requires --dense-method sgm or mvsgm");
     if (o.aerialTileSize < 64 || o.aerialTileSize > 2048
         || o.aerialOverlap < 8 || o.aerialOverlap > o.aerialTileSize / 2
         || o.aerialCoarseDimension < 128 || o.aerialCoarseDimension > 2048
@@ -1303,9 +1342,9 @@ public final class Options {
     choice(o.fusionGpuEvidence, "--fusion-gpu-evidence", "auto", "resident", "windowed");
     choice(o.fusionMode, "--fusion-mode", "reference", "incremental", "image");
     if (o.fusionMode.equals("image")
-        && (!o.fusionEmission.equals("pair") || !o.denseMethod.equals("sgm")))
+        && (!o.fusionEmission.equals("pair") || o.denseMethod.equals("patchmatch")))
       throw new IllegalArgumentException(
-          "--fusion-mode image requires --dense-method sgm and --fusion-emission pair");
+          "--fusion-mode image requires --dense-method sgm or mvsgm and --fusion-emission pair");
     choice(o.fusionOutliers, "--fusion-outliers", "reference", "robust");
     choice(o.fusionAssociation, "--fusion-association", "pair", "camera");
     if (o.fusionAssociation.equals("camera") && !o.fusionMode.equals("incremental"))
@@ -1382,7 +1421,30 @@ public final class Options {
         || o.gpuBankMb > 1024)
       throw new IllegalArgumentException(
           "Invalid matching-cost weight/truncation or GPU strip size");
-    choice(o.denseMethod, "--dense-method", "sgm", "patchmatch");
+    choice(o.denseMethod, "--dense-method", "sgm", "patchmatch", "mvsgm");
+    if (o.denseMethod.equals("mvsgm")) {
+      if (!o.fusionMode.equals("image") || !o.densePipeline.equals("standard")
+          || o.disparityRefinement.equals("multiview"))
+        throw new IllegalArgumentException(
+            "--dense-method mvsgm requires --fusion-mode image, --dense-pipeline standard and"
+                + " --disparity-refinement off");
+      if (o.mvsgmNeighbors < 1 || o.mvsgmNeighbors > 8
+          || o.mvsgmBestK < 1 || o.mvsgmBestK > o.mvsgmNeighbors
+          || (o.mvsgmCensus != 3 && o.mvsgmCensus != 5 && o.mvsgmCensus != 7)
+          || o.mvsgmLevels < -1 || o.mvsgmLevels > 5
+          || o.mvsgmConsistentViews < 0 || o.mvsgmConsistentViews > o.mvsgmNeighbors
+          || !(o.mvsgmConsistencyLabels > 0) || o.mvsgmConsistencyLabels > 64)
+        throw new IllegalArgumentException(
+            "mvsgm settings require --mvsgm-neighbors 1..8, --mvsgm-best-k 1..neighbors,"
+                + " --mvsgm-census-window 3|5|7, --mvsgm-levels -1..5, --mvsgm-consistent-views"
+                + " 0..neighbors, --mvsgm-consistency-labels >0..64");
+      if (Double.isFinite(o.twoViewConfidenceThreshold)) {
+        System.out.println(
+            "Note: --two-view-confidence-threshold applies to pair SGM only; ignored with"
+                + " --dense-method mvsgm (multi-view consistency replaces the left/right check)");
+        o.twoViewConfidenceThreshold = Double.NaN;
+      }
+    }
     if (!Double.isNaN(o.twoViewConfidenceThreshold)
         && (!Double.isFinite(o.twoViewConfidenceThreshold)
             || o.twoViewConfidenceThreshold < 0
@@ -1777,6 +1839,12 @@ public final class Options {
     out.stereoSelection = stereoSelection;
     out.tsgmSeeds = tsgmSeeds;
     out.gpuSmallSolves = gpuSmallSolves;
+    out.mvsgmNeighbors = mvsgmNeighbors;
+    out.mvsgmBestK = mvsgmBestK;
+    out.mvsgmCensus = mvsgmCensus;
+    out.mvsgmLevels = mvsgmLevels;
+    out.mvsgmConsistentViews = mvsgmConsistentViews;
+    out.mvsgmConsistencyLabels = mvsgmConsistencyLabels;
     try {
       for (java.lang.reflect.Field field : Options.class.getFields())
         field.set(out, field.get(this));
@@ -1904,6 +1972,25 @@ Calibration and reconstruction modes:
   --seed-pair A.jpg,B.jpg
       Explicit image-only SfM seed; sorted filenames must form a viable pair
       within the selected pair graph. Otherwise a suitable seed is selected automatically.
+
+Block processing (large image sets; whole-run command only, -i IMAGES -o PROJECT):
+  --block-processing off|auto|on
+      Split the images into overlapping blocks by GPS position and process them one after
+      another as ordinary sub-projects under PROJECT/blocks (default: off). auto splits only
+      when the memory forecast (alignment and image fusion, from the image count, --features,
+      --quality and the RAM free on this machine) says the whole set does not fit; on always
+      splits. The central block is aligned first and its final calibration is used, fixed, by
+      every block. Blocks are then aligned to each other with one 3D similarity each, from the
+      cameras they share, and merged: each point is kept by the block whose own camera is
+      nearest in plan view. Results: PROJECT/merged/dense.las, cameras.csv, block_report.md.
+      Repeat the same command to resume after an interruption (finished blocks are skipped);
+      'photogrammetry status -o PROJECT' shows the blocks. Requires GPS in every image.
+  --block-images N
+      Core images per block (default: 0 = from the memory forecast). Each block also takes
+      the images within --block-overlap footprints of its core.
+  --block-overlap F
+      Overlap margin around each block's core, in image ground footprints (default: 1;
+      0..20). More overlap: more shared cameras for aligning the blocks, more work per block.
 
 Resolution and memory planning:
   --quality NAME
@@ -2167,10 +2254,32 @@ Point filtering and multi-view fusion:
       Pair-only points additionally require matching confidence >= 0.35 and
       pass --max-depth-uncertainty. The default remains --min-views 3 pending
       the two-view quality gate; confidence cannot resolve every false match.
-  --dense-method sgm|patchmatch
+  --dense-method sgm|patchmatch|mvsgm
       Default sgm. Experimental PatchMatch estimates camera-space depth/planes
       directly from multiple views. Uses OpenCL GPU; --compute cpu selects its
       slow reference implementation. No silent substitution with SGM.
+      Opt-in mvsgm: multi-view plane-sweep SGM, one depth map per camera from
+      several neighbouring views (census, mean of the best k neighbour costs,
+      8-path SGM over inverse-depth labels, coarse-to-fine bands), then a
+      multi-view consistency check instead of the left/right check. Requires
+      --fusion-mode image. Pair-only options (--two-view-confidence-threshold,
+      --pairwise-search, --similarity-window) do not apply. See MULTIVIEW_SGM.md.
+  --mvsgm-neighbors N
+      mvsgm: neighbour cameras per reference camera, 1..8 (default 6).
+  --mvsgm-best-k K
+      mvsgm: per pixel and depth label, mean of the K lowest neighbour costs
+      (default 3), so occluded neighbours do not spoil a pixel.
+  --mvsgm-census-window W
+      mvsgm: census window 3, 5 or 7 (default 5).
+  --mvsgm-levels N
+      mvsgm: coarse-to-fine levels below full resolution, 0..5 (default -1 =
+      --tsgm-levels). 0 searches every depth label at full resolution.
+  --mvsgm-consistent-views N
+      mvsgm: a depth is kept only if at least N neighbour depth maps agree when
+      reprojected (default 1; 0 disables the check).
+  --mvsgm-consistency-labels T
+      mvsgm: agreement tolerance in the neighbour's inverse-depth label steps
+      (about one pixel of image motion each; default 1).
   --dense-pipeline standard|aerial-tiled
       Default standard is unchanged. Opt-in aerial-tiled requires a compatible OpenCL GPU.
       It rectifies source regions on demand, predicts tile search intervals from a coarse

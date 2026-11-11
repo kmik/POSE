@@ -412,11 +412,12 @@ final class Pipeline {
     if (options.rectified) skipFeatures("Already-rectified stereo bypasses SIFT and SfM");
     else if (options.poses != null) {
       boolean refineFixedIntrinsics = SharedCalibration.enabled(alignment());
-      if (options.extrinsicsMode.equals("fixed") && !refineFixedIntrinsics)
+      boolean tiePoints = fixedPoseTiePoints(refineFixedIntrinsics);
+      if (options.extrinsicsMode.equals("fixed") && !refineFixedIntrinsics && !tiePoints)
         skipFeatures("Supplied camera poses fixed");
       if (project != null) project.stage("04_geometry", "running", "Import supplied exterior orientations");
       PoseIO.read(options.poses, frames);
-      if (!options.extrinsicsMode.equals("fixed") || refineFixedIntrinsics) {
+      if (!options.extrinsicsMode.equals("fixed") || refineFixedIntrinsics || tiePoints) {
         for (ImageFrame f : frames) f.camera.fixed = options.extrinsicsMode.equals("fixed");
         features.build(frames, options, project);
       }
@@ -446,7 +447,26 @@ final class Pipeline {
       boolean refineFixedIntrinsics = SharedCalibration.enabled(alignment());
       // The match step read the supplied poses; they are the cameras as loaded.
       List<Camera> suppliedCameras = frames.stream().map(f -> f.camera.copy()).toList();
-      if (!options.extrinsicsMode.equals("fixed") || refineFixedIntrinsics) {
+      if (fixedPoseTiePoints(refineFixedIntrinsics)) {
+        // --dense-method mvsgm with fixed supplied poses: tie points are triangulated with the
+        // poses and calibration exactly as supplied (no adjustment); mvsgm takes its neighbours
+        // and depth ranges from them.
+        for (ImageFrame f : frames) f.camera.fixed = true;
+        Geometry.triangulateTracks(frames, features.tracks, options.reprojection * 2);
+        long triangulated = features.tracks.stream().filter(t -> t.point != null).count();
+        System.out.printf(
+            Locale.ROOT,
+            "Tie points with the supplied poses (fixed, not adjusted): %,d of %,d tracks triangulated"
+                + " for --dense-method mvsgm%n",
+            triangulated,
+            features.tracks.size());
+        if (triangulated < 12)
+          throw new IllegalArgumentException(
+              "--dense-method mvsgm needs sparse tie points, but only " + triangulated
+                  + " tracks triangulate with the supplied poses (reprojection limit "
+                  + options.reprojection * 2 + " px); check the poses, calibration and image overlap,"
+                  + " or use --dense-method sgm");
+      } else if (!options.extrinsicsMode.equals("fixed") || refineFixedIntrinsics) {
         for (ImageFrame f : frames) {
           if (options.extrinsicsMode.equals("prior")) {
             f.camera.reference = f.camera.copy();
@@ -688,6 +708,8 @@ final class Pipeline {
               ? "Source-region rectification and GPU aerial tiles"
               : options.denseMethod.equals("patchmatch")
               ? "PatchMatch multi-view depth and plane estimation"
+              : options.denseMethod.equals("mvsgm")
+              ? "Multi-view plane-sweep SGM depth maps per camera"
               : "Rectification and Java SGM");
     boolean reload = false;
     for (ImageFrame frame : frames) {
@@ -809,6 +831,18 @@ final class Pipeline {
               + " full ground processing.");
     GroundClassification.run(options, frames, crs());
     return "complete";
+  }
+
+  /**
+   * Fixed supplied poses normally skip features and matching. --dense-method mvsgm needs sparse
+   * tie points (neighbour choice and per-camera depth ranges), so they are still matched and later
+   * triangulated with the poses held fixed.
+   */
+  private boolean fixedPoseTiePoints(boolean refineFixedIntrinsics) {
+    return options.poses != null
+        && options.extrinsicsMode.equals("fixed")
+        && !refineFixedIntrinsics
+        && options.denseMethod.equals("mvsgm");
   }
 
   private void skipFeatures(String reason) throws IOException {

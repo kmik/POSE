@@ -73,6 +73,22 @@ final class DenseReconstruction {
 
   long run(List<FeatureTracks.Pair> pairs) throws IOException {
     pairs = DensePairSelection.select(frames, pairs, tracks, options);
+    String prototype = System.getProperty("sgm.mvsgm.prototype");
+    if (prototype != null) {
+      // Stage-1 diagnostic (MULTIVIEW_SGM.md): plane-sweep WTA depth maps only, then stop.
+      int[] cameras = Arrays.stream(prototype.split(",")).mapToInt(Integer::parseInt).toArray();
+      new MultiViewSgm(options).prototype(frames, tracks, cameras);
+      throw new IOException("mvsgm prototype finished: depth maps in 05_stereo/mvsgm (no cloud)");
+    }
+    String maps = System.getProperty("sgm.mvsgm.maps");
+    if (maps != null) {
+      // Stage-2 diagnostic: multi-view SGM depth maps only (all cameras or a list), then stop.
+      int[] cameras = maps.equals("all") ? null : Arrays.stream(maps.split(",")).mapToInt(Integer::parseInt).toArray();
+      try (GpuMemoryPool.Scope pool = GpuMemoryPool.install(GpuSgm.budget(GpuSgm.selectedDevice(options), options))) {
+        new MultiViewSgm(options).depthMaps(frames, tracks, cameras);
+      }
+      throw new IOException("mvsgm depth maps finished: 05_stereo/mvsgm (no cloud)");
+    }
     if (options.disparityRefinement.equals("multiview")) {
       if (frames.stream().filter(f -> f.camera.registered && !f.camera.denseExcluded).count() < 6)
         throw new IllegalArgumentException(
@@ -124,6 +140,8 @@ final class DenseReconstruction {
               new PatchMatchReconstruction(
                       options, frames, tracks, fusion, project == null ? null : project.data)
                   .run(pairs, out);
+        else if (options.denseMethod.equals("mvsgm"))
+          count = new MultiViewSgm(options).run(frames, tracks, fusion, out, pairStarts);
         else {
           // Decode the non-windowed pairs' images in parallel up front (identical rasters).
           List<ImageFrame> needed = new ArrayList<>();
@@ -139,7 +157,7 @@ final class DenseReconstruction {
           if (preloaded > 0)
             RunTelemetry.record("Parallel image preload (" + preloaded + ")", preloadStarted);
         }
-        if (!options.denseMethod.equals("patchmatch"))
+        if (options.denseMethod.equals("sgm"))
           try (WorkProgress densePairs =
               WorkProgress.start("Dense matching pairs", pairs.size(), "pairs")) {
           int inFlight = pairsInFlight(pairs);

@@ -195,6 +195,8 @@ Two optional extras:
 | `--gpu-memory-mb` | automatic | GPU working-set budget in MiB (default 70% of the VRAM). |
 | `--compute` | `auto` | `auto` uses the GPU when suitable, `cpu` or `gpu` force one. |
 | `--cores` | half the CPUs | CPU threads. |
+| `--dense-method` | `sgm` | `mvsgm` (opt-in, needs `--fusion-mode image`): one depth map per image from several neighbouring images at once ([multi-view SGM](MULTIVIEW_SGM.md)). |
+| `--block-processing` | `off` | `auto` or `on` splits very large image sets into overlapping blocks ([block processing](BLOCK_PROCESSING.md)). |
 
 `--estimate-memory` shows the memory plan without processing. Large images and GPU settings:
 [scaling](SCALING.md) and [performance and attributes](PERFORMANCE_AND_ATTRIBUTES.md).
@@ -246,6 +248,9 @@ not clash with the one in LAS.utils. The Java entry point is `photogrammetry`.
 - [Project layout](PROJECT_FORMAT.md)
 - [Storage and GPU processing](STORAGE_GPU.md)
 - [Large images and scaling](SCALING.md)
+- [Multi-view SGM](MULTIVIEW_SGM.md)
+- [Block processing](BLOCK_PROCESSING.md)
+- [Image fusion memory](FUSION_MEMORY.md)
 - [Third-party dependencies](THIRD_PARTY_NOTICES.md)
 
 Author: [Mikko Kukkonen](https://github.com/kmik). No project license has been selected;

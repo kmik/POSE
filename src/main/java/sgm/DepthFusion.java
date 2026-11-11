@@ -203,6 +203,18 @@ final class DepthFusion implements AutoCloseable {
     return second ? pairs.get(pair).b : pairs.get(pair).a;
   }
 
+  // --dense-method mvsgm: pairs whose candidates are one camera's depth map (camera a); b only
+  // supplies the triangulation-angle weight. Image fusion splats them into a only.
+  private final java.util.BitSet singleView = new java.util.BitSet();
+
+  void markSingleView(int pair) {
+    singleView.set(pair);
+  }
+
+  boolean singleView(int pair) {
+    return singleView.get(pair);
+  }
+
   Camera camera(int image) {
     return cameras[image];
   }
