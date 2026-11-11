@@ -23,6 +23,14 @@ final class BigTiffWindows {
   private final ByteOrder order;
   private final long[] offsets, counts;
   private final int width, height, tileWidth, tileHeight, planes, offsetTag, countTag;
+
+  int width() {
+    return width;
+  }
+
+  int height() {
+    return height;
+  }
   private static final Set<Integer> PIXEL_TAGS =
       Set.of(
           256, 257, 258, 259, 262, 266, 273, 277, 278, 279, 284, 292, 293, 301, 317, 320, 322, 323,

@@ -59,6 +59,7 @@ public final class SelfTest {
     checks += MultiViewSgmRegression.run();
     checks += LargeFormatRegression.run();
     checks += SpeckleFilterRegression.run();
+    checks += OrthomosaicRegression.run();
     checks += HelpSearchRegression.run();
     checks += BlockProcessingRegression.run(root.resolve("block-processing"));
     checks += DepthEdgeRegression.run();

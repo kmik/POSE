@@ -212,6 +212,7 @@ final class GcpAdjustment {
     double pixelRms = 0;
     for (double p : pixels) pixelRms += p * p;
     report.put("marker_pixel_rms", pixels.isEmpty() ? null : Math.sqrt(pixelRms / pixels.size()));
+    if (markers.checkNote != null) report.put("check_selection", markers.checkNote);
     report.put("crs", crs.name);
     report.put("points", rows);
     report.put(

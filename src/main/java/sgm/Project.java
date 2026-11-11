@@ -402,6 +402,12 @@ final class Project {
         Json.object("error", error == null ? null : error.toString()));
     Json.write(run.resolve("run.json"), runDescription(status, error));
     if (telemetry != null) telemetry.persist();
+    if (success && options.orthomosaic)
+      try {
+        Orthomosaic.create(run, run.resolve("07_results"), options);
+      } catch (IOException | RuntimeException | LinkageError orthoFailure) {
+        System.err.println("Orthomosaic failed; reconstruction status retained: " + orthoFailure);
+      }
     if (!options.processingReport.equals("none"))
       try (WorkProgress work = WorkProgress.start("Generate final processing report", 0, "files")) {
         ProcessingReport.generate(options, run, run.resolve("07_results"));
@@ -779,6 +785,7 @@ final class Project {
           "07_results/processing-report.pdf",
           "07_results/processing-report.json",
           "07_results/dsm.tif",
+          "07_results/orthomosaic.tif",
           "logs/processing.json",
           "07_results/coordinates.json",
           "00_inputs/images.csv",

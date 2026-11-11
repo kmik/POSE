@@ -231,13 +231,26 @@ final class GcpRegression {
     // the datum scale (the GCPs themselves sit at their given heights, see the control RMS).
     check(Math.hypot(moved[0] - OFFSET[0], moved[1] - OFFSET[1]) < .3, "block moved onto the GCP datum: " + Arrays.toString(moved));
     check(Math.abs(moved[2] - OFFSET[2]) < 1, "camera heights follow the GCP datum: " + moved[2]);
-    check(Main.run(new String[] {"dense", "ground", "finish", "-o", project.toString()}) == 0, "dense, ground and finish after the gcp step");
+    check(Main.run(new String[] {"dense", "ground", "finish", "-o", project.toString(), "--orthomosaic"}) == 0, "dense, ground and finish after the gcp step");
     check(Files.isRegularFile(run.resolve("07_results/dense.las")), "cloud written");
     try (var pdf = org.apache.pdfbox.Loader.loadPDF(run.resolve("07_results/processing-report.pdf").toFile())) {
       String text = new org.apache.pdfbox.text.PDFTextStripper().getText(pdf);
       check(text.contains("Ground Control Points") && text.contains("Check points") && text.contains("G8"), "report has the GCP section");
       check(text.contains("Camera Locations") && text.contains("Camera Calibration"), "report has camera sections");
     }
+    // 4. --orthomosaic at finish: a painted GeoTIFF in the GCP frame.
+    var ortho = JsonRead.object(JsonRead.read(run.resolve("07_results/orthomosaic.json")));
+    check("complete".equals(ortho.get("status")) && Files.size(run.resolve("07_results/orthomosaic.tif")) > 10_000, "orthomosaic written at finish: " + ortho.get("reason"));
+    check(((Number) ortho.get("painted_fraction")).doubleValue() > .1 && ((Number) ortho.get("photographs_contributing")).intValue() >= 2, "orthomosaic painted from several photographs: " + ortho.get("painted_fraction"));
+    check(((Number) ortho.get("epsg")).intValue() > 0 && Files.isRegularFile(run.resolve("07_results/orthomosaic.tfw")), "orthomosaic georeferenced");
+    // 5. Automatic check points on a branch: one more GCP held back without editing the file.
+    check(Main.run(new String[] {"gcp", "-o", project.toString(), "--branch", "--gcp-check-ids", "G1", "--gcp-markers", markersFile.toString()}) == 0, "gcp branch with --gcp-check-ids");
+    Path branch = project.resolve("runs").resolve(Main.latestRun(project));
+    check(!branch.equals(run), "the branch is a new run");
+    var held = JsonRead.object(JsonRead.read(branch.resolve("04_geometry/gcp/gcp_report.json")));
+    check(String.valueOf(held.get("check_selection")).contains("G1"), "report names the point held back: " + held.get("check_selection"));
+    check(((Number) JsonRead.object(held.get("check_rms_metres")).get("points")).intValue() == 3, "three check points on the branch");
+    check(((Number) JsonRead.object(held.get("check_rms_metres")).get("total")).doubleValue() < .4, "check RMS with G1 held back");
     return checks;
   }
 

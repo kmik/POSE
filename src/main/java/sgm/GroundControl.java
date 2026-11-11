@@ -64,6 +64,8 @@ final class GroundControl {
     final List<Point3> gcps = new ArrayList<>();
     final List<Marker> markers = new ArrayList<>();
     String crs;
+    /** How check points were chosen when not by the file (GroundControl.holdOut); not saved. */
+    String checkNote;
 
     Point3 gcp(String id) {
       for (Point3 p : gcps) if (p.id.equals(id)) return p;
@@ -152,6 +154,97 @@ final class GroundControl {
   private static double optional(String[] f, Map<String, Integer> column, String name, double fallback) {
     String v = field(f, column, name);
     return v == null ? fallback : Double.parseDouble(v);
+  }
+
+  // ---- Automatic check points (--gcp-check, --gcp-check-ids).
+
+  /** The points with their final types, and a sentence for the report (null: types as given). */
+  record Selection(List<Point3> points, String note) {}
+
+  /**
+   * Turns some control points into check points without editing the GCP file. Named ids first
+   * (--gcp-check-ids); then mode "auto" (about one in five, keeping at least four control points)
+   * or a count holds back that many more. The control points kept are the ones spread widest in
+   * XY (farthest-point selection from the two most distant points; ties go to the earlier line of
+   * the file), so the points held back lie between control points. Points typed check in the file
+   * stay check points. The choice depends only on the coordinates, so it is the same every run.
+   */
+  static Selection holdOut(List<Point3> points, String mode, List<String> ids) {
+    boolean[] check = new boolean[points.size()];
+    for (int i = 0; i < check.length; i++) check[i] = points.get(i).check;
+    List<String> named = new ArrayList<>(), chosen = new ArrayList<>();
+    for (String id : ids) {
+      int at = -1;
+      for (int i = 0; i < check.length; i++) if (points.get(i).id.equals(id)) at = i;
+      if (at < 0) throw new IllegalArgumentException("--gcp-check-ids: no ground control point " + id);
+      if (!check[at]) named.add(id);
+      check[at] = true;
+    }
+    List<Integer> control = new ArrayList<>();
+    for (int i = 0; i < check.length; i++) if (!check[i]) control.add(i);
+    int n = control.size(), hold = 0;
+    if (mode.equals("auto")) hold = n >= 5 ? Math.min(n - 4, Math.max(1, (int) Math.round(n / 5.))) : 0;
+    else if (!mode.equals("none")) {
+      hold = Integer.parseInt(mode);
+      if (n - hold < 3)
+        throw new IllegalArgumentException(
+            "--gcp-check " + hold + " would leave " + Math.max(0, n - hold) + " of " + n + " control points; at least 3 must remain");
+    }
+    if (hold > 0) {
+      boolean[] kept = new boolean[n];
+      double[] nearest = new double[n];
+      Arrays.fill(nearest, Double.POSITIVE_INFINITY);
+      int a = 0, b = 1;
+      double far = -1;
+      for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++) {
+          double d = distance(points.get(control.get(i)), points.get(control.get(j)));
+          if (d > far) {
+            far = d;
+            a = i;
+            b = j;
+          }
+        }
+      int next = a;
+      for (int count = 0; count < n - hold; count++) {
+        if (count == 1) next = b;
+        else if (count > 1) {
+          next = -1;
+          for (int i = 0; i < n; i++) if (!kept[i] && (next < 0 || nearest[i] > nearest[next])) next = i;
+        }
+        kept[next] = true;
+        for (int i = 0; i < n; i++)
+          nearest[i] = Math.min(nearest[i], distance(points.get(control.get(i)), points.get(control.get(next))));
+      }
+      for (int i = 0; i < n; i++)
+        if (!kept[i]) {
+          check[control.get(i)] = true;
+          chosen.add(points.get(control.get(i)).id);
+        }
+    }
+    if (named.isEmpty() && chosen.isEmpty())
+      return new Selection(
+          points,
+          mode.equals("auto") ? "--gcp-check auto held no point back: fewer than five control points." : null);
+    List<Point3> out = new ArrayList<>();
+    for (int i = 0; i < check.length; i++) {
+      Point3 p = points.get(i);
+      out.add(check[i] == p.check ? p : new Point3(p.id, p.xyz, p.sigma, check[i]));
+    }
+    String note =
+        (chosen.isEmpty() ? "" : "Check points held back automatically (--gcp-check " + mode + "; the control points kept are the ones spread widest): " + String.join(", ", chosen) + ". ")
+            + (named.isEmpty() ? "" : "Check points named with --gcp-check-ids: " + String.join(", ", named) + ".");
+    return new Selection(out, note.trim());
+  }
+
+  static List<String> ids(String list) {
+    List<String> out = new ArrayList<>();
+    for (String id : list.split(",")) if (!id.isBlank()) out.add(id.trim());
+    return out;
+  }
+
+  private static double distance(Point3 a, Point3 b) {
+    return Math.hypot(a.xyz[0] - b.xyz[0], a.xyz[1] - b.xyz[1]);
   }
 
   // ---- Markers file.

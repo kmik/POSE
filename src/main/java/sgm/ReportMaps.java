@@ -354,6 +354,13 @@ final class ReportMaps {
     return new Grid(w, h, z, box[0] + shift, box[3] - shift, cell * step);
   }
 
+  /** Photograph file per image name (archived copy when the run has one). */
+  static Map<String, Path> sourceFiles(Path run) throws IOException {
+    Map<String, Path> files = new LinkedHashMap<>();
+    for (var e : sources(run).entrySet()) files.put(e.getKey(), e.getValue().file);
+    return files;
+  }
+
   private static Map<String, Source> sources(Path run) throws IOException {
     Map<String, Source> sources = new LinkedHashMap<>();
     Path file = run.resolve("00_inputs/images.csv");

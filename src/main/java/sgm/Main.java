@@ -166,6 +166,10 @@ public final class Main {
         SurfaceDiagnostics.analyze(options);
         return 0;
       }
+      if (options.exportOrthomosaic != null) {
+        Orthomosaic.export(options);
+        return 0;
+      }
       if (options.exportOrientations != null) {
         OrientationIO.exportRun(options);
         return 0;

@@ -612,7 +612,12 @@ final class Pipeline {
             ? GroundControl.load(file)
             : options.gcpMarkers != null ? GroundControl.load(options.gcpMarkers) : new GroundControl.Markers();
     // The GCP file is read every time, so corrected coordinates or sigmas take effect.
-    List<GroundControl.Point3> points = GroundControl.read(options.gcp, options.gcpSigma, options.gcpHeightSigma);
+    GroundControl.Selection selection =
+        GroundControl.holdOut(
+            GroundControl.read(options.gcp, options.gcpSigma, options.gcpHeightSigma), options.gcpCheck, GroundControl.ids(options.gcpCheckIds));
+    List<GroundControl.Point3> points = selection.points();
+    markers.checkNote = selection.note();
+    if (selection.note() != null) System.out.println(selection.note());
     markers.gcps.clear();
     markers.gcps.addAll(points);
     markers.markers.removeIf(k -> markers.gcp(k.gcp) == null || k.image >= frames.size());

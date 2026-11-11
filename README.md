@@ -20,7 +20,10 @@ its own or as part of [LAS.utils](https://github.com/kmik/LAS.utils).
 - **Georeferencing:** from image GPS, with a GPS-weighted adjustment that also estimates the lens,
   the GPS time offset, the antenna lever arm and the rolling shutter.
 - **Ground control points:** import a GCP file, pin the points in the images in a browser editor,
-  and adjust the block onto them. Check points give an independent accuracy estimate.
+  and adjust the block onto them. Check points give an independent accuracy estimate; some can be
+  held back automatically (`--gcp-check auto`).
+- **Orthomosaic:** a full-resolution true orthomosaic of the original photographs as a tiled
+  GeoTIFF (`--orthomosaic`), also for finished runs (`--export-orthomosaic`).
 - **Dense matching:** semi-global matching (Census, AD-Census, Census-gradient, ZNCC costs) with
   multi-view depth fusion and surface consolidation.
 - **Ground classification:** ground points, a terrain model (DTM) and a canopy height model,
@@ -251,6 +254,7 @@ not clash with the one in LAS.utils. The Java entry point is `photogrammetry`.
 - [Multi-view SGM](MULTIVIEW_SGM.md)
 - [Block processing](BLOCK_PROCESSING.md)
 - [Image fusion memory](FUSION_MEMORY.md)
+- [Orthomosaic and automatic check points](ORTHOMOSAIC.md)
 - [Third-party dependencies](THIRD_PARTY_NOTICES.md)
 
 Author: [Mikko Kukkonen](https://github.com/kmik). No project license has been selected;

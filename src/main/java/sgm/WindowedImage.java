@@ -370,7 +370,7 @@ final class WindowedImage {
   }
 
   /** One reader and stream; ImageIO readers are not thread-safe. */
-  private static final class Source implements Closeable {
+  static final class Source implements Closeable {
     final Path path;
     final ImageInputStream input;
     final ImageReader reader;
@@ -399,6 +399,14 @@ final class WindowedImage {
         input.close();
         throw e;
       }
+    }
+
+    int width() throws IOException {
+      return big != null ? big.width() : reader.getWidth(0);
+    }
+
+    int height() throws IOException {
+      return big != null ? big.height() : reader.getHeight(0);
     }
 
     int[] window(int px, int py, int rw, int rh) throws IOException {

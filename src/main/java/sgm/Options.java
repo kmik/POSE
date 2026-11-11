@@ -64,6 +64,8 @@ public final class Options {
   public Path gcp, gcpMarkers;
   public double gcpSigma = .02, gcpHeightSigma = .03;
   public int gcpPort = 8765;
+  public String gcpCheck = "none";
+  public String gcpCheckIds = "";
   // Height sigma of the GPS camera prior: auto (0.2 m for DJI barometric heights, else gpsSigma).
   public String gpsHeightSigma = "auto";
   double gpsHeightSigmaValue = 2;
@@ -216,6 +218,10 @@ public final class Options {
   public double reportDsmResolution = 0;
   public boolean reportLocalDsm;
   public Path exportReport, reportOutput;
+  // Full-resolution true orthomosaic (ORTHOMOSAIC.md): off by default.
+  public boolean orthomosaic;
+  public double orthomosaicResolution = 0, orthomosaicSurfaceCell = 0, orthomosaicFill = -1;
+  public Path exportOrthomosaic, orthomosaicOutput;
   public boolean cache, listGpus;
   public int gpuDevice;
   public long gpuMemoryMb;
@@ -253,6 +259,9 @@ public final class Options {
           continue;
         case "--compatibility-copies":
           o.compatibilityCopies = true;
+          continue;
+        case "--orthomosaic":
+          o.orthomosaic = true;
           continue;
         case "--report-local-dsm":
           o.reportLocalDsm = true;
@@ -868,6 +877,12 @@ public final class Options {
         case "--gcp-height-sigma":
           o.gcpHeightSigma = number(v);
           break;
+        case "--gcp-check":
+          o.gcpCheck = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--gcp-check-ids":
+          o.gcpCheckIds = v.trim();
+          break;
         case "--gcp-port":
           o.gcpPort = Integer.parseInt(v);
           break;
@@ -1146,6 +1161,21 @@ public final class Options {
         case "--report-detail":
           o.reportDetail = v.toLowerCase(Locale.ROOT);
           break;
+        case "--orthomosaic-resolution":
+          o.orthomosaicResolution = v.equalsIgnoreCase("auto") ? 0 : number(v);
+          break;
+        case "--orthomosaic-fill":
+          o.orthomosaicFill = v.equalsIgnoreCase("auto") ? -1 : number(v);
+          break;
+        case "--orthomosaic-surface-cell":
+          o.orthomosaicSurfaceCell = v.equalsIgnoreCase("auto") ? 0 : number(v);
+          break;
+        case "--export-orthomosaic":
+          o.exportOrthomosaic = Paths.get(v);
+          break;
+        case "--orthomosaic-output":
+          o.orthomosaicOutput = Paths.get(v);
+          break;
         case "--export-report":
           o.exportReport = Paths.get(v);
           break;
@@ -1206,10 +1236,17 @@ public final class Options {
         || o.reportDsmMinPoints < 1)
       throw new IllegalArgumentException("Invalid fusion cache/batch or report DSM settings");
     if (java.util.stream.Stream.of(
-                o.exportReport, o.exportConfidence, o.analyzeRun, o.exportOrientations)
+                o.exportReport, o.exportConfidence, o.analyzeRun, o.exportOrientations, o.exportOrthomosaic)
             .filter(Objects::nonNull)
             .count()
         > 1) throw new IllegalArgumentException("Choose one standalone export/analysis action");
+    if (!(o.orthomosaicResolution >= 0) || !(o.orthomosaicSurfaceCell >= 0))
+      throw new IllegalArgumentException("--orthomosaic-resolution and --orthomosaic-surface-cell must be auto or positive");
+    if (o.exportOrthomosaic != null) {
+      if (!Files.isDirectory(o.exportOrthomosaic))
+        throw new IllegalArgumentException("Choose a valid run directory for --export-orthomosaic");
+      return o;
+    }
     if (o.exportReport != null) {
       if (!Files.isDirectory(o.exportReport)
           || o.analyzeRun != null
@@ -1703,6 +1740,8 @@ public final class Options {
       throw new IllegalArgumentException("--gcp file not found: " + o.gcp);
     if (!(o.gcpSigma > 0) || !(o.gcpHeightSigma > 0))
       throw new IllegalArgumentException("--gcp-sigma and --gcp-height-sigma must be positive");
+    if (!o.gcpCheck.matches("none|auto|[1-9][0-9]{0,5}"))
+      throw new IllegalArgumentException("--gcp-check must be none, auto or a number of check points");
     if (o.gcpPort < 1 || o.gcpPort > 65535)
       throw new IllegalArgumentException("--gcp-port must be 1..65535");
     if (!(o.groundMaxObject >= 1 && o.groundMaxObject <= 500))
@@ -2562,6 +2601,14 @@ Ground control points (the gcp step):
       and type (control or check). Header optional; separator , ; or tab. Coordinates
       are in --crs (or the GPS CRS). Check points are not used in the adjustment and
       give an independent accuracy estimate.
+  --gcp-check none|auto|N
+      Hold control points back as check points without editing the GCP file (default:
+      none, the types in the file). auto: about one in five, keeping at least four
+      control points (nothing with fewer than five). N: that many. The control points
+      kept are the ones spread widest, so check points lie between them; the choice
+      depends only on the coordinates. The report lists the points held back.
+  --gcp-check-ids ID,ID,...
+      Use these GCPs as check points, whatever their type in the file.
   --gcp-markers FILE
       Start from these image markers (markers.json from another run) instead of
       predicted ones.
@@ -2973,6 +3020,26 @@ Processing report:
   --report-local-dsm
       Explicitly allow local XY/Z surface raster without a geographic CRS. Default
       produces a DSM only when archived coordinates establish a projected CRS.
+Orthomosaic (ORTHOMOSAIC.md):
+  --orthomosaic
+      Write 07_results/orthomosaic.tif when the run finishes: a full-resolution true
+      orthomosaic of the original photographs on the surface of the final cloud, as a
+      tiled RGBA GeoTIFF (Deflate; BigTIFF above 4 GiB; transparent where there is no
+      surface or no camera sees it), with orthomosaic.tfw and orthomosaic.json. Needs a
+      projected coordinate frame (or --report-local-dsm). Default: off.
+  --orthomosaic-resolution auto|M
+      Pixel size in output units (default auto: the median ground sample distance of
+      the photographs, two significant digits).
+  --orthomosaic-surface-cell auto|M
+      Cell of the surface the photographs are projected on (default auto: twice the
+      point spacing of the cloud, not finer than a pixel).
+  --orthomosaic-fill auto|M
+      Close surface gaps up to about twice this wide by continuing the lower
+      neighbouring surface, so roads and ground without cloud points are still painted
+      (default auto: 32 surface cells; 0: none). Wider gaps stay transparent.
+  --export-orthomosaic RUN_DIRECTORY
+      Make the orthomosaic of a finished run without reprocessing; written to the
+      run's 07_results or to --orthomosaic-output DIRECTORY.
 Orientation import/export (supported variants and conventions in ORIENTATIONS.md):
   --orientation-input FILE_OR_DIRECTORY
       Combined interior/exterior source. Per-image intrinsics are supported;

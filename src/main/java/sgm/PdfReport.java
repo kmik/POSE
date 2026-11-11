@@ -373,6 +373,7 @@ final class PdfReport implements AutoCloseable {
           });
     }
     table(new String[] {"Label", "Type", "X error", "Y error", "Z error", "Total", "Images", "Image error"}, new float[] {70, 52, 65, 65, 65, 65, 50, 75}, rows);
+    if (gcp.get("check_selection") != null) paragraph(pdf(gcp.get("check_selection")));
     paragraph(
         "Errors are estimated minus given coordinates. Check points are triangulated from their"
             + " markers with the final cameras and were not used in the adjustment, so their errors"
@@ -606,7 +607,7 @@ final class PdfReport implements AutoCloseable {
     var checkRms = ProcessingReport.object(gcp.get("check_rms_metres"));
     var controlRms = ProcessingReport.object(gcp.get("control_rms_metres"));
     if (!gcp.isEmpty() && checkRms.isEmpty())
-      flags.add("No check points: the ground control residuals do not measure accuracy independently. Mark some GCPs as type 'check'.");
+      flags.add("No check points: the ground control residuals do not measure accuracy independently. Mark some GCPs as type 'check', or let --gcp-check auto hold some back.");
     // Check points within a few matching pixels on the ground are normal; well beyond is not.
     double gsd = number(survey.get("processed_ground_resolution"));
     if (checkRms.get("total") instanceof Number c && controlRms.get("total") instanceof Number k) {
