@@ -219,7 +219,7 @@ public final class Options {
   public boolean reportLocalDsm;
   public Path exportReport, reportOutput;
   // Full-resolution true orthomosaic (ORTHOMOSAIC.md): off by default.
-  public boolean orthomosaic;
+  public boolean orthomosaic, orthomosaicStrict;
   public double orthomosaicResolution = 0, orthomosaicSurfaceCell = 0, orthomosaicFill = -1;
   public Path exportOrthomosaic, orthomosaicOutput;
   public boolean cache, listGpus;
@@ -262,6 +262,9 @@ public final class Options {
           continue;
         case "--orthomosaic":
           o.orthomosaic = true;
+          continue;
+        case "--orthomosaic-strict":
+          o.orthomosaicStrict = true;
           continue;
         case "--report-local-dsm":
           o.reportLocalDsm = true;
@@ -3034,9 +3037,14 @@ Orthomosaic (ORTHOMOSAIC.md):
       Cell of the surface the photographs are projected on (default auto: twice the
       point spacing of the cloud, not finer than a pixel).
   --orthomosaic-fill auto|M
-      Close surface gaps up to about twice this wide by continuing the lower
-      neighbouring surface, so roads and ground without cloud points are still painted
-      (default auto: 32 surface cells; 0: none). Wider gaps stay transparent.
+      Close surface gaps up to about twice this wide: beside solid surface by continuing
+      the lower neighbouring surface, so roads and ground without cloud points are still
+      painted; between tree crowns with the height of the nearest crown (default auto:
+      64 surface cells; 0: none). Wider gaps stay transparent.
+  --orthomosaic-strict
+      Leave a pixel transparent whenever no camera passes the line-of-sight test.
+      Default: where only canopy (rough surface) is in the way, the least obstructed
+      camera paints it, so forest is not full of holes; solid roofs always hide.
   --export-orthomosaic RUN_DIRECTORY
       Make the orthomosaic of a finished run without reprocessing; written to the
       run's 07_results or to --orthomosaic-output DIRECTORY.

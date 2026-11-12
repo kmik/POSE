@@ -11,12 +11,15 @@ import java.util.*;
  *
  * <ul>
  *   <li>Surface: the highest cloud point per cell of a north-up grid (cell from the point
- *       spacing), small holes filled from their neighbours. Larger holes stay unknown and become
- *       transparent pixels: nothing is invented.
+ *       spacing), gaps filled from their neighbours. Larger gaps stay unknown and become
+ *       transparent pixels.
  *   <li>Each pixel takes its colour from the camera that sees its surface point closest to the
  *       image centre, among the cameras whose ray to that point is not blocked by the surface
  *       (so roofs and crowns stay at their true position and never cover the ground beside them;
- *       ground that no camera sees is transparent).
+ *       ground hidden behind anything solid is transparent).
+ *   <li>Canopy is rough and porous, and that test is too tight for it: cells that are rough on
+ *       their upper side are SOFT, and a pixel that no camera passes the test for is painted by
+ *       the least obstructed camera that has only SOFT cells in its way. A roof is never SOFT.
  *   <li>The mosaic is produced in blocks of 2,048 pixels: the heap holds the surface grid, one
  *       block and a bounded cache of decoded photographs; large TIFF sources are read by window.
  * </ul>
@@ -143,8 +146,11 @@ final class Orthomosaic {
     final int w, h;
     final double x0, yTop, cell;
     final float[] z;
+    /** Per cell after finish(): FILLED = no cloud point (gap filling); SOFT = rough on its upper side (canopy). */
+    static final byte FILLED = 1, SOFT = 2;
+    byte[] kind;
     float top = Float.NEGATIVE_INFINITY, bottom = Float.POSITIVE_INFINITY;
-    long known, filled;
+    long known, filled, soft;
 
     Surface(int w, int h, double x0, double yTop, double cell) {
       this.w = w;
@@ -168,21 +174,33 @@ final class Orthomosaic {
     }
 
     /**
-     * Fills unknown cells up to reach cells away from a known one (8-neighbour steps), then
-     * records the height range. Gaps are flooded from their lowest rim first (cells taken in
-     * order of height, each passing its height on), so a gap beside a roof or a crown continues
-     * the ground and the object does not grow sideways; the filled cells are then smoothed among
+     * Fills unknown cells up to reach cells away from a known one (8-neighbour steps), classifies
+     * the cells (SOFT) and records the height range. Gaps are flooded from their lowest solid rim
+     * first (cells taken in order of height, each passing its height on), so a gap beside a roof
+     * or a crown continues the ground and the object does not grow sideways. What that leaves,
+     * gaps with canopy (SOFT cells) all around, is flooded from the nearest rim cell: continuing
+     * the lowest crown cell would dig pits between the crowns that no camera sees into. The
+     * filled cells are then smoothed among
      * themselves and their known neighbours of similar height (within two cells), which turns the
      * flat fill into a ramp on sloping ground. Only cells enclosed by cloud points are kept (no
      * growth beyond the outer edge of the cloud). Deterministic: ties go to the lower cell index.
      */
     void finish(int reach) {
+      finish(reach, 1);
+    }
+
+    void finish(int reach, int workers) {
       reach = Math.min(reach, Short.MAX_VALUE);
+      kind = new byte[z.length];
       int unknown = 0;
       for (float v : z) if (Float.isNaN(v)) unknown++;
       if (unknown > 0 && unknown < z.length && reach > 0) {
         short[] steps = new short[z.length];
-        java.util.PriorityQueue<Long> queue = new java.util.PriorityQueue<>();
+        classify(workers);
+        // Two floods: from solid rims in order of height (unsigned keys: negative heights first),
+        // then from canopy rims in order of distance. Solid rims go first whatever their height:
+        // where ground is within reach the gap continues the ground.
+        java.util.PriorityQueue<Long> queue = new java.util.PriorityQueue<>(Long::compareUnsigned), canopy = new java.util.PriorityQueue<>();
         for (int p = 0; p < z.length; p++) {
           if (Float.isNaN(z[p])) continue;
           int x = p % w, y = p / w;
@@ -192,22 +210,26 @@ final class Orthomosaic {
               int xx = x + dx, yy = y + dy;
               rim = xx >= 0 && yy >= 0 && xx < w && yy < h && Float.isNaN(z[yy * w + xx]);
             }
-          if (rim) queue.add(key(z[p], p));
+          if (!rim) continue;
+          if ((kind[p] & SOFT) != 0) canopy.add((long) p);
+          else queue.add(key(z[p], p));
         }
         int[] list = new int[16];
         int count = 0;
-        while (!queue.isEmpty()) {
-          int p = (int) (long) queue.poll(), x = p % w, y = p / w;
+        while (!queue.isEmpty() || !canopy.isEmpty()) {
+          int p = (int) (long) (queue.isEmpty() ? canopy : queue).poll(), x = p % w, y = p / w;
           if (steps[p] >= reach) continue;
           for (int dy = -1; dy <= 1; dy++)
             for (int dx = -1; dx <= 1; dx++) {
               int xx = x + dx, yy = y + dy, q = yy * w + xx;
               if (xx < 0 || yy < 0 || xx >= w || yy >= h || !Float.isNaN(z[q])) continue;
               z[q] = z[p];
+              kind[q] = kind[p];
               steps[q] = (short) (steps[p] + 1);
               if (count == list.length) list = Arrays.copyOf(list, (int) Math.min(z.length, 2L * count));
               list[count++] = q;
-              queue.add(key(z[q], q));
+              if ((kind[q] & SOFT) != 0) canopy.add((long) steps[q] << 32 | q);
+              else queue.add(key(z[q], q));
             }
         }
         // Keep only interpolation: a filled cell stays when, on at least two of the four axes
@@ -258,6 +280,8 @@ final class Orthomosaic {
           }
           for (int i = 0; i < count; i++) z[list[i]] = next[i];
         }
+        Arrays.fill(kind, (byte) 0);
+        for (int i = 0; i < count; i++) kind[list[i]] = FILLED | SOFT;
       }
       known = 0;
       for (float v : z)
@@ -266,6 +290,55 @@ final class Orthomosaic {
           top = Math.max(top, v);
           bottom = Math.min(bottom, v);
         }
+      classify(workers);
+      soft = 0;
+      for (byte k : kind) if ((k & SOFT) != 0) soft++;
+    }
+
+    static final int ROUGH_RADIUS = 10, ROUGH_DEPTH = 10, ROUGH_PAIRS = 6;
+    static final double ROUGH_FRACTION = .1;
+
+    /**
+     * Marks the cells that are rough on their upper side as SOFT. For a cell, the cells of its
+     * neighbourhood (ROUGH_RADIUS) that are not more than ROUGH_DEPTH cells below it are its own
+     * object seen from above (a roof for a roof-edge cell, never the ground beside it); among the
+     * pairs of adjacent cells of that set, height steps of more than two cells are counted. A
+     * roof, a wall top or a car has almost none; a crown is full of them. SOFT: a share of steps
+     * of at least ROUGH_FRACTION, or fewer than ROUGH_PAIRS pairs (tips of crowns, poles).
+     * Depends on the heights only (rows in parallel, each cell on its own).
+     */
+    private void classify(int workers) {
+      int radius = ROUGH_RADIUS;
+      float depth = (float) (ROUGH_DEPTH * cell), step = (float) (2 * cell);
+      Parallel.forEach(h, workers, y -> {
+        int ya = Math.max(0, y - radius), yb = Math.min(h - 1, y + radius);
+        for (int x = 0; x < w; x++) {
+          int p = y * w + x;
+          if (Float.isNaN(z[p])) continue;
+          float floor = z[p] - depth;
+          int xa = Math.max(0, x - radius), xb = Math.min(w - 1, x + radius), pairs = 0, steps = 0;
+          for (int yy = ya; yy <= yb; yy++)
+            for (int xx = xa, q = yy * w + xa; xx <= xb; xx++, q++) {
+              float a = z[q];
+              if (!(a >= floor)) continue;
+              if (xx < xb) {
+                float b = z[q + 1];
+                if (b >= floor) {
+                  pairs++;
+                  if (Math.abs(a - b) > step) steps++;
+                }
+              }
+              if (yy < yb) {
+                float b = z[q + w];
+                if (b >= floor) {
+                  pairs++;
+                  if (Math.abs(a - b) > step) steps++;
+                }
+              }
+            }
+          if ((kind[p] & FILLED) == 0 && (pairs < ROUGH_PAIRS || steps >= ROUGH_FRACTION * pairs)) kind[p] |= SOFT;
+        }
+      });
     }
 
     /** Heap key: height first (ascending), then cell index. */
@@ -316,11 +389,38 @@ final class Orthomosaic {
       }
       return true;
     }
+
+    /**
+     * How far the surface rises into the line of sight of visible(lenient): the largest height of
+     * a cell above the line and its allowance; 0 when the line is free. POSITIVE_INFINITY when the
+     * camera is not above the point, when the obstruction exceeds limit, or when a cell that is
+     * not SOFT is in the way (a roof hides what is behind it; canopy and filled gaps are not
+     * taken as tight occluders).
+     */
+    double obstruction(double[] camera, double x, double y, double v, double limit) {
+      double dx = camera[0] - x, dy = camera[1] - y, dz = camera[2] - v, length = Math.hypot(dx, dy);
+      if (!(dz > 0)) return Double.POSITIVE_INFINITY;
+      if (length < cell) return 0;
+      double end = Math.min(length, length * (top - v) / dz), step = .75 * cell, worst = 0;
+      for (double s = 2 * step; s < end; s += step) {
+        double t = s / length;
+        int col = (int) Math.floor((x + dx * t - x0) / cell), row = (int) Math.floor((yTop - y - dy * t) / cell);
+        if (col < 0 || row < 0 || col >= w || row >= h) continue;
+        double over = z[row * w + col] - (v + dz * t + 1.5 * cell);
+        if (!(over > 0)) continue;
+        if ((kind[row * w + col] & SOFT) == 0) return Double.POSITIVE_INFINITY;
+        if (over > worst) {
+          worst = over;
+          if (worst > limit) return Double.POSITIVE_INFINITY;
+        }
+      }
+      return worst;
+    }
   }
 
   /** Counts of a rendered mosaic. */
   static final class Result {
-    long painted, unknown, unseen;
+    long painted, unknown, unseen, relaxed;
     long[] pixels;
   }
 
@@ -328,11 +428,20 @@ final class Orthomosaic {
    * Renders the mosaic of width x height pixels of size cell, top-left outer corner (x0, yTop),
    * and passes its compressed tiles (TILE pixels, row-major R G B A, alpha 0 = no data) to sink
    * in row-major order. occlusion false skips the visibility test (a conventional orthophoto:
-   * tall objects lean and cover the ground; for tests).
+   * tall objects lean and cover the ground; for tests). canopy false leaves a pixel that no
+   * camera passes the test for transparent also where only canopy is in the way
+   * (--orthomosaic-strict).
    */
   static Result render(
       Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int width, int height,
       int workers, boolean occlusion, TileSink sink)
+      throws IOException {
+    return render(surface, views, photos, x0, yTop, cell, width, height, workers, occlusion, true, sink);
+  }
+
+  static Result render(
+      Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int width, int height,
+      int workers, boolean occlusion, boolean canopy, TileSink sink)
       throws IOException {
     Result result = new Result();
     result.pixels = new long[views.size()];
@@ -344,7 +453,7 @@ final class Orthomosaic {
       for (int by = 0; by < height; by += BLOCK)
         for (int bx = 0; bx < width; bx += BLOCK) {
           int bw = Math.min(BLOCK, width - bx), bh = Math.min(BLOCK, height - by);
-          block(surface, views, photos, x0, yTop, cell, bx, by, bw, bh, workers, occlusion, sink, result);
+          block(surface, views, photos, x0, yTop, cell, bx, by, bw, bh, workers, occlusion, canopy, sink, result);
           work.update(++done);
         }
       work.done();
@@ -354,7 +463,7 @@ final class Orthomosaic {
 
   private static void block(
       Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int bx, int by, int bw, int bh,
-      int workers, boolean occlusion, TileSink sink, Result result)
+      int workers, boolean occlusion, boolean canopy, TileSink sink, Result result)
       throws IOException {
     double left = x0 + bx * cell, right = left + bw * cell, upper = yTop - by * cell, lower = upper - bh * cell;
     List<Integer> near = new ArrayList<>();
@@ -366,9 +475,10 @@ final class Orthomosaic {
     // 1. Per pixel: the surface height and the camera that sees it best.
     short[] chosen = new short[bw * bh];
     float[] heights = new float[bw * bh];
-    long[] unknown = new long[bh], unseen = new long[bh];
+    long[] unknown = new long[bh], unseen = new long[bh], relaxed = new long[bh];
+    boolean relax = occlusion && canopy && surface.kind != null;
     Parallel.forEach(bh, workers, row -> {
-      double[] uv = new double[2];
+      double[] uv = new double[2], excess = new double[candidates.length], scores = new double[candidates.length];
       double y = upper - (row + .5) * cell;
       for (int col = 0; col < bw; col++) {
         int p = row * bw + col;
@@ -398,12 +508,39 @@ final class Orthomosaic {
           }
         }
         if (chosen[p] < 0) chosen[p] = (short) lenient;
+        if (chosen[p] < 0 && relax) {
+          // No camera passes the test. Canopy is rough and porous, and the test is too tight for
+          // it: cameras with only canopy (SOFT cells) in the way remain candidates, never those
+          // behind anything solid. Of the least obstructed ones, the nearest its image centre.
+          double least = Double.POSITIVE_INFINITY;
+          for (int k = 0; k < candidates.length; k++) {
+            View view = views.get(candidates[k]);
+            excess[k] = Double.POSITIVE_INFINITY;
+            if (!view.project(x, y, v, uv)) continue;
+            if (!(uv[0] >= 0 && uv[1] >= 0 && uv[0] <= view.width - 1 && uv[1] <= view.height - 1)) continue;
+            double a = (uv[0] - view.cx) / view.fx, b = (uv[1] - view.cy) / view.fy;
+            scores[k] = a * a + b * b;
+            excess[k] = surface.obstruction(view.centre, x, y, v, 1.25 * least + 4 * surface.cell);
+            least = Math.min(least, excess[k]);
+          }
+          if (least < Double.POSITIVE_INFINITY) {
+            double limit = 1.25 * least + 4 * surface.cell;
+            best = Double.POSITIVE_INFINITY;
+            for (int k = 0; k < candidates.length; k++)
+              if (excess[k] <= limit && scores[k] < best) {
+                best = scores[k];
+                chosen[p] = (short) candidates[k];
+              }
+            relaxed[row]++;
+          }
+        }
         if (chosen[p] < 0) unseen[row]++;
       }
     });
     for (int row = 0; row < bh; row++) {
       result.unknown += unknown[row];
       result.unseen += unseen[row];
+      result.relaxed += relaxed[row];
     }
     // 2. Colours, one camera at a time: its source window, then bilinear samples.
     int[] rgba = new int[bw * bh];
@@ -695,8 +832,8 @@ final class Orthomosaic {
     surfaceCell = Math.max(surfaceCell, Math.sqrt(area / maxCells));
     Surface surface = grid(bounds, surfaceCell);
     surface.add(cloud::scan, "Orthomosaic: surface");
-    int fill = o.orthomosaicFill < 0 ? 32 : (int) Math.ceil(o.orthomosaicFill / surfaceCell);
-    surface.finish(fill);
+    int fill = o.orthomosaicFill < 0 ? 64 : (int) Math.ceil(o.orthomosaicFill / surfaceCell);
+    surface.finish(fill, Math.max(1, o.cores));
     if (surface.known == 0) return unavailable(out, "the surface is empty");
     boolean big = TiledGeoTiff.needsBig(width, height);
     System.out.printf(
@@ -713,7 +850,7 @@ final class Orthomosaic {
     Path file = out.resolve("orthomosaic.tif");
     RunPhotos photos = new RunPhotos(files, widths, heights, cache);
     try (photos; TiledGeoTiff tiff = new TiledGeoTiff(file, width, height, TILE, x0, yTop, cell, projected ? epsg : 0, big)) {
-      result = render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), true, tiff::write);
+      result = render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), true, !o.orthomosaicStrict, tiff::write);
     } catch (IOException | RuntimeException | Error failure) {
       Files.deleteIfExists(file);
       throw failure;
@@ -743,6 +880,7 @@ final class Orthomosaic {
             "surface_height", surface.h,
             "surface_cells_known", surface.known,
             "surface_cells_filled", surface.filled,
+            "surface_cells_canopy", surface.soft,
             "surface_fill_cells", fill,
             "source_points", cloud.count,
             "photographs_used", views.size(),
@@ -751,6 +889,8 @@ final class Orthomosaic {
             "painted_pixels", result.painted,
             "pixels_without_surface", result.unknown,
             "pixels_seen_by_no_camera", result.unseen,
+            "pixels_painted_through_canopy", result.relaxed,
+            "strict", o.orthomosaicStrict,
             "painted_fraction", result.painted / (double) total,
             "file_bytes", Files.size(file),
             "photographs_decoded_whole", photos.decoded,
@@ -759,13 +899,15 @@ final class Orthomosaic {
             "method",
             "Original photographs projected onto the highest-point surface of the final cloud. Each pixel takes the"
                 + " camera that sees its surface point nearest the image centre among the cameras whose ray is not"
-                + " blocked by the surface (true orthomosaic). Pixels without a surface or seen by no camera are"
-                + " transparent. No seam blending, no radiometric balancing, no overviews.");
+                + " blocked by the surface (true orthomosaic). Where no camera passes and only canopy (rough surface)"
+                + " is in the way, the least obstructed camera paints the pixel unless strict; solid surfaces always"
+                + " hide. Pixels without a surface or seen by no camera are transparent. No seam blending, no"
+                + " radiometric balancing, no overviews.");
     Json.write(out.resolve("orthomosaic.json"), metadata);
     System.out.printf(
         Locale.ROOT,
-        "Orthomosaic: %s, %,d MiB; %.1f%% of the pixels painted from %d of %d photographs (%.1f%% no surface, %.1f%% seen by no camera); %.1f s%n",
-        file, Files.size(file) >> 20, 100. * result.painted / total, contributing, views.size(), 100. * result.unknown / total,
+        "Orthomosaic: %s, %,d MiB; %.1f%% of the pixels painted from %d of %d photographs (%.1f%% by the least obstructed camera; %.1f%% no surface, %.1f%% seen by no camera); %.1f s%n",
+        file, Files.size(file) >> 20, 100. * result.painted / total, contributing, views.size(), 100. * result.relaxed / total, 100. * result.unknown / total,
         100. * result.unseen / total, (System.nanoTime() - clock) / 1e9);
     return metadata;
   }

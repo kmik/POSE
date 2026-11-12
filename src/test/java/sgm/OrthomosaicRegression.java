@@ -153,6 +153,11 @@ final class OrthomosaicRegression {
     for (int p = 0; p < 16; p++) slope.z[p] = p % 4;
     slope.finish(0);
     check(Math.abs(slope.height(2, 2) - 1.5) < 1e-9 && Math.abs(slope.height(1.25, 3.1) - .75) < 1e-9, "bilinear on a continuous slope");
+    // Heights on both sides of zero: the gap still continues the lower side.
+    Orthomosaic.Surface signs = new Orthomosaic.Surface(30, 12, 0, 12, 1);
+    for (int p = 0; p < 360; p++) signs.z[p] = p % 30 < 12 ? -.5f : p % 30 >= 18 ? 3 : Float.NaN;
+    signs.finish(8);
+    check(signs.height(12.5, 6) == -.5 && signs.height(17.5, 6) == -.5 && signs.filled == 48, "a gap between heights below and above zero continues the lower side");
     check(surface.visible(new double[] {25, 27, 50}, 28, 27, 0, false), "ground in front of the box is visible");
     check(!surface.visible(new double[] {25, 27, 50}, 38, 27, 0, false), "ground behind the box is hidden");
     check(surface.visible(new double[] {40, 27, 50}, 38, 27, 0, false), "... and visible from the other side");
@@ -302,9 +307,142 @@ final class OrthomosaicRegression {
     check(Orthomosaic.twoDigits(.03933) == .04 && Math.abs(Orthomosaic.twoDigits(.1234) - .13) < 1e-12 && Orthomosaic.twoDigits(5) == 5, "pixel size rounded up to two digits");
     Options parsed = Options.parse(new String[] {"-i", ".", "--orthomosaic", "--orthomosaic-resolution", "0.05", "--orthomosaic-fill", "0"});
     check(parsed.orthomosaic && parsed.orthomosaicResolution == .05 && parsed.orthomosaicFill == 0 && !new Options().orthomosaic, "orthomosaic options; off by default");
+    check(!parsed.orthomosaicStrict && Options.parse(new String[] {"-i", ".", "--orthomosaic", "--orthomosaic-strict"}).orthomosaicStrict, "--orthomosaic-strict; off by default");
 
+    canopy();
     checkPoints();
     return checks;
+  }
+
+  /**
+   * Canopy. Conifers (cones of slope 4, crowns of 1.2 m radius, apexes 12..18 m) on a 3 m lattice
+   * with only their crowns in the cloud, a strip of ground in the west, and in the north-east
+   * corner a box of 4 x 4 x 10 m on ground that has no points just east of the box. Two cameras
+   * in the west, 40 m up: the east flanks of the crowns and the gaps between them fail the
+   * line-of-sight test, and so does the ground behind the box.
+   *
+   * <ul>
+   *   <li>crowns are SOFT, the roof (edges included) and the ground are not;
+   *   <li>a gap between crowns takes the height of the nearest crown, a gap next to ground the
+   *       ground;
+   *   <li>strict: the stand is full of holes; default: the stand is painted (all but 0.2%), the
+   *       counts add up, and the ground behind the box is as transparent as before;
+   *   <li>the same tiles on 1 and 8 threads.
+   * </ul>
+   */
+  private static void canopy() throws Exception {
+    List<double[]> trees = new ArrayList<>();
+    for (int j = 0; j < 8; j++)
+      for (int i = 0; i < 8; i++) {
+        if (i >= 5 && j >= 5) continue;
+        int hash = (i * 73 + j * 151) % 17;
+        trees.add(new double[] {8 + 3 * i + .05 * (hash % 5), 8 + 3 * j + .05 * (hash % 7), 12 + 6 * hash / 16.});
+      }
+    Orthomosaic.Cloud cloud = (label, consumer) -> {
+      for (int b = 0; b < 660; b++)
+        for (int a = 0; a < 660; a++) {
+          double x = .025 + .05 * a, y = .025 + .05 * b;
+          if (x < 5) consumer.point(x, y, 0);
+          else if (x >= 26 && x <= 30 && y >= 26 && y <= 30) consumer.point(x, y, 10);
+          else if (x >= 23 && y >= 23) {
+            if (!(x > 30 && x < 31.5 && y >= 26 && y <= 30)) consumer.point(x, y, 0);
+          } else
+            for (double[] t : trees) {
+              double d = Math.hypot(x - t[0], y - t[1]);
+              if (d <= 1.2) consumer.point(x, y, t[2] - 4 * d);
+            }
+        }
+    };
+    Orthomosaic.Surface s = new Orthomosaic.Surface(330, 330, 0, 33, .1);
+    s.add(cloud, "test canopy");
+    boolean[] original = new boolean[s.z.length];
+    for (int p = 0; p < original.length; p++) original[p] = !Float.isNaN(s.z[p]);
+    s.finish(20, 4);
+    long crowns = 0, softCrowns = 0, softSolid = 0, solid = 0;
+    for (int p = 0; p < original.length; p++) {
+      if (!original[p]) continue;
+      double x = (p % 330 + .5) * .1, y = 33 - (p / 330 + .5) * .1;
+      boolean soft = (s.kind[p] & Orthomosaic.Surface.SOFT) != 0;
+      if (s.z[p] > 1 && s.z[p] != 10) {
+        crowns++;
+        if (soft) softCrowns++;
+      } else if (x < 4.5 || (x >= 24 && y >= 24)) {
+        solid++;
+        if (soft) softSolid++;
+      }
+    }
+    check(crowns > 20_000 && softCrowns >= .95 * crowns, "crowns are rough on their upper side: " + softCrowns + " of " + crowns + " cells");
+    check(solid > 20_000 && softSolid == 0, "the roof with its edges and the ground are solid (" + softSolid + " of " + solid + " cells rough)");
+    check(s.soft >= softCrowns + s.filled && s.filled > 10_000, "filled cells count as canopy, not as solid");
+    // Between the crowns of the trees at (14.05, 14.3) and (17.05, 14.2), far from any ground.
+    double gap = s.height(15.55, 14.25);
+    check(gap > 7 && gap < 14, "a gap between crowns takes the height of a crown edge, not of the lowest rim (" + gap + ")");
+    check(s.height(5.5, 15) == 0 && s.height(6.2, 12.5) == 0, "a gap next to ground continues the ground");
+    check(s.height(30.8, 28) == 0, "the gap beside the box continues the ground");
+    double[] west = {-30, 14.25, 60};
+    check(!s.visible(west, 15.55, 14.25, gap, false) && !s.visible(west, 15.55, 14.25, gap, true), "the gap is behind a crown for a camera in the west");
+    double through = s.obstruction(west, 15.55, 14.25, gap, Double.POSITIVE_INFINITY);
+    check(through > .5 && through < 10, "... with only canopy in the way (" + through + " m of it)");
+    check(s.obstruction(west, 15.55, 14.25, gap, .25) == Double.POSITIVE_INFINITY, "an obstruction above the limit is not measured further");
+    check(s.obstruction(new double[] {15.55, 14.25, 60}, 15.6, 14.25, gap, 1) == 0 && s.obstruction(west, 3, 15, 0, 1) == 0, "nothing in the way: no obstruction");
+    check(s.obstruction(new double[] {-30, 28, 60}, 30.8, 28, 0, Double.POSITIVE_INFINITY) == Double.POSITIVE_INFINITY, "the roof in the way is solid");
+    check(s.obstruction(west, 15.55, 14.25, 70, 1) == Double.POSITIVE_INFINITY, "a camera below the point sees nothing");
+
+    List<Orthomosaic.View> views = new ArrayList<>();
+    for (double y : new double[] {10, 23}) {
+      Camera pose = new Camera(250, 250, 199.5, 199.5);
+      pose.rotation = new double[] {1, 0, 0, 0, -1, 0, 0, 0, -1};
+      pose.translation = Math3.times(Math3.mv(pose.rotation, new double[] {2, y, 40}), -1);
+      views.add(new Orthomosaic.View("west" + views.size(), pose, new Calibration(250, 250, 199.5, 199.5, new double[5], SIZE, SIZE), 1));
+    }
+    int[] colours = {0x20c040, 0x2040c0};
+    Orthomosaic.Photos photos = (view, x, y, w, h) -> {
+      int[] out = new int[w * h];
+      Arrays.fill(out, colours[view]);
+      return out;
+    };
+    // 500 x 460 pixels of 0.05 m from (7, 30): one tile.
+    byte[][] tile = new byte[3][];
+    Orthomosaic.Result strict = Orthomosaic.render(s, views, photos, 7, 30, .05, 500, 460, 8, true, false, (tx, ty, bytes) -> tile[0] = bytes);
+    Orthomosaic.Result open = Orthomosaic.render(s, views, photos, 7, 30, .05, 500, 460, 8, true, true, (tx, ty, bytes) -> tile[1] = bytes);
+    Orthomosaic.Result single = Orthomosaic.render(s, views, photos, 7, 30, .05, 500, 460, 1, true, true, (tx, ty, bytes) -> tile[2] = bytes);
+    check(Arrays.equals(tile[1], tile[2]) && single.relaxed == open.relaxed, "canopy tiles do not depend on the thread count");
+    check(strict.relaxed == 0 && open.relaxed > 0 && open.painted == strict.painted + open.relaxed && open.unseen == strict.unseen - open.relaxed && open.unknown == strict.unknown,
+        "pixels painted through canopy are counted (" + open.relaxed + " of " + strict.unseen + " unseen)");
+    byte[] before = inflate(tile[0]), after = inflate(tile[1]);
+    long stand = 0, holes = 0, left = 0, behind = 0, hidden = 0, changed = 0;
+    for (int row = 0; row < 460; row++)
+      for (int col = 0; col < 500; col++) {
+        double x = 7 + (col + .5) * .05, y = 30 - (row + .5) * .05;
+        int at = 4 * (row * 512 + col);
+        if (before[at + 3] != 0 && (after[at] != before[at] || after[at + 1] != before[at + 1] || after[at + 2] != before[at + 2] || after[at + 3] != before[at + 3])) changed++;
+        if (x >= 8 && x <= 21 && y >= 9 && y <= 21) {
+          stand++;
+          if (before[at + 3] == 0) holes++;
+          if (after[at + 3] == 0) left++;
+        }
+        if (x >= 30.3 && x <= 31.9 && y >= 27.5 && y <= 29.5) {
+          behind++;
+          if (after[at + 3] == 0 && before[at + 3] == 0) hidden++;
+        }
+      }
+    check(holes > .05 * stand, "strict: the stand has holes (" + holes + " of " + stand + " pixels)");
+    check(500 * left < stand && 50 * left < holes, "default: the stand is painted but for pixels behind the few smooth crown cells (" + left + " of " + stand + " transparent, strict " + holes + ")");
+    check(behind > 1000 && hidden == behind, "the ground behind the box stays transparent next to canopy (" + hidden + " of " + behind + ")");
+    check(changed == 0, "pixels that pass the line-of-sight test are the same (" + changed + " changed)");
+  }
+
+  private static byte[] inflate(byte[] bytes) throws Exception {
+    java.util.zip.Inflater inflater = new java.util.zip.Inflater();
+    inflater.setInput(bytes);
+    byte[] samples = new byte[512 * 512 * 4];
+    try {
+      int got = 0;
+      while (got < samples.length && !inflater.finished()) got += inflater.inflate(samples, got, samples.length - got);
+    } finally {
+      inflater.end();
+    }
+    return samples;
   }
 
   /** Transparent and wrong pixels in the strip of ground just east of the box (x 36.6..38). */
