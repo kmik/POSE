@@ -96,13 +96,11 @@ per-step JVM starts and state reloads; a single call avoids the latter, and
 
 ## Verification
 
-- Default path unchanged: GPS replay `gps_bundle.json` SHA identical to before; the default
-  single-call run's outputs are those listed in SPEED_20261109.md.
+- Default path unchanged: GPS replay `gps_bundle.json` SHA identical to before.
 - Quick mode is deterministic and step-split runs equal the single call: `inputs` with
   `--quick-calibration` then `calibrate`, `match`, `align`, `georeference` as separate processes
   gave the same `04_geometry/final/exterior.csv` (SHA `577b8456…`) as the single call.
-- Self tests: see SPEED_20261109.md (the launcher regression checks that the help lists the new
-  option).
+- Self tests: the launcher regression checks that the help lists the new option.
 
 Comparison tool: `C2C.java` (single-file scratch tool, not in this repository: `java C2C.java A.las B.las [samples]
 [raw|icp|sim]`).

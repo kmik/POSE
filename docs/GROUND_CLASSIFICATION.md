@@ -92,7 +92,7 @@ are blocked.
   filter for forest_8 and forest_11, the first filter version for forest_2); profiles show
   the remaining ground at the foot of the trees. A block without any large smooth ground has no
   trusted ground, so the filter does nothing there.
-- The DTM inherits orientation height errors (see `ORIENTATION_GPS_ADJUSTMENT.md`).
+- The DTM inherits orientation height errors.
 - C2: per-pair ground labels on depth maps, voted in fusion. C3: keep the second, farther
   matching minimum in gaps.
 

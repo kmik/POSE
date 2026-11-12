@@ -124,7 +124,7 @@ G7,605553.10,6938371.44,88.10,,,,check
   measure in the report.
 - `--gcp-check auto` (or a number) holds some control points back as check points without
   editing the file, keeping the control points that are spread widest; `--gcp-check-ids A,B`
-  names them. The report lists the points held back. See ORTHOMOSAIC.md.
+  names them. The report lists the points held back. See [ORTHOMOSAIC.md](ORTHOMOSAIC.md).
 
 ### Workflow
 

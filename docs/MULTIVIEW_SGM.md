@@ -353,7 +353,7 @@ would be very slow. Use `--dense-method sgm` (windowed stereo) for such frames u
 
 ## Large frames (100+ Mpx per image)
 
-Status (11 November 2026): items 2 and 3 below are done; see STREAMED_PROCESSING.md (mvsgm
+Status (11 November 2026): items 2 and 3 below are done (mvsgm
 depth maps in tiles, maps handed to fusion without a candidate file, image fusion in row strips
 with memory-mapped maps, `--streamed-processing off|auto|on`, the 4-image block end to end at
 `--quality high`). The plan as written before:
