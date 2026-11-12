@@ -168,6 +168,38 @@ standing in filled ground (cars in a building's shadow) are drawn at ground leve
 classification, fill heights, strict against default coverage, the ground behind the box still
 transparent, pixels that pass the test unchanged, thread independence.
 
+### Speed and GPU (12 November 2026)
+
+A profile of the forest export showed 65% of the time in the line-of-sight test (the canopy
+fallback 3%, classification 4%, decoding, compression and writing under 3%). Two changes; the
+files are identical to before on both blocks.
+
+- **Cameras best-first.** The cameras of a pixel are tried from the nearest its image centre
+  outwards, so the first that passes is the answer (before: in file order, testing every camera
+  better than the best so far).
+- **Camera choice on the GPU** (`GpuOrthomosaic`): surface height, projection into the candidate
+  cameras and the line-of-sight walks run in an OpenCL kernel that repeats the Java code in
+  64-bit arithmetic without FMA contraction (the horizontal distance is now `sqrt(dx*dx+dy*dy)`
+  on both sides, not `hypot`). Colours, compression and writing stay on the CPU.
+  - Device memory: 5 bytes per surface cell (uploaded once) and 7 bytes per pixel of one block:
+    46 MiB for the forest block. When that exceeds the GPU budget (`--gpu-memory-mb`, default
+    70% of the device) or one allocation, the CPU code runs and a line says so.
+  - The work is sent in chunks of rows of about a quarter of a second, so the display driver's
+    watchdog is not triggered.
+  - The first block is compared with the CPU code on every sixteenth row; a difference or a GPU
+    failure switches to the CPU for the rest of the process. `--compute cpu` never uses the GPU.
+    A block with more than 64 candidate cameras is left to the CPU.
+
+| Data | Before | Best-first, CPU | With GPU |
+| --- | --- | --- | --- |
+| forest (33 Mpx mosaic) | 33.6 s | 20.6 s | 16.7 s |
+| city2 (24 Mpx mosaic) | 11.8 s | 8.7 s | 7.2 s |
+
+Not done: a coarse grid of surface maxima would let a walk over open ground stop checking cells
+early; it needs the sample positions defined by index instead of by repeated addition to stay
+exact. `OrthomosaicRegression` (106 checks) compares GPU and CPU tiles (default and strict), and
+checks that a surface beyond the budget and `--compute cpu` use the CPU.
+
 ## Automatic check points (`--gcp-check`)
 
 Check points were already supported: a GCP typed `check` in the GCP file is left out of the

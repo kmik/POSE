@@ -810,6 +810,48 @@ public final class CensusSgm {
     return descriptors;
   }
 
+  /**
+   * The element Arrays.sort(a, 0, n) would leave at a[n / 2], for finite values (n >= 1); a is
+   * reordered. Bit for bit the same value, including the sign of a zero: Arrays.sort orders -0.0
+   * before 0.0, as Math.min and Math.max do.
+   */
+  static float middle(float[] a, int n) {
+    if (n == 9) {
+      // Median of nine by a 19-exchange network (each exchange leaves min, max).
+      float p0 = a[0], p1 = a[1], p2 = a[2], p3 = a[3], p4 = a[4], p5 = a[5], p6 = a[6], p7 = a[7], p8 = a[8], t;
+      t = Math.min(p1, p2); p2 = Math.max(p1, p2); p1 = t;
+      t = Math.min(p4, p5); p5 = Math.max(p4, p5); p4 = t;
+      t = Math.min(p7, p8); p8 = Math.max(p7, p8); p7 = t;
+      t = Math.min(p0, p1); p1 = Math.max(p0, p1); p0 = t;
+      t = Math.min(p3, p4); p4 = Math.max(p3, p4); p3 = t;
+      t = Math.min(p6, p7); p7 = Math.max(p6, p7); p6 = t;
+      t = Math.min(p1, p2); p2 = Math.max(p1, p2); p1 = t;
+      t = Math.min(p4, p5); p5 = Math.max(p4, p5); p4 = t;
+      t = Math.min(p7, p8); p8 = Math.max(p7, p8); p7 = t;
+      p3 = Math.max(p0, p3);
+      p5 = Math.min(p5, p8);
+      t = Math.min(p4, p7); p7 = Math.max(p4, p7); p4 = t;
+      p6 = Math.max(p3, p6);
+      p4 = Math.max(p1, p4);
+      p2 = Math.min(p2, p5);
+      p4 = Math.min(p4, p7);
+      t = Math.min(p4, p2); p2 = Math.max(p4, p2); p4 = t;
+      p4 = Math.max(p6, p4);
+      return Math.min(p4, p2);
+    }
+    if (n < 16) {
+      Arrays.sort(a, 0, n);
+      return a[n / 2];
+    }
+    int k = n / 2;
+    float v = ImageFusion.select(a, n, k);
+    if (v != 0) return v;
+    // A zero: the selection does not order -0.0 before 0.0; count what the sort puts before 0.0.
+    int before = 0;
+    for (int i = 0; i < n; i++) if (a[i] < 0 || Float.floatToRawIntBits(a[i]) == 0x80000000) before++;
+    return k < before ? -0f : 0f;
+  }
+
   static float[] medianValid(float[] a, int w, int h, int window) {
     float[] out = a.clone();
     ThreadLocal<float[]> scratch = ThreadLocal.withInitial(() -> new float[window * window]);
@@ -825,8 +867,7 @@ public final class CensusSgm {
             float v = a[yy * w + xx];
             if (Float.isFinite(v)) values[n++] = v;
           }
-        Arrays.sort(values, 0, n);
-        out[y * w + x] = values[n / 2];
+        out[y * w + x] = middle(values, n);
       }
     });
     return out;
@@ -856,8 +897,7 @@ public final class CensusSgm {
                         <= edgeThreshold)) values[n++] = value;
           }
         if (n > 0) {
-          Arrays.sort(values, 0, n);
-          out[y * w + x] = values[n / 2];
+          out[y * w + x] = middle(values, n);
         }
       }
     });

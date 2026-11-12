@@ -298,3 +298,35 @@ cross-check speed (100 s here; GPU port); a real block of dozens or hundreds of 
 Tests after all of the above: full SelfTest 118,602 checks, all passed (including
 LargeFormatRegression); ImageFusionAgreementRegression on forest_tiny 48 checks passed; default
 output identity check SAME.
+
+## Large-format block after the 12 November 2026 changes; what "output staging" is
+
+Dense step of the four-frame large-format block at `--quality high` (mvsgm, 6.5 GB heap, fusion
+in strips of 849 rows over memory-mapped maps), run once with the current classes and a JFR
+recording. `dense.las` is byte-identical to the run of 11 November apart from the creation date
+in the header.
+
+| | 11 November | 12 November |
+|---|---:|---:|
+| stereo stage (mvsgm) | 284 s | 192 s |
+| fusion stage | 222 s | 212 s |
+| pass-1 filter label (spike, speckle, depth sanity) | about 20-30 s | 7.3 s |
+| of that, spike filter (GPU, 64 MiB of device memory per band) | | 1.9 s |
+| cross-check, ownership, normals | 100 s | 103 s |
+| candidate output staging | 54 s | 54 s |
+
+The two runs are a day apart, so small differences are within the spread; the stereo stage's
+gain comes from the row workers in mvsgm, the pass-1 gain from the spike filter on the GPU (see
+MULTIVIEW_SGM.md and FUSION_MEMORY.md).
+
+`Image fusion: candidate output staging` is the working time of the single writer thread that
+appends the emitted points in camera and row order while the next band is cross-checked. It is
+not time the fusion waits: the new label `Image fusion: cross-check blocked on the output writer`
+(time the cross-check thread is held because two bands already wait for the writer) was 0.03 s
+in this run. The writer's samples: 59% in `FusionOutput.add` itself, 26% growing the buffered
+output stream, 15% in file writes, plus the two-view diagnostics. Nothing to gain there for the
+wall time.
+
+Where the fusion stage's 212 s are on this block: cross-check 103 s, final LAS export 36 s,
+pass-1 pair reads 22 s, pass-2 pair reads and re-merge 19 s, pass-1 merge 6 s, pass-1 filters
+7 s.

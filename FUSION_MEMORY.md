@@ -287,3 +287,97 @@ cameras, so with several cameras in pass 1 at once they include waiting for the 
 - Full SelfTest (from a short working folder): 121,749 checks, all passed. Standalone on
   forest_tiny: `LargeFormatRegression` 53 checks and `ImageFusionAgreementRegression` 48 checks
   (with their forced-strip and forced-spill reruns), passed. Fixtures deleted.
+
+## Spike filter on the GPU (12 November 2026)
+
+The pass-1 spike filter (5 x 5 median and MAD decision per pixel of a camera's merged depth map)
+was the largest part of the telemetry label `Image fusion: pass 1 2D speckle filter` after the
+speckle filter became parallel. It now runs in an OpenCL kernel (`GpuSpikeFilter`); the Java code
+(`ImageFusion.spikeRow`, the former loop body unchanged) stays the reference and the fallback.
+
+### Identity
+
+The kernel repeats `spikeRow` operation for operation: the same float operations (the median of
+an even count, the deviations) and the same double operations (footprint, spread, limits), FP64
+with `#pragma OPENCL FP_CONTRACT OFF`, and only `+ - * /` and comparisons, which are correctly
+rounded on both sides. The medians are the same order statistics (an insertion sort of at most 24
+values instead of the selection). NaN and negative depths take the same branches. The marks are
+therefore equal bit for bit. The first map of a process is compared with the CPU code on every
+eighth row (printed as `GPU spike filter: ... identical to the CPU code`); a difference or a GPU
+error prints one warning and switches the GPU path off for the rest of the process.
+
+### Device memory
+
+4 bytes per uploaded pixel (the rows of a band plus two halo rows on each side) and 1 byte per
+decided pixel. Before anything is allocated the size is checked against the GPU budget
+(`--gpu-memory-mb`, default 70% of the device memory) and the largest single allocation of the
+device. A map that does not fit is sent in bands of rows (also never more than 16.8 million
+pixels per band, which bounds the host copy at 16 MiB per upload slice); when not even 256 rows
+fit, the CPU code runs and one line says so. The bytes of a band are reserved from the shared GPU
+pool when one is installed. Cameras that reach the filter at the same time take turns, so one
+band is on the device at a time. Fusion in strips calls the filter per strip with its halo rows,
+as before. Kernels run in launches of at most 4 million pixels (milliseconds each). The device
+context is opened at the first map and closed at the end of pass 1.
+
+Switching it off: `--compute cpu` or `-Dsgm.cpuSpikeFilter=true`. Maps below 250,000 pixels always
+use the CPU.
+
+### Measured (city2, `--quality high`, 17 cameras of 2000 x 1125, two cameras at once in pass 1)
+
+New telemetry label `Image fusion: pass 1 spike filter (within the filter time)`: the sum over
+cameras of the time in the filter (including waiting for the device).
+
+| | spike filter, 17 maps | one map alone |
+|---|---:|---:|
+| CPU (`-Dsgm.cpuSpikeFilter=true`), 12 threads | 2.2 s | 65-75 ms |
+| GPU | 0.5-0.6 s | 13-18 ms |
+
+Of the GPU time about 0.1 s is opening the device context and the first-map check; the kernels
+take 55 ms for all 17 maps. The first run after a driver or kernel-source change compiles the
+kernel once (about 2.5 s; the driver caches it). On this small set the fusion step's wall time
+changes by less than its run-to-run spread (19.6 s before, 18.5-20.5 s after); the gain is meant
+for large frames, where the spike filter is most of the pass-1 filter time (not re-measured there).
+
+`dense.las` and `point-confidence.bin` are byte-identical to the run with the classes before the
+change; `spike_rejected` 123,715 in both.
+
+### Verification
+
+- `GpuSpikeFilterRegression` (in SelfTest): GPU marks against the CPU code on every pixel of six
+  synthetic maps (smooth to rough surfaces, a depth edge, isolated spikes, thin lines, holes,
+  sparse regions, NaN and negative depths, row ranges as fusion in strips uses them, maps sent in
+  several bands under a 2 MiB budget); band sizes against budget and allocation limits; a 1 MiB
+  budget, `--compute cpu` and `-Dsgm.cpuSpikeFilter=true` give the CPU path.
+
+
+## Cross-check: CPU overhead looked for, none found (12 November 2026)
+
+Question: does the pass-2 cross-check lose time to per-access `MemorySegment` overhead in its
+inner loop, and is a GPU port worth it afterwards?
+
+Measured on city2 (`--quality high`, 17 cameras), JFR sample proportions and the telemetry label
+`Image fusion: cross-check, ownership, normals`:
+
+- With resident maps the neighbour loop reads the arrays directly (`at()`); segment alignment
+  checks are about 1% of all samples of the dense step and none of them lie under the
+  cross-check. An earlier note that put them at 14% of the phase does not hold for this code.
+- Forced strips (`-Dsgm.fusion.tileRows=256`, every neighbour map read through its mapped file):
+  13.6 s, against 13.9 s with resident maps in the same session. Reading through the segment
+  costs nothing measurable.
+- Samples under the cross-check: 63% in the loop body itself, 8% `SurfacePatchGrid.build`, 7%
+  patch predictions, 11% normals (`surfaceSample`, `SurfaceGeometry.plane`), 2% `hypot`. Within
+  the loop body about 40% sits on the 3 x 3 neighbourhood scan of the neighbour's map and 13% on
+  the neighbour's patch prediction.
+- Scanning the 3 x 3 neighbourhood as floats (exact) gave no gain (15.2 s against 13.9 s, within
+  the spread of this session: the same classes gave 11.4 s and 13.9 s an hour apart); removed
+  again. The time on those lines is most likely waiting for memory, not arithmetic.
+
+`crossCheck` is unchanged from the baseline. Output of all four runs byte-identical.
+
+GPU port, estimate only (not written): the kernel could take the projection into each neighbour,
+the 3 x 3 statistics, the vote and the agreement search, at most about half of the phase (city2
+about 13 s to 7 s, large frames about 100 s to 50 s if the proportions hold). The patch
+predictions (lazy grids, `hypot`), ownership marks and normals stay on the CPU, so the kernel
+would have to hand back per pixel and neighbour results (tens of bytes each, several hundred MiB
+per camera on city2), and neighbour maps larger than the device budget need bands per neighbour.
+It is the largest kernel so far with every fusion option as a branch.

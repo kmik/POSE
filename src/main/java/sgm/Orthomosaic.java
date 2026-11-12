@@ -376,7 +376,7 @@ final class Orthomosaic {
      * (for surface points no camera sees strictly, e.g. inside rough canopy).
      */
     boolean visible(double[] camera, double x, double y, double v, boolean lenient) {
-      double dx = camera[0] - x, dy = camera[1] - y, dz = camera[2] - v, length = Math.hypot(dx, dy);
+      double dx = camera[0] - x, dy = camera[1] - y, dz = camera[2] - v, length = Math.sqrt(dx * dx + dy * dy);
       if (length < cell || !(dz > 0)) return dz > 0;
       double end = Math.min(length, length * (top - v) / dz), step = .75 * cell;
       for (double s = 2 * step; s < end; s += step) {
@@ -398,7 +398,7 @@ final class Orthomosaic {
      * taken as tight occluders).
      */
     double obstruction(double[] camera, double x, double y, double v, double limit) {
-      double dx = camera[0] - x, dy = camera[1] - y, dz = camera[2] - v, length = Math.hypot(dx, dy);
+      double dx = camera[0] - x, dy = camera[1] - y, dz = camera[2] - v, length = Math.sqrt(dx * dx + dy * dy);
       if (!(dz > 0)) return Double.POSITIVE_INFINITY;
       if (length < cell) return 0;
       double end = Math.min(length, length * (top - v) / dz), step = .75 * cell, worst = 0;
@@ -443,6 +443,14 @@ final class Orthomosaic {
       Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int width, int height,
       int workers, boolean occlusion, boolean canopy, TileSink sink)
       throws IOException {
+    return render(surface, views, photos, x0, yTop, cell, width, height, workers, occlusion, canopy, null, sink);
+  }
+
+  /** gpu: the camera choice on the GPU where it applies (same result), or null. */
+  static Result render(
+      Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int width, int height,
+      int workers, boolean occlusion, boolean canopy, GpuOrthomosaic gpu, TileSink sink)
+      throws IOException {
     Result result = new Result();
     result.pixels = new long[views.size()];
     double[] limit = {x0, yTop - height * cell, x0 + width * cell, yTop};
@@ -453,7 +461,7 @@ final class Orthomosaic {
       for (int by = 0; by < height; by += BLOCK)
         for (int bx = 0; bx < width; bx += BLOCK) {
           int bw = Math.min(BLOCK, width - bx), bh = Math.min(BLOCK, height - by);
-          block(surface, views, photos, x0, yTop, cell, bx, by, bw, bh, workers, occlusion, canopy, sink, result);
+          block(surface, views, photos, x0, yTop, cell, bx, by, bw, bh, workers, occlusion, canopy, gpu, sink, result);
           work.update(++done);
         }
       work.done();
@@ -461,9 +469,88 @@ final class Orthomosaic {
     return result;
   }
 
+  /** State of a pixel after the choice of its camera. */
+  static final byte PAINTED = 0, UNKNOWN = 1, UNSEEN = 2, RELAXED = 3;
+
+  /**
+   * The surface height and the camera of each pixel of row row of a block (left, upper: its outer
+   * corner; bw pixels of size cell), written from index at: chosen (index into views or -1),
+   * heights and state. GpuOrthomosaic repeats this operation for operation.
+   */
+  static void chooseRow(
+      Surface surface, List<View> views, int[] candidates, double left, double upper, double cell, int bw, int row,
+      boolean occlusion, boolean relax, short[] chosen, float[] heights, byte[] state, int at) {
+    double[] uv = new double[2], excess = new double[candidates.length], scores = new double[candidates.length], pending = new double[candidates.length];
+    double y = upper - (row + .5) * cell;
+    for (int col = 0; col < bw; col++) {
+      int p = at + col;
+      chosen[p] = -1;
+      state[p] = PAINTED;
+      double x = left + (col + .5) * cell, v = surface.height(x, y);
+      heights[p] = (float) v;
+      if (Double.isNaN(v)) {
+        state[p] = UNKNOWN;
+        continue;
+      }
+      // Nearest the image centre among the cameras with a strictly free line of sight; if there
+      // is none, among those that pass the lenient test. Cameras are tried from the nearest
+      // outwards (equal scores: the earlier camera), so the first that passes is the answer.
+      for (int k = 0; k < candidates.length; k++) {
+        View view = views.get(candidates[k]);
+        scores[k] = Double.POSITIVE_INFINITY;
+        if (view.project(x, y, v, uv) && uv[0] >= 0 && uv[1] >= 0 && uv[0] <= view.width - 1 && uv[1] <= view.height - 1) {
+          double a = (uv[0] - view.cx) / view.fx, b = (uv[1] - view.cy) / view.fy;
+          scores[k] = a * a + b * b;
+        }
+        pending[k] = scores[k];
+      }
+      int lenient = -1;
+      while (true) {
+        int k = -1;
+        double best = Double.POSITIVE_INFINITY;
+        for (int j = 0; j < candidates.length; j++)
+          if (pending[j] < best) {
+            best = pending[j];
+            k = j;
+          }
+        if (k < 0) break;
+        pending[k] = Double.POSITIVE_INFINITY;
+        View view = views.get(candidates[k]);
+        if (!occlusion || surface.visible(view.centre, x, y, v, false)) {
+          chosen[p] = (short) candidates[k];
+          break;
+        }
+        if (lenient < 0 && surface.visible(view.centre, x, y, v, true)) lenient = candidates[k];
+      }
+      if (chosen[p] < 0) chosen[p] = (short) lenient;
+      if (chosen[p] < 0 && relax) {
+        // No camera passes the test. Canopy is rough and porous, and the test is too tight for
+        // it: cameras with only canopy (SOFT cells) in the way remain candidates, never those
+        // behind anything solid. Of the least obstructed ones, the nearest its image centre.
+        double least = Double.POSITIVE_INFINITY;
+        for (int k = 0; k < candidates.length; k++) {
+          excess[k] = Double.POSITIVE_INFINITY;
+          if (scores[k] == Double.POSITIVE_INFINITY) continue;
+          excess[k] = surface.obstruction(views.get(candidates[k]).centre, x, y, v, 1.25 * least + 4 * surface.cell);
+          least = Math.min(least, excess[k]);
+        }
+        if (least < Double.POSITIVE_INFINITY) {
+          double limit = 1.25 * least + 4 * surface.cell, best = Double.POSITIVE_INFINITY;
+          for (int k = 0; k < candidates.length; k++)
+            if (excess[k] <= limit && scores[k] < best) {
+              best = scores[k];
+              chosen[p] = (short) candidates[k];
+            }
+          state[p] = RELAXED;
+        }
+      }
+      if (chosen[p] < 0) state[p] = UNSEEN;
+    }
+  }
+
   private static void block(
       Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int bx, int by, int bw, int bh,
-      int workers, boolean occlusion, boolean canopy, TileSink sink, Result result)
+      int workers, boolean occlusion, boolean canopy, GpuOrthomosaic gpu, TileSink sink, Result result)
       throws IOException {
     double left = x0 + bx * cell, right = left + bw * cell, upper = yTop - by * cell, lower = upper - bh * cell;
     List<Integer> near = new ArrayList<>();
@@ -475,73 +562,15 @@ final class Orthomosaic {
     // 1. Per pixel: the surface height and the camera that sees it best.
     short[] chosen = new short[bw * bh];
     float[] heights = new float[bw * bh];
-    long[] unknown = new long[bh], unseen = new long[bh], relaxed = new long[bh];
+    byte[] state = new byte[bw * bh];
     boolean relax = occlusion && canopy && surface.kind != null;
-    Parallel.forEach(bh, workers, row -> {
-      double[] uv = new double[2], excess = new double[candidates.length], scores = new double[candidates.length];
-      double y = upper - (row + .5) * cell;
-      for (int col = 0; col < bw; col++) {
-        int p = row * bw + col;
-        chosen[p] = -1;
-        double x = left + (col + .5) * cell, v = surface.height(x, y);
-        heights[p] = (float) v;
-        if (Double.isNaN(v)) {
-          unknown[row]++;
-          continue;
-        }
-        // Nearest the image centre among the cameras with a strictly free line of sight; if there
-        // is none, among those that pass the lenient test.
-        double best = Double.POSITIVE_INFINITY, fallback = Double.POSITIVE_INFINITY;
-        int lenient = -1;
-        for (int i : candidates) {
-          View view = views.get(i);
-          if (!view.project(x, y, v, uv)) continue;
-          if (!(uv[0] >= 0 && uv[1] >= 0 && uv[0] <= view.width - 1 && uv[1] <= view.height - 1)) continue;
-          double a = (uv[0] - view.cx) / view.fx, b = (uv[1] - view.cy) / view.fy, score = a * a + b * b;
-          if (score >= best) continue;
-          if (!occlusion || surface.visible(view.centre, x, y, v, false)) {
-            best = score;
-            chosen[p] = (short) i;
-          } else if (score < fallback && surface.visible(view.centre, x, y, v, true)) {
-            fallback = score;
-            lenient = i;
-          }
-        }
-        if (chosen[p] < 0) chosen[p] = (short) lenient;
-        if (chosen[p] < 0 && relax) {
-          // No camera passes the test. Canopy is rough and porous, and the test is too tight for
-          // it: cameras with only canopy (SOFT cells) in the way remain candidates, never those
-          // behind anything solid. Of the least obstructed ones, the nearest its image centre.
-          double least = Double.POSITIVE_INFINITY;
-          for (int k = 0; k < candidates.length; k++) {
-            View view = views.get(candidates[k]);
-            excess[k] = Double.POSITIVE_INFINITY;
-            if (!view.project(x, y, v, uv)) continue;
-            if (!(uv[0] >= 0 && uv[1] >= 0 && uv[0] <= view.width - 1 && uv[1] <= view.height - 1)) continue;
-            double a = (uv[0] - view.cx) / view.fx, b = (uv[1] - view.cy) / view.fy;
-            scores[k] = a * a + b * b;
-            excess[k] = surface.obstruction(view.centre, x, y, v, 1.25 * least + 4 * surface.cell);
-            least = Math.min(least, excess[k]);
-          }
-          if (least < Double.POSITIVE_INFINITY) {
-            double limit = 1.25 * least + 4 * surface.cell;
-            best = Double.POSITIVE_INFINITY;
-            for (int k = 0; k < candidates.length; k++)
-              if (excess[k] <= limit && scores[k] < best) {
-                best = scores[k];
-                chosen[p] = (short) candidates[k];
-              }
-            relaxed[row]++;
-          }
-        }
-        if (chosen[p] < 0) unseen[row]++;
-      }
-    });
-    for (int row = 0; row < bh; row++) {
-      result.unknown += unknown[row];
-      result.unseen += unseen[row];
-      result.relaxed += relaxed[row];
-    }
+    if (gpu == null || !gpu.choose(views, candidates, left, upper, cell, bw, bh, workers, occlusion, relax, chosen, heights, state))
+      Parallel.forEach(bh, workers, row -> chooseRow(surface, views, candidates, left, upper, cell, bw, row, occlusion, relax, chosen, heights, state, row * bw));
+    long[] states = new long[4];
+    for (byte s : state) states[s]++;
+    result.unknown += states[UNKNOWN];
+    result.unseen += states[UNSEEN];
+    result.relaxed += states[RELAXED];
     // 2. Colours, one camera at a time: its source window, then bilinear samples.
     int[] rgba = new int[bw * bh];
     boolean[] used = new boolean[views.size()];
@@ -849,8 +878,9 @@ final class Orthomosaic {
     Result result;
     Path file = out.resolve("orthomosaic.tif");
     RunPhotos photos = new RunPhotos(files, widths, heights, cache);
-    try (photos; TiledGeoTiff tiff = new TiledGeoTiff(file, width, height, TILE, x0, yTop, cell, projected ? epsg : 0, big)) {
-      result = render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), true, !o.orthomosaicStrict, tiff::write);
+    GpuOrthomosaic gpu = GpuOrthomosaic.open(o, surface, (int) Math.min((long) BLOCK * BLOCK, (long) width * height));
+    try (photos; gpu; TiledGeoTiff tiff = new TiledGeoTiff(file, width, height, TILE, x0, yTop, cell, projected ? epsg : 0, big)) {
+      result = render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), true, !o.orthomosaicStrict, gpu, tiff::write);
     } catch (IOException | RuntimeException | Error failure) {
       Files.deleteIfExists(file);
       throw failure;
@@ -891,6 +921,8 @@ final class Orthomosaic {
             "pixels_seen_by_no_camera", result.unseen,
             "pixels_painted_through_canopy", result.relaxed,
             "strict", o.orthomosaicStrict,
+            "gpu_blocks", gpu == null ? 0 : gpu.blocks,
+            "gpu_device_bytes", gpu == null ? 0 : gpu.deviceBytes,
             "painted_fraction", result.painted / (double) total,
             "file_bytes", Files.size(file),
             "photographs_decoded_whole", photos.decoded,

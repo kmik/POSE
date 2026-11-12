@@ -1028,6 +1028,7 @@ final class ImageFusion {
         }
       } finally {
         if (cameraWorkers != null) cameraWorkers.shutdownNow();
+        GpuSpikeFilter.close();
       }
       for (int c = 0; c < cameras; c++) {
         if (perCamera[c] == null) continue;
@@ -1046,13 +1047,14 @@ final class ImageFusion {
       // Spike filter, speckle filter and depth sanity together; then the speckle filter alone.
       RunTelemetry.recordTotal("Image fusion: pass 1 2D speckle filter", speckleNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: pass 1 speckle components (within the filter time)", componentNanos, cameras);
+      RunTelemetry.recordTotal("Image fusion: pass 1 spike filter (within the filter time)", spikeNanos.get(), cameras);
       long clock = System.nanoTime();
       if (DepthOutlierFilter.enabled(o)) surfaceContext = new SurfacePatchGrid[cameras];
       for (int c = 0; c < cameras; c++) if (compact[c] != null) grid(c);
       for (int c = 0; c < cameras; c++) neighbours[c] = overlapping(c, samples);
       checkWorkingSet();
       RunTelemetry.record("Image fusion: camera overlap", clock);
-      long remergeNanos = 0, checkNanos = 0, outputNanos = 0;
+      long remergeNanos = 0, checkNanos = 0, outputNanos = 0, outputWaitNanos = 0;
       // Pass 2: re-merge one camera at a time (identical), cross-check, own and emit, in row bands.
       // --fusion-seed-order precision repeats it per precision tier (precise seeds first).
       // Ownership marks (used/emitted) are applied after each band, before the next band or camera
@@ -1111,7 +1113,10 @@ final class ImageFusion {
                   emitted[c].set(e.cameraPixel());
                 }
               }
+          // Time this thread is blocked because two bands already wait for the writer.
+          long blocked = System.nanoTime();
           while (pending.size() >= 2) outputNanos += awaitOutput(pending.poll());
+          outputWaitNanos += System.nanoTime() - blocked;
           pending.add(
               writer.submit(
                   () -> {
@@ -1136,6 +1141,7 @@ final class ImageFusion {
       RunTelemetry.recordTotal("Image fusion: pass 2 pair reads and re-merge", remergeNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: cross-check, ownership, normals", checkNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: candidate output staging", outputNanos, cameras);
+      RunTelemetry.recordTotal("Image fusion: cross-check blocked on the output writer", outputWaitNanos, cameras);
       progress.done();
       progress.close();
     }
@@ -1612,56 +1618,74 @@ final class ImageFusion {
     return a[k];
   }
 
-  /** Spike filter decisions for local rows [from, to) of m (all rows of m are read). */
+  /**
+   * Spike filter decisions for local rows [from, to) of m (all rows of m are read). The marks come
+   * from GpuSpikeFilter when it applies (identical marks), otherwise from spikeRow on the CPU.
+   */
   private long spikes(Merged m, Camera camera, int from, int to) {
     if (!o.fusionSpikeFilter) return 0;
-    int w = m.w, h = m.h, r = 2;
+    long clock = System.nanoTime();
+    int w = m.w, h = m.h;
     double focal = Math.min(camera.fx, camera.fy);
     float[] z = m.z;
-    boolean[] spike = new boolean[w * h];
-    long[] counts = new long[h];
-    parallel(to - from, row -> {
-      int y = from + row;
-      float[] values = new float[(2 * r + 1) * (2 * r + 1)], deviations = new float[values.length];
-      for (int x = 0; x < w; x++) {
-        int p = y * w + x;
-        float centre = z[p];
-        if (centre <= 0) continue;
-        int n = 0;
-        for (int dy = -r; dy <= r; dy++)
-          for (int dx = -r; dx <= r; dx++) {
-            int xx = x + dx, yy = y + dy;
-            if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
-            float v = z[yy * w + xx];
-            if (v > 0) values[n++] = v;
-          }
-        if (n < 12) continue;
-        // The median by selection: the same order statistic(s) as after Arrays.sort; the later
-        // loops over values do not depend on their order.
-        float upper = select(values, n, n / 2);
-        float median = n % 2 == 1 ? upper : .5f * (maxBelow(values, n / 2) + upper);
-        // limit >= 2 footprints: within that the pixel is kept whatever the spread is (identical
-        // decision without the second sort).
-        if (Math.abs(centre - median) <= 2 * (median / focal)) continue;
-        for (int i = 0; i < n; i++) deviations[i] = Math.abs(values[i] - median);
-        Arrays.sort(deviations, 0, n);
-        double spread = 1.4826 * (n % 2 == 1 ? deviations[n / 2] : .5 * (deviations[n / 2 - 1] + deviations[n / 2]));
-        double footprint = median / focal, limit = Math.max(4 * spread, 2 * footprint);
-        if (Math.abs(centre - median) <= limit) continue;
-        // A thin structure (pole, wire, branch) is a line of pixels: two neighbours at its depth
-        // keep it. A spike stands alone.
-        int own = 0;
-        double near = Math.max(spread, footprint);
-        for (int i = 0; i < n && own < 2; i++) if (Math.abs(values[i] - centre) <= near) own++;
-        if (own >= 2) continue;
-        spike[p] = true;
-        counts[y]++;
-      }
-    });
+    byte[] gpu = GpuSpikeFilter.marks(o, z, w, h, from, to, focal);
+    byte[] spike = gpu != null ? gpu : new byte[w * (to - from)];
+    if (gpu == null)
+      parallel(to - from, row -> spikeRow(z, w, h, focal, from + row, new float[24], new float[24], spike, row * w));
     long removed = 0;
-    for (int p = 0; p < z.length; p++) if (spike[p]) z[p] = 0;
-    for (long c : counts) removed += c;
+    for (int i = 0, p = from * w; i < spike.length; i++, p++)
+      if (spike[i] != 0) {
+        z[p] = 0;
+        removed++;
+      }
+    spikeNanos.addAndGet(System.nanoTime() - clock);
     return removed;
+  }
+
+  private final java.util.concurrent.atomic.AtomicLong spikeNanos = new java.util.concurrent.atomic.AtomicLong();
+
+  /**
+   * Spike decisions of row y of the w x h map z into marks[at + x] (1 = spike; other entries are
+   * left alone); returns the number of spikes. values and deviations: scratch of 24 floats.
+   * GpuSpikeFilter repeats this operation for operation.
+   */
+  static int spikeRow(float[] z, int w, int h, double focal, int y, float[] values, float[] deviations, byte[] marks, int at) {
+    int r = 2, count = 0;
+    for (int x = 0; x < w; x++) {
+      int p = y * w + x;
+      float centre = z[p];
+      if (centre <= 0) continue;
+      int n = 0;
+      for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++) {
+          int xx = x + dx, yy = y + dy;
+          if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+          float v = z[yy * w + xx];
+          if (v > 0) values[n++] = v;
+        }
+      if (n < 12) continue;
+      // The median by selection: the same order statistic(s) as after Arrays.sort; the later
+      // loops over values do not depend on their order.
+      float upper = select(values, n, n / 2);
+      float median = n % 2 == 1 ? upper : .5f * (maxBelow(values, n / 2) + upper);
+      // limit >= 2 footprints: within that the pixel is kept whatever the spread is (identical
+      // decision without the second sort).
+      if (Math.abs(centre - median) <= 2 * (median / focal)) continue;
+      for (int i = 0; i < n; i++) deviations[i] = Math.abs(values[i] - median);
+      Arrays.sort(deviations, 0, n);
+      double spread = 1.4826 * (n % 2 == 1 ? deviations[n / 2] : .5 * (deviations[n / 2 - 1] + deviations[n / 2]));
+      double footprint = median / focal, limit = Math.max(4 * spread, 2 * footprint);
+      if (Math.abs(centre - median) <= limit) continue;
+      // A thin structure (pole, wire, branch) is a line of pixels: two neighbours at its depth
+      // keep it. A spike stands alone.
+      int own = 0;
+      double near = Math.max(spread, footprint);
+      for (int i = 0; i < n && own < 2; i++) if (Math.abs(values[i] - centre) <= near) own++;
+      if (own >= 2) continue;
+      marks[at + x] = 1;
+      count++;
+    }
+    return count;
   }
 
   /**

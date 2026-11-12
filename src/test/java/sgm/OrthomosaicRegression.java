@@ -407,6 +407,23 @@ final class OrthomosaicRegression {
     Orthomosaic.Result open = Orthomosaic.render(s, views, photos, 7, 30, .05, 500, 460, 8, true, true, (tx, ty, bytes) -> tile[1] = bytes);
     Orthomosaic.Result single = Orthomosaic.render(s, views, photos, 7, 30, .05, 500, 460, 1, true, true, (tx, ty, bytes) -> tile[2] = bytes);
     check(Arrays.equals(tile[1], tile[2]) && single.relaxed == open.relaxed, "canopy tiles do not depend on the thread count");
+    // The camera choice on the GPU (where there is one): the same tiles, strict and default.
+    try (GpuOrthomosaic gpu = GpuOrthomosaic.open(new Options(), s, 500 * 460)) {
+      if (gpu != null) {
+        byte[][] device = new byte[2][];
+        Orthomosaic.Result a = Orthomosaic.render(s, views, photos, 7, 30, .05, 500, 460, 8, true, true, gpu, (tx, ty, bytes) -> device[0] = bytes);
+        Orthomosaic.Result b = Orthomosaic.render(s, views, photos, 7, 30, .05, 500, 460, 8, true, false, gpu, (tx, ty, bytes) -> device[1] = bytes);
+        check(gpu.blocks == 2 && gpu.cpuBlocks == 0, "both blocks chosen on the GPU");
+        check(Arrays.equals(device[0], tile[1]) && a.relaxed == open.relaxed && a.unseen == open.unseen, "GPU camera choice: the same tile and counts as the CPU");
+        check(Arrays.equals(device[1], tile[0]) && b.unseen == strict.unseen, "GPU camera choice, strict: the same tile and counts as the CPU");
+      }
+    }
+    Options tiny = new Options();
+    tiny.gpuMemoryMb = 1;
+    check(GpuOrthomosaic.open(tiny, s, 500 * 460) == null && GpuOrthomosaic.bytes(s.z.length, 500 * 460) > 1 << 20, "a surface beyond the GPU memory budget is left to the CPU");
+    Options cpu = new Options();
+    cpu.compute = "cpu";
+    check(GpuOrthomosaic.open(cpu, s, 500 * 460) == null, "--compute cpu: no GPU session");
     check(strict.relaxed == 0 && open.relaxed > 0 && open.painted == strict.painted + open.relaxed && open.unseen == strict.unseen - open.relaxed && open.unknown == strict.unknown,
         "pixels painted through canopy are counted (" + open.relaxed + " of " + strict.unseen + " unseen)");
     byte[] before = inflate(tile[0]), after = inflate(tile[1]);

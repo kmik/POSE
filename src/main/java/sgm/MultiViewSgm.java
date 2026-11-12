@@ -1419,8 +1419,16 @@ final class MultiViewSgm {
       return t;
     });
     final int[] list = cameras;
-    java.util.function.IntFunction<Future<Plan>> prepare = i -> preparer.submit(() -> plan(frames, tracks, list[i]));
-    try (WorkProgress progress = WorkProgress.start("Multi-view SGM cameras", cameras.length, "cameras")) {
+    // Row workers (CensusSgm, TsgmSearch: independent rows, the same results on any number of
+    // threads) for the plan thread and for this thread; without a scope those loops are serial.
+    final int rowCores = Math.max(1, o.cores / 2);
+    java.util.function.IntFunction<Future<Plan>> prepare = i -> preparer.submit(() -> {
+      try (var rows = StereoRows.open(rowCores)) {
+        return plan(frames, tracks, list[i]);
+      }
+    });
+    try (var rows = StereoRows.open(rowCores);
+        WorkProgress progress = WorkProgress.start("Multi-view SGM cameras", cameras.length, "cameras")) {
       Future<Plan> next = cameras.length > 0 ? prepare.apply(0) : null;
       for (int i = 0; i < cameras.length; i++) {
         int c = cameras[i];

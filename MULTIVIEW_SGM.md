@@ -389,3 +389,81 @@ and `consistent_depth.*` (the depths that pass the multi-view consistency check,
 fusion). Each is `.pfm` (depth in scene units, NaN = none), `.png` (linear grayscale over that
 image's label depth range, near dark, far bright, 0 = none) and `.json`, written with the same
 helper as the pair path's `disparity.*`. Without either option nothing extra is written.
+
+## Matching stage: where the time is, and row workers for mvsgm (12 November 2026)
+
+Measured on city2 (`--quality high`, 17 cameras of 2000 x 1125, 12 cores, RTX 5070 laptop GPU)
+with JFR and the run telemetry. JFR samples only a few threads per tick, so sample counts are
+proportions; seconds come from the telemetry and the mvsgm report.
+
+### Pair SGM (stereo stage 31 s wall, 58 pairs, about 2.5 pairs in flight)
+
+Per-pair task times summed over the pairs (77.5 pair-seconds):
+
+| part | pair-seconds | share | where |
+|---|---:|---:|---|
+| TSGM pyramid and bands | 15.7 | 20% | GPU solves, CPU band planning |
+| SGM left and right (banded) | 23.7 | 31% | GPU |
+| left/right, median, ZNCC check; right-image confidence | 4.8 | 6% | GPU |
+| edge-aware depth outlier rejection | 3.8 | 5% | GPU, a few pixels on the CPU |
+| disparity range estimate | 13.4 | 17% | CPU (OpenCV features natively; guard solve on the GPU) |
+| triangulation and depth evidence | 9.1 | 12% | CPU |
+| census, texture, edge descriptors | 3.2 | 4% | CPU, row-parallel |
+| speckle removal | 1.7 | 2% | CPU |
+| rectification, files, rest | 2.1 | 3% | CPU |
+
+About 62% of the pair time is in GPU-backed tasks and about 38% is CPU-only. Within the
+GPU-backed tasks the host side is visible too: of the Java samples of the stage, 8.6% copy memory
+into upload buffers and 6.5% zero freshly allocated native segments
+(`SegmentFactories.initNativeMemory`); 56% of the native samples wait in OpenCL calls. Largest
+CPU methods by samples: census 10%, edge flags 7%, texture mask 7% (all three row-parallel, so
+many samples but about 3 s of pair time), `StereoCost.subpixel` 6%, `CensusSgm.match` 3.5%,
+`DenseReconstruction.publish` 3.4%, speckle removal 3.3%, `asin` (triangulation angle) 3.2%.
+
+Not changed. Candidates, in order of expected gain per effort: reuse the upload segments instead
+of allocating zeroed ones per solve (exact, small); the disparity range estimate (17%, mostly
+feature extraction; changing it changes ranges unless the features are reused from the match
+step); triangulation was analysed before and is off the critical path.
+
+### mvsgm (stereo stage 23.6 s wall before the change)
+
+Per-camera phases from `mvsgm.json`, summed over 17 cameras:
+
+| phase | before | after | where |
+|---|---:|---:|---|
+| waiting for the plan (`prepare_wait_seconds`) | 1.8 s | 1.5 s | CPU: neighbour warps, census, on the plan thread |
+| solve (`sgm_seconds`) | 12.2 s | 9.7-10.3 s | GPU solves; CPU banding and selection of bands |
+| select and filter (`select_seconds`) | 6.3 s | 2.6-3.1 s | CPU: medians, speckles, subpixel |
+| stereo stage | 23.6 s | 16.9-18.9 s | |
+
+Before the change 38% of the Java samples of the stage were the census of the warped neighbours
+and 12% the median filter, both on a single thread: mvsgm never opened a `StereoRows` scope, so
+every row loop of `CensusSgm` and `TsgmSearch` that is row-parallel in pair SGM ran serially.
+
+Change: `MultiViewSgm` opens a `StereoRows` scope (half of `--cores`) in the plan thread and
+around the camera loop. The loops are the ones pair SGM already runs in parallel; rows are
+independent, so results do not depend on the number of threads. `dense.las` byte-identical
+(two runs each, old and new classes back to back). No memory is added beyond the row threads.
+
+What is left on the CPU in mvsgm after this: the per-level band and selection loops inside the
+solve (`MultiViewSgm.run`, about 16% of the Java samples before the change) and the plan thread's
+warps, which are mostly hidden behind the GPU solve of the previous camera.
+
+### Median filter without a full sort (12 November 2026, later)
+
+`CensusSgm.medianValid` and `medianEdgePreserving` sorted every window and took the middle
+element. `CensusSgm.middle` now returns that element directly: for nine values (the default
+3 x 3 window with all neighbours valid) by a 19-exchange median network of `Math.min` and
+`Math.max`, for 16 or more values by selection, otherwise by the sort as before. The value is
+the same bit for bit, including the sign of a zero (`Arrays.sort` puts -0.0 before 0.0; `Math.min`
+and `Math.max` order zeros the same way, and the selection path counts them).
+
+One 2000 x 1125 map on one thread: 3 x 3 window 220 ms to 105 ms, 5 x 5 window 790 ms to 670 ms.
+city2 mvsgm, two runs each back to back: select-and-filter phase 2.69 / 2.36 s before,
+2.28 / 1.96 s after; stereo stage 18.0 / 15.9 s before, 16.6 / 15.2 s after (the difference is
+inside the run-to-run spread on this small set). `dense.las` byte-identical. Not re-measured on
+the large-format block, where the median was 16% of the stereo samples.
+
+Test: `MedianSelectionRegression` (in SelfTest) compares `middle` with `Arrays.sort` for 1 to 49
+values with negative values, both zeros and repeated values, and both filters with a copy of the
+former code on whole maps (windows 3, 5, 7).
