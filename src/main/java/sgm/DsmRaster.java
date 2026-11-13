@@ -119,6 +119,7 @@ final class DsmRaster {
       }
     ImageIO.write(preview, "png", out.resolve("dsm.png").toFile());
     preview.flush();
+    Map<String, Object> density = density(counts, w, h, pw, ph, cell, out.resolve("density.png"));
     Files.writeString(
         out.resolve("dsm.tfw"),
         String.format(
@@ -180,8 +181,63 @@ final class DsmRaster {
             "caution",
             "Surface model includes vegetation/roofs; not classified bare-earth terrain. Max cells"
                 + " can retain remaining outliers. Preview uses nearest-cell sampling.");
+    result.put("density_preview", "density.png");
+    result.put("density", density);
     Json.write(out.resolve("dsm.json"), result);
     return result;
+  }
+
+  /** Colour of the density preview: pale yellow (few points) through orange to dark red (t = 1). */
+  static int densityColour(double t) {
+    t = Math.max(0, Math.min(1, t));
+    int[] a = t < .5 ? new int[] {0xff, 0xf3, 0xc4} : new int[] {0xf2, 0x8e, 0x2b};
+    int[] b = t < .5 ? new int[] {0xf2, 0x8e, 0x2b} : new int[] {0x7a, 0x1c, 0x1c};
+    double u = t < .5 ? 2 * t : 2 * t - 1;
+    int rgb = 0;
+    for (int k = 0; k < 3; k++) rgb = rgb << 8 | (int) Math.round(a[k] + u * (b[k] - a[k]));
+    return rgb;
+  }
+
+  /**
+   * Points per DSM cell: quantiles over the occupied cells and a preview on a logarithmic colour
+   * scale from one point to the 99th percentile. Counts above 65,535 share the last histogram bin.
+   */
+  private static Map<String, Object> density(
+      long[] counts, int w, int h, int pw, int ph, double cell, Path file) throws IOException {
+    long[] histogram = new long[65536];
+    long occupied = 0;
+    for (long c : counts)
+      if (c > 0) {
+        histogram[(int) Math.min(65535, c)]++;
+        occupied++;
+      }
+    double[] share = {.05, .5, .95, .99};
+    long[] quantile = new long[share.length];
+    long seen = 0;
+    int next = 0;
+    for (int c = 1; c < histogram.length && next < share.length; c++) {
+      seen += histogram[c];
+      while (next < share.length && occupied > 0 && seen >= Math.ceil(share[next] * occupied))
+        quantile[next++] = c;
+    }
+    double top = Math.max(2, quantile[3]);
+    BufferedImage image = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_RGB);
+    for (int y = 0; y < ph; y++)
+      for (int x = 0; x < pw; x++) {
+        long c = counts[Math.min(h - 1, y * h / ph) * w + Math.min(w - 1, x * w / pw)];
+        image.setRGB(x, y, c <= 0 ? 0xe5e7eb : densityColour(Math.log(c) / Math.log(top)));
+      }
+    ImageIO.write(image, "png", file.toFile());
+    image.flush();
+    return Json.object(
+        "units", "points per DSM cell",
+        "cell_area", cell * cell,
+        "occupied_cells", occupied,
+        "p05_points_per_cell", quantile[0],
+        "median_points_per_cell", quantile[1],
+        "p95_points_per_cell", quantile[2],
+        "colour_scale_maximum_points_per_cell", top,
+        "colour_scale", "logarithmic from 1 point to the 99th percentile; gray: no points");
   }
 
   // GeoTIFF pixel-is-area, north-up; Float32 single strip and explicit NaN nodata.

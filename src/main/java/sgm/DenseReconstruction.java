@@ -144,7 +144,12 @@ final class DenseReconstruction {
         {
           MultiViewSgm mvs = new MultiViewSgm(options);
           try {
-            count = mvs.run(frames, tracks, fusion, out, pairStarts);
+            if (MvsgmWindow.enabled(options)) {
+              mvsgmWindow = new MvsgmWindow(mvs, frames, tracks, fusion, project);
+              for (int k = 0; k < mvsgmWindow.planningStarts.length - 1; k++)
+                pairStarts.add(mvsgmWindow.planningStarts[k]);
+              count = mvsgmWindow.planningStarts[mvsgmWindow.planningStarts.length - 1];
+            } else count = mvs.run(frames, tracks, fusion, out, pairStarts);
           } finally {
             mvsgmMaps = mvs.handoff;
           }
@@ -285,11 +290,13 @@ final class DenseReconstruction {
       this.candidates = count;
       Files.write(options.output.resolve("stereo-quality.csv"), quality);
       if (project != null) {
-        project.stage(
-            "05_stereo",
-            "complete",
-            "Rectification, filtering stages and confidence rasters exported");
-        project.stage("06_fusion", "running", "Independent stereo-pair depth corroboration");
+        if (mvsgmWindow == null) {
+          project.stage(
+              "05_stereo",
+              "complete",
+              "Rectification, filtering stages and confidence rasters exported");
+          project.stage("06_fusion", "running", "Independent stereo-pair depth corroboration");
+        }
         long exportStarted = System.nanoTime();
         fusion.export(project.data);
         RunTelemetry.record("Fusion depth evidence export", exportStarted);
@@ -329,6 +336,12 @@ final class DenseReconstruction {
             starts[k] = k < pairStarts.size() ? pairStarts.get(k) : count;
           ImageFusion.Counters c =
               ImageFusion.run(options, fusion, candidates, starts, output, twoViewDiagnostics, mvsgmMaps);
+          if (mvsgmWindow != null) {
+            count = mvsgmWindow.count();
+            rawCandidates = count;
+            this.candidates = count;
+            if (count == 0) throw new IOException("No dense candidates; check camera calibration and baseline");
+          }
           fusionWork.done();
           long finishStarted = System.nanoTime();
           output.finish();
@@ -346,7 +359,7 @@ final class DenseReconstruction {
           uncertaintyRejected = c.uncertainty;
           matchingConfidenceRejected = c.twoView;
           refinedPoints = c.refined;
-          Json.write(options.output.resolve("06_fusion/image_fusion.json"), c.json());
+          Json.write(options.output.resolve("06_fusion/image_fusion.json"), c.json(true));
           System.out.println("Image-space fusion: " + Json.string(c.json()));
         }
       } else
@@ -535,6 +548,7 @@ final class DenseReconstruction {
 
   // --dense-method mvsgm: the depth and evidence maps handed to image fusion (deleted after it).
   private MvsgmMaps mvsgmMaps;
+  private MvsgmWindow mvsgmWindow;
 
   private String aerialSummary;
 

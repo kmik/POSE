@@ -33,7 +33,7 @@ final class PdfReport implements AutoCloseable {
   private final PDFont regular, bold;
   private PDPageContentStream content;
   private float y;
-  private int page;
+  private int page, figures;
   private String runId, section = "Processing report";
   private Map<String, Object> maps;
 
@@ -117,6 +117,7 @@ final class PdfReport implements AutoCloseable {
       pdf.calibration(survey);
       pdf.cameraLocations(survey);
       pdf.groundControl(survey);
+      pdf.denseCloud(data, survey, out);
       pdf.elevation(data, survey, out);
       pdf.parameters(data, survey, stages);
       if (detail.equals("full")) pdf.appendix(data, out);
@@ -126,6 +127,11 @@ final class PdfReport implements AutoCloseable {
       documentSave(pdf.document, temporary);
       Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
     }
+  }
+
+  /** The next figure label: figures are numbered in the order they appear in this report. */
+  private String fig() {
+    return "Fig. " + ++figures + ". ";
   }
 
   // ---------------------------------------------------------------- sections
@@ -177,7 +183,7 @@ final class PdfReport implements AutoCloseable {
     page("Survey Data");
     String units = String.valueOf(survey.getOrDefault("units", "units"));
     figurePair(out.resolve("camera-map.png"), out.resolve("overlap.png"), 250);
-    paragraph("Fig. 1. Camera locations and viewing directions (left) and geometric image overlap (right).");
+    paragraph(fig() + "Camera locations and viewing directions (left) and geometric image overlap (right).");
     paragraph(pdf(maps.getOrDefault("overlap_note", "Coverage unavailable.")));
     List<String[]> grid = new ArrayList<>();
     grid.add(new String[] {"Number of images", count(survey.getOrDefault("images", maps.get("input_images"))), "Camera stations", count(survey.getOrDefault("aligned", maps.get("registered_cameras")))});
@@ -220,7 +226,7 @@ final class PdfReport implements AutoCloseable {
     if (!residuals.isEmpty()) {
       residualPlot(residuals);
       paragraph(
-          "Fig. 2. Image residuals: mean tie point residual (observed minus predicted) per image cell, all"
+          fig() + "Image residuals: mean tie point residual (observed minus predicted) per image cell, all"
               + " images together. A systematic pattern means the lens model does not fit.");
     }
     var gpsLens = ProcessingReport.object(survey.get("gps_intrinsics"));
@@ -292,7 +298,7 @@ final class PdfReport implements AutoCloseable {
     }
     errorPlot(at, error, labels, List.of(), units);
     paragraph(
-        "Fig. 3. Camera locations and error estimates. Arrows show the horizontal error, colour the"
+        fig() + "Camera locations and error estimates. Arrows show the horizontal error, colour the"
             + " vertical error. Errors are the estimated antenna position (camera centre with the"
             + " lever arm and time offset) minus the "
             + pdf(locations.get("reference"))
@@ -341,7 +347,7 @@ final class PdfReport implements AutoCloseable {
     }
     gcpPlot(at, error, labels, check, cameras, units);
     paragraph(
-        "Fig. 4. GCP locations and error estimates: control points (triangles) and check points"
+        fig() + "GCP locations and error estimates: control points (triangles) and check points"
             + " (circles); arrows show the horizontal error, colour the vertical error. Grey dots are"
             + " the camera stations.");
     paragraph("Datum: " + pdf(gcp.get("datum")) + ". Adjustment: " + pdf(gcp.get("adjustment")) + ".");
@@ -382,12 +388,270 @@ final class PdfReport implements AutoCloseable {
             + ".");
   }
 
+  /** Rejection reasons of image-space fusion: counter in image_fusion.json, label. */
+  private static final String[][] FUSION_REASONS = {
+    {"spike_rejected", "Spike filter (isolated depth jumps)"},
+    {"speckle_rejected", "Speckle filter (small detached patches)"},
+    {"ambiguous_layer_rejected", "Ambiguous depth layer"},
+    {"depth_outlier_rejected", "Depth outlier filter"},
+    {"free_space_rejected", "Contradicted by another camera's free space"},
+    {"support_rejected", "Too little support from other cameras"},
+    {"visibility_contradiction_rejected", "Visibility contradiction"},
+    {"depth_uncertainty_rejected", "Depth uncertainty too large"},
+    {"two_view_rejected", "Two-view matching confidence too low"},
+  };
+
+  /**
+   * The dense cloud: how the stereo matches became points, how many cameras support a point, how
+   * complete each camera's depth map is, and the point density on the ground. Blocks whose data
+   * the run did not record are left out; the page is skipped when nothing is available.
+   */
+  private void denseCloud(Map<String, Object> data, Map<String, Object> survey, Path out) throws IOException {
+    var dense = ProcessingReport.object(data.get("dense"));
+    var dsm = ProcessingReport.object(data.get("dsm"));
+    var density = ProcessingReport.object(dsm.get("density"));
+    var summary = ProcessingReport.object(dense.get("summary"));
+    var image = ProcessingReport.object(dense.get("image_fusion"));
+    var completeness = ProcessingReport.object(dense.get("completeness"));
+    Path densityMap = out.resolve("density.png");
+    boolean hasDensity = !density.isEmpty() && Files.isRegularFile(densityMap);
+    if (summary.isEmpty() && image.isEmpty() && !hasDensity) return;
+    page("Dense Point Cloud");
+    String units = String.valueOf(survey.getOrDefault("units", "units"));
+    Object points = summary.get("Exported points") != null ? summary.get("Exported points") : dsm.get("source_points");
+    List<String[]> grid = new ArrayList<>();
+    grid.add(new String[] {"Points", count(points), "Dense method", dense.get("method") == null ? "-" : pdf(dense.get("method")) + (dense.get("fusion_mode") == null ? "" : ", " + dense.get("fusion_mode") + " fusion")});
+    grid.add(
+        new String[] {
+          "Point density", survey.get("point_density") instanceof Number d ? String.format(Locale.ROOT, "%.1f points/%s", d.doubleValue(), units.equals("m") ? "m2" : "unit2") : "-",
+          "Minimum cameras per point", dense.get("minimum_views") == null ? "-" : count(dense.get("minimum_views"))
+        });
+    if (!completeness.isEmpty())
+      grid.add(
+          new String[] {
+            "Depth-map completeness", share(completeness.get("overall")),
+            "Median / lowest camera", share(completeness.get("median")) + " / " + share(completeness.get("minimum"))
+          });
+    facts(grid);
+
+    // From stereo matches to points.
+    List<Object[]> stages = new ArrayList<>();
+    var pair = ProcessingReport.object(dense.get("pair_matching"));
+    var multi = ProcessingReport.object(dense.get("multi_view_matching"));
+    if (!pair.isEmpty()) {
+      stages.add(new Object[] {"Stereo matches selected (" + count(pair.get("pairs")) + " pairs)", pair.get("selected_matches")});
+      stages.add(new Object[] {"Matches kept by the pair filters", pair.get("kept_matches")});
+    }
+    if (!multi.isEmpty()) {
+      stages.add(new Object[] {"Depths matched (multi-view)", multi.get("depths")});
+      stages.add(new Object[] {"Depths consistent between views", multi.get("consistent")});
+    }
+    if (pair.isEmpty() && multi.isEmpty() && summary.get("Raw stereo observations") != null)
+      stages.add(new Object[] {"Stereo observations", summary.get("Raw stereo observations")});
+    if (image.get("merged_valid_pixels") != null)
+      stages.add(new Object[] {"Depth-map pixels after merging and filters", image.get("merged_valid_pixels")});
+    if (summary.get("Accepted before surface consolidation") != null
+        && !summary.get("Accepted before surface consolidation").equals(points))
+      stages.add(new Object[] {"Points accepted by fusion", summary.get("Accepted before surface consolidation")});
+    if (points != null) stages.add(new Object[] {"Points exported", points});
+    stages.removeIf(s -> !(s[1] instanceof Number));
+    if (stages.size() > 1) {
+      heading("From stereo matches to points");
+      List<String> labels = new ArrayList<>();
+      List<Double> values = new ArrayList<>();
+      for (Object[] s : stages) {
+        labels.add((String) s[0]);
+        values.add(((Number) s[1]).doubleValue());
+      }
+      horizontalBars(labels, values, null);
+      paragraph(
+          fig()
+              + "Counts at each step from matching to the exported cloud. A surface seen by several"
+              + " cameras gives several matches and depth-map pixels but one point, so the steps"
+              + " narrow even when nothing is rejected.");
+    }
+    // Why depth-map pixels did not become points.
+    List<String[]> reasons = new ArrayList<>();
+    double merged = number(image.get("merged_valid_pixels"));
+    if (!image.isEmpty()) {
+      for (String[] reason : FUSION_REASONS)
+        if (ReportDense.count(image.get(reason[0])) > 0)
+          reasons.add(new String[] {reason[1], count(image.get(reason[0])), "removed"});
+      for (var e : ProcessingReport.object(image.get("thin_surface_checks")).entrySet())
+        if (ReportDense.count(e.getValue()) > 0)
+          reasons.add(new String[] {"Thin-surface check: " + e.getKey().replace('_', ' '), count(e.getValue()), "removed"});
+      if (ReportDense.count(image.get("consumed_by_earlier_point")) > 0)
+        reasons.add(new String[] {"Same surface already emitted from another camera", count(image.get("consumed_by_earlier_point")), "represented"});
+      if (ReportDense.count(image.get("owned_by_other_camera")) > 0)
+        reasons.add(new String[] {"Surface owned by another camera", count(image.get("owned_by_other_camera")), "represented"});
+      if (image.get("emitted") != null) reasons.add(new String[] {"Emitted as points", count(image.get("emitted")), "kept"});
+    } else
+      for (String key : List.of("Fusion rejected", "Per-ray depth consensus rejected", "Depth uncertainty rejected", "Visibility contradiction rejected", "Two-view matching/conditioning rejected", "Triangulation angle rejected", "Voxel duplicates", "Confidence threshold rejected"))
+        if (ReportDense.count(summary.get(key)) > 0) reasons.add(new String[] {key, count(summary.get(key)), "removed"});
+    if (!reasons.isEmpty()) {
+      heading("Fusion decisions");
+      table(new String[] {"Decision", image.isEmpty() ? "Count" : "Depth-map pixels", "Outcome"}, new float[] {297, 120, 90}, reasons);
+      if (!image.isEmpty())
+        paragraph(
+            "The spike, speckle and outlier filters act before the "
+                + (Double.isFinite(merged) ? count(image.get("merged_valid_pixels")) + " " : "")
+                + "merged depth-map pixels are counted; the other rows act on those pixels. \"Represented\""
+                + " pixels show a surface that another camera already turned into a point: they are"
+                + " not a loss. The rows do not add up to the merged pixels: the rest is not itemised.");
+    }
+
+    // Cameras per point.
+    var views = ProcessingReport.object(dense.get("views_per_point"));
+    if (views.get("histogram") instanceof List<?> histogram) {
+      heading("Cameras per point");
+      List<String> labels = new ArrayList<>();
+      List<Double> values = new ArrayList<>();
+      double total = number(views.get("points"));
+      int first = 0, last = histogram.size() - 1;
+      while (first < last && ReportDense.count(histogram.get(first)) == 0) first++;
+      while (last > first && ReportDense.count(histogram.get(last)) == 0) last--;
+      for (int k = first; k <= last; k++) {
+        labels.add(k == histogram.size() - 1 ? k + "+" : Integer.toString(k));
+        values.add((double) ReportDense.count(histogram.get(k)));
+      }
+      columns(labels, values, total, "cameras", 110);
+      paragraph(
+          fig()
+              + "Points by the number of cameras that support them (percent of all points). More"
+              + " cameras per point means more redundancy and usually less noise.");
+    }
+
+    // Depth-map completeness per camera.
+    List<Map<String, Object>> cameras = new ArrayList<>();
+    for (Object item : dense.get("cameras") instanceof List<?> l ? l : List.of()) {
+      var c = ProcessingReport.object(item);
+      if (Boolean.TRUE.equals(c.get("used"))) cameras.add(c);
+    }
+    if (!cameras.isEmpty()) {
+      heading("Depth-map completeness");
+      // One column per camera in image order; long blocks are averaged in groups to at most 160.
+      int groups = Math.min(cameras.size(), 160);
+      List<String> labels = new ArrayList<>();
+      List<Double> values = new ArrayList<>();
+      for (int g = 0; g < groups; g++) {
+        int from = (int) ((long) g * cameras.size() / groups), to = (int) ((long) (g + 1) * cameras.size() / groups);
+        double sum = 0;
+        for (int i = from; i < to; i++) sum += number(cameras.get(i).get("completeness"));
+        values.add(sum / Math.max(1, to - from));
+        labels.add(groups <= 24 ? count(cameras.get(from).get("camera")) : "");
+      }
+      columns(labels, values, 1, cameras.size() == groups ? "camera" : "cameras in image order, averaged in groups of about " + (cameras.size() + groups - 1) / groups, 90);
+      paragraph(
+          fig()
+              + "Share of each camera's pixels that have a depth after the per-camera merge and"
+              + " filters. Cameras at the edge of the block see ground that no other camera covers,"
+              + " so they are normally lower.");
+      cameras.sort(Comparator.comparingDouble(c -> number(c.get("completeness"))));
+      boolean all = cameras.size() <= 12;
+      List<String[]> rows = new ArrayList<>();
+      for (var c : cameras.subList(0, Math.min(cameras.size(), all ? 12 : 8)))
+        rows.add(new String[] {count(c.get("camera")) + ": " + pdf(c.get("image")), share(c.get("completeness")), count(c.get("valid_depth_pixels")), count(c.get("emitted_points"))});
+      table(new String[] {all ? "Camera" : "Least complete cameras", "Completeness", "Pixels with depth", "Points emitted"}, new float[] {207, 100, 100, 100}, rows);
+      if (ReportDense.count(completeness.get("cameras_without_depth")) > 0)
+        paragraph(count(completeness.get("cameras_without_depth")) + " cameras have no depth map and are left out of these figures.");
+    } else if (!image.isEmpty())
+      paragraph("Cameras per point and depth-map completeness were not recorded for this run.");
+
+    // Point density on the ground.
+    if (hasDensity) {
+      ensure(305);
+      heading("Point density");
+      figure(densityMap, 200);
+      double top = number(density.get("colour_scale_maximum_points_per_cell")), area = number(density.get("cell_area"));
+      ramp(top, area, units);
+      paragraph(
+          fig()
+              + String.format(
+                  Locale.ROOT,
+                  "Points per DSM cell (%s cells), logarithmic colour scale; gray cells have no points."
+                      + " Median %s points per occupied cell (5th to 95th percentile: %s to %s).",
+                  length(Math.sqrt(area), units, 2),
+                  count(density.get("median_points_per_cell")),
+                  count(density.get("p05_points_per_cell")),
+                  count(density.get("p95_points_per_cell"))));
+    }
+  }
+
+  private static String share(Object v) {
+    return v instanceof Number n && Double.isFinite(n.doubleValue()) ? String.format(Locale.ROOT, "%.1f%%", 100 * n.doubleValue()) : "-";
+  }
+
+  /** Labelled horizontal bars, longest = full width, with the count at the bar's end. */
+  private void horizontalBars(List<String> labels, List<Double> values, Color colour) throws IOException {
+    double max = 0;
+    for (double v : values) max = Math.max(max, v);
+    float labelWidth = 215, barWidth = WIDTH - labelWidth - 80, h = 15;
+    ensure(values.size() * h + 8);
+    for (int i = 0; i < values.size(); i++) {
+      text(labels.get(i), LEFT, y - 10, 8.5f, regular, INK);
+      float w = max > 0 ? (float) (values.get(i) / max * barWidth) : 0;
+      fill(LEFT + labelWidth, y - 12, Math.max(w, .8f), 9, colour == null ? TEAL : colour);
+      text(String.format(Locale.ROOT, "%,.0f", values.get(i)), LEFT + labelWidth + Math.max(w, .8f) + 5, y - 10, 8.5f, regular, GRAY);
+      y -= h;
+    }
+    y -= 14;
+  }
+
+  /**
+   * Vertical columns on a zero baseline. Values are shown as a share of {@code total}; labels sit
+   * under the columns (empty labels are not drawn), percentages above when there is room.
+   */
+  private void columns(List<String> labels, List<Double> values, double total, String axis, float height) throws IOException {
+    if (values.isEmpty() || !(total > 0)) return;
+    double max = 0;
+    for (double v : values) max = Math.max(max, v / total);
+    if (!(max > 0)) return;
+    // The scale tops out at a round share at or above the largest column.
+    double top = total == 1 ? 1 : Math.min(1, Math.ceil(max * 10) / 10);
+    float left = LEFT + 34, width = WIDTH - 44, slot = width / values.size();
+    float bar = Math.max(.6f, Math.min(34, slot - (slot > 4 ? 2 : 0)));
+    ensure(height + 42);
+    float base = y - height - 8;
+    for (int k = 0; k <= 2; k++) {
+      float gy = base + k * height / 2;
+      rule(left, gy, left + width, gy);
+      text(String.format(Locale.ROOT, "%.0f%%", 100 * top * k / 2), LEFT, gy - 3, 7.5f, regular, GRAY);
+    }
+    for (int i = 0; i < values.size(); i++) {
+      double v = values.get(i) / total;
+      float h = (float) (Math.min(v, top) / top * height), x = left + i * slot + (slot - bar) / 2;
+      if (h > 0) fill(x, base, bar, Math.max(h, .5f), TEAL);
+      if (slot >= 26) {
+        String value = String.format(Locale.ROOT, v >= .1 ? "%.0f%%" : "%.1f%%", 100 * v);
+        text(value, x + (bar - regular.getStringWidth(value) * 7.5f / 1000) / 2, base + h + 3, 7.5f, regular, INK);
+      }
+      if (!labels.get(i).isEmpty())
+        text(labels.get(i), x + (bar - regular.getStringWidth(labels.get(i)) * 7.5f / 1000) / 2, base - 10, 7.5f, regular, GRAY);
+    }
+    text(axis, left, base - 21, 7.5f, regular, GRAY);
+    y = base - 36;
+  }
+
+  /** The density colour ramp with its end values as points per cell and per area unit. */
+  private void ramp(double top, double cellArea, String units) throws IOException {
+    if (!(top > 1)) return;
+    float w = 220, x = LEFT + (WIDTH - w) / 2, h = 8;
+    ensure(30);
+    for (int k = 0; k < 44; k++) fill(x + k * w / 44, y - h, w / 44 + .3f, h, new Color(DsmRaster.densityColour(k / 43.)));
+    String unit = units.equals("m") ? "m2" : "unit2";
+    String low = cellArea > 0 ? String.format(Locale.ROOT, "1 point/cell (%,.0f /%s)", 1 / cellArea, unit) : "1 point/cell";
+    String high = cellArea > 0 ? String.format(Locale.ROOT, "%.0f points/cell (%,.0f /%s)", top, top / cellArea, unit) : String.format(Locale.ROOT, "%.0f points/cell", top);
+    text(low, x, y - h - 10, 7.5f, regular, GRAY);
+    text(high, x + w - regular.getStringWidth(high) * 7.5f / 1000, y - h - 10, 7.5f, regular, GRAY);
+    y -= h + 27;
+  }
+
   private void elevation(Map<String, Object> data, Map<String, Object> survey, Path out) throws IOException {
     var dsm = ProcessingReport.object(data.get("dsm"));
     page("Digital Elevation Model");
     String units = String.valueOf(survey.getOrDefault("units", "units"));
     figure(out.resolve("dsm.png"), 330);
-    paragraph("Fig. 5. Digital surface model (highest point per cell; vegetation and roofs included).");
+    paragraph(fig() + "Digital surface model (highest point per cell; vegetation and roofs included).");
     List<String[]> grid = new ArrayList<>();
     grid.add(new String[] {"Resolution", dsm.get("cell_size") instanceof Number c ? length(c, units, 3) + "/pix" : "-", "Point density", survey.get("point_density") instanceof Number d ? String.format(Locale.ROOT, "%.1f points/%s", d.doubleValue(), units.equals("m") ? "m2" : "unit2") : "-"});
     grid.add(new String[] {"Elevation range", dsm.get("minimum_elevation") instanceof Number lo && dsm.get("maximum_elevation") instanceof Number hi ? String.format(Locale.ROOT, "%.2f .. %.2f %s", lo.doubleValue(), hi.doubleValue(), units) : "-", "Coverage area", area(survey.get("coverage_area"), units)});
@@ -399,7 +663,7 @@ final class PdfReport implements AutoCloseable {
       heading("Ground classification and terrain model");
       if (survey.get("dtm_preview") instanceof String dtm) {
         figure(Path.of(dtm), 230);
-        paragraph("Fig. 6. Digital terrain model from the ground points (interpolated under canopy).");
+        paragraph(fig() + "Digital terrain model from the ground points (interpolated under canopy).");
       }
       var checks = ProcessingReport.object(g.get("checks"));
       var islands = ProcessingReport.object(g.get("canopy_islands"));
@@ -421,7 +685,7 @@ final class PdfReport implements AutoCloseable {
   private static final String[][][] STEP_OPTIONS = {
     {{"inputs"}, {"quality", "--quality"}, {"maxDimension", "--max-dimension"}, {"calibration", "--calibration"}, {"focal", "--focal"}},
     {{"calibrate"}, {"calibrationPipeline", "--calibration-pipeline"}, {"quickCalibration", "--quick-calibration"}, {"selfCalibration", "self calibration"}, {"intrinsicsMode", "--intrinsics-mode"}, {"refineIntrinsics", "--refine-intrinsics"}},
-    {{"match"}, {"matchingAlgorithm", "--matching-algorithm"}, {"features", "--features"}, {"ratio", "--ratio"}, {"minMatches", "--min-matches"}, {"pairCandidates", "--pair-candidates"}},
+    {{"match"}, {"pairSelection", "--pair-selection"}, {"neighbors", "--neighbors"}, {"matchingAlgorithm", "--matching-algorithm"}, {"features", "--features"}, {"ratio", "--ratio"}, {"minMatches", "--min-matches"}, {"pairCandidates", "--pair-candidates"}},
     {{"align"}, {"iterations", "--bundle-iterations"}, {"reprojection", "--reprojection"}, {"trackMinViews", "--track-min-views"}, {"trackMaxError", "--track-max-error"}, {"cameraScreening", "--camera-screening"}},
     {{"georeference"}, {"crs", "--crs"}, {"gpsBundle", "--gps-bundle"}, {"gpsSigma", "--gps-sigma"}, {"gpsHeightSigma", "--gps-height-sigma"}, {"gpsIntrinsics", "--gps-intrinsics"}, {"gpsFocalPrior", "--gps-focal-prior"}, {"gpsTimeOffset", "--gps-time-offset"}, {"gpsLeverArm", "--gps-lever-arm"}, {"rollingShutter", "--rolling-shutter"}},
     {{"gcp"}, {"gcp", "--gcp"}, {"gcpSigma", "--gcp-sigma"}, {"gcpHeightSigma", "--gcp-height-sigma"}},
@@ -596,13 +860,41 @@ final class PdfReport implements AutoCloseable {
         && maps.get("registered_cameras") instanceof Number reg
         && reg.intValue() < in.intValue())
       flags.add((in.intValue() - reg.intValue()) + " of " + in.intValue() + " images were not registered.");
-    var geometry = stages.get("04_geometry");
-    if (geometry != null) {
-      var m = java.util.regex.Pattern.compile("RMS=([0-9.]+) m").matcher(String.valueOf(geometry.get("detail")));
-      if (m.find() && Double.parseDouble(m.group(1)) > 2)
-        flags.add("GPS camera fit RMS " + m.group(1) + " m: georeferencing may be weak (consumer GPS, timing offset or bent block).");
-    }
+    // The GPS camera fit, from coordinates.json (not parsed out of the stage text).
+    if (ProcessingReport.object(data.get("coordinates")).get("inlier_rms_metres") instanceof Number rms
+        && rms.doubleValue() > GPS_FIT_FLAG_METRES)
+      flags.add(String.format(Locale.ROOT, "GPS camera fit RMS %.2f m: georeferencing may be weak (consumer GPS, timing offset or bent block).", rms.doubleValue()));
     var survey = ProcessingReport.object(data.get("survey"));
+    var dense = ProcessingReport.object(data.get("dense"));
+    if (survey.get("reprojection_rms_processed_pixels") instanceof Number rms && rms.doubleValue() > REPROJECTION_FLAG_PIXELS)
+      flags.add(
+          String.format(
+              Locale.ROOT,
+              "Tie point reprojection RMS %.2f px (processed pixels) is above %.0f px: the alignment or"
+                  + " the lens model fits poorly; see the image residuals under Camera Calibration.",
+              rms.doubleValue(), REPROJECTION_FLAG_PIXELS));
+    // Overlap: surface cells seen by fewer than three cameras (an all-zero count means the
+    // coverage could not be computed, not that nothing was seen).
+    long cells = 0, weak = 0, unseen = 0;
+    for (var e : ProcessingReport.object(maps.get("coverage_histogram")).entrySet()) {
+      long n = ReportDense.count(e.getValue());
+      int cameras;
+      try {
+        cameras = Integer.parseInt(String.valueOf(e.getKey()));
+      } catch (NumberFormatException other) {
+        continue;
+      }
+      cells += n;
+      if (cameras < 3) weak += n;
+      if (cameras == 0) unseen += n;
+    }
+    if (cells > 0 && unseen < cells && weak > WEAK_OVERLAP_FLAG_SHARE * cells)
+      flags.add(
+          String.format(
+              Locale.ROOT,
+              "%.0f%% of the reconstructed surface is seen by fewer than three cameras: weak overlap,"
+                  + " so those areas have little redundancy (see the overlap map).",
+              100. * weak / cells));
     var gcp = ProcessingReport.object(survey.get("gcp"));
     var checkRms = ProcessingReport.object(gcp.get("check_rms_metres"));
     var controlRms = ProcessingReport.object(gcp.get("control_rms_metres"));
@@ -635,9 +927,13 @@ final class PdfReport implements AutoCloseable {
               + (named.size() > 12 ? "; ..." : "")
               + ". See 04_geometry/camera_screening.json.");
     }
-    var stereo = stages.get("05_stereo");
-    if (stereo != null && String.valueOf(stereo.get("detail")).toLowerCase(Locale.ROOT).contains("skipped"))
-      flags.add("Some stereo pairs were skipped: see 05_stereo/skipped_pairs.json.");
+    // Skipped pairs, from 05_stereo/skipped_pairs.json (not from the stage text).
+    var skipped = ProcessingReport.object(dense.get("skipped_pairs"));
+    if (ReportDense.count(skipped.get("skipped")) > 0)
+      flags.add(
+          count(skipped.get("skipped")) + " of " + count(skipped.get("attempted"))
+              + " stereo pairs failed and were skipped: see 05_stereo/skipped_pairs.json.");
+    denseFlags(flags, survey, dense, ProcessingReport.object(data.get("parameters")));
     var checks = ProcessingReport.object(ProcessingReport.object(data.get("ground")).get("checks"));
     if (checks.get("observed_ground_fraction") instanceof Number seen && seen.doubleValue() < .1)
       flags.add(
@@ -661,6 +957,77 @@ final class PdfReport implements AutoCloseable {
                   + " ground_support.tif).",
               100 * blocked.doubleValue()));
     return flags;
+  }
+
+  /** Flag thresholds (documented in PROCESSING_REPORT.md). */
+  static final double GPS_FIT_FLAG_METRES = 2,
+      REPROJECTION_FLAG_PIXELS = 1,
+      WEAK_OVERLAP_FLAG_SHARE = .25,
+      COMPLETENESS_FLAG_SHARE = .4;
+
+  /** Dense-cloud findings: no points, thin depth maps, work that left the GPU or the memory. */
+  private static void denseFlags(
+      List<String> flags, Map<String, Object> survey, Map<String, Object> dense, Map<String, Object> parameters) {
+    var summary = ProcessingReport.object(dense.get("summary"));
+    if (summary.get("Exported points") instanceof Number n && n.longValue() == 0)
+      flags.add("The dense cloud is empty: no point passed fusion.");
+    var completeness = ProcessingReport.object(dense.get("completeness"));
+    double median = number(completeness.get("median"));
+    if (completeness.get("overall") instanceof Number overall && overall.doubleValue() < COMPLETENESS_FLAG_SHARE)
+      flags.add(
+          String.format(
+              Locale.ROOT,
+              "Depth maps cover only %.0f%% of the image pixels (median camera %.0f%%): low dense"
+                  + " completeness; expect holes. See Dense Point Cloud.",
+              100 * overall.doubleValue(), 100 * median));
+    // Cameras far below the others (under half the median completeness).
+    List<String> thin = new ArrayList<>();
+    for (Object item : dense.get("cameras") instanceof List<?> l ? l : List.of()) {
+      var c = ProcessingReport.object(item);
+      if (Boolean.TRUE.equals(c.get("used")) && number(c.get("completeness")) < .5 * median)
+        thin.add(String.format(Locale.ROOT, "%s (%.0f%%)", c.get("image"), 100 * number(c.get("completeness"))));
+    }
+    if (!thin.isEmpty())
+      flags.add(
+          (thin.size() == 1 ? "1 camera has a depth map" : thin.size() + " cameras have depth maps") + " under half as complete as the median camera: "
+              + String.join(", ", thin.subList(0, Math.min(8, thin.size())))
+              + (thin.size() > 8 ? ", ..." : "")
+              + ".");
+    long without = ReportDense.count(completeness.get("cameras_without_depth"));
+    long unaligned =
+        survey.get("images") instanceof Number images && survey.get("aligned") instanceof Number aligned
+            ? images.longValue() - aligned.longValue()
+            : 0;
+    if (without > unaligned)
+      flags.add((without - unaligned) + " aligned camera(s) produced no depth map (no usable stereo partner, or excluded from dense matching).");
+    var disk = ProcessingReport.object(dense.get("fusion_on_disk"));
+    long spilled = ReportDense.count(disk.get("spill_bytes_written"));
+    if (spilled > 0)
+      flags.add(
+          String.format(
+              Locale.ROOT,
+              "Fusion wrote %.1f GiB of depth maps to temporary disk because they did not fit the"
+                  + " memory budget: same result, slower. A larger --memory-mb avoids it.",
+              spilled / 1073741824.));
+    else if (ReportDense.count(disk.get("strip_rows")) > 0)
+      flags.add(
+          "Fusion ran in strips of " + count(disk.get("strip_rows"))
+              + " rows from memory-mapped depth maps (large frames or a small memory budget): same"
+              + " result, slower than in memory.");
+    var backends = ProcessingReport.object(dense.get("backends"));
+    if (Boolean.TRUE.equals(backends.get("gpu_device_selected")) && !"cpu".equals(String.valueOf(parameters.get("compute")))) {
+      List<String> onCpu = new ArrayList<>();
+      if (ReportDense.count(backends.get("multi_view_cameras_on_cpu")) > 0)
+        onCpu.add(count(backends.get("multi_view_cameras_on_cpu")) + " of " + count(backends.get("multi_view_cameras")) + " cameras in multi-view matching");
+      if (ReportDense.count(backends.get("pair_search_pairs_with_cpu_levels")) > 0)
+        onCpu.add(count(backends.get("pair_search_pairs_with_cpu_levels")) + " of " + count(backends.get("pair_search_pairs")) + " stereo pairs");
+      if (ReportDense.count(backends.get("gpu_fusion_fallback_events")) > 0)
+        onCpu.add("part of the fusion evidence checks");
+      if (!onCpu.isEmpty())
+        flags.add(
+            "Ran on the CPU although a GPU was selected: " + String.join("; ", onCpu)
+                + ". Same result, slower; check the GPU memory budget (--gpu-memory-mb) and the console log.");
+    }
   }
 
   private static String gcpLine(Map<String, Object> gcp) {

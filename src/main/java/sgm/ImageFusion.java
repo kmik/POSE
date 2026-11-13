@@ -47,6 +47,12 @@ final class ImageFusion {
     boolean edgeEnabled, thinEnabled;
     // Memory plan and depth-map spill counters (FUSION_MEMORY.md).
     Object memory;
+    // Report statistics (counting only): points by number of supporting cameras (the last bucket is
+    // VIEW_BUCKETS - 1 or more), and per camera the image size, the pixels with a filtered merged
+    // depth and the points emitted from it.
+    static final int VIEW_BUCKETS = 17;
+    final long[] viewHistogram = new long[VIEW_BUCKETS];
+    long[] cameraPixels, cameraValid, cameraEmitted;
 
     long rejected() {
       return ambiguous + spikes + freeSpace + speckle + unsupported + visibility + uncertainty + twoView
@@ -54,6 +60,11 @@ final class ImageFusion {
     }
 
     Object json() {
+      return json(false);
+    }
+
+    /** The summary; {@code perCamera} adds the per-camera list (the file, not the console line). */
+    Object json(boolean perCamera) {
       Map<String, Object> out = Json.object(
           "merged_valid_pixels", pixels,
           "ambiguous_layer_rejected", ambiguous,
@@ -84,6 +95,19 @@ final class ImageFusion {
               "uncertain_averaging_members_skipped",uncertainAverageSkipped,
               "surface_departing_averages_reverted",averageReverted):null);
       if (memory != null) out.put("memory", memory);
+      out.put("views_per_point_histogram", viewHistogram.clone());
+      out.put("views_per_point_last_bucket", (VIEW_BUCKETS - 1) + " or more cameras");
+      if (perCamera && cameraPixels != null) {
+        List<Object> list = new ArrayList<>();
+        for (int c = 0; c < cameraPixels.length; c++)
+          list.add(
+              Json.object(
+                  "camera", c,
+                  "pixels", cameraPixels[c],
+                  "valid_depth_pixels", cameraValid[c],
+                  "emitted_points", cameraEmitted[c]));
+        out.put("cameras", list);
+      }
       if (thinEnabled)
         out.put(
             "thin_surface_checks",
@@ -197,7 +221,8 @@ final class ImageFusion {
   // The result is identical to the untiled path.
   private final boolean tiled;
   private final int stripRows;
-  private MappedFiles tileFiles;
+  private final Map<Integer, MappedFiles> tileFiles = new HashMap<>();
+  private long tileMappedBytes;
   // Halo rows: pass 1 spike filter (5x5 window: 2), pass 2 normals (7x7 at stride 4: 12); +1 for
   // the merge's 3x3 search, which makes a region's outermost row inexact.
   static final int PASS_ONE_HALO = 3, PASS_TWO_HALO = 13, SIGMA_HALO = 4, MIN_STRIP_ROWS = 32;
@@ -221,6 +246,14 @@ final class ImageFusion {
   private long allMapBytes, worstMap, residentBytes;
   private final LinkedHashMap<Integer, Long> resident = new LinkedHashMap<>(16, .75f, true);
   private long mapLoads, mapEvictions, spillWritten, spillRead;
+  private final boolean earlyDelete = !Boolean.getBoolean("sgm.fusion.keepFinishedMaps");
+  private int retiredCameras;
+  private long retiredMapBytes;
+  private int[] lastUse;
+  private long plannedMapPeakBytes, liveMapBytes, peakLiveMapBytes, peakResidentBytes;
+  private int liveCameras, peakLiveCameras;
+  private int preparedCameras, passTwoCameras;
+  private List<NavigableSet<Integer>> remainingReaders;
 
   /** One pair's candidates, read from the stream; sinef = f * sin(triangulation angle). */
   private static final class PairData {
@@ -294,6 +327,8 @@ final class ImageFusion {
 
   // --dense-method mvsgm: candidates come from the cameras' maps instead of the candidate file.
   private final MvsgmMaps maps;
+  private final MvsgmWindow window;
+  private final int mapWindowCameras;
 
   private ImageFusion(Options o, DepthFusion fusion, Path candidates, long[] start, MvsgmMaps maps) {
     this.o = o;
@@ -301,6 +336,7 @@ final class ImageFusion {
     this.candidates = candidates;
     this.start = start;
     this.maps = maps;
+    window = maps == null ? null : maps.window;
     sigmaTolerance = o.fusionTolerance.equals("sigma");
     precisionCheck = o.fusionPrecisionCheck;
     sigmaK = o.fusionSigmaK;
@@ -310,6 +346,7 @@ final class ImageFusion {
     storeWeights =
         o.fusionStrategy.equals("graph-average") || DepthOutlierFilter.enabled(o) || o.thinSurfaceFusion();
     cameras = fusion.cameraCount();
+    mapWindowCameras = window == null ? cameras : window.graph.peakCameras;
     words = (cameras + 63) / 64;
     fields = Double.isFinite(fusion.twoViewConfidenceThreshold()) ? 6 : 5;
     record = 24 + 3 + 8 + 4 * fields;
@@ -326,12 +363,14 @@ final class ImageFusion {
     // resident (no temporary files; the fastest path). Otherwise maps are spilled to files under
     // 06_fusion and only the camera being fused and its overlapping cameras are resident; the
     // operating system's file cache then uses whatever RAM is free. Neither changes any result.
-    gridCells = SurfacePatchGrid.cacheCells(o, cameras);
+    gridCells = SurfacePatchGrid.cacheCells(o, Math.max(1, mapWindowCameras));
+    long[] plannedMaps = new long[cameras];
     long worstCamera = 0, worstPixels = 0, speckleWork = 0, speckleLimit = Long.MAX_VALUE;
     int threads = Math.max(1, o.cores), speckleThreads = threads;
     for (int c = 0; c < cameras; c++) {
       long pixels = (long) fusion.width(c) * fusion.height(c), pairBytes = 0;
       allMapBytes += mapBytes(c);
+      plannedMaps[c] = mapBytes(c);
       worstMap = Math.max(worstMap, mapBytes(c));
       worstPixels = Math.max(worstPixels, pixels);
       for (int k : pairsOf.get(c)) pairBytes += (start[k + 1] - start[k]) * (24L + 12 + 4L * fields) + 20 * pixels;
@@ -342,6 +381,7 @@ final class ImageFusion {
       speckleWork = Math.max(speckleWork, speckle);
       worstCamera = Math.max(worstCamera, pairBytes + pixels * (34L + 8L * words + 1) + speckle);
     }
+    if (window != null) allMapBytes = window.graph.peakBytes(plannedMaps, window.retainFusion);
     boolean surfaceAttributes = o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal");
     long normalBytes = surfaceAttributes && 24L * worstPixels <= 512L << 20 ? 24L * worstPixels : 0;
     long budget = (long) (Runtime.getRuntime().maxMemory() * .75);
@@ -349,6 +389,7 @@ final class ImageFusion {
     long requestedCache = o.memoryMb * 1048576 / 4;
     if (o.imageFusionCacheMb >= 0)
       requestedCache = Math.min(requestedCache, (long) o.imageFusionCacheMb * 1048576);
+    if (window != null) requestedCache = 0;
     long avail = budget - budget / 8, base = worstCamera + normalBytes;
     long minEmit = 3L * MIN_BAND_PIXELS * EMISSION_BYTES;
     long needed = allMapBytes + base + minEmit;
@@ -357,7 +398,16 @@ final class ImageFusion {
     int forcedRows = Integer.getInteger("sgm.fusion.tileRows", 0);
     boolean wantTiles = forcedRows > 0 || o.streamedProcessing.equals("on");
     boolean spillFits = avail - worstCamera - minEmit >= 2 * worstMap;
-    tiled = wantTiles || !(forced < 0 && needed <= avail) && !spillFits && !o.streamedProcessing.equals("off");
+    long compulsoryMaps = 0;
+    if (window != null)
+      for (int c = 0; c < cameras; c++) if (window.eligible[c]) {
+        long bytes = plannedMaps[c];
+        for (int j : window.graph.possible[c]) bytes += plannedMaps[j];
+        compulsoryMaps = Math.max(compulsoryMaps, bytes);
+      }
+    boolean windowSetFits = window == null || compulsoryMaps + base + minEmit <= avail;
+    tiled = wantTiles || (!(forced < 0 && needed <= avail) && !spillFits || !windowSetFits)
+        && !o.streamedProcessing.equals("off");
     if (tiled) {
       // One camera at a time, strip by strip; maps are memory-mapped files, so the heap holds
       // one strip's work (merge, splats, candidates, normal cache), emission bands and the
@@ -377,7 +427,7 @@ final class ImageFusion {
         pairData = Math.max(pairData, bytes);
       }
       long perPixel = 27 + 8L * words + 16L * pairsMax + 1 + (maps != null ? 36 + 4L * fields : 0) + (normalCache ? 24 : 0);
-      long fixed = (DepthOutlierFilter.enabled(o) ? 4096L * gridCells * cameras : 0) + (maps == null ? pairData : 0);
+      long fixed = (DepthOutlierFilter.enabled(o) ? 4096L * gridCells * mapWindowCameras : 0) + (maps == null ? pairData : 0);
       long left = avail - fixed;
       bandPixels = bandFor(left / 4);
       left -= 3L * bandPixels * EMISSION_BYTES;
@@ -412,7 +462,7 @@ final class ImageFusion {
         int full = 16;
         for (int c = 0; c < cameras; c++)
           full = Math.max(full, Math.ceilDiv(fusion.width(c), 16) * Math.ceilDiv(fusion.height(c), 16));
-        long extra = 4096L * Math.max(0, full - gridCells) * cameras;
+        long extra = 4096L * Math.max(0, full - gridCells) * mapWindowCameras;
         if (extra > 0 && allMapBytes + extra + base + minEmit + worstCamera <= avail) {
           gridCells = full;
           allMapBytes += extra;
@@ -425,7 +475,7 @@ final class ImageFusion {
       // gets what is left. Neither changes any result.
       long headroom = Math.max(0, avail - allMapBytes - working);
       passOneCameras =
-          (int) Math.max(1, Math.min(Math.max(1, o.cores / 2), 1 + headroom / 2 / Math.max(1, worstCamera)));
+          window != null ? 1 : (int) Math.max(1, Math.min(Math.max(1, o.cores / 2), 1 + headroom / 2 / Math.max(1, worstCamera)));
       cacheLimit = Math.max(0, Math.min(requestedCache, headroom - (passOneCameras - 1) * worstCamera));
       workingBytes = working;
     } else {
@@ -463,6 +513,11 @@ final class ImageFusion {
         speckleWork + 1048575 >> 20, speckleThreads);
     speckleBudget = speckleLimit;
     System.out.println(plan);
+    if (window != null)
+      System.out.printf(Locale.ROOT, "Image fusion overlap window: %d/%d cameras; peak planned maps %,d MiB%n",
+          mapWindowCameras, cameras, allMapBytes >> 20);
+    plannedMapPeakBytes = allMapBytes;
+    if (window != null) allMapBytes = 0;
     compact = new Raster[cameras];
     neighbours = new int[cameras][];
     used = new Bits[cameras];
@@ -501,10 +556,16 @@ final class ImageFusion {
       c.memory = Json.object(
           "plan", f.plan, "map_loads", f.mapLoads, "map_evictions", f.mapEvictions,
           "spill_bytes_written", f.spillWritten, "spill_bytes_read", f.spillRead,
-          "strip_rows", f.stripRows, "mapped_bytes", f.tileFiles == null ? 0 : f.tileFiles.mappedBytes());
+          "strip_rows", f.stripRows, "mapped_bytes", f.tileMappedBytes,
+          "early_map_deletion", f.earlyDelete, "retired_cameras", f.retiredCameras,
+          "retired_map_bytes", f.retiredMapBytes, "remaining_map_bytes", f.allMapBytes,
+          "remaining_resident_bytes", f.residentBytes,
+          "last_map_use", f.lastUse, "planned_peak_map_bytes", f.plannedMapPeakBytes,
+          "peak_live_map_bytes", f.peakLiveMapBytes, "peak_live_cameras", f.peakLiveCameras,
+          "peak_resident_bytes", f.peakResidentBytes, "window", f.window == null ? null : f.window.report());
       if (f.tiled)
         System.out.printf(Locale.ROOT, "Image fusion in strips of %,d rows: %,d MiB of memory-mapped maps%n",
-            f.stripRows, f.tileFiles == null ? 0 : f.tileFiles.mappedBytes() >> 20);
+            f.stripRows, f.tileMappedBytes >> 20);
       else if (f.spillDirectory != null)
         System.out.printf(Locale.ROOT, "Image fusion depth maps on disk: %,d loads, %,d evictions, %,d MiB written, %,d MiB read%n",
             f.mapLoads, f.mapEvictions, f.spillWritten >> 20, f.spillRead >> 20);
@@ -512,7 +573,8 @@ final class ImageFusion {
     } finally {
       f.pairCache.clear();
       f.readBuffer = null;
-      f.pool.shutdown();
+      stopWorkers(f.pool);
+      GpuSpikeFilter.close();
       f.deleteSpill();
     }
   }
@@ -544,10 +606,16 @@ final class ImageFusion {
     compactWeight[c] = weight;
     localBest[c] = best;
     hasMap[c] = true;
+    liveMapBytes += mapBytes(c);
+    liveCameras++;
+    peakLiveMapBytes = Math.max(peakLiveMapBytes, liveMapBytes);
+    peakLiveCameras = Math.max(peakLiveCameras, liveCameras);
+    if (window != null) allMapBytes += mapBytes(c);
     // Strips: every map is a memory-mapped file; nothing is resident on the heap.
     if (tiled) return;
     resident.put(c, mapBytes(c));
     residentBytes += mapBytes(c);
+    peakResidentBytes = Math.max(peakResidentBytes, residentBytes);
     evictBeyond(mapBudget, Set.of(c));
   }
 
@@ -572,6 +640,40 @@ final class ImageFusion {
       else load(j);
     }
     evictBeyond(mapBudget, needed);
+  }
+
+  /**
+   * Last camera in pass-2 order that can touch each camera's maps or marks. Edges are directed:
+   * c reads c and neighbours[c], markUsed writes only those neighbours, and emittedNear reads
+   * only earlier neighbours. The own-camera entry also covers re-merge, normals and local sigma.
+   * With precision tiers this schedule applies only after the final tier.
+   */
+  static int[] lastMapUse(int[][] neighbours) {
+    int[] last = IntStream.range(0, neighbours.length).toArray();
+    for (int c = 0; c < neighbours.length; c++)
+      for (int j : neighbours[c]) last[j] = Math.max(last[j], c);
+    return last;
+  }
+
+  /** No later cross-check or mark update can access c. Pending output owns values, not maps. */
+  private void releaseCamera(int c) throws IOException {
+    if (!hasMap[c]) return;
+    MappedFiles owner = tileFiles.remove(c);
+    if (owner != null) owner.close();
+    compact[c] = compactWeight[c] = localBest[c] = null;
+    used[c] = emitted[c] = null;
+    if (surfaceContext != null) surfaceContext[c] = null;
+    Long bytes = resident.remove(c);
+    if (bytes != null) residentBytes -= bytes;
+    if (spillDirectory != null) deleteCameraSpill(c);
+    if (maps != null) maps.finishedCamera(c);
+    hasMap[c] = false;
+    spilledMaps[c] = false;
+    retiredMapBytes += mapBytes(c);
+    allMapBytes -= mapBytes(c);
+    liveMapBytes -= mapBytes(c);
+    liveCameras--;
+    retiredCameras++;
   }
 
   /** Spilled mode needs one camera plus all of its overlapping cameras resident at once. */
@@ -663,6 +765,7 @@ final class ImageFusion {
     grid(j);
     resident.put(j, mapBytes(j));
     residentBytes += mapBytes(j);
+    peakResidentBytes = Math.max(peakResidentBytes, residentBytes);
     mapLoads++;
   }
 
@@ -733,8 +836,9 @@ final class ImageFusion {
 
   /** A new zero map file of camera c, memory-mapped read-write. */
   private java.lang.foreign.MemorySegment tileMap(int c, String kind, long bytes) throws IOException {
-    if (tileFiles == null) tileFiles = new MappedFiles();
-    return tileFiles.create(tileFile(c, kind), bytes);
+    var segment = tileFiles.computeIfAbsent(c, k -> new MappedFiles()).create(tileFile(c, kind), bytes);
+    tileMappedBytes += bytes;
+    return segment;
   }
 
   /** used/emitted marks of camera j, created on first use (memory-mapped in strips). */
@@ -743,22 +847,48 @@ final class ImageFusion {
     return tiled ? new Bits(tileMap(j, kind, 8 * words)) : new Bits(new long[(int) words]);
   }
 
+  private void deleteCameraSpill(int c) throws IOException {
+    IOException failure = null;
+    List<Path> files = new ArrayList<>(List.of(mapFile(c), bitsFile(c)));
+    for (String kind : TILE_KINDS) files.add(tileFile(c, kind));
+    for (Path file : files)
+      try {
+        Files.deleteIfExists(file);
+      } catch (IOException e) {
+        if (failure == null) failure = e;
+        else failure.addSuppressed(e);
+      }
+    if (failure != null) throw failure;
+  }
+
   private void deleteSpill() {
-    if (tileFiles != null) tileFiles.close();
-    tileFiles = null;
+    for (MappedFiles owner : tileFiles.values()) owner.close();
+    tileFiles.clear();
     if (spillDirectory == null || !Files.isDirectory(spillDirectory)) return;
     for (int c = 0; c < cameras; c++)
       try {
-        Files.deleteIfExists(mapFile(c));
-        Files.deleteIfExists(bitsFile(c));
-        for (String kind : TILE_KINDS) Files.deleteIfExists(tileFile(c, kind));
-      } catch (IOException ignored) {
-        // Temporary files; a later run overwrites them.
+        deleteCameraSpill(c);
+      } catch (IOException cleanup) {
+        System.err.println("Warning: could not delete fusion maps for camera " + c + ": " + cleanup);
       }
     try {
       Files.deleteIfExists(spillDirectory);
     } catch (IOException ignored) {
     }
+  }
+
+  /** Finish workers before unmapping/deleting files they may still access after interruption. */
+  private static void stopWorkers(ExecutorService workers) {
+    workers.shutdownNow();
+    boolean interrupted = false;
+    for (;;) {
+      try {
+        if (workers.awaitTermination(1, TimeUnit.SECONDS)) break;
+      } catch (InterruptedException e) {
+        interrupted = true;
+      }
+    }
+    if (interrupted) Thread.currentThread().interrupt();
   }
 
   private void parallel(int n, java.util.function.IntConsumer action) {
@@ -934,21 +1064,88 @@ final class ImageFusion {
     return 1 / Math.max(1e-20, sigma * sigma);
   }
 
+  private Counters passOneCamera(FileChannel channel, int camera, long[] times,
+      double[][] samples, Counters counters) throws IOException {
+    Counters own = new Counters();
+    if (tiled) {
+      passOneTiled(channel, camera, own, times, samples, counters);
+      return own;
+    }
+    int h = fusion.height(camera);
+    long clock = System.nanoTime();
+    Splat[] splats = splat(channel, camera, false, counters, 0, h);
+    times[0] = System.nanoTime() - clock;
+    clock = System.nanoTime();
+    Merged m = merge(camera, splats, own, 0, h, 0, h);
+    times[1] = System.nanoTime() - clock;
+    clock = System.nanoTime();
+    own.spikes += spikes(m, fusion.camera(camera), 0, h);
+    long componentClock = System.nanoTime();
+    own.speckle += speckles(m, fusion.camera(camera));
+    times[3] = System.nanoTime() - componentClock;
+    if (o.fusionDepthOutliers) own.depthOutliers += depthOutliers(m.z);
+    times[2] = System.nanoTime() - clock;
+    for (float z : m.z) if (z > 0) own.pixels++;
+    samples[camera] = sample(camera, m, splats);
+    // Diagnostic (-Dsgm.dumpMergedMaps=true): the filtered pass-1 merged depth map, for
+    // comparisons with other depth-map methods. Writes files only; results unchanged.
+    if (Boolean.getBoolean("sgm.dumpMergedMaps"))
+      DepthMapFile.write(
+          o.output.resolve("06_fusion/merged_maps/camera_" + camera + ".depth"),
+          fusion.camera(camera), fusion.width(camera), fusion.height(camera), m.z);
+    admit(camera, new Raster(m.z), storeWeights ? new Raster(m.wsum) : null,
+        localSigma > 0 ? new Raster(localMinimumSigma(m.z, m.wsum, m.w, m.h, 4)) : null);
+    return own;
+  }
+
+  private void ensurePassOne(FileChannel channel, int c, Counters[] perCamera, long[][] times,
+      double[][] samples, Counters counters) throws IOException {
+    if (perCamera[c] != null || !window.eligible[c]) return;
+    window.prepare(c);
+    window.fusionStarting();
+    perCamera[c] = passOneCamera(channel, c, times[c], samples, counters);
+    preparedCameras++;
+    grid(c);
+    neighbours[c] = overlapping(c, samples);
+    for (int j : neighbours[c])
+      if (Arrays.binarySearch(window.graph.possible[c], j) < 0)
+        throw new IOException("Fusion overlap escaped the conservative window for cameras " + c + " and " + j);
+    // Future cameras initially contribute conservative edges. Once their samples exist, remove
+    // edges the reference overlap test rejected, so a known-finished camera is not kept longer.
+    for (int j : window.graph.possible[c])
+      if (Arrays.binarySearch(neighbours[c], j) < 0) {
+        remainingReaders.get(j).remove(c);
+        lastUse[j] = remainingReaders.get(j).last();
+      }
+    samples[c] = null;
+  }
+
+  private void retireWindowThrough(int completedCamera) throws IOException {
+    for (int j = 0; j < cameras; j++)
+      if (hasMap[j] && lastUse[j] <= completedCamera) releaseCamera(j);
+  }
+
   private Counters fuse(FusionOutput output, TwoViewConfidence.Diagnostics diagnostics)
       throws IOException {
     Counters counters = new Counters();
     counters.cacheLimitBytes = cacheLimit;
     counters.edgeEnabled=DepthOutlierFilter.enabled(o);
     counters.thinEnabled = o.thinSurfaceFusion();
+    counters.cameraPixels = new long[cameras];
+    counters.cameraValid = new long[cameras];
+    counters.cameraEmitted = new long[cameras];
+    for (int c = 0; c < cameras; c++) counters.cameraPixels[c] = (long) fusion.width(c) * fusion.height(c);
     double[][] samples = new double[cameras][];
     long splatNanos = 0, mergeNanos = 0, speckleNanos = 0, componentNanos = 0;
-    try (FileChannel channel = FileChannel.open(candidates, StandardOpenOption.READ)) {
-      WorkProgress progress = WorkProgress.start("Image fusion cameras", 2L * cameras, "camera passes");
+    try (FileChannel channel = FileChannel.open(candidates, StandardOpenOption.READ);
+        WorkProgress progress = WorkProgress.start(window == null ? "Image fusion cameras" : "Overlap-window fusion",
+            window == null ? 2L * cameras : (1L + tierCount) * (window.planningStarts.length - 1), "camera passes")) {
       // Pass 1: filtered merged depth per camera, plus sample points for overlap detection. A
       // camera's pass 1 reads only its own pairs and writes only its own maps, so several cameras
       // run at once (bounded by heap; see passOneCameras). Counts are added in camera order.
       long[][] times = new long[cameras][4];
       Counters[] perCamera = new Counters[cameras];
+      if (window == null) {
       int concurrent = Math.max(1, Math.min(passOneCameras, cameras));
       ExecutorService cameraWorkers =
           concurrent > 1
@@ -967,37 +1164,7 @@ final class ImageFusion {
           final int camera = c;
           Callable<Void> task =
               () -> {
-                Counters own = new Counters();
-                if (tiled) {
-                  passOneTiled(channel, camera, own, times[camera], samples, counters);
-                  perCamera[camera] = own;
-                  return null;
-                }
-                int h = fusion.height(camera);
-                long clock = System.nanoTime();
-                Splat[] splats = splat(channel, camera, false, counters, 0, h);
-                times[camera][0] = System.nanoTime() - clock;
-                clock = System.nanoTime();
-                Merged m = merge(camera, splats, own, 0, h, 0, h);
-                times[camera][1] = System.nanoTime() - clock;
-                clock = System.nanoTime();
-                own.spikes += spikes(m, fusion.camera(camera), 0, h);
-                long componentClock = System.nanoTime();
-                own.speckle += speckles(m, fusion.camera(camera));
-                times[camera][3] = System.nanoTime() - componentClock;
-                if (o.fusionDepthOutliers) own.depthOutliers += depthOutliers(m.z);
-                times[camera][2] = System.nanoTime() - clock;
-                for (float z : m.z) if (z > 0) own.pixels++;
-                samples[camera] = sample(camera, m, splats);
-                // Diagnostic (-Dsgm.dumpMergedMaps=true): the filtered pass-1 merged depth map, for
-                // comparisons with other depth-map methods. Writes files only; results unchanged.
-                if (Boolean.getBoolean("sgm.dumpMergedMaps"))
-                  DepthMapFile.write(
-                      o.output.resolve("06_fusion/merged_maps/camera_" + camera + ".depth"),
-                      fusion.camera(camera), fusion.width(camera), fusion.height(camera), m.z);
-                admit(camera, new Raster(m.z), storeWeights ? new Raster(m.wsum) : null,
-                    localSigma > 0 ? new Raster(localMinimumSigma(m.z, m.wsum, m.w, m.h, 4)) : null);
-                perCamera[camera] = own;
+                perCamera[camera] = passOneCamera(channel, camera, times[camera], samples, counters);
                 return null;
               };
           if (cameraWorkers == null) {
@@ -1027,32 +1194,31 @@ final class ImageFusion {
           progress.update(++finished);
         }
       } finally {
-        if (cameraWorkers != null) cameraWorkers.shutdownNow();
+        if (cameraWorkers != null) stopWorkers(cameraWorkers);
         GpuSpikeFilter.close();
       }
-      for (int c = 0; c < cameras; c++) {
-        if (perCamera[c] == null) continue;
-        counters.ambiguousKept += perCamera[c].ambiguousKept;
-        counters.spikes += perCamera[c].spikes;
-        counters.speckle += perCamera[c].speckle;
-        counters.depthOutliers += perCamera[c].depthOutliers;
-        counters.pixels += perCamera[c].pixels;
-        splatNanos += times[c][0];
-        mergeNanos += times[c][1];
-        speckleNanos += times[c][2];
-        componentNanos += times[c][3];
       }
-      RunTelemetry.recordTotal("Image fusion: pass 1 splats (pair reads)", splatNanos, cameras);
-      RunTelemetry.recordTotal("Image fusion: pass 1 per-camera merge", mergeNanos, cameras);
-      // Spike filter, speckle filter and depth sanity together; then the speckle filter alone.
-      RunTelemetry.recordTotal("Image fusion: pass 1 2D speckle filter", speckleNanos, cameras);
-      RunTelemetry.recordTotal("Image fusion: pass 1 speckle components (within the filter time)", componentNanos, cameras);
-      RunTelemetry.recordTotal("Image fusion: pass 1 spike filter (within the filter time)", spikeNanos.get(), cameras);
       long clock = System.nanoTime();
       if (DepthOutlierFilter.enabled(o)) surfaceContext = new SurfacePatchGrid[cameras];
-      for (int c = 0; c < cameras; c++) if (compact[c] != null) grid(c);
-      for (int c = 0; c < cameras; c++) neighbours[c] = overlapping(c, samples);
-      checkWorkingSet();
+      if (window == null) {
+        for (int c = 0; c < cameras; c++) if (compact[c] != null) grid(c);
+        for (int c = 0; c < cameras; c++) neighbours[c] = overlapping(c, samples);
+      }
+      List<List<Integer>> finishedAfter = new ArrayList<>();
+      for (int c = 0; c < cameras; c++) finishedAfter.add(new ArrayList<>());
+      lastUse = window == null ? lastMapUse(neighbours) : window.graph.last.clone();
+      if (window != null) {
+        remainingReaders = new ArrayList<>();
+        for (int j = 0; j < cameras; j++) remainingReaders.add(new TreeSet<>(Set.of(j)));
+        for (int c = 0; c < cameras; c++)
+          for (int j : window.graph.possible[c]) remainingReaders.get(j).add(c);
+      }
+      for (int c = 0; c < cameras; c++) finishedAfter.get(lastUse[c]).add(c);
+      // Skipped cameras never materialised their planned maps.
+      if (window == null) {
+        for (int c = 0; c < cameras; c++) if (!hasMap[c]) allMapBytes -= mapBytes(c);
+        checkWorkingSet();
+      }
       RunTelemetry.record("Image fusion: camera overlap", clock);
       long remergeNanos = 0, checkNanos = 0, outputNanos = 0, outputWaitNanos = 0;
       // Pass 2: re-merge one camera at a time (identical), cross-check, own and emit, in row bands.
@@ -1075,8 +1241,20 @@ final class ImageFusion {
       try {
       for (int tier = 0; tier < tierCount; tier++)
       for (int c = 0; c < cameras; c++) {
-        progress.update(cameras + c);
-        if (!hasMap[c]) continue;
+        progress.update(window == null ? cameras + c : preparedCameras + passTwoCameras);
+        if (window != null && window.eligible[c]) {
+          ensurePassOne(channel, c, perCamera, times, samples, counters);
+          for (int j : neighbours[c]) ensurePassOne(channel, j, perCamera, times, samples, counters);
+          window.beforePassTwo(c, start);
+          progress.update(preparedCameras + passTwoCameras);
+          if (earlyDelete && tier == tierCount - 1) retireWindowThrough(c - 1);
+        }
+        if (!hasMap[c]) {
+          if (earlyDelete && tier == tierCount - 1)
+            if (window == null) { for (int j : finishedAfter.get(c)) releaseCamera(j); }
+            else retireWindowThrough(c);
+          continue;
+        }
         residentFor(c);
         // The whole image at once, or (fusion in strips) strip by strip with a halo covering the
         // normal fits (+-12 rows) and the merge's 3x3 search. Bands and strips never change results.
@@ -1103,6 +1281,8 @@ final class ImageFusion {
                 if (e == null || !e.result.accepted()) continue;
                 if (e.result.shift > 1e-8) counters.refined++;
                 counters.emitted++;
+                counters.cameraEmitted[c]++;
+                counters.viewHistogram[Math.max(0, Math.min(Counters.VIEW_BUCKETS - 1, e.result.views))]++;
                 if (e.agreements() != null && o.fusionStrategy.equals("graph-average")) {
                   // Members were averaged into this point: exactly those pixels are used.
                   markUsed(e, 0);
@@ -1133,11 +1313,34 @@ final class ImageFusion {
                   }));
         }
         }
+        if (earlyDelete && tier == tierCount - 1)
+          if (window == null) { for (int j : finishedAfter.get(c)) releaseCamera(j); }
+          else retireWindowThrough(c);
+        if (window != null) progress.update(preparedCameras + ++passTwoCameras);
       }
       while (!pending.isEmpty()) outputNanos += awaitOutput(pending.poll());
       } finally {
-        writer.shutdownNow();
+        stopWorkers(writer);
       }
+      for (int c = 0; c < cameras; c++) {
+        if (perCamera[c] == null) continue;
+        counters.ambiguousKept += perCamera[c].ambiguousKept;
+        counters.spikes += perCamera[c].spikes;
+        counters.speckle += perCamera[c].speckle;
+        counters.depthOutliers += perCamera[c].depthOutliers;
+        counters.pixels += perCamera[c].pixels;
+        counters.cameraValid[c] = perCamera[c].pixels;
+        splatNanos += times[c][0];
+        mergeNanos += times[c][1];
+        speckleNanos += times[c][2];
+        componentNanos += times[c][3];
+      }
+      RunTelemetry.recordTotal("Image fusion: pass 1 splats (pair reads)", splatNanos, cameras);
+      RunTelemetry.recordTotal("Image fusion: pass 1 per-camera merge", mergeNanos, cameras);
+      // Spike filter, speckle filter and depth sanity together; then the speckle filter alone.
+      RunTelemetry.recordTotal("Image fusion: pass 1 2D speckle filter", speckleNanos, cameras);
+      RunTelemetry.recordTotal("Image fusion: pass 1 speckle components (within the filter time)", componentNanos, cameras);
+      RunTelemetry.recordTotal("Image fusion: pass 1 spike filter (within the filter time)", spikeNanos.get(), cameras);
       RunTelemetry.recordTotal("Image fusion: pass 2 pair reads and re-merge", remergeNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: cross-check, ownership, normals", checkNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: candidate output staging", outputNanos, cameras);
@@ -1370,7 +1573,7 @@ final class ImageFusion {
     int n = samples[c].length / 3;
     List<Integer> out = new ArrayList<>();
     for (int j = 0; j < cameras; j++) {
-      if (j == c || !hasMap[j]) continue;
+      if (j == c || (window == null ? !hasMap[j] : !window.eligible[j])) continue;
       Camera other = fusion.camera(j);
       int inside = 0;
       for (int i = 0; i < n; i++) {

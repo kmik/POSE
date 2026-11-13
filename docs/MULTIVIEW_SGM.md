@@ -219,6 +219,7 @@ so default run settings and reports are unchanged; recorded in `05_stereo/mvsgm/
 | option | default | meaning |
 |---|---:|---|
 | `--mvsgm-neighbors N` | 6 | neighbour cameras per reference camera (1..8) |
+| `--mvsgm-optimal-neighbors` | off | experimental: keep the strongest neighbour, then favour complementary coverage and baseline directions |
 | `--mvsgm-best-k K` | 3 | mean of the K lowest neighbour costs per pixel and label |
 | `--mvsgm-census-window W` | 5 | census window (3, 5, 7) |
 | `--mvsgm-levels N` | -1 | coarse-to-fine levels (-1 = `--tsgm-levels`; 0 = full range) |

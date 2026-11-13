@@ -44,20 +44,8 @@ final class OverlapSelection {
     for (int[] pair : pairs) {
       Estimate e =
           estimate(c[pair[0]], w[pair[0]], h[pair[0]], c[pair[1]], w[pair[1]], h[pair[1]], plane);
-      boolean unknown =
-          !Double.isFinite(e.area)
-              || (o.minForwardOverlap > 0 || o.minSideOverlap > 0) && !Double.isFinite(e.forward);
-      String reason =
-          unknown
-              ? "unknown_" + o.overlapUnknown
-              : e.area + 1e-8 < o.minPairOverlap
-                  ? "shared_area_below_minimum"
-                  : e.forward + 1e-8 < o.minForwardOverlap
-                      ? "forward_overlap_below_minimum"
-                      : e.side + 1e-8 < o.minSideOverlap
-                          ? "side_overlap_below_minimum"
-                          : "accepted";
-      boolean accept = reason.equals("accepted") || reason.equals("unknown_keep");
+      String reason = decision(e, o);
+      boolean accept = accepted(e, o);
       if (accept) selected.add(pair);
       report.add(
           Json.object(
@@ -120,6 +108,28 @@ final class OverlapSelection {
         pairs.size(),
         stage);
     return selected;
+  }
+
+  static boolean accepted(Estimate e, Options o) {
+    String reason = decision(e, o);
+    return reason.equals("accepted") || reason.equals("unknown_keep");
+  }
+
+  static String decision(Estimate e, Options o) {
+    boolean unknown =
+        !Double.isFinite(e.area)
+          || (o.minForwardOverlap > 0 || o.minSideOverlap > 0) && !Double.isFinite(e.forward);
+    String reason =
+        unknown
+          ? "unknown_" + o.overlapUnknown
+          : e.area + 1e-8 < o.minPairOverlap
+            ? "shared_area_below_minimum"
+            : e.forward + 1e-8 < o.minForwardOverlap
+                ? "forward_overlap_below_minimum"
+                : e.side + 1e-8 < o.minSideOverlap
+                  ? "side_overlap_below_minimum"
+                  : "accepted";
+    return reason;
   }
 
   static Plane plane(Camera[] cameras, List<double[]> points, Options o) {

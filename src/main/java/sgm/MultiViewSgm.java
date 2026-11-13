@@ -36,6 +36,7 @@ final class MultiViewSgm {
   final boolean bilinear;
   final double labelPixels;
   final int maxLabels;
+  final Map<Integer, Object> neighborSelectionReports = new ConcurrentHashMap<>();
 
   MultiViewSgm(Options o) {
     this.o = o;
@@ -104,6 +105,11 @@ final class MultiViewSgm {
 
   static boolean usable(Camera camera) {
     return camera.registered && !camera.denseExcluded;
+  }
+
+  private void annotateNeighborSelection(int camera, Map<String, Object> report) {
+    if (o.mvsgmOptimalNeighbors)
+      report.put("neighbor_selection", neighborSelectionReports.get(camera));
   }
 
   /** The inverse-depth labels of a reference camera: q(l) = low + l * step. */
@@ -176,21 +182,33 @@ final class MultiViewSgm {
 
   /** A reference image: census, textured-and-valid mask. */
   static final class Reference {
-    final int w, h;
+    final int w, h, window;
     final byte[] gray, valid;
-    final long[] census;
+    volatile long[] census;
+    final boolean deferredCensus;
     final boolean[] use;
 
     Reference(int w, int h, byte[] gray, byte[] valid, int window) {
+      this(w, h, gray, valid, window, false);
+    }
+
+    Reference(int w, int h, byte[] gray, byte[] valid, int window, boolean defer) {
       this.w = w;
       this.h = h;
+      this.window = window;
+      deferredCensus = defer;
       this.gray = gray;
       this.valid = valid;
-      census = CensusSgm.census(gray, w, h, window)[0];
+      if (!defer) census = CensusSgm.census(gray, w, h, window)[0];
       boolean[] textured = CensusSgm.textureMask(gray, w, h, window);
       boolean[] whole = windowValid(valid, w, h, window / 2);
       use = new boolean[w * h];
       for (int p = 0; p < use.length; p++) use[p] = textured[p] && whole[p];
+    }
+
+    synchronized long[] cpuCensus() {
+      if (census == null) census = CensusSgm.census(gray, w, h, window)[0];
+      return census;
     }
   }
 
@@ -199,14 +217,20 @@ final class MultiViewSgm {
    * centre, on a canvas whose pixel (0,0) is virtual pixel (x0, y0). shift = K_c t'.
    */
   static final class Warped {
-    final int id, x0, y0, w, h;
+    final int id, x0, y0, w, h, window;
     final double[] shift;
-    final long[] census;
+    volatile long[] census;
+    final boolean deferredCensus;
     final boolean[] valid;
     // Resampled gray and its validity before the census-window erosion (for coarser levels).
     final byte[] gray, raw;
 
     Warped(int id, int x0, int y0, int w, int h, double[] shift, long[] census, boolean[] valid, byte[] gray, byte[] raw) {
+      this(id, x0, y0, w, h, shift, census, valid, gray, raw, 5, false);
+    }
+
+    Warped(int id, int x0, int y0, int w, int h, double[] shift, long[] census, boolean[] valid,
+        byte[] gray, byte[] raw, int window, boolean defer) {
       this.id = id;
       this.x0 = x0;
       this.y0 = y0;
@@ -217,6 +241,13 @@ final class MultiViewSgm {
       this.valid = valid;
       this.gray = gray;
       this.raw = raw;
+      this.window = window;
+      deferredCensus = defer;
+    }
+
+    synchronized long[] cpuCensus() {
+      if (census == null) census = CensusSgm.census(gray, w, h, window)[0];
+      return census;
     }
 
     /** The 2x2-downsampled canvas (TsgmSearch.downsample), census recomputed once. */
@@ -224,7 +255,9 @@ final class MultiViewSgm {
       int lw = w / 2, lh = h / 2;
       byte[] g = new byte[lw * lh], v = new byte[lw * lh];
       TsgmSearch.downsample(gray, raw, w, lw, lh, g, v);
-      return new Warped(id, x0, y0, lw, lh, shift, CensusSgm.census(g, lw, lh, window)[0], windowValid(v, lw, lh, window / 2), g, v);
+      return new Warped(id, x0, y0, lw, lh, shift,
+          deferredCensus ? null : CensusSgm.census(g, lw, lh, window)[0],
+          windowValid(v, lw, lh, window / 2), g, v, window, deferredCensus);
     }
   }
 
@@ -236,10 +269,16 @@ final class MultiViewSgm {
 
   static Warped warp(
       Camera ref, int rw, int rh, Labels labels, int id, Camera other, byte[] gray, byte[] mask, int ow, int oh, int window) {
+    return warp(ref, rw, rh, labels, id, other, gray, mask, ow, oh, window, false);
+  }
+
+  static Warped warp(
+      Camera ref, int rw, int rh, Labels labels, int id, Camera other, byte[] gray, byte[] mask,
+      int ow, int oh, int window, boolean defer) {
     int[] canvas = canvas(ref, other, 0, 0, rw, rh, labels, window);
     if ((long) canvas[2] * canvas[3] > 4L * rw * rh)
       throw new IllegalArgumentException("mvsgm: neighbour canvas too large for image ");
-    return warp(ref, other, id, canvas, gray, mask, 0, 0, ow, oh, window);
+    return warp(ref, other, id, canvas, gray, mask, 0, 0, ow, oh, window, defer);
   }
 
   /**
@@ -302,6 +341,12 @@ final class MultiViewSgm {
    */
   static Warped warp(
       Camera ref, Camera other, int id, int[] canvas, byte[] gray, byte[] mask, int gx0, int gy0, int gw, int gh, int window) {
+    return warp(ref, other, id, canvas, gray, mask, gx0, gy0, gw, gh, window, false);
+  }
+
+  static Warped warp(
+      Camera ref, Camera other, int id, int[] canvas, byte[] gray, byte[] mask,
+      int gx0, int gy0, int gw, int gh, int window, boolean defer) {
     double[] s = shift(ref, other);
     int x0 = canvas[0], y0 = canvas[1], w = canvas[2], h = canvas[3];
     double[] hm = homography(ref, other);
@@ -325,9 +370,9 @@ final class MultiViewSgm {
         valid[yy * w + xx] = 1;
       }
     });
-    long[] c = CensusSgm.census(out, w, h, window)[0];
+    long[] c = defer ? null : CensusSgm.census(out, w, h, window)[0];
     boolean[] whole = windowValid(valid, w, h, window / 2);
-    return new Warped(id, x0, y0, w, h, s, c, whole, out, valid);
+    return new Warped(id, x0, y0, w, h, s, c, whole, out, valid, window, defer);
   }
 
   /** Pixels whose whole (2r+1)^2 window is valid (separable erosion). */
@@ -435,8 +480,10 @@ final class MultiViewSgm {
       int b = iy * nb.w + ix;
       if (!nb.valid[b] || !nb.valid[b + 1] || !nb.valid[b + nb.w] || !nb.valid[b + nb.w + 1]) continue;
       float fx = sx - flx, fy = sy - fly;
-      float h00 = Long.bitCount(c ^ nb.census[b]), h10 = Long.bitCount(c ^ nb.census[b + 1]);
-      float h01 = Long.bitCount(c ^ nb.census[b + nb.w]), h11 = Long.bitCount(c ^ nb.census[b + nb.w + 1]);
+      long[] nc = nb.census;
+      if (nc == null) nc = nb.cpuCensus();
+      float h00 = Long.bitCount(c ^ nc[b]), h10 = Long.bitCount(c ^ nc[b + 1]);
+      float h01 = Long.bitCount(c ^ nc[b + nb.w]), h11 = Long.bitCount(c ^ nc[b + nb.w + 1]);
       float top = (1f - fx) * h00 + fx * h10, bottom = (1f - fx) * h01 + fx * h11;
       float hv = (1f - fy) * top + fy * bottom;
       int h = (int) Math.floor(hv * COST_SCALE + .5f);
@@ -509,7 +556,7 @@ final class MultiViewSgm {
       int lw = ref.w / 2, lh = ref.h / 2, f = factor * 2;
       byte[] g = new byte[lw * lh], v = new byte[lw * lh];
       TsgmSearch.downsample(ref.gray, ref.valid, ref.w, lw, lh, g, v);
-      Reference r = new Reference(lw, lh, g, v, window);
+      Reference r = new Reference(lw, lh, g, v, window, ref.deferredCensus);
       Warped[] vs = new Warped[views.length];
       for (int i = 0; i < vs.length; i++) vs[i] = views[i].coarser(window);
       int c = (labels.count() - 1) / f + 1;
@@ -527,8 +574,20 @@ final class MultiViewSgm {
   final Map<Integer, String> skipped = new ConcurrentHashMap<>();
 
   Plan plan(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int c) throws IOException {
+    Plan header = headerPlan(frames, tracks, c);
+    return header == null ? null : preparePlan(frames, header);
+  }
+
+  /** Geometry only: decides map existence and labels before any raster or temporary map exists. */
+  Plan headerPlan(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int c) {
     ImageFrame rf = frames.get(c);
-    List<Neighbor> chosen = neighbours(frames, tracks, c, neighbors);
+    List<Neighbor> chosen;
+    if (o.mvsgmOptimalNeighbors) {
+      var selection = OptimalMvsgmNeighbors.select(frames, tracks, c, neighbors,
+          Math.max(k, o.mvsgmConsistentViews));
+      chosen = selection.neighbors();
+      neighborSelectionReports.put(c, selection.report());
+    } else chosen = neighbours(frames, tracks, c, neighbors);
     if (chosen.isEmpty()) {
       skipped.put(c, "no neighbour camera shares at least 12 sparse tie points with it at a usable angle");
       return null;
@@ -542,14 +601,23 @@ final class MultiViewSgm {
       skipped.put(c, e.getMessage());
       return null;
     }
-    if (tileSize(rf) > 0) return Plan.header(c, chosen, labels);
+    return Plan.header(c, chosen, labels);
+  }
+
+  Plan preparePlan(List<ImageFrame> frames, Plan header) throws IOException {
+    int c = header.camera;
+    ImageFrame rf = frames.get(c);
+    List<Neighbor> chosen = header.neighbours;
+    Labels labels = header.labels;
+    if (tileSize(rf) > 0) return header;
     byte[][] r = rasters(rf);
-    Reference ref = new Reference(rf.width, rf.height, r[0], r[1], census);
+    boolean defer = GpuMvsgmCensus.enabled(o);
+    Reference ref = new Reference(rf.width, rf.height, r[0], r[1], census, defer);
     Warped[] views = new Warped[chosen.size()];
     for (int i = 0; i < views.length; i++) {
       ImageFrame of = frames.get(chosen.get(i).id());
       byte[][] g = rasters(of);
-      views[i] = warp(rf.camera, rf.width, rf.height, labels, of.id, of.camera, g[0], g[1], of.width, of.height, census);
+      views[i] = warp(rf.camera, rf.width, rf.height, labels, of.id, of.camera, g[0], g[1], of.width, of.height, census, defer);
     }
     return new Plan(c, chosen, labels, ref, views);
   }
@@ -575,6 +643,8 @@ final class MultiViewSgm {
   /** Packed costs of the bands (CPU reference). */
   short[] costs(Plan plan, DisparityBands bands) {
     Reference ref = plan.ref;
+    long[] referenceCensus = ref.cpuCensus();
+    for (Warped view : plan.views) view.cpuCensus();
     int w = ref.w, h = ref.h;
     int[] offset = bands.offsets();
     short[] cost = new short[(int) bands.total()];
@@ -585,7 +655,7 @@ final class MultiViewSgm {
         int p = y * w + x, at = offset[p];
         for (int j = 0; j < bands.count[p]; j++)
           cost[at + j] =
-              (short) (ref.use[p] ? cost(ref.census[p], plan.views, plan.table, bands.low[p] + j, x, y, k, pen, each) : INVALID);
+              (short) (ref.use[p] ? cost(referenceCensus[p], plan.views, plan.table, bands.low[p] + j, x, y, k, pen, each) : INVALID);
       }
     });
     return cost;
@@ -763,23 +833,41 @@ final class MultiViewSgm {
   int[] solveLevel(Plan plan, DisparityBands bands, long[] peak) {
     GpuMultiViewSgm.Session[] session = new GpuMultiViewSgm.Session[1];
     try {
-      if (!gpuDisabled && GpuMultiViewSgm.use(o, this, plan, bands))
-        try {
-          long bytes = GpuMultiViewSgm.deviceBytes(this, plan, bands.total());
-          session[0] = new GpuMultiViewSgm.Session(o, this, plan, bytes);
-          peak[0] = Math.max(peak[0], bytes);
-        } catch (RuntimeException e) {
-          if (o.compute.equals("gpu")) throw e;
-          System.out.println("mvsgm: GPU session failed (" + e.getMessage() + "); CPU reference for image " + plan.camera);
-        }
-      if (session[0] == null) {
-        lastBackend = "cpu";
-        return cpuSummary(plan, bands);
-      }
-      return summary(plan, bands, session).clone();
+      return solveLevel(plan, bands, peak, session);
     } finally {
       if (session[0] != null) session[0].close();
     }
+  }
+
+  /** The finest retry retains input buffers when its larger reservation can be acquired now. */
+  private int[] solveLevel(Plan plan, DisparityBands bands, long[] peak, GpuMultiViewSgm.Session[] session) {
+    if (!gpuDisabled && GpuMultiViewSgm.use(o, this, plan, bands)) {
+      try {
+        long bytes = GpuMultiViewSgm.deviceBytes(this, plan, bands.total());
+        if (session[0] != null && (session[0].plan != plan || !session[0].reserve(bytes))) {
+          session[0].close();
+          session[0] = null;
+        }
+        if (session[0] == null) session[0] = new GpuMultiViewSgm.Session(o, this, plan, bytes);
+        peak[0] = Math.max(peak[0], bytes);
+      } catch (RuntimeException e) {
+        if (o.compute.equals("gpu")) throw e;
+        if (session[0] != null) {
+          session[0].close();
+          session[0] = null;
+        }
+        System.out.println("mvsgm: GPU session failed (" + e.getMessage() + "); CPU reference for image " + plan.camera);
+      }
+    } else if (session[0] != null) {
+      session[0].close();
+      session[0] = null;
+    }
+    if (session[0] == null) {
+      if (GpuMvsgmCensus.enabled(o) && plan.ref.census == null) GpuMvsgmCensus.memoryFallback();
+      lastBackend = "cpu";
+      return cpuSummary(plan, bands);
+    }
+    return summary(plan, bands, session).clone();
   }
 
   /**
@@ -813,15 +901,20 @@ final class MultiViewSgm {
         seeded = seed(bands, seeds, p.factor, p.ref.use);
         bands.changed();
       }
-      summary = solveLevel(p, bands, peak);
-      if (l == 0 && parent != null) {
-        long[] touched = new long[1];
-        DisparityBands widened = widen(bands, summary, touched);
-        if (widened != null) {
-          retried = touched[0];
-          bands = widened;
-          summary = solveLevel(p, bands, peak);
+      GpuMultiViewSgm.Session[] session = new GpuMultiViewSgm.Session[1];
+      try {
+        summary = solveLevel(p, bands, peak, session);
+        if (l == 0 && parent != null) {
+          long[] touched = new long[1];
+          DisparityBands widened = widen(bands, summary, touched);
+          if (widened != null) {
+            retried = touched[0];
+            bands = widened;
+            summary = solveLevel(p, bands, peak, session);
+          }
         }
+      } finally {
+        if (session[0] != null) session[0].close();
       }
       report.add(Json.object(
           "factor", p.factor, "width", p.ref.w, "height", p.ref.h, "labels", p.count,
@@ -974,7 +1067,8 @@ final class MultiViewSgm {
         int ex0 = Math.max(0, tx0 - O), ey0 = Math.max(0, ty0 - O), ex1 = Math.min(W, cx1 + O), ey1 = Math.min(H, cy1 + O);
         int ew = ex1 - ex0, eh = ey1 - ey0;
         byte[][] r = region(rf, ex0, ey0, ew, eh);
-        Reference ref = new Reference(ew, eh, r[0], r[1], census);
+        boolean defer = GpuMvsgmCensus.enabled(o);
+        Reference ref = new Reference(ew, eh, r[0], r[1], census, defer);
         if (count(ref.use) == 0) continue;
         Warped[] views = new Warped[header.neighbours.size()];
         for (int i = 0; i < views.length; i++) {
@@ -983,7 +1077,7 @@ final class MultiViewSgm {
           int[] src = sourceRegion(homography(rf.camera, of.camera), cv, of.width, of.height);
           byte[][] g = src == null ? new byte[][] {new byte[4], new byte[4]} : region(of, src[0], src[1], src[2], src[3]);
           if (src == null) src = new int[] {0, 0, 2, 2};
-          views[i] = warp(rf.camera, of.camera, of.id, cv, g[0], g[1], src[0], src[1], src[2], src[3], census);
+          views[i] = warp(rf.camera, of.camera, of.id, cv, g[0], g[1], src[0], src[1], src[2], src[3], census, defer);
         }
         Plan p = new Plan(c, header.neighbours, header.labels, ref, views, ex0, ey0);
         double[] local = new double[seeds.length];
@@ -1006,10 +1100,12 @@ final class MultiViewSgm {
         peak = Math.max(peak, solved.peakDeviceBytes());
         tiles++;
       }
-    return new LinkedHashMap<>(Json.object(
+    Map<String, Object> report = new LinkedHashMap<>(Json.object(
         "tiled", true, "tile_size", T, "tile_overlap", O, "tiles", tiles, "packed_cells", cells,
         "peak_device_bytes", peak, "backend", lastBackend, "valid", valid,
         "neighbours", header.neighbours.stream().map(x -> x.id()).toList()));
+    annotateNeighborSelection(c, report);
+    return report;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1216,6 +1312,13 @@ final class MultiViewSgm {
           "Note: --step " + o.step + " does not thin --dense-method mvsgm depth maps; every consistent"
               + " pixel goes to fusion (sparse samples of a per-camera map are removed as speckles)");
     List<Object> cameraReports;
+    Path dir = o.output.resolve("05_stereo/mvsgm");
+    // Own even partially written phase-1 files: DenseReconstruction closes this hand-off on
+    // failure too. Dense resumes recompute these maps from the saved geometry.
+    handoff = new MvsgmMaps(dir, o.diagnostics || Boolean.getBoolean("sgm.mvsgm.keepMaps"));
+    for (ImageFrame frame : frames)
+      if (usable(frame.camera))
+        handoff.add(new MvsgmMaps.Camera(frame.id, -1, 0, 0, null, false));
     try (GpuMemoryPool.Scope pool =
         o.compute.equals("cpu") ? null : GpuMemoryPool.install(gpuBudget())) {
       cameraReports = depthMaps(frames, tracks, null);
@@ -1227,125 +1330,24 @@ final class MultiViewSgm {
               : "every camera was skipped, e.g. image " + skipped.keySet().iterator().next() + ": "
                   + skipped.values().iterator().next()) + " (05_stereo/mvsgm/mvsgm.json lists each camera)");
     long phase2 = System.nanoTime();
-    Path dir = o.output.resolve("05_stereo/mvsgm");
-    // From here on the maps belong to the hand-off: image fusion reads them directly and they are
-    // deleted after fusion (MvsgmMaps.close), also when anything below fails.
-    handoff = new MvsgmMaps(dir, o.diagnostics || Boolean.getBoolean("sgm.mvsgm.keepMaps"));
-    for (CameraInfo ci : info.values()) handoff.add(new MvsgmMaps.Camera(ci.camera(), -1, 0, 0, null, ci.tiled()));
     long count = 0, considered = 0, kept = 0, inconsistent = 0;
     int minViews = o.mvsgmConsistentViews;
     double tolerance = o.mvsgmConsistencyLabels;
     // Depth maps are memory-mapped (never read whole into the heap): the camera's own map and its
     // neighbours' maps, read where the reprojections fall. Colours are copied in row bands.
-    try (WorkProgress progress = WorkProgress.start("Multi-view consistency", info.size(), "cameras");
-        MappedFiles mapped = new MappedFiles()) {
+    try (WorkProgress progress = WorkProgress.start("Multi-view consistency", info.size(), "cameras")) {
       int done = 0;
       for (CameraInfo ci : info.values()) {
         progress.update(done++);
         int c = ci.camera();
-        ImageFrame rf = frames.get(c);
         int pair = fusion.addPair(c, ci.neighbours()[0]);
         fusion.markSingleView(pair);
         while (pairStarts.size() <= pair) pairStarts.add(count);
-        int w = rf.width, h = rf.height;
-        long bytes = 4L * w * h;
-        java.lang.foreign.MemorySegment z = mapped.map(dir.resolve("camera_" + c + ".depth"), DepthMapFile.HEADER, bytes, false);
-        java.lang.foreign.MemorySegment[] others = new java.lang.foreign.MemorySegment[ci.neighbours().length];
-        for (int i = 0; i < others.length; i++) {
-          CameraInfo oi = info.get(ci.neighbours()[i]);
-          if (oi != null) {
-            ImageFrame of = frames.get(oi.camera());
-            others[i] = mapped.map(dir.resolve("camera_" + oi.camera() + ".depth"), DepthMapFile.HEADER, 4L * of.width * of.height, false);
-          }
-        }
-        Path lrFile = dir.resolve("camera_" + c + ".lr"), rgbFile = dir.resolve("camera_" + c + ".rgb");
-        DepthMapFile.create(lrFile, rf.camera, w, h);
-        DepthMapFile.create(rgbFile, rf.camera, w, h);
-        java.lang.foreign.MemorySegment lr = mapped.map(lrFile, DepthMapFile.HEADER, bytes, true);
-        java.lang.foreign.MemorySegment rgb = mapped.map(rgbFile, DepthMapFile.HEADER, bytes, true);
-        Camera cam = rf.camera;
-        double[] rt = Math3.transpose(cam.rotation);
-        // lr = best agreement in labels; NaN = no depth or rejected (fewer than minViews agreeing
-        // neighbours). A candidate is a pixel with depth > 0 and lr not NaN.
-        long[] rows = new long[2 * h];
-        parallel(h, y -> {
-          double[] v = new double[3];
-          for (int x = 0; x < w; x++) {
-            int p = y * w + x;
-            float zp = z.getAtIndex(MappedFiles.FLOAT, p);
-            if (zp <= 0) {
-              lr.setAtIndex(MappedFiles.FLOAT, p, Float.NaN);
-              continue;
-            }
-            rows[2 * y]++;
-            double[] X = world(cam, rt, x, y, zp);
-            int agree = 0;
-            double best = Double.POSITIVE_INFINITY;
-            for (int i = 0; i < others.length && minViews > 0; i++) {
-              CameraInfo oi = info.get(ci.neighbours()[i]);
-              if (oi == null || others[i] == null) continue;
-              ImageFrame of = frames.get(oi.camera());
-              of.camera.viewInto(X[0], X[1], X[2], v);
-              if (v[2] <= 0) continue;
-              int u = (int) Math.round(of.camera.fx * v[0] / v[2] + of.camera.cx),
-                  t = (int) Math.round(of.camera.fy * v[1] / v[2] + of.camera.cy);
-              if (u < 0 || t < 0 || u >= of.width || t >= of.height) continue;
-              float d = others[i].getAtIndex(MappedFiles.FLOAT, (long) t * of.width + u);
-              if (d <= 0) continue;
-              double labelsOff = Math.abs(1 / v[2] - 1 / (double) d) / oi.step();
-              if (labelsOff <= tolerance) {
-                agree++;
-                best = Math.min(best, labelsOff);
-              }
-            }
-            if (agree >= minViews) {
-              lr.setAtIndex(MappedFiles.FLOAT, p, minViews == 0 ? 0 : (float) best);
-              rows[2 * y + 1]++;
-            } else lr.setAtIndex(MappedFiles.FLOAT, p, Float.NaN);
-          }
-        });
-        long camConsidered = 0, camKept = 0;
-        long[] rowStart = new long[h + 1];
-        for (int y = 0; y < h; y++) {
-          camConsidered += rows[2 * y];
-          camKept += rows[2 * y + 1];
-          rowStart[y + 1] = camKept;
-        }
-        considered += camConsidered;
-        kept += camKept;
-        inconsistent += camConsidered - camKept;
-        // Packed colour r << 16 | g << 8 | b (as fusion stores it), copied in bands of rows.
-        int band = Math.max(1, (1 << 22) / Math.max(1, w));
-        for (int y0 = 0; y0 < h; y0 += band) {
-          int y1 = Math.min(h, y0 + band);
-          byte[] colors;
-          synchronized (RasterCache.class) {
-            RasterCache.pair(rf, rf);
-            org.opencv.core.Mat sub = rf.color.submat(y0, y1, 0, w).clone();
-            try {
-              colors = bytes(sub);
-            } finally {
-              sub.release();
-            }
-          }
-          long base = (long) y0 * w;
-          for (int i = 0; i < (y1 - y0) * w; i++)
-            rgb.setAtIndex(MappedFiles.INT, base + i,
-                (colors[i * 3 + 2] & 255) << 16 | (colors[i * 3 + 1] & 255) << 8 | colors[i * 3] & 255);
-        }
-        // Every consistent pixel goes to fusion: the maps are dense per camera, and a thinned
-        // (--step > 1) map falls apart in fusion's 4-connected speckle filter.
-        handoff.add(new MvsgmMaps.Camera(c, pair, w, h, rowStart, ci.tiled()));
-        count += camKept;
-        if (exportImages() && ci.tiled()) exportDepthStreamed(rf, "consistent_depth", z, lr, ci.near(), ci.far());
-        else if (exportImages()) {
-          float[] zz = DepthMapFile.read(dir.resolve("camera_" + c + ".depth")).z();
-          float[] ll = new float[w * h];
-          java.lang.foreign.MemorySegment.copy(lr, MappedFiles.FLOAT, 0, ll, 0, w * h);
-          exportDepth(rf, "consistent_depth", zz, ll, ci.near(), ci.far());
-        }
-        System.out.printf(Locale.ROOT, "mvsgm image %d: %,d of %,d depths consistent with %d+ neighbour maps%n",
-            c, camKept, camConsidered, minViews);
+        Consistency result = consistentCamera(frames, ci, pair);
+        considered += result.considered();
+        kept += result.kept();
+        inconsistent += result.considered() - result.kept();
+        count += result.kept();
       }
       progress.done();
     }
@@ -1359,6 +1361,114 @@ final class MultiViewSgm {
         "levels", levels(), "consistency", phaseTwo, "cameras", cameraReports));
     System.out.printf(Locale.ROOT, "mvsgm: %,d of %,d depths consistent; %,d candidates (maps handed to fusion)%n", kept, considered, count);
     return count;
+  }
+
+  record Consistency(long considered, long kept) {}
+
+  /** Reads raw neighbours only; no neighbour's consistency or fusion result is an input. */
+  Consistency consistentCamera(List<ImageFrame> frames, CameraInfo ci, int pair) throws IOException {
+    int c = ci.camera(), minViews = o.mvsgmConsistentViews;
+    double tolerance = o.mvsgmConsistencyLabels;
+    Path dir = o.output.resolve("05_stereo/mvsgm");
+    try (MappedFiles mapped = new MappedFiles()) {
+      ImageFrame rf = frames.get(c);
+      int w = rf.width, h = rf.height;
+      long bytes = 4L * w * h;
+      java.lang.foreign.MemorySegment z = mapped.map(dir.resolve("camera_" + c + ".depth"), DepthMapFile.HEADER, bytes, false);
+      java.lang.foreign.MemorySegment[] others = new java.lang.foreign.MemorySegment[ci.neighbours().length];
+      for (int i = 0; i < others.length; i++) {
+        CameraInfo oi = info.get(ci.neighbours()[i]);
+        if (oi != null) {
+          ImageFrame of = frames.get(oi.camera());
+          others[i] = mapped.map(dir.resolve("camera_" + oi.camera() + ".depth"), DepthMapFile.HEADER, 4L * of.width * of.height, false);
+        }
+      }
+      Path lrFile = dir.resolve("camera_" + c + ".lr"), rgbFile = dir.resolve("camera_" + c + ".rgb");
+      DepthMapFile.create(lrFile, rf.camera, w, h);
+      DepthMapFile.create(rgbFile, rf.camera, w, h);
+      java.lang.foreign.MemorySegment lr = mapped.map(lrFile, DepthMapFile.HEADER, bytes, true);
+      java.lang.foreign.MemorySegment rgb = mapped.map(rgbFile, DepthMapFile.HEADER, bytes, true);
+      Camera cam = rf.camera;
+      double[] rt = Math3.transpose(cam.rotation);
+      // lr = best agreement in labels; NaN = no depth or rejected (fewer than minViews agreeing
+      // neighbours). A candidate is a pixel with depth > 0 and lr not NaN.
+      long[] rows = new long[2 * h];
+      parallel(h, y -> {
+        double[] v = new double[3];
+        for (int x = 0; x < w; x++) {
+          int p = y * w + x;
+          float zp = z.getAtIndex(MappedFiles.FLOAT, p);
+          if (zp <= 0) {
+            lr.setAtIndex(MappedFiles.FLOAT, p, Float.NaN);
+            continue;
+          }
+          rows[2 * y]++;
+          double[] X = world(cam, rt, x, y, zp);
+          int agree = 0;
+          double best = Double.POSITIVE_INFINITY;
+          for (int i = 0; i < others.length && minViews > 0; i++) {
+            CameraInfo oi = info.get(ci.neighbours()[i]);
+            if (oi == null || others[i] == null) continue;
+            ImageFrame of = frames.get(oi.camera());
+            of.camera.viewInto(X[0], X[1], X[2], v);
+            if (v[2] <= 0) continue;
+            int u = (int) Math.round(of.camera.fx * v[0] / v[2] + of.camera.cx),
+                t = (int) Math.round(of.camera.fy * v[1] / v[2] + of.camera.cy);
+            if (u < 0 || t < 0 || u >= of.width || t >= of.height) continue;
+            float d = others[i].getAtIndex(MappedFiles.FLOAT, (long) t * of.width + u);
+            if (d <= 0) continue;
+            double labelsOff = Math.abs(1 / v[2] - 1 / (double) d) / oi.step();
+            if (labelsOff <= tolerance) {
+              agree++;
+              best = Math.min(best, labelsOff);
+            }
+          }
+          if (agree >= minViews) {
+            lr.setAtIndex(MappedFiles.FLOAT, p, minViews == 0 ? 0 : (float) best);
+            rows[2 * y + 1]++;
+          } else lr.setAtIndex(MappedFiles.FLOAT, p, Float.NaN);
+        }
+      });
+      long camConsidered = 0, camKept = 0;
+      long[] rowStart = new long[h + 1];
+      for (int y = 0; y < h; y++) {
+        camConsidered += rows[2 * y];
+        camKept += rows[2 * y + 1];
+        rowStart[y + 1] = camKept;
+      }
+      // Packed colour r << 16 | g << 8 | b (as fusion stores it), copied in bands of rows.
+      int band = Math.max(1, (1 << 22) / Math.max(1, w));
+      for (int y0 = 0; y0 < h; y0 += band) {
+        int y1 = Math.min(h, y0 + band);
+        byte[] colors;
+        synchronized (RasterCache.class) {
+          RasterCache.pair(rf, rf);
+          org.opencv.core.Mat sub = rf.color.submat(y0, y1, 0, w).clone();
+          try {
+            colors = bytes(sub);
+          } finally {
+            sub.release();
+          }
+        }
+        long base = (long) y0 * w;
+        for (int i = 0; i < (y1 - y0) * w; i++)
+          rgb.setAtIndex(MappedFiles.INT, base + i,
+              (colors[i * 3 + 2] & 255) << 16 | (colors[i * 3 + 1] & 255) << 8 | colors[i * 3] & 255);
+      }
+      // Every consistent pixel goes to fusion: the maps are dense per camera, and a thinned
+      // (--step > 1) map falls apart in fusion's 4-connected speckle filter.
+      handoff.add(new MvsgmMaps.Camera(c, pair, w, h, rowStart, ci.tiled()));
+      if (exportImages() && ci.tiled()) exportDepthStreamed(rf, "consistent_depth", z, lr, ci.near(), ci.far());
+      else if (exportImages()) {
+        float[] zz = DepthMapFile.read(dir.resolve("camera_" + c + ".depth")).z();
+        float[] ll = new float[w * h];
+        java.lang.foreign.MemorySegment.copy(lr, MappedFiles.FLOAT, 0, ll, 0, w * h);
+        exportDepth(rf, "consistent_depth", zz, ll, ci.near(), ci.far());
+      }
+      System.out.printf(Locale.ROOT, "mvsgm image %d: %,d of %,d depths consistent with %d+ neighbour maps%n",
+          c, camKept, camConsidered, minViews);
+        return new Consistency(camConsidered, camKept);
+    }
   }
 
   /** Phase 2's result for image fusion (null before run); the caller closes it after fusion. */
@@ -1399,6 +1509,67 @@ final class MultiViewSgm {
    * Depth maps for the given cameras (all usable ones when null), written to 05_stereo/mvsgm as
    * DepthMapFile (.depth, .margin). Returns the per-camera reports.
    */
+  /** One camera solve, shared by the sequential driver and the overlap-window producer. */
+  Object computeCamera(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int c, Plan plan, long t0)
+      throws IOException {
+    Path dir = o.output.resolve("05_stereo/mvsgm");
+    if (plan.tiled()) {
+      ImageFrame rf = frames.get(c);
+      long t1 = System.nanoTime();
+      Map<String, Object> tiled = tiledDepth(frames, tracks, plan, dir);
+      double near = 1 / plan.labels.q(plan.labels.count() - 1), far = 1 / plan.labels.low();
+      info.put(c, new CameraInfo(c, plan.neighbours.stream().mapToInt(Neighbor::id).toArray(), plan.labels.step(), near, far, true));
+      if (exportImages())
+        try (MappedFiles mapped = new MappedFiles()) {
+          exportDepthStreamed(rf, "depth", mapped.map(dir.resolve("camera_" + c + ".depth"), DepthMapFile.HEADER,
+              4L * rf.width * rf.height, false), null, near, far);
+        }
+      tiled.put("image", c);
+      tiled.put("labels", plan.labels.count());
+      tiled.put("wait_seconds", (t1 - t0) / 1e9);
+      tiled.put("seconds", (System.nanoTime() - t1) / 1e9);
+
+      RunTelemetry.record("Multi-view SGM camera " + c, t0);
+      System.out.printf(Locale.ROOT, "mvsgm image %d: %dx%d in %s tiles, %d labels, %.1f s, %,d valid%n",
+          c, rf.width, rf.height, tiled.get("tiles"), plan.labels.count(), (System.nanoTime() - t1) / 1e9, tiled.get("valid"));
+      return tiled;
+    }
+    long t1 = System.nanoTime();
+    Solved solved = solve(plan, seeds(frames.get(c), tracks, plan.labels));
+    int[] summary = solved.summary();
+    DisparityBands bands = solved.bands();
+    long t2 = System.nanoTime();
+    DepthMap map = select(plan, summary);
+    long t3 = System.nanoTime();
+    ImageFrame rf = frames.get(c);
+    DepthMapFile.write(dir.resolve("camera_" + c + ".depth"), rf.camera, rf.width, rf.height, map.depth());
+    DepthMapFile.write(dir.resolve("camera_" + c + ".margin"), rf.camera, rf.width, rf.height, map.margin());
+    DepthMapFile.write(dir.resolve("camera_" + c + ".sharp"), rf.camera, rf.width, rf.height, map.sharpness());
+    DepthMapFile.write(dir.resolve("camera_" + c + ".photo"), rf.camera, rf.width, rf.height, map.photometric());
+    int[] ids = plan.neighbours.stream().mapToInt(Neighbor::id).toArray();
+    double near = 1 / plan.labels.q(plan.labels.count() - 1), far = 1 / plan.labels.low();
+    info.put(c, new CameraInfo(c, ids, plan.labels.step(), near, far, false));
+    if (exportImages()) exportDepth(rf, "depth", map.depth(), null, near, far);
+    List<Object> nb = new ArrayList<>();
+    for (Neighbor x : plan.neighbours)
+      nb.add(Json.object("image", x.id(), "score", x.score(), "shared_points", x.shared(), "median_angle_deg", x.medianAngle()));
+    Map<String, Object> entry = Json.object(
+        "image", c, "neighbours", nb, "labels", plan.labels.count(), "inverse_depth_low", plan.labels.low(),
+        "inverse_depth_step", plan.labels.step(), "depth_near", 1 / plan.labels.q(plan.labels.count() - 1),
+        "depth_far", 1 / plan.labels.low(), "sparse_samples", plan.labels.samples(),
+        "packed_cells", bands.total(), "full_range_cells", (long) count(plan.ref.use) * plan.labels.count(),
+        "peak_device_bytes", solved.peakDeviceBytes(), "levels", solved.levels(),
+        "backend", lastBackend, "p1", p1(), "p2", p2(),
+        "prepare_wait_seconds", (t1 - t0) / 1e9, "sgm_seconds", (t2 - t1) / 1e9, "select_seconds", (t3 - t2) / 1e9,
+        "selection", map.report());
+
+    annotateNeighborSelection(c, entry);
+    RunTelemetry.record("Multi-view SGM camera " + c, t0);
+    System.out.printf(Locale.ROOT, "mvsgm image %d: %d neighbours, %d labels, %s, waited %.2f s for preparation, SGM %.2f s, %,d valid%n",
+        c, plan.views.length, plan.labels.count(), lastBackend, (t1 - t0) / 1e9, (t2 - t1) / 1e9, map.report().get("valid"));
+    return entry;
+  }
+
   List<Object> depthMaps(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int[] cameras) throws IOException {
     long points = tracks.stream().filter(t -> t.point != null).count();
     if (points < 12)
@@ -1454,59 +1625,7 @@ final class MultiViewSgm {
               + ") has no depth map: " + reason);
           continue;
         }
-        if (plan.tiled()) {
-          ImageFrame rf = frames.get(c);
-          long t1 = System.nanoTime();
-          Map<String, Object> tiled = tiledDepth(frames, tracks, plan, dir);
-          double near = 1 / plan.labels.q(plan.labels.count() - 1), far = 1 / plan.labels.low();
-          info.put(c, new CameraInfo(c, plan.neighbours.stream().mapToInt(Neighbor::id).toArray(), plan.labels.step(), near, far, true));
-          if (exportImages())
-            try (MappedFiles mapped = new MappedFiles()) {
-              exportDepthStreamed(rf, "depth", mapped.map(dir.resolve("camera_" + c + ".depth"), DepthMapFile.HEADER,
-                  4L * rf.width * rf.height, false), null, near, far);
-            }
-          tiled.put("image", c);
-          tiled.put("labels", plan.labels.count());
-          tiled.put("wait_seconds", (t1 - t0) / 1e9);
-          tiled.put("seconds", (System.nanoTime() - t1) / 1e9);
-          report.add(tiled);
-          RunTelemetry.record("Multi-view SGM camera " + c, t0);
-          System.out.printf(Locale.ROOT, "mvsgm image %d: %dx%d in %s tiles, %d labels, %.1f s, %,d valid%n",
-              c, rf.width, rf.height, tiled.get("tiles"), plan.labels.count(), (System.nanoTime() - t1) / 1e9, tiled.get("valid"));
-          continue;
-        }
-        long t1 = System.nanoTime();
-        Solved solved = solve(plan, seeds(frames.get(c), tracks, plan.labels));
-        int[] summary = solved.summary();
-        DisparityBands bands = solved.bands();
-        long t2 = System.nanoTime();
-        DepthMap map = select(plan, summary);
-        long t3 = System.nanoTime();
-        ImageFrame rf = frames.get(c);
-        DepthMapFile.write(dir.resolve("camera_" + c + ".depth"), rf.camera, rf.width, rf.height, map.depth());
-        DepthMapFile.write(dir.resolve("camera_" + c + ".margin"), rf.camera, rf.width, rf.height, map.margin());
-        DepthMapFile.write(dir.resolve("camera_" + c + ".sharp"), rf.camera, rf.width, rf.height, map.sharpness());
-        DepthMapFile.write(dir.resolve("camera_" + c + ".photo"), rf.camera, rf.width, rf.height, map.photometric());
-        int[] ids = plan.neighbours.stream().mapToInt(Neighbor::id).toArray();
-        double near = 1 / plan.labels.q(plan.labels.count() - 1), far = 1 / plan.labels.low();
-        info.put(c, new CameraInfo(c, ids, plan.labels.step(), near, far, false));
-        if (exportImages()) exportDepth(rf, "depth", map.depth(), null, near, far);
-        List<Object> nb = new ArrayList<>();
-        for (Neighbor x : plan.neighbours)
-          nb.add(Json.object("image", x.id(), "score", x.score(), "shared_points", x.shared(), "median_angle_deg", x.medianAngle()));
-        Map<String, Object> entry = Json.object(
-            "image", c, "neighbours", nb, "labels", plan.labels.count(), "inverse_depth_low", plan.labels.low(),
-            "inverse_depth_step", plan.labels.step(), "depth_near", 1 / plan.labels.q(plan.labels.count() - 1),
-            "depth_far", 1 / plan.labels.low(), "sparse_samples", plan.labels.samples(),
-            "packed_cells", bands.total(), "full_range_cells", (long) count(plan.ref.use) * plan.labels.count(),
-            "peak_device_bytes", solved.peakDeviceBytes(), "levels", solved.levels(),
-            "backend", lastBackend, "p1", p1(), "p2", p2(),
-            "prepare_wait_seconds", (t1 - t0) / 1e9, "sgm_seconds", (t2 - t1) / 1e9, "select_seconds", (t3 - t2) / 1e9,
-            "selection", map.report());
-        report.add(entry);
-        RunTelemetry.record("Multi-view SGM camera " + c, t0);
-        System.out.printf(Locale.ROOT, "mvsgm image %d: %d neighbours, %d labels, %s, waited %.2f s for preparation, SGM %.2f s, %,d valid%n",
-            c, plan.views.length, plan.labels.count(), lastBackend, (t1 - t0) / 1e9, (t2 - t1) / 1e9, map.report().get("valid"));
+        report.add(computeCamera(frames, tracks, c, plan, t0));
       }
       progress.done();
     } finally {

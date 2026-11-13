@@ -300,12 +300,17 @@ final class WorkflowRegression {
     selection.output = dir;
     selection.neighbors = 1;
     selection.pairCandidates = 2;
+    // Put the strongest overlap beyond the filename neighbour: 0, 2, 1 capture order.
+    Path selectionImages = Files.createDirectory(dir.resolve("selection images"));
+    for (int i = 0; i < 3; i++)
+      Files.copy(images.resolve((i == 0 ? 0 : 3 - i) + ".png"),
+          selectionImages.resolve(i + ".png"));
     try {
       for (int i = 0; i < 3; i++) {
         ImageFrame f =
             new ImageFrame(
                 i,
-                images.resolve(i + ".png"),
+                selectionImages.resolve(i + ".png"),
                 new Calibration(240, 240, 159.5, 119.5, new double[5], w, h),
                 selection);
         f.extract(500);

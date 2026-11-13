@@ -143,7 +143,10 @@ final class BlockProcessing {
     boolean filter = DepthOutlierFilter.enabled(o);
     long perCamera = (filter ? 8 : 4) * pixels + (o.fusionLocalSigma > 0 ? 4 * pixels : 0);
     long cache = filter ? 4096L * SurfacePatchGrid.cacheCells(o, n) : 0;
-    int words = (n + 63) / 64, pairsPerCamera = Math.max(1, 2 * o.neighbors);
+    int words = (n + 63) / 64;
+    // Incoming overlap/GPS choices can concentrate on one camera, even with small K.
+    long pairsPerCamera = o.pairSelection.equals("sequential")
+        ? Math.min(Math.max(0, n - 1), 2L * o.neighbors) : Math.max(0, n - 1);
     // Candidates per pair: about a third of the pixels survive stereo; 64 bytes per candidate.
     long worst = pairsPerCamera * (pixels / 3 * 64 + 20 * pixels) + pixels * (34L + 8L * words);
     return n * (perCamera + cache) + worst;
@@ -152,7 +155,7 @@ final class BlockProcessing {
   /** Bytes of the sparse alignment graph and bundle workspace for a block of n images. */
   static long estimateAlignment(Options o, int n) {
     long keypoints = (long) n * o.features, observations = keypoints / 2, tracks = observations / 3;
-    long pairs = (long) n * Math.max(1, o.neighbors), matches = pairs * o.features / 4;
+    long pairs = PairSelection.maximumPairs(n, o), matches = pairs * o.features / 4;
     return AlignmentMemory.graphBytes(keypoints, tracks, observations, pairs, matches)
         + AlignmentMemory.bundleBytes(tracks, observations, n, true);
   }

@@ -10,6 +10,7 @@ import java.util.*;
 final class TestSupport {
   static Options options() {
     Options o = new Options();
+    o.pairSelection = "sequential";
     o.diagnostics = true;
     o.compatibilityCopies = true;
     o.compute = "cpu";
@@ -28,6 +29,8 @@ final class TestSupport {
     List<String> args =
         new ArrayList<>(
             List.of(
+                "--pair-selection",
+                "sequential",
                 "--diagnostics",
                 "--compatibility-copies",
                 "--point-attributes",

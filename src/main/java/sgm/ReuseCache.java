@@ -78,6 +78,8 @@ final class ReuseCache {
           TwoViewConfidence.class,
           FeatureAlgorithms.class,
           PairSelection.class,
+          VisualPairSelection.class,
+          OptimalMvsgmNeighbors.class,
           DensePairSelection.class,
           CameraEmission.class,
           CameraEvidence.class,
@@ -455,6 +457,12 @@ final class ReuseCache {
                 "flightHeading",
                 "overlapUnknown"));
     key.append(featureSettings(o));
+    // Overlap ranking/filtering can depend on supplied exterior orientations.
+    if (o.poses != null) key.append(hash(o.poses));
+    for (var entry : o.calibrationPoses.entrySet())
+      key.append(entry.getKey())
+          .append(Arrays.toString(entry.getValue().rotation))
+          .append(Arrays.toString(entry.getValue().translation));
     for (ImageFrame f : frames) {
       key.append(frame(f));
       if (f.gps != null) key.append(f.gps.latitude).append(f.gps.longitude);

@@ -86,6 +86,23 @@ final class PdfReportRegression {
         for (String section : List.of("Summary", "Quality flags", "Survey Data", "Digital Elevation Model", "Processing Parameters"))
           check(text.contains(section), "survey report section " + section);
         check(!text.contains("Ground Control Points"), "no GCP section without ground control");
+        for (String block : List.of("Dense Point Cloud", "From stereo matches to points", "Fusion decisions", "Cameras per point", "Depth-map completeness", "Point density"))
+          check(text.contains(block), "dense cloud page block " + block);
+        check(text.contains("Fig. 1.") && !text.contains("Fig. 1. Digital"), "figures numbered in order of appearance");
+      }
+      check(Files.isRegularFile(summaryOut.resolve("density.png")), "point density preview written");
+      var density = ProcessingReport.object(ProcessingReport.map(summaryOut.resolve("dsm.json")).get("density"));
+      check(((Number) density.get("median_points_per_cell")).longValue() == 1, "one fixture point per DSM cell");
+      {
+        // Flags come from archived files, never from the wording of a stage message.
+        String flags = Json.string(ProcessingReport.map(summaryOut.resolve("processing-report.json")).get("quality_flags"));
+        check(flags.contains("GPS camera fit RMS 3.50 m"), "GPS flag reads coordinates.json: " + flags);
+        check(!flags.contains("9.9"), "stage text is not parsed for the GPS fit");
+        check(flags.contains("2 of 5 stereo pairs failed and were skipped"), "skipped pairs read from skipped_pairs.json");
+        check(flags.contains("Depth maps cover only 24%"), "low dense completeness flagged");
+        check(flags.contains("temporary disk"), "fusion spill flagged");
+        check(flags.contains("Ran on the CPU although a GPU was selected: 1 of 1 cameras"), "CPU fallback flagged");
+        check(flags.contains("reprojection RMS") == false, "no reprojection flag without tie point residuals");
       }
       o.reportDetail = "full";
       ProcessingReport.generate(o, run, out);
@@ -210,14 +227,41 @@ final class PdfReportRegression {
             Json.object(
                 "00_inputs",
                 Json.object("status", "complete", "elapsed_seconds", .5),
+                "04_geometry",
+                Json.object("status", "complete", "elapsed_seconds", 1.0, "detail", "wording only: RMS=9.9 m"),
                 "05_stereo",
                 Json.object("status", "complete", "elapsed_seconds", 1.5))));
+    // Dense statistics as a run archives them.
+    Files.createDirectories(run.resolve("05_stereo/mvsgm"));
+    Files.createDirectories(run.resolve("06_fusion"));
+    Json.write(
+        run.resolve("05_stereo/skipped_pairs.json"),
+        Json.object("policy", "skip", "attempted", 5, "skipped", List.of(Json.object("pair", "0-1"), Json.object("pair", "0-2"))));
+    Json.write(
+        run.resolve("05_stereo/mvsgm/mvsgm.json"),
+        Json.object(
+            "consistency", Json.object("depths", 3000, "consistent", 2000, "inconsistent_rejected", 1000, "consistent_views_required", 2),
+            "cameras", List.of(Json.object("image", 0, "backend", "cpu"))));
+    Json.write(run.resolve("06_fusion/fusion.json"), Json.object("dense_method", "mvsgm", "fusion_mode", "image", "minimum_distinct_views", 2));
+    Files.writeString(run.resolve("06_fusion/fusion-quality.txt"), "Raw stereo observations=2000\nExported points=256\nDense method=mvsgm\n");
+    Json.write(
+        run.resolve("06_fusion/image_fusion.json"),
+        Json.object(
+            "merged_valid_pixels", 1000, "spike_rejected", 40, "speckle_rejected", 60, "support_rejected", 100,
+            "consumed_by_earlier_point", 500, "emitted", 256,
+            "views_per_point_histogram", new long[] {0, 0, 100, 96, 60},
+            "views_per_point_last_bucket", "4 or more cameras",
+            "cameras", List.of(Json.object("camera", 0, "pixels", 4096, "valid_depth_pixels", 1000, "emitted_points", 256)),
+            "memory", Json.object("spill_bytes_written", 3221225472L, "map_evictions", 2, "strip_rows", 0)));
+    Json.write(
+        run.resolve("logs/processing.json"),
+        Json.object("selected_opencl_device", Json.object("name", "control device"), "tasks", List.of()));
     Files.writeString(
         run.resolve("logs/run-settings.properties"),
         "scale=" + scale + "\nprocessingReport=none\nquality=custom\n");
     Json.write(
         run.resolve("07_results/coordinates.json"),
-        Json.object("georeferenced", false, "xyz_units", "local output units"));
+        Json.object("georeferenced", false, "xyz_units", "local output units", "inlier_rms_metres", 3.5));
     String header =
         "ply\n"
             + "format binary_little_endian 1.0\n"

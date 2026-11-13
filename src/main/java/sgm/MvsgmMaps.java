@@ -27,7 +27,8 @@ final class MvsgmMaps implements AutoCloseable {
   private final Map<Integer, Camera> cameras = new TreeMap<>();
   private final Map<Integer, MemorySegment[]> segments = new HashMap<>();
   private final boolean keep;
-  private MappedFiles mapped;
+  private final Map<Integer, MappedFiles> mapped = new HashMap<>();
+  MvsgmWindow window;
 
   MvsgmMaps(Path dir, boolean keep) {
     this.dir = dir;
@@ -36,6 +37,10 @@ final class MvsgmMaps implements AutoCloseable {
 
   void add(Camera camera) {
     cameras.put(camera.camera(), camera);
+  }
+
+  boolean keepsFiles() {
+    return keep;
   }
 
   Camera camera(int c) {
@@ -59,21 +64,51 @@ final class MvsgmMaps implements AutoCloseable {
   synchronized MemorySegment segment(int c, int kind) throws IOException {
     MemorySegment[] s = segments.computeIfAbsent(c, k -> new MemorySegment[KINDS.length]);
     if (s[kind] == null) {
-      if (mapped == null) mapped = new MappedFiles();
       Camera cam = cameras.get(c);
-      s[kind] = mapped.map(file(c, kind), DepthMapFile.HEADER, 4L * cam.width() * cam.height(), false);
+      s[kind] = mapped.computeIfAbsent(c, k -> new MappedFiles())
+          .map(file(c, kind), DepthMapFile.HEADER, 4L * cam.width() * cam.height(), false);
     }
     return s[kind];
+  }
+
+  /** Releases one finished camera, unmapping before deletion (required on Windows). */
+  synchronized void releaseCamera(int c) throws IOException {
+    MappedFiles owner = mapped.remove(c);
+    if (owner != null) owner.close();
+    segments.remove(c);
+    if (!keep) {
+      IOException failure = null;
+      for (int k = 0; k < KINDS.length; k++)
+        try {
+          Files.deleteIfExists(file(c, k));
+        } catch (IOException e) {
+          if (failure == null) failure = e;
+          else failure.addSuppressed(e);
+        }
+      // Keep the camera registered if deletion failed so close() can retry every file.
+      if (failure != null) throw failure;
+    }
+    cameras.remove(c);
+  }
+
+  /** Fusion may finish before a later consistency pass has read this camera's raw depth. */
+  void finishedCamera(int c) throws IOException {
+    if (window == null) releaseCamera(c);
+    else window.fusionFinished(c);
   }
 
   /** Unmaps; deletes the maps unless --diagnostics or -Dsgm.mvsgm.keepMaps=true asked to keep them. */
   @Override
   public synchronized void close() throws IOException {
-    if (mapped != null) mapped.close();
-    mapped = null;
-    segments.clear();
-    if (keep) return;
-    for (int c : cameras.keySet())
-      for (int k = 0; k < KINDS.length; k++) Files.deleteIfExists(file(c, k));
+    if (window != null) window.close();
+    IOException failure = null;
+    for (int c : new ArrayList<>(cameras.keySet()))
+      try {
+        releaseCamera(c);
+      } catch (IOException e) {
+        if (failure == null) failure = e;
+        else failure.addSuppressed(e);
+      }
+    if (failure != null) throw failure;
   }
 }

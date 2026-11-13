@@ -181,6 +181,14 @@ final class ProcessingReport {
     } catch (IOException | RuntimeException unavailable) {
       System.err.println("Report survey data unavailable: " + unavailable.getMessage());
     }
+    try {
+      data.put("dense", ReportDense.collect(run, telemetry));
+    } catch (IOException | RuntimeException unavailable) {
+      System.err.println("Report dense-cloud data unavailable: " + unavailable.getMessage());
+    }
+    Map<String, Map<String, Object>> stageIndex = new LinkedHashMap<>();
+    for (Object item : stages) stageIndex.put(String.valueOf(object(item).get("stage")), object(item));
+    data.put("quality_flags", PdfReport.flags(data, maps, stageIndex));
     if (current != null) {
       current.persist();
       telemetry = map(run.resolve("logs/processing.json"));

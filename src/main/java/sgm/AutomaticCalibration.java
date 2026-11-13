@@ -146,10 +146,7 @@ final class AutomaticCalibration {
         }
         extraction.done();
       }
-      List<int[]> edges = new ArrayList<>();
-      for (int a = 0; a < frames.size(); a++)
-        for (int b = a + 1; b < Math.min(frames.size(), a + o.neighbors + 1); b++)
-          edges.add(new int[] {a, b});
+      List<int[]> edges = PairSelection.select(frames, o, project);
       try (WorkProgress pairs =
           WorkProgress.start("Focal bootstrap pairs", edges.size(), "pairs")) {
         long[] completed = {0};

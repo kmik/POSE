@@ -29,13 +29,14 @@ public final class Options {
   public int densePairNeighbors = 3;
   // Image-fusion decoded candidate cache; -1 = bounded auto, 0 = reference replay.
   public int imageFusionCacheMb = -1;
-  // --streamed-processing (STREAMED_PROCESSING.md): low-memory paths only when needed (auto).
+  // MVSGM image-fusion windows by default; auto selects row strips only when the heap needs them.
   public String streamedProcessing = "auto";
   public Path exportConfidence;
   public boolean disparitiesExplicit, minDisparityExplicit, selfCalibration = true;
   // --quick-calibration: EXIF/XMP focal initialization (joint pipeline, no bootstrap) and one GPS
   // focal start. Changes the calibration path and therefore the geometry; opt-in.
   public boolean quickCalibration;
+  public boolean mvsgmOptimalNeighbors;
   // --ply off / --point-confidence off: skip writing dense.ply / 07_results/point-confidence.bin.
   public boolean writePly = true, writePointConfidence = true;
   Map<String, Camera> calibrationPoses = Collections.emptyMap();
@@ -193,7 +194,7 @@ public final class Options {
   public boolean maxDimensionExplicit, estimateMemory;
   public String matchingAlgorithm = "sift",
       descriptorMatcher = "auto",
-      pairSelection = "sequential",
+      pairSelection = "overlap",
       pairMatching = "parallel";
   public String alignmentQuality = "same", intrinsicsMode = "fixed", extrinsicsMode = "fixed";
   public String refineIntrinsics = "f,k1,k2,k3,cx,cy,p1,p2", rerunFrom = "none";
@@ -251,6 +252,12 @@ public final class Options {
         key = key.substring(0, eq);
       }
       switch (key) {
+        case "--mvsgm-optimal-neighbors":
+          o.mvsgmOptimalNeighbors = true;
+          continue;
+        case "--no-mvsgm-optimal-neighbors":
+          o.mvsgmOptimalNeighbors = false;
+          continue;
         case "--diagnostics":
           o.diagnostics = true;
           continue;
@@ -2077,7 +2084,9 @@ Feature matching and final bundle adjustment:
   --features N
       Requested maximum features per image (default: 8000; minimum: 100).
   --neighbors N
-      Match each image to the next N sorted images (default: 3; minimum: 1).
+      Select each image's N strongest estimated-overlap neighbors (default: 3; minimum: 1).
+      Match the union once; incoming choices can increase an image's total degree.
+      With --pair-selection sequential, match the next N filename-sorted images.
       Increase for broader overlap; larger values cost time and retained memory.
   --min-matches N
       Minimum geometrically verified matches for a viable pair (default: 20;
@@ -2317,6 +2326,12 @@ Point filtering and multi-view fusion:
   --mvsgm-best-k K
       mvsgm: per pixel and depth label, mean of the K lowest neighbour costs
       (default 3), so occluded neighbours do not spoil a pixel.
+  --mvsgm-optimal-neighbors
+      Experimental: retain the strongest neighbour, then favour complementary
+      sparse image coverage and baseline directions within --mvsgm-neighbors.
+      Preserves angle-weighted scores and eligibility checks; deterministic greedy
+      selection, not a guarantee of optimality or improved dense accuracy.
+      Default off. --no-mvsgm-optimal-neighbors explicitly restores score-only selection.
   --mvsgm-census-window W
       mvsgm: census window 3, 5 or 7 (default 5).
   --mvsgm-levels N
@@ -2792,11 +2807,10 @@ Additional workflow controls:
       a consistent EXIF focal it falls back to the bootstrap. Give it with the
       first step (inputs/calibrate); see QUICK_CALIBRATION.md.
   --streamed-processing off|auto|on
-      Low-memory processing for large images (default: auto). auto engages it only
-      when the memory plan shows the normal path cannot run in the heap; with enough
-      RAM nothing changes. Today: image fusion in row strips with memory-mapped depth
-      maps when one camera does not fit (same points as the untiled path, slower).
-      on always uses it; off never does (fusion then stops with the heap it needs).
+      MVSGM image fusion uses an overlap window (default: auto). auto selects row
+      strips only when required by the heap; on forces strips too. off keeps the
+      separate stereo/fusion phases and refuses fusion when its work cannot fit.
+      Camera order and output stay unchanged.
   --image-fusion-cache-mb auto|N
       Reuse decoded image-fusion candidates across cameras and passes. Default auto
       uses at most a quarter of --memory-mb and available estimated heap headroom.
@@ -2926,11 +2940,17 @@ Additional workflow controls:
       KAZE detector response threshold (default: 0.001; positive).
       Thresholds apply to their selected algorithm, including calibration/previews.
   --pair-selection sequential|overlap|gps|all
-      Default sequential uses filename neighbors. overlap shortlists reciprocal
-      preview matches; gps adds nearby GPS cameras, falling back to previews when
-      coordinates are missing. Both retain sequential edges; all considers every pair.
+      Default overlap ranks shared ground footprints when poses and a scene plane
+      are known; otherwise ranks reciprocal visual support and spatial coverage.
+      Large visual searches use an approximate global descriptor index, then exact
+      preview scoring. Scores estimate overlap, not a guaranteed physical percentage.
+      No filename edges are added. sequential explicitly uses filename neighbors.
+      gps ranks nearest GPS cameras, using visual search if coordinates are missing.
+      all considers every pair, ignoring --neighbors.
   --pair-candidates N
-      Additional shortlist neighbors per image (default: 6; positive).
+      Extra visual retrieval candidates before selecting --neighbors (default: 6;
+      positive). Increase for broader search; N >= image count requests exhaustive
+      preview scoring. Does not increase the final choices per image.
   --min-forward-overlap N, --min-side-overlap N, --min-pair-overlap N
       Minimum common footprint extents along/across flight, and common footprint
       area, respectively, in percent (0..100; all default 0 = disabled). Denominator

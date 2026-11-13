@@ -69,17 +69,15 @@ final class ResolutionPlan {
                 processed[0] / (double) original[0], processed[1] / (double) original[1]
               }));
     }
-    int pairs = 0;
+    long pairs = 0;
     for (int i = 0; i < paths.size(); i++)
       for (int j = i + 1; j < Math.min(paths.size(), i + o.neighbors + 1); j++) {
         pairs++;
         evidence += 8 * (sizes[i] + sizes[j]);
       }
     if (!o.pairSelection.equals("sequential")) {
-      pairs = paths.size() * (paths.size() - 1) / 2;
-      evidence = 0;
-      for (int i = 0; i < paths.size(); i++)
-        for (int j = i + 1; j < paths.size(); j++) evidence += 8 * (sizes[i] + sizes[j]);
+      pairs = PairSelection.maximumPairs(paths.size(), o);
+      evidence = 16 * maxPixels * pairs;
     }
     if (o.rectified) {
       pairs = 1;

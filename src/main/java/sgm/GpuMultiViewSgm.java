@@ -20,11 +20,18 @@ final class GpuMultiViewSgm {
   /** Inputs: reference census/mask/gray, bands, summary, neighbour canvases (census + valid), table. */
   static long inputBytes(MultiViewSgm.Plan plan) {
     long n = (long) plan.ref.w * plan.ref.h;
-    return n * (8 + 1 + 1 + 12 + 24) + plan.canvasPixels() * 9 + 4L * plan.table.length + 16L * plan.views.length + 64;
+    return n * (8 + 1 + 1 + 12 + 24) + plan.canvasPixels() * 9 + 4L * plan.table.length + 16L * plan.views.length + 256;
   }
 
   static long deviceBytes(MultiViewSgm mv, MultiViewSgm.Plan plan, long cells) {
-    return cells * (2L + mv.sumBytes()) + inputBytes(plan);
+    long inputs = inputBytes(plan), solve = cells * (2L + mv.sumBytes()) + inputs;
+    // Gray scratch exists only before the packed volume is allocated.
+    long scratch = 0;
+    if (GpuMvsgmCensus.enabled(mv.o)) {
+      var device = GpuSgm.selectedDevice(mv.o);
+      scratch = GpuMvsgmCensus.scratchBytes(plan, GpuSgm.budget(device, mv.o) - inputs, device.allocation());
+    }
+    return Math.max(solve, inputs + scratch);
   }
 
   static boolean use(Options o, MultiViewSgm mv, MultiViewSgm.Plan plan, DisparityBands bands) {
@@ -61,11 +68,12 @@ final class GpuMultiViewSgm {
     private final MemorySegment costs, paths, winners;
     private final long bank, budget, localMemory;
     private final GpuMemoryPool.Reservation reservation;
+    private final List<GpuMemoryPool.Reservation> growth = new ArrayList<>();
+    private long reservedBytes;
     private long capacity;
     private int[] summaryBuffer;
 
     Session(Options o, MultiViewSgm mv, MultiViewSgm.Plan plan, long reserveBytes) {
-      reservation = GpuMemoryPool.reserve(reserveBytes);
       this.o = o;
       this.mv = mv;
       this.plan = plan;
@@ -76,32 +84,38 @@ final class GpuMultiViewSgm {
       bank = GpuBandedStereo.bankCells(o, device);
       budget = GpuSgm.budget(device, o);
       localMemory = device.localMemory();
+      long scratch = GpuMvsgmCensus.enabled(o)
+          ? GpuMvsgmCensus.scratchBytes(plan, budget - inputBytes(plan), device.allocation()) : 0;
+      reservedBytes = Math.max(reserveBytes, inputBytes(plan) + scratch);
+      if (reservedBytes > budget) throw new IllegalArgumentException("mvsgm inputs exceed the GPU budget");
+      reservation = GpuMemoryPool.reserveAuxiliary(reservedBytes);
+      if (reservation == null) throw new IllegalStateException("mvsgm inputs exceed the shared GPU memory available now");
       try {
-        cl = new GpuSgm.Compute(o, GpuBandedStereo.source(false, mv.sumBytes(), "") + KERNELS);
+        cl = GpuMvsgmCensus.compute(o, GpuBandedStereo.source(false, mv.sumBytes(), "") + KERNELS);
       } catch (RuntimeException | Error e) {
         reservation.close();
+        arena.close();
         throw e;
       }
       try {
-        refCensus = upload(arena.allocateFrom(JAVA_LONG, plan.ref.census));
         refUse = upload(arena.allocateFrom(JAVA_BYTE, bits(plan.ref.use)));
         refGray = upload(arena.allocateFrom(JAVA_BYTE, plan.ref.gray));
+        refCensus = cl.buffer(8L * n);
         int V = plan.views.length;
         long canvas = plan.canvasPixels();
-        MemorySegment census = arena.allocate(8 * canvas, 8), valid = arena.allocate(canvas);
+        MemorySegment valid = arena.allocate(canvas);
         int[] meta = new int[4 * V];
         long at = 0;
         for (int v = 0; v < V; v++) {
           var view = plan.views[v];
           int pixels = view.w * view.h;
-          MemorySegment.copy(MemorySegment.ofArray(view.census), 0, census, 8 * at, 8L * pixels);
           MemorySegment.copy(MemorySegment.ofArray(bits(view.valid)), 0, valid, at, pixels);
           meta[4 * v] = (int) at;
           meta[4 * v + 1] = view.w;
           meta[4 * v + 2] = view.h;
           at += pixels;
         }
-        viewCensus = upload(census);
+        viewCensus = cl.buffer(Math.max(8, 8 * canvas));
         viewValid = upload(valid);
         viewMeta = upload(arena.allocateFrom(JAVA_INT, meta));
         table = upload(arena.allocateFrom(JAVA_FLOAT, plan.table));
@@ -112,6 +126,31 @@ final class GpuMultiViewSgm {
         costs = cl.kernel("mvcosts");
         paths = cl.kernel("bpaths");
         winners = cl.kernel("mvwinners");
+        boolean generated = false;
+        if (GpuMvsgmCensus.enabled(o) && scratch > 0) {
+          MemorySegment grayBand = null;
+          try {
+            grayBand = cl.buffer(scratch);
+            MemorySegment censusKernel = cl.kernel("mvcensus");
+            GpuMvsgmCensus.generate(cl, censusKernel, refGray, refCensus, 0, plan.ref.gray,
+                w, h, plan.ref.window, true, scratch, plan.ref::cpuCensus);
+            int offset = 0;
+            for (var view : plan.views) {
+              GpuMvsgmCensus.generate(cl, censusKernel, grayBand, viewCensus, offset, view.gray,
+                  view.w, view.h, view.window, false, scratch, view::cpuCensus);
+              offset = Math.addExact(offset, view.gray.length);
+            }
+            generated = true;
+          } catch (RuntimeException | Error e) {
+            GpuMvsgmCensus.failed(e);
+          } finally {
+            if (grayBand != null) {
+              cl.finish();
+              cl.releaseBuffer(grayBand);
+            }
+          }
+        } else if (GpuMvsgmCensus.enabled(o)) GpuMvsgmCensus.memoryFallback();
+        if (!generated) cpuCensus();
       } catch (RuntimeException | Error e) {
         try {
           close();
@@ -134,8 +173,34 @@ final class GpuMultiViewSgm {
       return buffer;
     }
 
+    private void cpuCensus() {
+      try (Arena staging = Arena.ofConfined()) {
+        cl.transfer(refCensus, 0, staging.allocateFrom(JAVA_LONG, plan.ref.cpuCensus()), false);
+      }
+      long offset = 0;
+      for (var view : plan.views) {
+        try (Arena staging = Arena.ofConfined()) {
+          cl.transfer(viewCensus, offset, staging.allocateFrom(JAVA_LONG, view.cpuCensus()), false);
+        }
+        offset += 8L * view.gray.length;
+      }
+    }
+
+    /** Nonblocking growth while holding this session's reservation; otherwise reopen after close. */
+    boolean reserve(long bytes) {
+      if (bytes > budget) return false;
+      if (bytes <= reservedBytes) return true;
+      GpuMemoryPool.Reservation extra = GpuMemoryPool.reserveAuxiliary(bytes - reservedBytes);
+      if (extra == null) return false;
+      growth.add(extra);
+      reservedBytes = bytes;
+      return true;
+    }
+
     int[] summary(DisparityBands bands) {
       long total = Math.max(1, bands.total());
+      if (!reserve(deviceBytes(mv, plan, total)))
+        throw new IllegalStateException("mvsgm session cannot grow within the shared GPU budget");
       int cap = Math.max(1, bands.maxCount()), sumBytes = mv.sumBytes();
       if (total > capacity) {
         if (total > 8 * bank)
@@ -196,7 +261,11 @@ final class GpuMultiViewSgm {
           try {
             arena.close();
           } finally {
-            reservation.close();
+            try {
+              for (var extra : growth) extra.close();
+            } finally {
+              reservation.close();
+            }
           }
         }
       }

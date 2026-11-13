@@ -57,7 +57,10 @@ public final class SelfTest {
     checks += GpuRangeGuardRegression.run();
     checks += GpuTsgmRegression.run();
     checks += MultiViewSgmRegression.run();
+    checks += OptimalMvsgmNeighborsRegression.run(root.resolve("optimal-neighbors"));
+      checks += GpuMvsgmCensusRegression.run();
     checks += LargeFormatRegression.run();
+    checks += CameraWindowRegression.run(root.resolve("camera-window"));
     checks += SpeckleFilterRegression.run();
     checks += GpuSpikeFilterRegression.run();
     checks += MedianSelectionRegression.run();
@@ -91,6 +94,7 @@ public final class SelfTest {
     checks += UpgradeStereoRegression.run(root);
     checks += OrientationRegression.run(root);
     checks += OverlapRegression.run(root);
+    checks += PairSelectionRegression.run(root.resolve("pair-selection"));
     checks += SurfaceRegression.run(root);
     checks += SubpixelRegression.run();
     checks += MeasuredReprojectionRegression.run();
