@@ -319,6 +319,7 @@ final class ProcessingReport {
     for (var figure :
         List.of(
             new String[] {"orthomosaic.png", "Orthomosaic overview", "orthomosaic_note"},
+            new String[] {"image-overlap.png", "Camera locations and image overlap", "image_overlap_note"},
             new String[] {"camera-map.png", "Camera locations and acquisition", "camera_note"},
             new String[] {"overlap.png", "Geometric image overlap", "overlap_note"},
             new String[] {

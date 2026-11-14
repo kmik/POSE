@@ -165,7 +165,7 @@ final class PdfReport implements AutoCloseable {
     facts.add(new String[] {"Images / aligned", count(survey.getOrDefault("images", maps.get("input_images"))) + " / " + count(survey.getOrDefault("aligned", maps.get("registered_cameras")))});
     facts.add(new String[] {"Tie points", count(survey.get("tie_points"))});
     facts.add(new String[] {"Dense points", count(surface.get("source_points"))});
-    facts.add(new String[] {"Coordinate system", coordinates(ProcessingReport.object(data.get("coordinates")))});
+    facts.add(new String[] {"Coordinate system", coordinates(ProcessingReport.object(data.get("coordinates")), adjustedCameraRms(data))});
     var gcp = ProcessingReport.object(survey.get("gcp"));
     if (!gcp.isEmpty())
       facts.add(new String[] {"Ground control", gcpLine(gcp)});
@@ -182,8 +182,12 @@ final class PdfReport implements AutoCloseable {
   private void surveyData(Map<String, Object> data, Map<String, Object> survey, Path out) throws IOException {
     page("Survey Data");
     String units = String.valueOf(survey.getOrDefault("units", "units"));
+    if (Files.isRegularFile(out.resolve("image-overlap.png"))) {
+      figure(out.resolve("image-overlap.png"), 330);
+      paragraph(fig() + "Camera locations and image overlap: the number of photographs that see each ground point.");
+    }
     figurePair(out.resolve("camera-map.png"), out.resolve("overlap.png"), 250);
-    paragraph(fig() + "Camera locations and viewing directions (left) and geometric image overlap (right).");
+    paragraph(fig() + "Camera locations and viewing directions (left) and camera-frustum coverage on the DSM surface (right).");
     paragraph(pdf(maps.getOrDefault("overlap_note", "Coverage unavailable.")));
     List<String[]> grid = new ArrayList<>();
     grid.add(new String[] {"Number of images", count(survey.getOrDefault("images", maps.get("input_images"))), "Camera stations", count(survey.getOrDefault("aligned", maps.get("registered_cameras")))});
@@ -197,7 +201,9 @@ final class PdfReport implements AutoCloseable {
               + resolution(processed, units)
               + " (processed images). Flying altitude is the mean camera height above the median tie point. Reprojection error is the RMS of all tie point projections in source pixels"
               + (survey.get("reprojection_max_pixels") instanceof Number max ? String.format(Locale.ROOT, " (maximum %.2f px)", max.doubleValue()) : "")
-              + ".");
+              + "."
+              + coverageNote(survey));
+    else if (survey.get("coverage_basis") != null) paragraph(coverageNote(survey).trim());
     var camera = ProcessingReport.object(survey.get("camera"));
     if (!camera.isEmpty()) {
       heading("Cameras");
@@ -715,7 +721,7 @@ final class PdfReport implements AutoCloseable {
     heading("General");
     List<String[]> general = new ArrayList<>();
     general.add(new String[] {"Cameras / aligned", count(survey.getOrDefault("images", maps.get("input_images"))) + " / " + count(survey.getOrDefault("aligned", maps.get("registered_cameras")))});
-    general.add(new String[] {"Coordinate system", coordinates(ProcessingReport.object(data.get("coordinates")))});
+    general.add(new String[] {"Coordinate system", coordinates(ProcessingReport.object(data.get("coordinates")), adjustedCameraRms(data))});
     general.add(new String[] {"Arguments", String.join(" ", (data.get("arguments") instanceof List<?> a ? a : List.of()).stream().map(String::valueOf).toList())});
     table(new String[] {"Setting", "Value"}, new float[] {150, 357}, general);
     paragraph(
@@ -860,9 +866,15 @@ final class PdfReport implements AutoCloseable {
         && maps.get("registered_cameras") instanceof Number reg
         && reg.intValue() < in.intValue())
       flags.add((in.intValue() - reg.intValue()) + " of " + in.intValue() + " images were not registered.");
-    // The GPS camera fit, from coordinates.json (not parsed out of the stage text).
-    if (ProcessingReport.object(data.get("coordinates")).get("inlier_rms_metres") instanceof Number rms
-        && rms.doubleValue() > GPS_FIT_FLAG_METRES)
+    // The GPS camera fit: the camera location error after the GPS-weighted adjustment (the same
+    // number as the Camera Locations page), else the similarity fit of coordinates.json.
+    Object similarity = ProcessingReport.object(data.get("coordinates")).get("inlier_rms_metres");
+    double adjusted = adjustedCameraRms(data);
+    if (Double.isFinite(adjusted)) {
+      if (adjusted > GPS_FIT_FLAG_METRES)
+        flags.add(String.format(Locale.ROOT, "Camera location error vs GPS %.2f m RMS after the GPS adjustment%s: georeferencing may be weak (consumer GPS, timing offset or bent block).",
+            adjusted, similarity instanceof Number s ? String.format(Locale.ROOT, " (similarity fit %.2f m)", s.doubleValue()) : ""));
+    } else if (similarity instanceof Number rms && rms.doubleValue() > GPS_FIT_FLAG_METRES)
       flags.add(String.format(Locale.ROOT, "GPS camera fit RMS %.2f m: georeferencing may be weak (consumer GPS, timing offset or bent block).", rms.doubleValue()));
     var survey = ProcessingReport.object(data.get("survey"));
     var dense = ProcessingReport.object(data.get("dense"));
@@ -1089,17 +1101,32 @@ final class PdfReport implements AutoCloseable {
   }
 
   /** One readable line: CRS and units, GPS fit, height reference. */
-  private static String coordinates(Map<String, Object> c) {
+  /** Total camera location RMS after the GPS-weighted adjustment (Camera Locations page), or NaN. */
+  static double adjustedCameraRms(Map<String, Object> data) {
+    var locations = ProcessingReport.object(ProcessingReport.object(data.get("survey")).get("camera_locations"));
+    return ProcessingReport.object(locations.get("rms")).get("total") instanceof Number n ? n.doubleValue() : Double.NaN;
+  }
+
+  private static String coordinates(Map<String, Object> c, double adjusted) {
     if (c.isEmpty()) return "Unavailable";
     if (!Boolean.TRUE.equals(c.get("georeferenced")))
       return "Local reconstruction frame (not georeferenced)";
     StringBuilder s = new StringBuilder(String.valueOf(c.getOrDefault("horizontal_crs", "projected CRS")));
     if (c.get("xyz_units") != null) s.append(", ").append(c.get("xyz_units"));
     if (c.get("datum") != null) s.append("; datum from ").append(c.get("datum"));
-    if (c.get("inlier_rms_metres") instanceof Number rms)
-      s.append(String.format(Locale.ROOT, "; GPS camera fit RMS %.2f m", rms.doubleValue()));
-    if (c.get("gps_inliers") instanceof Number in && c.get("gps_controls") instanceof Number all)
-      s.append(String.format(Locale.ROOT, " (%d/%d cameras)", in.intValue(), all.intValue()));
+    if (Double.isFinite(adjusted)) {
+      s.append(String.format(Locale.ROOT, "; camera location error vs GPS %.2f m RMS (after the GPS adjustment", adjusted));
+      if (c.get("inlier_rms_metres") instanceof Number rms)
+        s.append(String.format(Locale.ROOT, "; similarity fit %.2f m", rms.doubleValue()));
+      if (c.get("gps_inliers") instanceof Number in && c.get("gps_controls") instanceof Number all)
+        s.append(String.format(Locale.ROOT, " on %d/%d cameras", in.intValue(), all.intValue()));
+      s.append(")");
+    } else {
+      if (c.get("inlier_rms_metres") instanceof Number rms)
+        s.append(String.format(Locale.ROOT, "; GPS camera fit RMS %.2f m", rms.doubleValue()));
+      if (c.get("gps_inliers") instanceof Number in && c.get("gps_controls") instanceof Number all)
+        s.append(String.format(Locale.ROOT, " (%d/%d cameras)", in.intValue(), all.intValue()));
+    }
     if (c.get("vertical_crs") == null)
       s.append(c.get("datum") != null ? "; heights from the GCPs" : "; heights: GPS altitude, vertical datum unspecified");
     return s.toString();
@@ -1136,6 +1163,14 @@ final class PdfReport implements AutoCloseable {
     return units.equals("m")
         ? String.format(Locale.ROOT, "%.2f cm/pix", 100 * n.doubleValue())
         : String.format(Locale.ROOT, "%.4g units/pix", n.doubleValue());
+  }
+
+  private static String coverageNote(Map<String, Object> survey) {
+    Object basis = survey.get("coverage_basis");
+    if (basis == null) return "";
+    return String.valueOf(basis).startsWith("dense cloud")
+        ? " Coverage area is the ground area of report DSM cells that hold dense points (gaps excluded)."
+        : " Coverage area is the convex hull of the tie points within their 1st-99th percentiles (no DSM).";
   }
 
   private static String area(Object v, String units) {

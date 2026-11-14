@@ -70,7 +70,7 @@ final class ExactReuseRegression {
               Core.norm(expected, frame.color, Core.NORM_INF) == 0,
               "identity undistortion bypass has identical colors");
           check(
-              Core.norm(expectedMask, frame.validMask, Core.NORM_INF) == 0,
+              norm(expectedMask, frame) == 0,
               "identity mask is identical");
         } finally {
           original.release();
@@ -112,5 +112,14 @@ final class ExactReuseRegression {
       check(plain.stats.csv().equals(result.stats.csv()), "cached/uncached rejection counts exact");
     }
     return checks;
+  }
+
+  private static double norm(Mat expected, ImageFrame frame) {
+    Mat mask = frame.mask();
+    try {
+      return Core.norm(expected, mask, Core.NORM_INF);
+    } finally {
+      frame.releaseMask(mask);
+    }
   }
 }

@@ -765,7 +765,13 @@ final class MultiViewSgm {
 
   // First-use checks per process: one for a solve with full bands, one with narrowed bands.
   static volatile boolean gpuVerifiedFull, gpuVerifiedBanded, gpuDisabled;
-  String lastBackend = "cpu";
+  // Per thread: cameras in flight (--mvsgm-cameras-in-flight) each report their own backend.
+  private final ThreadLocal<String> backend = ThreadLocal.withInitial(() -> "cpu");
+
+  /** Backend of the calling thread's most recent solve. */
+  String lastBackend() {
+    return backend.get();
+  }
 
   int[] summary(Plan plan, DisparityBands bands, GpuMultiViewSgm.Session[] session) {
     if (!gpuDisabled && GpuMultiViewSgm.use(o, this, plan, bands)) {
@@ -776,7 +782,7 @@ final class MultiViewSgm {
         if (full ? !gpuVerifiedFull : !gpuVerifiedBanded) selfCheck(plan, session[0], bands, full);
         if (!gpuDisabled) {
           int[] s = session[0].summary(bands);
-          lastBackend = "gpu";
+          backend.set("gpu");
           return s;
         }
       } catch (RuntimeException e) {
@@ -784,7 +790,7 @@ final class MultiViewSgm {
         System.out.println("mvsgm: GPU solve failed (" + e.getMessage() + "); using the CPU reference for image " + plan.camera);
       }
     }
-    lastBackend = "cpu";
+    backend.set("cpu");
     return cpuSummary(plan, bands);
   }
 
@@ -864,7 +870,7 @@ final class MultiViewSgm {
     }
     if (session[0] == null) {
       if (GpuMvsgmCensus.enabled(o) && plan.ref.census == null) GpuMvsgmCensus.memoryFallback();
-      lastBackend = "cpu";
+      backend.set("cpu");
       return cpuSummary(plan, bands);
     }
     return summary(plan, bands, session).clone();
@@ -920,7 +926,7 @@ final class MultiViewSgm {
           "factor", p.factor, "width", p.ref.w, "height", p.ref.h, "labels", p.count,
           "packed_cells", bands.total(), "mean_band", bands.total() / (double) Math.max(1, count(p.ref.use)),
           "full_range_fallback_pixels", fallback, "seed_widened_pixels", seeded, "band_edge_retry_pixels", retried,
-          "backend", lastBackend, "seconds", (System.nanoTime() - started) / 1e9));
+          "backend", backend.get(), "seconds", (System.nanoTime() - started) / 1e9));
       if (l > 0) parent = parentMap(p, summary);
     }
     return new Solved(summary, bands, report, peak[0]);
@@ -1033,7 +1039,9 @@ final class MultiViewSgm {
     synchronized (RasterCache.class) {
       RasterCache.pair(f, f);
       org.opencv.core.Mat g = f.gray.submat(y0, y0 + h, x0, x0 + w).clone(),
-          m = f.validMask.submat(y0, y0 + h, x0, x0 + w).clone();
+          m = f.fullMask()
+              ? new org.opencv.core.Mat(h, w, org.opencv.core.CvType.CV_8U, new org.opencv.core.Scalar(255))
+              : f.validMask.submat(y0, y0 + h, x0, x0 + w).clone();
       try {
         return new byte[][] {bytes(g), bytes(m)};
       } finally {
@@ -1102,7 +1110,7 @@ final class MultiViewSgm {
       }
     Map<String, Object> report = new LinkedHashMap<>(Json.object(
         "tiled", true, "tile_size", T, "tile_overlap", O, "tiles", tiles, "packed_cells", cells,
-        "peak_device_bytes", peak, "backend", lastBackend, "valid", valid,
+        "peak_device_bytes", peak, "backend", backend.get(), "valid", valid,
         "neighbours", header.neighbours.stream().map(x -> x.id()).toList()));
     annotateNeighborSelection(c, report);
     return report;
@@ -1214,6 +1222,7 @@ final class MultiViewSgm {
    * keep value is not NaN (the consistent ones) are written.
    */
   void exportDepth(ImageFrame f, String kind, float[] z, float[] keep, double near, double far) throws IOException {
+    OutputDiskSpace.require(o, 8L * f.width * f.height + (1L << 20), "MVSGM depth preview");
     float[] values = new float[z.length];
     for (int p = 0; p < z.length; p++)
       values[p] = z[p] > 0 && (keep == null || !Float.isNaN(keep[p])) ? z[p] : Float.NaN;
@@ -1230,6 +1239,7 @@ final class MultiViewSgm {
    */
   void exportDepthStreamed(ImageFrame f, String kind, java.lang.foreign.MemorySegment z,
       java.lang.foreign.MemorySegment keep, double near, double far) throws IOException {
+    OutputDiskSpace.require(o, 8L * f.width * f.height + (1L << 20), "MVSGM depth preview");
     int w = f.width, h = f.height, scale = Math.max(1, Math.ceilDiv(Math.max(w, h), 4096));
     String stem = f.path.getFileName().toString().replaceFirst("[.][^.]*$", "").replaceAll("[^A-Za-z0-9_.-]", "_");
     Path dir = o.output.resolve("05_stereo/mvsgm/image_" + f.id + "_" + stem);
@@ -1286,7 +1296,7 @@ final class MultiViewSgm {
             + " valid depths); preview clipping does not alter numeric PFM"));
   }
 
-  final Map<Integer, CameraInfo> info = new TreeMap<>();
+  final Map<Integer, CameraInfo> info = new ConcurrentSkipListMap<>();
   final Map<String, Object> phaseTwo = new LinkedHashMap<>();
 
   /**
@@ -1374,6 +1384,8 @@ final class MultiViewSgm {
       ImageFrame rf = frames.get(c);
       int w = rf.width, h = rf.height;
       long bytes = 4L * w * h;
+      OutputDiskSpace.require(o, 2 * bytes + 2L * DepthMapFile.HEADER,
+          "MVSGM consistency maps for camera " + c);
       java.lang.foreign.MemorySegment z = mapped.map(dir.resolve("camera_" + c + ".depth"), DepthMapFile.HEADER, bytes, false);
       java.lang.foreign.MemorySegment[] others = new java.lang.foreign.MemorySegment[ci.neighbours().length];
       for (int i = 0; i < others.length; i++) {
@@ -1501,7 +1513,12 @@ final class MultiViewSgm {
   static byte[][] rasters(ImageFrame f) throws IOException {
     synchronized (RasterCache.class) {
       RasterCache.pair(f, f);
-      return new byte[][] {bytes(f.gray), bytes(f.validMask)};
+      byte[] mask;
+      if (f.fullMask()) {
+        mask = new byte[f.width * f.height];
+        java.util.Arrays.fill(mask, (byte) -1);
+      } else mask = bytes(f.validMask);
+      return new byte[][] {bytes(f.gray), mask};
     }
   }
 
@@ -1559,16 +1576,79 @@ final class MultiViewSgm {
         "depth_far", 1 / plan.labels.low(), "sparse_samples", plan.labels.samples(),
         "packed_cells", bands.total(), "full_range_cells", (long) count(plan.ref.use) * plan.labels.count(),
         "peak_device_bytes", solved.peakDeviceBytes(), "levels", solved.levels(),
-        "backend", lastBackend, "p1", p1(), "p2", p2(),
+        "backend", backend.get(), "p1", p1(), "p2", p2(),
         "prepare_wait_seconds", (t1 - t0) / 1e9, "sgm_seconds", (t2 - t1) / 1e9, "select_seconds", (t3 - t2) / 1e9,
         "selection", map.report());
 
     annotateNeighborSelection(c, entry);
     RunTelemetry.record("Multi-view SGM camera " + c, t0);
     System.out.printf(Locale.ROOT, "mvsgm image %d: %d neighbours, %d labels, %s, waited %.2f s for preparation, SGM %.2f s, %,d valid%n",
-        c, plan.views.length, plan.labels.count(), lastBackend, (t1 - t0) / 1e9, (t2 - t1) / 1e9, map.report().get("valid"));
+        c, plan.views.length, plan.labels.count(), backend.get(), (t1 - t0) / 1e9, (t2 - t1) / 1e9, map.report().get("valid"));
     return entry;
   }
+
+  /** Heap estimate of one camera in flight, per pixel of its largest solve (image or tile). */
+  static final long CAMERA_HEAP_BYTES = 256;
+
+  /**
+   * --mvsgm-cameras-in-flight resolved for these frames: auto is one camera per 4 cores, at most
+   * 8 (1 with --compute cpu); any value is lowered until the per-camera heap estimate fits 35% of
+   * the heap (fusion runs beside the cameras in the overlap window).
+   */
+  int camerasInFlight(List<ImageFrame> frames, int cameras) {
+    int requested = o.mvsgmCamerasInFlight;
+    if (requested == 1 || cameras < 2 || o.cores < 2) return 1;
+    long pixels = 1;
+    for (ImageFrame f : frames) {
+      if (!usable(f.camera)) continue;
+      int t = tileSize(f);
+      long side = t + 2L * TILE_OVERLAP;
+      pixels = Math.max(pixels, t > 0 ? Math.min(f.width, side) * Math.min(f.height, side) : (long) f.width * f.height);
+    }
+    long fit = Math.max(1, (long) (Runtime.getRuntime().maxMemory() * .35) / (pixels * CAMERA_HEAP_BYTES));
+    int wanted = requested > 0 ? requested : o.compute.equals("cpu") ? 1 : Math.max(1, Math.min(8, o.cores / 4));
+    if (wanted > fit) {
+      if (requested > 0)
+        System.out.printf(Locale.ROOT, "mvsgm: --mvsgm-cameras-in-flight %d lowered to %d: about %,d MiB of heap per camera"
+            + " in flight (raise --memory-mb for more)%n", requested, fit, pixels * CAMERA_HEAP_BYTES >> 20);
+      wanted = (int) fit;
+    }
+    return Math.min(wanted, cameras);
+  }
+
+  /** depthMaps with several cameras in flight; reports in the unchanged camera order. */
+  private List<Object> parallelDepthMaps(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int[] cameras,
+      int inFlight) throws IOException {
+    List<Object> report = new ArrayList<>();
+    GpuMemoryPool.Scope own = o.compute.equals("cpu") || GpuMemoryPool.enabled() ? null : GpuMemoryPool.install(gpuBudget());
+    System.out.printf(Locale.ROOT, "mvsgm: %d cameras in flight (--mvsgm-cameras-in-flight), %d row workers each%n",
+        inFlight, Math.max(1, o.cores / inFlight));
+    try (MvsgmCameraPool pool = new MvsgmCameraPool(inFlight, o.cores, cameras, c -> {
+          long t0 = System.nanoTime();
+          Plan plan = plan(frames, tracks, c);
+          if (plan == null) {
+            String reason = skipped.getOrDefault(c, "no neighbour");
+            System.out.println("WARNING: mvsgm image " + c + " (" + frames.get(c).path.getFileName()
+                + ") has no depth map: " + reason);
+            return Json.object("image", c, "skipped", reason);
+          }
+          return computeCamera(frames, tracks, c, plan, t0);
+        });
+        WorkProgress progress = WorkProgress.start("Multi-view SGM cameras", cameras.length, "cameras")) {
+      for (int i = 0; i < cameras.length; i++) {
+        progress.update(i);
+        report.add(pool.await(cameras[i]));
+      }
+      progress.done();
+      parallelReport = pool.report();
+    } finally {
+      if (own != null) own.close();
+    }
+    return report;
+  }
+
+  /** Set by a phase-1 run with several cameras in flight; written to mvsgm.json. */
+  Map<String, Object> parallelReport;
 
   List<Object> depthMaps(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int[] cameras) throws IOException {
     long points = tracks.stream().filter(t -> t.point != null).count();
@@ -1582,6 +1662,14 @@ final class MultiViewSgm {
     List<Object> report = new ArrayList<>();
     if (cameras == null)
       cameras = frames.stream().filter(f -> usable(f.camera)).mapToInt(f -> f.id).toArray();
+    int inFlight = camerasInFlight(frames, cameras.length);
+    if (inFlight > 1) {
+      List<Object> parallel = parallelDepthMaps(frames, tracks, cameras, inFlight);
+      Json.write(dir.resolve("mvsgm.json"), Json.object(
+          "census_window", census, "best_k", k, "neighbours", neighbors, "label_pixels", labelPixels,
+          "cameras", parallel, "cameras_in_flight", parallelReport));
+      return parallel;
+    }
     // The next camera's plan (CPU: neighbour resampling, census) is prepared on one thread while the
     // current camera is solved; at most two plans are resident. Plans do not depend on each other.
     ExecutorService preparer = Executors.newSingleThreadExecutor(r -> {

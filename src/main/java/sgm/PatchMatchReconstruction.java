@@ -470,7 +470,9 @@ final class PatchMatchReconstruction {
       Mat gray = new Mat(), mask = new Mat();
       try {
         Imgproc.resize(f.gray, gray, new Size(w, h), 0, 0, Imgproc.INTER_AREA);
-        Imgproc.resize(f.validMask, mask, new Size(w, h), 0, 0, Imgproc.INTER_NEAREST);
+        if (f.fullMask()) mask.create(h, w, CvType.CV_8U);
+        if (f.fullMask()) mask.setTo(new Scalar(255));
+        else Imgproc.resize(f.validMask, mask, new Size(w, h), 0, 0, Imgproc.INTER_NEAREST);
         byte[] a = new byte[w * h], b = new byte[w * h];
         gray.get(0, 0, a);
         mask.get(0, 0, b);

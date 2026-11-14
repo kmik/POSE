@@ -5,7 +5,6 @@ import java.nio.*;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.time.LocalDate;
 import java.util.*;
 
 /**
@@ -770,14 +769,15 @@ final class BlockProcessing {
 
   private static Las header(Path file) throws IOException {
     try (FileChannel ch = FileChannel.open(file)) {
-      ByteBuffer h = ByteBuffer.allocate(227).order(ByteOrder.LITTLE_ENDIAN);
+      ByteBuffer h = ByteBuffer.allocate(CloudWriter.HEADER_14).order(ByteOrder.LITTLE_ENDIAN);
       ch.read(h, 0);
-      if (!new String(h.array(), 0, 4, StandardCharsets.US_ASCII).equals("LASF")) throw new IOException("Not a LAS file: " + file);
+      h.flip();
+      if (h.limit() < CloudWriter.HEADER_12 || !new String(h.array(), 0, 4, StandardCharsets.US_ASCII).equals("LASF")) throw new IOException("Not a LAS file: " + file);
       int headerSize = h.getShort(94) & 0xffff;
       long offset = h.getInt(96) & 0xffffffffL;
       int vlrCount = h.getInt(100);
       int recordLength = h.getShort(105) & 0xffff;
-      long count = h.getInt(107) & 0xffffffffL;
+      long count = CloudWriter.lasPointCount(h);
       double[] scale = {h.getDouble(131), h.getDouble(139), h.getDouble(147)};
       double[] origin = {h.getDouble(155), h.getDouble(163), h.getDouble(171)};
       ByteBuffer v = ByteBuffer.allocate((int) (offset - headerSize));
@@ -807,7 +807,6 @@ final class BlockProcessing {
     long total = 0;
     for (long k : kept) total += k;
     if (total == 0) throw new IOException("No points were kept from the blocks");
-    if (total > 0xffffffffL) throw new IOException("Merged cloud exceeds the LAS 1.2 point count limit");
     double quantization = .0001;
     for (int k = 0; k < 3; k++) quantization = Math.max(quantization, (max[k] - min[k]) / (2.0 * Integer.MAX_VALUE - 2));
     double q = quantization;
@@ -816,24 +815,9 @@ final class BlockProcessing {
     Las first = headers.get(0);
     Path part = target.resolveSibling(target.getFileName() + ".part");
     try (OutputStream o = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20)) {
-      ByteBuffer h = ByteBuffer.allocate(227).order(ByteOrder.LITTLE_ENDIAN);
-      h.put("LASF".getBytes(StandardCharsets.US_ASCII));
-      h.position(24);
-      h.put((byte) 1).put((byte) 2);
-      byte[] system = new byte[32], software = new byte[32];
-      byte[] s1 = "LAS.utils photogrammetry".getBytes(StandardCharsets.US_ASCII), s2 = ("POSE " + PdfReport.VERSION + " blocks").getBytes(StandardCharsets.US_ASCII);
-      System.arraycopy(s1, 0, system, 0, Math.min(32, s1.length));
-      System.arraycopy(s2, 0, software, 0, Math.min(32, s2.length));
-      h.put(system).put(software);
-      LocalDate now = LocalDate.now();
-      h.putShort((short) now.getDayOfYear()).putShort((short) now.getYear());
-      h.putShort((short) 227).putInt(227 + first.vlrs().length).putInt(first.vlrCount()).put((byte) 2)
-          .putShort((short) length).putInt((int) total).putInt((int) total);
-      for (int i = 0; i < 4; i++) h.putInt(0);
-      for (int i = 0; i < 3; i++) h.putDouble(q);
-      for (double v : offsets) h.putDouble(v);
-      for (int k = 0; k < 3; k++) { h.putDouble(max[k]); h.putDouble(min[k]); }
-      o.write(h.array());
+      // LAS 1.2, or LAS 1.4 above 4,294,967,295 points (same bytes as before up to that).
+      o.write(CloudWriter.lasHeader(total, q, offsets, min, max, first.vlrs().length,
+          first.vlrCount(), length - 26, "POSE " + PdfReport.VERSION + " blocks"));
       o.write(first.vlrs());
       ByteBuffer rec = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN);
       for (int b = 0; b < runs.size(); b++) {

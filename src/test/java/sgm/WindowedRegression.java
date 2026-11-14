@@ -87,7 +87,12 @@ public final class WindowedRegression {
         var image = store.source(f);
         compareImage(f.color, image, image.color, 3, "source color " + f.id);
         compareImage(f.gray, image, image.gray, 1, "source gray " + f.id);
-        compareImage(f.validMask, image, image.mask, 1, "source mask " + f.id);
+        org.opencv.core.Mat sourceMask = f.mask();
+        try {
+          compareImage(sourceMask, image, image.mask, 1, "source mask " + f.id);
+        } finally {
+          f.releaseMask(sourceMask);
+        }
         image.discard();
       }
       var dense = new DenseReconstruction(o, frames);

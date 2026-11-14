@@ -20,7 +20,35 @@ final class ReportMaps {
 
   private record Grid(int width, int height, float[] z, double x, double y, double cell) {}
 
-  private record Bounds(double x, double y, double width, double height) {}
+  /** World rectangle drawn into a plot area of pw x ph pixels at (70, 80) of the canvas. */
+  private record Bounds(double x, double y, double width, double height, int pw, int ph) {
+    int canvasWidth() {
+      return pw + 140;
+    }
+
+    int canvasHeight() {
+      return ph + 170;
+    }
+  }
+
+  static final int PLOT_WIDTH = 860, PLOT_HEIGHT = 700, PLOT_MIN = 240;
+
+  /**
+   * Plot size for a world width x height: as large as fits 860 x 700 pixels with the same aspect,
+   * never thinner than 240 pixels (the world rectangle is widened instead, see fit()).
+   */
+  private static int[] plot(double width, double height) {
+    double aspect = width / height;
+    int pw, ph;
+    if (aspect > PLOT_WIDTH / (double) PLOT_HEIGHT) {
+      pw = PLOT_WIDTH;
+      ph = (int) Math.round(PLOT_WIDTH / aspect);
+    } else {
+      ph = PLOT_HEIGHT;
+      pw = (int) Math.round(PLOT_HEIGHT * aspect);
+    }
+    return new int[] {Math.max(PLOT_MIN, pw), Math.max(PLOT_MIN, ph)};
+  }
 
   static Map<String, Object> create(
       Path run,
@@ -31,7 +59,7 @@ final class ReportMaps {
       Map<String, Object> parameters)
       throws IOException {
     for (String name :
-        List.of("orthomosaic.png", "orthomosaic.pgw", "overlap.png", "camera-map.png", "maps.json"))
+        List.of("orthomosaic.png", "orthomosaic.pgw", "overlap.png", "camera-map.png", "image-overlap.png", "maps.json"))
       Files.deleteIfExists(out.resolve(name));
     Options sourceOptions = options.copy();
     sourceOptions.orientationPixels = "source";
@@ -111,8 +139,10 @@ final class ReportMaps {
               "camera_note",
               cameraNote,
               "orthomosaic_note",
-              "Orthomosaic unavailable: no usable projected DSM. For a meaningful local XY/Z frame,"
-                  + " explicitly enable --report-local-dsm.",
+              "Orthomosaic unavailable: no report DSM. "
+                  + (dsm.get("reason") instanceof String why && !why.isBlank()
+                      ? why
+                      : "Use --report-local-dsm for a meaningful local XY/Z frame."),
               "overlap_note",
               "Coverage unavailable without a usable surface model.");
       partial.putAll(captures);
@@ -191,7 +221,7 @@ final class ReportMaps {
               double wx = grid.x + (x + .5) * grid.cell, wy = grid.y - (y + .5) * grid.cell;
               double[] q = camera.view(new double[] {wx / s, wy / s, z / s});
               if (!(q[2] > 0)) continue;
-              Point2D.Double uv = project(k, view.calibration.distortion, q);
+              Point2D.Double uv = project(k, view.calibration.distortion, q, view.calibration.width, view.calibration.height);
               if (!Double.isFinite(uv.x + uv.y)
                   || uv.x < 0
                   || uv.y < 0
@@ -234,6 +264,12 @@ final class ReportMaps {
     BufferedImage overlap = overlap(grid, coverage, views.size(), north);
     ImageIO.write(overlap, "png", out.resolve("overlap.png").toFile());
     overlap.flush();
+    long overlapStarted = System.nanoTime();
+    Object[] imageOverlap = imageOverlap(views, grid, bounds, scale, north, options.cores);
+    ImageIO.write((BufferedImage) imageOverlap[0], "png", out.resolve("image-overlap.png").toFile());
+    ((BufferedImage) imageOverlap[0]).flush();
+    long[] overlapClasses = (long[]) imageOverlap[1];
+    RunTelemetry.record("Report image overlap map", overlapStarted);
     Map<Integer, Long> histogram = new TreeMap<>();
     long supported = 0;
     for (int i = 0; i < n; i++)
@@ -272,6 +308,13 @@ final class ReportMaps {
             note,
             "camera_note",
             cameraNote,
+            "image_overlap_note",
+            "Number of photographs whose frame contains each ground point of the camera-map area"
+                + " (report DSM height where known, else its median height; no occlusion test),"
+                + " like the image overlap figure of other photogrammetry reports. Camera centres"
+                + " are black dots.",
+            "image_overlap_classes",
+            overlapClasses,
             "overlap_note",
             "Geometric camera-frustum coverage at supported DSM cells; not reconstructed depth"
                 + " support or confidence. DSM holes are unknown. Source-image readability does not"
@@ -303,10 +346,17 @@ final class ReportMaps {
     return result;
   }
 
-  private static Point2D.Double project(Camera k, double[] d, double[] q) {
-    org.opencv.core.Point p =
-        SharedCalibration.distorted(
-            k, d, new org.opencv.core.Point(k.fx * q[0] / q[2] + k.cx, k.fy * q[1] / q[2] + k.cy));
+  /**
+   * Distorted pixel of camera-frame point q; NaN when its undistorted pixel lies more than a
+   * quarter of the image outside the frame. The distortion polynomial folds back far outside the
+   * image, which made cameras that cannot see a cell claim it near their image centre and paint
+   * the wrong ground (shifted blocks in the overview; same guard as Orthomosaic.View.project).
+   */
+  private static Point2D.Double project(Camera k, double[] d, double[] q, int width, int height) {
+    double pu = k.fx * q[0] / q[2] + k.cx, pv = k.fy * q[1] / q[2] + k.cy;
+    if (pu < -.25 * width || pv < -.25 * height || pu > 1.25 * width || pv > 1.25 * height)
+      return new Point2D.Double(Double.NaN, Double.NaN);
+    org.opencv.core.Point p = SharedCalibration.distorted(k, d, new org.opencv.core.Point(pu, pv));
     return new Point2D.Double(p.x, p.y);
   }
 
@@ -322,30 +372,15 @@ final class ReportMaps {
   private static Grid grid(Path out, Map<String, Object> metadata) throws IOException {
     if (!"complete".equals(metadata.get("status")) || !Files.isRegularFile(out.resolve("dsm.tif")))
       return null;
-    BufferedImage source;
-    int step, offset;
-    try (ImageInputStream input = ImageIO.createImageInputStream(out.resolve("dsm.tif").toFile())) {
-      Iterator<ImageReader> readers = ImageIO.getImageReaders(input);
-      if (!readers.hasNext()) return null;
-      ImageReader reader = readers.next();
-      try {
-        reader.setInput(input, true, true);
-        step =
-            Math.max(1, (int) Math.ceil(Math.max(reader.getWidth(0), reader.getHeight(0)) / 1024.));
+    // Own reader: ImageIO returned 1.0 for every finite height (see DsmRaster.readTiff).
+    DsmRaster.Heights dsm = DsmRaster.readTiff(out.resolve("dsm.tif"));
+    int step = Math.max(1, (int) Math.ceil(Math.max(dsm.width(), dsm.height()) / 1024.)),
         offset = step / 2;
-        ImageReadParam param = reader.getDefaultReadParam();
-        param.setSourceSubsampling(step, step, offset, offset);
-        source = reader.read(0, param);
-      } finally {
-        reader.dispose();
-      }
-    }
-    if (source == null) return null;
-    int w = source.getWidth(), h = source.getHeight();
+    int w = (dsm.width() - offset + step - 1) / step, h = (dsm.height() - offset + step - 1) / step;
     float[] z = new float[w * h];
     for (int y = 0; y < h; y++)
-      for (int x = 0; x < w; x++) z[y * w + x] = source.getRaster().getSampleFloat(x, y, 0);
-    source.flush();
+      for (int x = 0; x < w; x++)
+        z[y * w + x] = dsm.z()[(offset + y * step) * dsm.width() + offset + x * step];
     Object extent = metadata.get("extent");
     double[] box;
     if (extent instanceof double[] values) box = values;
@@ -505,7 +540,7 @@ final class ReportMaps {
       loY = Math.min(loY, c[1] * scale);
       hiY = Math.max(hiY, c[1] * scale);
     }
-    if (!Double.isFinite(loX + loY + hiX + hiY)) return new Bounds(0, 0, 1, 1);
+    if (!Double.isFinite(loX + loY + hiX + hiY)) return new Bounds(0, 0, 1, 1, PLOT_MIN, PLOT_MIN);
     double width = Math.max(1e-6, hiX - loX),
         height = Math.max(1e-6, hiY - loY),
         border = .08 * Math.max(width, height);
@@ -513,24 +548,27 @@ final class ReportMaps {
     loY -= border;
     width += 2 * border;
     height += 2 * border;
-    if (width / height > 860. / 390) {
-      double next = width * 390 / 860;
+    // The plot follows the area's shape (until 14 November 2026 a fixed 860 x 390 box, which
+    // drew a north-south block as a thin column of cameras in a wide empty frame).
+    int[] p = plot(width, height);
+    if (width / height > p[0] / (double) p[1]) {
+      double next = width * p[1] / p[0];
       loY -= (next - height) / 2;
       height = next;
     } else {
-      double next = height * 860 / 390;
+      double next = height * p[0] / p[1];
       loX -= (next - width) / 2;
       width = next;
     }
-    return new Bounds(loX, loY, width, height);
+    return new Bounds(loX, loY, width, height, p[0], p[1]);
   }
 
   private static int px(double x, Bounds b) {
-    return 70 + (int) ((x - b.x) / b.width * 860);
+    return 70 + (int) ((x - b.x) / b.width * b.pw);
   }
 
   private static int py(double y, Bounds b) {
-    return 470 - (int) ((y - b.y) / b.height * 390);
+    return 80 + b.ph - (int) ((y - b.y) / b.height * b.ph);
   }
 
   private static Graphics2D graphics(BufferedImage image) {
@@ -551,10 +589,10 @@ final class ReportMaps {
       double scale,
       boolean north,
       int inputs) {
-    BufferedImage image = new BufferedImage(1000, 560, BufferedImage.TYPE_INT_RGB);
+    BufferedImage image = new BufferedImage(b.canvasWidth(), b.canvasHeight(), BufferedImage.TYPE_INT_RGB);
     Graphics2D g = graphics(image);
     g.setColor(new Color(190, 202, 210));
-    g.drawRect(70, 80, 860, 390);
+    g.drawRect(70, 80, b.pw, b.ph);
     if (ordered) {
       g.setColor(new Color(85, 139, 167));
       for (int i = 1; i < flight.size(); i++) {
@@ -601,9 +639,9 @@ final class ReportMaps {
             b.y,
             b.y + b.height),
         70,
-        520);
-    compass(g, north);
-    scale(g, b.width / 860, 70, 495);
+        b.ph + 130);
+    compass(g, north, b.canvasWidth());
+    scale(g, b.width / b.pw, 70, b.ph + 105);
     g.dispose();
     return image;
   }
@@ -632,14 +670,16 @@ final class ReportMaps {
     Stroke old = g.getStroke();
     g.setStroke(new BasicStroke(1, 0, 0, 10, new float[] {5, 4}, 0));
     g.setColor(new Color(164, 184, 193));
-    g.setClip(70, 80, 860, 390);
+    g.setClip(70, 80, b.pw, b.ph);
     g.drawPolygon(xs, ys, 4);
     g.setClip(null);
     g.setStroke(old);
   }
 
   private static BufferedImage overlap(Grid grid, int[] counts, int maximum, boolean north) {
-    BufferedImage image = new BufferedImage(1000, 560, BufferedImage.TYPE_INT_RGB);
+    int[] p = plot(grid.width, grid.height);
+    int canvasWidth = Math.max(p[0] + 140, 560);
+    BufferedImage image = new BufferedImage(canvasWidth, p[1] + 170, BufferedImage.TYPE_INT_RGB);
     Graphics2D g = graphics(image);
     BufferedImage raster = new BufferedImage(grid.width, grid.height, BufferedImage.TYPE_INT_RGB);
     for (int y = 0; y < grid.height; y++)
@@ -647,23 +687,104 @@ final class ReportMaps {
         int i = y * grid.width + x;
         raster.setRGB(x, y, Float.isFinite(grid.z[i]) ? color(counts[i], maximum) : 0xe1e5e8);
       }
-    double s = Math.min(860. / grid.width, 390. / grid.height);
+    double s = Math.min(p[0] / (double) grid.width, p[1] / (double) grid.height);
     int w = (int) (grid.width * s), h = (int) (grid.height * s);
-    g.drawImage(raster, 70 + (860 - w) / 2, 80 + (390 - h) / 2, w, h, null);
+    g.drawImage(raster, 70 + (p[0] - w) / 2, 80 + (p[1] - h) / 2, w, h, null);
     raster.flush();
     g.setColor(new Color(30, 55, 70));
     g.drawString("Camera-frustum coverage on DSM | gray: unknown surface", 70, 35);
-    for (int i = 0; i <= Math.min(maximum, 10); i++) {
-      int count = (int) Math.round(i * maximum / (double) Math.min(maximum, 10));
-      int x = 70 + i * 65;
+    int entries = Math.min(maximum, 10) + 1, step = Math.min(65, (canvasWidth - 100) / entries);
+    for (int i = 0; i < entries; i++) {
+      int count = (int) Math.round(i * maximum / (double) Math.max(1, entries - 1));
+      int x = 70 + i * step;
       g.setColor(new Color(color(count, maximum)));
-      g.fillRect(x, 490, 40, 15);
+      g.fillRect(x, p[1] + 100, step - 20, 15);
       g.setColor(Color.DARK_GRAY);
-      g.drawString(Integer.toString(count), x + 12, 527);
+      g.drawString(Integer.toString(count), x + 4, p[1] + 137);
     }
-    compass(g, north);
+    compass(g, north, canvasWidth);
     g.dispose();
     return image;
+  }
+
+  // Image overlap classes 1..9 and >9, red (one image) to blue (more than nine).
+  private static final int[] OVERLAP_COLOURS = {
+    0xa50026, 0xd73027, 0xf46d43, 0xfdae61, 0xfee08b, 0xd9ef8b, 0xa6d96a, 0x66bd63, 0x1a9850, 0x2166ac
+  };
+
+  /**
+   * Metashape-style "camera locations and image overlap": over the whole camera-map area, the
+   * number of photographs whose frame contains each ground point (DSM height where the report DSM
+   * has one, else its median height; no occlusion test), with the camera centres on top.
+   * Returns {image, histogram (index 0 = no image, 1..9, 10 = more than 9)}.
+   */
+  private static Object[] imageOverlap(
+      List<View> views, Grid grid, Bounds b, double scale, boolean north, int cores) {
+    int rw = Math.max(1, b.pw / 2), rh = Math.max(1, b.ph / 2);
+    float[] finite = grid.z.clone();
+    Arrays.sort(finite);
+    int end = 0;
+    while (end < finite.length && Float.isFinite(finite[end])) end++;
+    double plane = end == 0 ? 0 : finite[end / 2];
+    int[] counts = new int[rw * rh];
+    Camera[] ks = new Camera[views.size()];
+    for (int v = 0; v < ks.length; v++)
+      ks[v] = views.get(v).calibration.camera(views.get(v).calibration.width, views.get(v).calibration.height);
+    Parallel.forEach(rh, Math.max(1, cores), j -> {
+      double wy = b.y + b.height - (j + .5) * b.height / rh;
+      for (int i = 0; i < rw; i++) {
+        double wx = b.x + (i + .5) * b.width / rw;
+        int gx = (int) Math.floor((wx - grid.x) / grid.cell), gy = (int) Math.floor((grid.y - wy) / grid.cell);
+        double z = plane;
+        if (gx >= 0 && gy >= 0 && gx < grid.width && gy < grid.height && Float.isFinite(grid.z[gy * grid.width + gx]))
+          z = grid.z[gy * grid.width + gx];
+        int n = 0;
+        for (int vi = 0; vi < ks.length; vi++) {
+          View v = views.get(vi);
+          double[] q = v.camera.view(new double[] {wx / scale, wy / scale, z / scale});
+          if (!(q[2] > 0)) continue;
+          Camera k = ks[vi];
+          Point2D.Double uv = project(k, v.calibration.distortion, q, v.calibration.width, v.calibration.height);
+          if (uv.x >= 0 && uv.y >= 0 && uv.x <= v.calibration.width - 1 && uv.y <= v.calibration.height - 1) n++;
+        }
+        counts[j * rw + i] = n;
+      }
+    });
+    long[] histogram = new long[11];
+    BufferedImage raster = new BufferedImage(rw, rh, BufferedImage.TYPE_INT_RGB);
+    for (int j = 0; j < rh; j++)
+      for (int i = 0; i < rw; i++) {
+        int n = counts[j * rw + i];
+        histogram[Math.min(10, n)]++;
+        raster.setRGB(i, j, n == 0 ? 0xffffff : OVERLAP_COLOURS[Math.min(10, n) - 1]);
+      }
+    int canvasWidth = Math.max(b.canvasWidth(), 560);
+    BufferedImage image = new BufferedImage(canvasWidth, b.canvasHeight(), BufferedImage.TYPE_INT_RGB);
+    Graphics2D g = graphics(image);
+    g.drawImage(raster, 70, 80, b.pw, b.ph, null);
+    raster.flush();
+    g.setColor(new Color(190, 202, 210));
+    g.drawRect(70, 80, b.pw, b.ph);
+    g.setColor(Color.BLACK);
+    int dot = views.size() > 300 ? 2 : 3;
+    for (View v : views) {
+      double[] c = v.camera.center();
+      g.fillOval(px(c[0] * scale, b) - dot, py(c[1] * scale, b) - dot, 2 * dot, 2 * dot);
+    }
+    g.setColor(new Color(30, 55, 70));
+    g.drawString("Number of overlapping images | black dots: camera locations", 70, 35);
+    int step = Math.min(60, (canvasWidth - 100) / 10);
+    for (int c = 0; c < 10; c++) {
+      int x = 70 + c * step;
+      g.setColor(new Color(OVERLAP_COLOURS[c]));
+      g.fillRect(x, b.ph + 100, step - 16, 15);
+      g.setColor(Color.DARK_GRAY);
+      g.drawString(c < 9 ? Integer.toString(c + 1) : ">9", x + 4, b.ph + 137);
+    }
+    compass(g, north, canvasWidth);
+    scale(g, b.width / b.pw, canvasWidth - 270, 68);
+    g.dispose();
+    return new Object[] {image, histogram};
   }
 
   private static int color(int count, int max) {
@@ -672,12 +793,13 @@ final class ReportMaps {
         : Color.HSBtoRGB((float) (.65 * (count - 1) / Math.max(1, max - 1)), .75f, .88f) & 0xffffff;
   }
 
-  private static void compass(Graphics2D g, boolean north) {
+  private static void compass(Graphics2D g, boolean north, int canvasWidth) {
+    int x = canvasWidth - 40;
     g.setColor(new Color(30, 55, 70));
-    g.drawLine(960, 100, 960, 60);
-    g.drawLine(960, 60, 953, 72);
-    g.drawLine(960, 60, 967, 72);
-    g.drawString(north ? "N" : "+Y", 950, 48);
+    g.drawLine(x, 100, x, 60);
+    g.drawLine(x, 60, x - 7, 72);
+    g.drawLine(x, 60, x + 7, 72);
+    g.drawString(north ? "N" : "+Y", x - 10, 48);
   }
 
   private static void scale(Graphics2D g, double unitsPerPixel, int x, int y) {

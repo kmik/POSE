@@ -65,6 +65,11 @@ final class GroundClassification {
   static Map<String, Object> run(Options o, List<ImageFrame> frames, Crs crs) throws IOException {
     Path las = o.output.resolve("dense.las");
     if (!Files.isRegularFile(las)) las = o.output.resolve("07_results/dense.las");
+    if (!Files.isRegularFile(las)
+        && Files.isRegularFile(o.output.resolve("07_results/dense_tiles/tiles.csv")))
+      throw new IllegalArgumentException(
+          "Ground classification needs the single dense.las; this run wrote LAS tiles"
+              + " (--tiled-las-output). Rerun the dense step without it to classify ground.");
     Path results = o.output.resolve("07_results"), report = results.resolve("ground.json");
     Files.createDirectories(results);
     if (crs == null) {
@@ -1169,14 +1174,16 @@ final class GroundClassification {
     Cloud c = new Cloud();
     double[] scale = new double[3], offset = new double[3];
     try (FileChannel ch = FileChannel.open(las, StandardOpenOption.READ)) {
-      ByteBuffer h = ByteBuffer.allocate(227).order(ByteOrder.LITTLE_ENDIAN);
+      ByteBuffer h = ByteBuffer.allocate(CloudWriter.HEADER_14).order(ByteOrder.LITTLE_ENDIAN);
       ch.read(h, 0);
-      if (h.get(0) != 'L' || h.get(1) != 'A' || h.get(2) != 'S' || h.get(3) != 'F')
+      h.flip();
+      if (h.limit() < CloudWriter.HEADER_12
+          || h.get(0) != 'L' || h.get(1) != 'A' || h.get(2) != 'S' || h.get(3) != 'F')
         throw new IOException("Not a LAS file: " + las);
       c.dataOffset = h.getInt(96) & 0xffffffffL;
       int format = h.get(104) & 255;
       c.recordLength = h.getShort(105) & 0xffff;
-      long count = h.getInt(107) & 0xffffffffL;
+      long count = CloudWriter.lasPointCount(h);
       if (format != 2 && format != 3 && format != 0 && format != 1)
         throw new IOException("Unsupported LAS point format " + format);
       if (count > Integer.MAX_VALUE - 8) throw new IOException("Cloud too large for classification");

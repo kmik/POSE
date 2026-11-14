@@ -735,6 +735,10 @@ final class Project {
 
   private String artifactHash(Path file) throws IOException {
     String name = file.getFileName().toString();
+    // Clouds hashed in the background after they were written (unchanged since then).
+    var now = Files.readAttributes(file, java.nio.file.attribute.BasicFileAttributes.class);
+    String background = ArtifactDigests.lookup(file, now);
+    if (background != null) return background;
     // Only closed cloud outputs are reused. Telemetry/log files can still change at this point.
     if (!name.equals("dense.las") && !name.equals("dense.ply")) return sha256(file);
     Path key = file.toAbsolutePath().normalize();
@@ -779,6 +783,7 @@ final class Project {
     for (String relative :
         new String[] {
           "07_results/dense.las",
+          "07_results/dense_tiles/tiles.csv",
           "07_results/dense.ply",
           "07_results/report.txt",
           "07_results/processing-report.html",

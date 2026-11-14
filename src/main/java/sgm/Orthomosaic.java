@@ -754,10 +754,10 @@ final class Orthomosaic {
     long clock = System.nanoTime();
     Map<String, Object> coordinates = ProcessingReport.map(run.resolve("07_results/coordinates.json"));
     if (coordinates.isEmpty()) coordinates = ProcessingReport.map(run.resolve("coordinates.json"));
-    int epsg = coordinates.get("epsg") instanceof Number n ? n.intValue() : 0;
+    int epsg = DsmRaster.epsg(coordinates);
     boolean projected = Boolean.TRUE.equals(coordinates.get("georeferenced")) && epsg > 0;
     if (!projected && !o.reportLocalDsm)
-      return unavailable(out, "no projected coordinate frame; use --report-local-dsm when the local XY/Z frame is meaningful (Z up)");
+      return unavailable(out, DsmRaster.frameProblem(coordinates));
     double scale = 1;
     Path settings = run.resolve("logs/run-settings.properties");
     if (Files.isRegularFile(settings)) {
@@ -806,16 +806,8 @@ final class Orthomosaic {
     if (views.isEmpty())
       return unavailable(out, "no oriented photograph is readable" + (skipped.isEmpty() ? "" : ": " + skipped.get(0)));
     if (views.size() > Short.MAX_VALUE) return unavailable(out, "more than 32,767 photographs");
-    Path path = run.resolve("07_results/dense.ply");
-    if (!Files.isRegularFile(path)) path = run.resolve("dense.ply");
-    PlyStream cloud;
-    if (Files.isRegularFile(path)) cloud = new PlyStream(path);
-    else {
-      Path las = run.resolve("07_results/dense.las");
-      if (!Files.isRegularFile(las)) las = run.resolve("dense.las");
-      if (!Files.isRegularFile(las)) return unavailable(out, "no final PLY/LAS cloud");
-      cloud = PlyStream.las(las);
-    }
+    PlyStream cloud = PlyStream.finalCloud(run);
+    if (cloud == null) return unavailable(out, "no final PLY/LAS cloud");
     // Extent and mean height of the cloud.
     double[] bounds = {Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY};
     double[] sum = new double[2];

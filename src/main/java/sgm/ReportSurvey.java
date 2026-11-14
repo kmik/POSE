@@ -143,10 +143,24 @@ final class ReportSurvey {
         if (processedFx > 0) s.put("processed_ground_resolution", altitude / processedFx);
       }
     }
-    // Coverage: convex hull of the tie points (the reconstructed area, holes included).
-    double area = hullArea(trackXY);
+    // Coverage: the ground area of the report DSM cells that hold dense points (gaps excluded).
+    // Without a DSM: the convex hull of the tie points between the 1st and 99th percentiles in X
+    // and Y. (Until 14 November 2026 the hull of all tie points: a few far mismatched tie points
+    // stretched it to 33 km2 for a 3 ha forest block.)
+    double area = 0;
+    String basis = null;
+    if (dsm.get("occupied_cells") instanceof Number occupied
+        && dsm.get("cell_size") instanceof Number cell
+        && occupied.doubleValue() > 0) {
+      area = occupied.doubleValue() * cell.doubleValue() * cell.doubleValue();
+      basis = "dense cloud: report DSM cells with points";
+    } else {
+      area = hullArea(trimmed(trackXY, .01));
+      basis = "tie points: convex hull within the 1st-99th percentiles of X and Y";
+    }
     if (area > 0) {
       s.put("coverage_area", area);
+      s.put("coverage_basis", basis);
       if (dsm.get("source_points") instanceof Number points && area > 0)
         s.put("point_density", points.doubleValue() / area);
     }
@@ -220,6 +234,20 @@ final class ReportSurvey {
   }
 
   /** Area of the convex hull (monotone chain). */
+  /** Points whose X and Y both lie between the given lower and upper quantiles. */
+  static List<double[]> trimmed(List<double[]> points, double tail) {
+    List<double[]> p = new ArrayList<>();
+    for (double[] q : points) if (Double.isFinite(q[0]) && Double.isFinite(q[1])) p.add(q);
+    if (p.size() < 20) return p;
+    double[] x = p.stream().mapToDouble(q -> q[0]).sorted().toArray();
+    double[] y = p.stream().mapToDouble(q -> q[1]).sorted().toArray();
+    int lo = (int) Math.floor(tail * (p.size() - 1)), hi = (int) Math.ceil((1 - tail) * (p.size() - 1));
+    List<double[]> kept = new ArrayList<>();
+    for (double[] q : p)
+      if (q[0] >= x[lo] && q[0] <= x[hi] && q[1] >= y[lo] && q[1] <= y[hi]) kept.add(q);
+    return kept;
+  }
+
   static double hullArea(List<double[]> points) {
     List<double[]> p = new ArrayList<>();
     for (double[] q : points) if (Double.isFinite(q[0]) && Double.isFinite(q[1])) p.add(q);

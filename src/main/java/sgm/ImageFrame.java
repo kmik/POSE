@@ -103,8 +103,44 @@ final class ImageFrame implements AutoCloseable {
     releaseRasters();
   }
 
+  /** Colour 3 + gray 1 bytes per pixel, plus 1 for the valid mask when there is one. */
   long rasterBytes() {
-    return 5L * width * height;
+    return ((options.rectified || zeroDistortion(calibration)) ? 4L : 5L) * width * height;
+  }
+
+  // Set while rasters are loaded without a mask image because every pixel is valid.
+  private boolean maskFull;
+
+  /**
+   * True when the loaded rasters have no mask image because every pixel is valid (no distortion,
+   * or --rectified input): validMask is then empty. Use mask()/maskTo()/maskRow().
+   */
+  boolean fullMask() {
+    return maskFull;
+  }
+
+  /** The valid mask; a temporary all-255 image when fullMask() (give it back to releaseMask). */
+  Mat mask() {
+    return maskFull ? new Mat(height, width, CvType.CV_8U, new Scalar(255)) : validMask;
+  }
+
+  void releaseMask(Mat m) {
+    if (m != validMask) m.release();
+  }
+
+  void maskTo(Mat out) {
+    if (!maskFull) {
+      validMask.copyTo(out);
+      return;
+    }
+    out.create(height, width, CvType.CV_8U);
+    out.setTo(new Scalar(255));
+  }
+
+  /** Row y of the valid mask into row[0, width). */
+  void maskRow(int y, byte[] row) {
+    if (maskFull) java.util.Arrays.fill(row, 0, width, (byte) -1);
+    else validMask.get(y, 0, row);
   }
 
   String sourceReader() {
@@ -123,6 +159,7 @@ final class ImageFrame implements AutoCloseable {
     color.release();
     gray.release();
     validMask.release();
+    maskFull = false;
   }
 
   void loadRasters() throws IOException {
@@ -130,8 +167,13 @@ final class ImageFrame implements AutoCloseable {
     Mat resized = new Mat(), loaded = new Mat();
     try (WorkProgress work =
         WorkProgress.start("Decode/resize/undistort " + path.getFileName(), 0, "pixels")) {
-      boolean windowed = sourceReader().equals("imageio_source_windows");
-      if (windowed) {
+      String reader = sourceReader();
+      boolean windowed = reader.equals("imageio_source_windows");
+      Mat cached = ProcessedImageCache.read(this, reader);
+      if (cached != null) {
+        resized.release();
+        resized = cached;
+      } else if (windowed) {
         resized.release();
         resized =
             WindowedImage.read(
@@ -149,15 +191,19 @@ final class ImageFrame implements AutoCloseable {
                 path.toString(), Imgcodecs.IMREAD_COLOR | Imgcodecs.IMREAD_IGNORE_ORIENTATION);
         if (loaded.empty()) throw new IOException("Cannot decode " + path);
         Imgproc.resize(loaded, resized, new Size(width, height), 0, 0, Imgproc.INTER_AREA);
+        loaded.release();
       }
+      if (cached == null) ProcessedImageCache.write(this, reader, resized);
       Mat k = camera.intrinsic();
       MatOfDouble d = new MatOfDouble(calibration.distortion);
-      Mat ones = new Mat(height, width, CvType.CV_8U, new Scalar(255));
+      Mat ones = new Mat();
       try {
         if (options.rectified || zeroDistortion(calibration)) {
+          // Every pixel is valid: no mask image is kept (see fullMask()).
           resized.copyTo(color);
-          ones.copyTo(validMask);
+          maskFull = true;
         } else {
+          ones = new Mat(height, width, CvType.CV_8U, new Scalar(255));
           Calib3d.undistort(resized, color, k, d);
           Calib3d.undistort(ones, validMask, k, d);
           Imgproc.threshold(validMask, validMask, 254, 255, Imgproc.THRESH_BINARY);

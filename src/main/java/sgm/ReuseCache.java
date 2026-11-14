@@ -80,6 +80,8 @@ final class ReuseCache {
           PairSelection.class,
           VisualPairSelection.class,
           OptimalMvsgmNeighbors.class,
+          OutputDiskSpace.class,
+          MvsgmDiskPlan.class,
           DensePairSelection.class,
           CameraEmission.class,
           CameraEvidence.class,
@@ -199,7 +201,7 @@ final class ReuseCache {
       for (int y = 0; y < f.height; y++) {
         f.gray.get(y, 0, row);
         d.update(row);
-        f.validMask.get(y, 0, row);
+        f.maskRow(y, row);
         d.update(row);
       }
       f.pixelFingerprint = HexFormat.of().formatHex(d.digest());

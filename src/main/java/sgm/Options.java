@@ -39,6 +39,14 @@ public final class Options {
   public boolean mvsgmOptimalNeighbors;
   // --ply off / --point-confidence off: skip writing dense.ply / 07_results/point-confidence.bin.
   public boolean writePly = true, writePointConfidence = true;
+  // --tiled-las-output SIZE: square LAS tiles of SIZE output units (07_results/dense_tiles) instead
+  // of dense.las; 0 = one dense.las (LAS 1.4 automatically above 4,294,967,295 points).
+  public double tiledLasOutput = 0;
+  // --processed-image-cache auto|on|off: decoded processed images kept on disk for reuse
+  // (ProcessedImageCache). denseOptions: the full options behind an alignment copy.
+  public String processedImageCache = "auto";
+  Options denseOptions;
+  Path processedImageCacheDir;
   Map<String, Camera> calibrationPoses = Collections.emptyMap();
   public String crs = "EPSG:3067";
   public double gpsThreshold = 10;
@@ -142,6 +150,8 @@ public final class Options {
   /** --dense-method mvsgm settings (MULTIVIEW_SGM.md); recorded in 05_stereo/mvsgm.json. */
   int mvsgmNeighbors = 6, mvsgmBestK = 3, mvsgmCensus = 5, mvsgmLevels = -1, mvsgmConsistentViews = 1;
   double mvsgmConsistencyLabels = 1;
+  /** --mvsgm-cameras-in-flight: cameras whose depth maps are computed at once (0 = auto; 1 = serial). */
+  int mvsgmCamerasInFlight = 1;
   public double censusWeight = .5;
   public int adTruncation = 30, gradientTruncation = 60, gpuStripRows = 64;
   public int gpuBankMb = 1024;
@@ -233,6 +243,7 @@ public final class Options {
       kazeThreshold = .001;
   public int orbFastThreshold = 20, briskThreshold = 30;
   java.nio.file.Path cacheDirectory;
+  OutputDiskSpace outputDiskSpace;
   java.nio.file.Path projectDirectory;
   Path runFeatureDirectory;
   java.util.concurrent.atomic.AtomicLong runFeatureHits =
@@ -654,6 +665,12 @@ public final class Options {
         case "--fusion-mode":
           o.fusionMode = v.toLowerCase(Locale.ROOT);
           break;
+        case "--processed-image-cache":
+          o.processedImageCache = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--tiled-las-output":
+          o.tiledLasOutput = number(v);
+          break;
         case "--ply":
           o.writePly = onOff(v, "--ply");
           break;
@@ -758,6 +775,9 @@ public final class Options {
           break;
         case "--mvsgm-consistency-labels":
           o.mvsgmConsistencyLabels = number(v);
+          break;
+        case "--mvsgm-cameras-in-flight":
+          o.mvsgmCamerasInFlight = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
           break;
         case "--block-overlap":
           o.blockOverlap = number(v);
@@ -1388,6 +1408,18 @@ public final class Options {
           "Note: --point-confidence off ignored; ground classification/correction and --diagnostics"
               + " need 07_results/point-confidence.bin");
     }
+    if (o.tiledLasOutput < 0 || o.tiledLasOutput > 0 && o.tiledLasOutput * 1e4 > 4e9)
+      throw new IllegalArgumentException(
+          "--tiled-las-output requires a tile size above 0 and at most 400000 output units (0 = off)");
+    if (o.tiledLasOutput > 0 && (o.classifyGround || o.groundPairCorrection || o.groundAwareFusion))
+      throw new IllegalArgumentException(
+          "--tiled-las-output cannot be combined with ground classification/correction: the ground"
+              + " step reads and edits the single 07_results/dense.las");
+    if (o.tiledLasOutput > 0 && !o.blockProcessing.equals("off"))
+      throw new IllegalArgumentException(
+          "--tiled-las-output cannot be combined with --block-processing: block merging reads each"
+              + " block's single dense.las");
+    choice(o.processedImageCache, "--processed-image-cache", "auto", "on", "off");
     choice(o.calibrationPipeline, "--calibration-pipeline", "bootstrap", "joint");
     choice(o.fusionEmission, "--fusion-emission", "pair", "camera");
     choice(o.fusionEvidence, "--fusion-evidence", "pair", "camera", "auto");
@@ -1491,6 +1523,8 @@ public final class Options {
             "mvsgm settings require --mvsgm-neighbors 1..8, --mvsgm-best-k 1..neighbors,"
                 + " --mvsgm-census-window 3|5|7, --mvsgm-levels -1..5, --mvsgm-consistent-views"
                 + " 0..neighbors, --mvsgm-consistency-labels >0..64");
+      if (o.mvsgmCamerasInFlight < 0 || o.mvsgmCamerasInFlight > 16)
+        throw new IllegalArgumentException("--mvsgm-cameras-in-flight must be auto or 1..16");
       if (Double.isFinite(o.twoViewConfidenceThreshold)) {
         System.out.println(
             "Note: --two-view-confidence-threshold applies to pair SGM only; ignored with"
@@ -1781,6 +1815,7 @@ public final class Options {
 
   Options alignmentOptions() {
     Options a = copy();
+    a.denseOptions = denseOptions != null ? denseOptions : this;
     if (!alignmentQuality.equals("same")) {
       a.quality = alignmentQuality;
       a.maxDimension = 1600;
@@ -1883,6 +1918,7 @@ public final class Options {
   Options copy() {
     Options out = new Options();
     out.cacheDirectory = cacheDirectory;
+    out.outputDiskSpace = outputDiskSpace;
     out.runFeatureDirectory = runFeatureDirectory;
     out.runFeatureHits = runFeatureHits;
     out.projectDirectory = projectDirectory;
@@ -1900,6 +1936,7 @@ public final class Options {
     out.mvsgmLevels = mvsgmLevels;
     out.mvsgmConsistentViews = mvsgmConsistentViews;
     out.mvsgmConsistencyLabels = mvsgmConsistencyLabels;
+    out.mvsgmCamerasInFlight = mvsgmCamerasInFlight;
     try {
       for (java.lang.reflect.Field field : Options.class.getFields())
         field.set(out, field.get(this));
@@ -2343,6 +2380,16 @@ Point filtering and multi-view fusion:
   --mvsgm-consistency-labels T
       mvsgm: agreement tolerance in the neighbour's inverse-depth label steps
       (about one pixel of image motion each; default 1).
+  --mvsgm-cameras-in-flight N|auto
+      mvsgm: compute the depth maps of N cameras at once (default 1 = one at a time;
+      1..16). Each camera in flight prepares its neighbour images on the CPU and solves
+      on the GPU in its own session; all sessions share --gpu-memory-mb and wait for
+      free device memory, and the cameras share --cores. Depth maps do not depend on
+      each other and are handed to consistency and fusion in the unchanged order, so
+      the output equals the serial path. auto = one per 4 cores, at most 8, lowered
+      until the per-camera heap estimate fits; 1 with --compute cpu. Up to N raw depth
+      maps exist ahead of fusion (extra temporary disk: 16 bytes per pixel each). If
+      a camera runs out of heap, the remaining cameras are computed one at a time.
   --dense-pipeline standard|aerial-tiled
       Default standard is unchanged. Opt-in aerial-tiled requires a compatible OpenCL GPU.
       It rectifies source regions on demand, predicts tile search intervals from a coarse
@@ -2741,6 +2788,13 @@ Additional workflow controls:
       At least one active pair must fit; raise this or lower resolution if needed.
       Metadata/keypoints survive eviction; active source pairs load on demand.
       Stereo/rectification buffers and codec scratch are additional to this cache.
+  --processed-image-cache auto|on|off
+      Keeps each decoded, resized photograph (3 bytes per processed pixel, before
+      undistortion) in the run's cache/processed-images folder until the dense step
+      ends, so the dense step and frames evicted from the raster cache read it back
+      instead of decoding the photograph again. Identical results. Default auto
+      writes only while at least 16 GiB and a tenth of the volume stay free; on
+      only needs 1 GiB free; off always decodes. Only images at the dense size.
   --descriptor-memory-mb N
       Native descriptor LRU cap (default: 256 MiB), also capped at memory-mb/4.
       Both active descriptor sets must fit. Exact descriptor spills are run-local
@@ -2791,6 +2845,12 @@ Additional workflow controls:
       Default on writes 07_results/dense.ply next to dense.las (same points; double
       coordinates). off skips it: less disk and write time. The report DSM then reads
       dense.las; --analyze-run needs the PLY.
+  --tiled-las-output SIZE
+      Default 0 writes one 07_results/dense.las: LAS 1.2, switched automatically to
+      LAS 1.4 above 4,294,967,295 points. SIZE > 0 writes square LAS tiles of SIZE
+      output units (metres in a projected frame) to 07_results/dense_tiles/
+      tile_X_Y.las (X, Y = lower-left corner) with tiles.csv, instead of dense.las.
+      dense.ply stays one file. Not with --classify-ground or --block-processing.
   --point-confidence on|off
       Default on writes 07_results/point-confidence.bin (lossless per-point metadata in
       cloud order, about 200 bytes per point). off skips it; the cloud is unchanged.

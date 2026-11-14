@@ -721,6 +721,15 @@ final class ImageFusion {
   private void spill(int j) throws IOException {
     if (spillDirectory == null) spillDirectory = o.output.resolve("06_fusion/map-spill");
     Files.createDirectories(spillDirectory);
+    if (o.outputDiskSpace != null) {
+      long bytes = spilledMaps[j] ? 0 : 4L * (compact[j].a.length
+          + (compactWeight[j] == null ? 0L : compactWeight[j].a.length)
+          + (localBest[j] == null ? 0L : localBest[j].a.length));
+      long marks = 2 + 8L * ((used[j] == null ? 0L : used[j].a.length)
+          + (emitted[j] == null ? 0L : emitted[j].a.length));
+      long previous = Files.exists(bitsFile(j)) ? Files.size(bitsFile(j)) : 0;
+      OutputDiskSpace.require(o, bytes + Math.max(0, marks - previous), "fusion map spill");
+    }
     if (!spilledMaps[j]) {
       try (FileChannel ch = FileChannel.open(mapFile(j), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
         writeFloats(ch, compact[j].a);
@@ -836,6 +845,7 @@ final class ImageFusion {
 
   /** A new zero map file of camera c, memory-mapped read-write. */
   private java.lang.foreign.MemorySegment tileMap(int c, String kind, long bytes) throws IOException {
+    OutputDiskSpace.require(o, bytes, "fusion " + kind + " map for camera " + c);
     var segment = tileFiles.computeIfAbsent(c, k -> new MappedFiles()).create(tileFile(c, kind), bytes);
     tileMappedBytes += bytes;
     return segment;

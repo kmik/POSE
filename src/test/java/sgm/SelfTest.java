@@ -61,6 +61,9 @@ public final class SelfTest {
       checks += GpuMvsgmCensusRegression.run();
     checks += LargeFormatRegression.run();
     checks += CameraWindowRegression.run(root.resolve("camera-window"));
+    checks += MvsgmCameraPoolRegression.run(root.resolve("camera-pool"));
+    checks += DiskAdmissionRegression.run(root.resolve("disk-admission"));
+    checks += CloudOutputRegression.run(root.resolve("cloud-output"));
     checks += SpeckleFilterRegression.run();
     checks += GpuSpikeFilterRegression.run();
     checks += MedianSelectionRegression.run();
@@ -86,6 +89,7 @@ public final class SelfTest {
     checks += ExactReuseRegression.run(root.resolve("exact-reuse"));
     checks += TwoViewConfidenceRegression.run(root.resolve("two-view-confidence"));
     checks += PdfReportRegression.run(root.resolve("pdf-report"));
+    checks += ReportFixesRegression.run(root.resolve("report-fixes"));
     checks += WorkflowRegression.run(root);
     checks += StorageGpuRegression.run(root);
     checks += DepthIoRegression.run(root);

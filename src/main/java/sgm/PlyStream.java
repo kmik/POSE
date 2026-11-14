@@ -19,8 +19,42 @@ final class PlyStream {
   // LAS mode (dense.las when --ply off): int32 X/Y/Z at record offsets 0/4/8, scaled.
   final boolean las;
   final double[] lasScale, lasOffset;
+  // A set of LAS tiles (--tiled-las-output): scanned one after another.
+  private final List<PlyStream> parts;
+
+  private PlyStream(List<PlyStream> parts) {
+    this.parts = parts;
+    long n = 0;
+    for (PlyStream p : parts) n += p.count;
+    count = n;
+    file = parts.get(0).file;
+    header = 0;
+    bytes = x = y = z = 0;
+    xd = yd = zd = false;
+    las = true;
+    lasScale = lasOffset = null;
+  }
+
+  /**
+   * The final cloud of a run: dense.ply, else dense.las (--ply off), else the LAS tiles listed in
+   * 07_results/dense_tiles/tiles.csv; null when none exists.
+   */
+  static PlyStream finalCloud(Path run) throws IOException {
+    for (Path path : new Path[] {run.resolve("07_results/dense.ply"), run.resolve("dense.ply")})
+      if (Files.isRegularFile(path)) return new PlyStream(path);
+    for (Path path : new Path[] {run.resolve("07_results/dense.las"), run.resolve("dense.las")})
+      if (Files.isRegularFile(path)) return las(path);
+    Path index = run.resolve("07_results/dense_tiles/tiles.csv");
+    if (!Files.isRegularFile(index)) return null;
+    List<PlyStream> tiles = new ArrayList<>();
+    List<String> lines = Files.readAllLines(index);
+    for (String line : lines.subList(1, lines.size()))
+      if (!line.isBlank()) tiles.add(las(index.resolveSibling(line.substring(0, line.indexOf(',')))));
+    return tiles.isEmpty() ? null : new PlyStream(tiles);
+  }
 
   private PlyStream(Path file, long count, long header, int bytes, double[] scale, double[] offset) {
+    parts = null;
     this.file = file;
     this.count = count;
     this.header = header;
@@ -58,6 +92,7 @@ final class PlyStream {
   }
 
   PlyStream(Path file) throws IOException {
+    parts = null;
     las = false;
     lasScale = lasOffset = null;
     this.file = file;
@@ -129,6 +164,10 @@ final class PlyStream {
   }
 
   void scan(String label, Consumer consumer) throws IOException {
+    if (parts != null) {
+      for (PlyStream part : parts) part.scan(label, consumer);
+      return;
+    }
     try (FileChannel in = FileChannel.open(file);
         WorkProgress work = WorkProgress.start(label, count, "points")) {
       in.position(header);

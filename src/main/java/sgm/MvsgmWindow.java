@@ -12,6 +12,7 @@ final class MvsgmWindow implements AutoCloseable {
   final boolean retainFusion;
   final long[] planningStarts;
   final long estimatedPeakBytes;
+  final MvsgmDiskPlan diskPlan;
   final int[] pairOf;
   private final MultiViewSgm mvs;
   private final Options o;
@@ -26,6 +27,7 @@ final class MvsgmWindow implements AutoCloseable {
   private final ExecutorService preparer;
   private final GpuMemoryPool.Scope gpu;
   private final WorkProgress stereoWork;
+  private final MvsgmCameraPool pool;
   private Future<MultiViewSgm.Plan> next;
   private int nextCamera = -1, completed, depthCompleted, cameraCount;
   private long considered, kept, depthNanos, consistencyNanos, currentSourceBytes, peakSourceBytes;
@@ -90,17 +92,19 @@ final class MvsgmWindow implements AutoCloseable {
     long[] fusionBytes = new long[n];
     for (int c = 0; c < n; c++) fusionBytes[c] = 13L * widths[c] * heights[c];
     long mapDisk = Math.addExact(graph.sourcePeakBytes, graph.peakBytes(fusionBytes, retainFusion));
-    int attributes = o.pointAttributes.equals("surface") ? SurfaceAttributes.BYTES : 0;
-    long spool = Math.multiplyExact(pixels, 27L + attributes);
-    long records = o.writePointConfidence ? Math.multiplyExact(pixels, 224L + Math.ceilDiv(n, 8)) : 0;
-    if (o.fusionEmission.equals("camera") || o.surfaceConsolidation.equals("normal"))
-      records = Math.addExact(records, Math.multiplyExact(pixels, 256L + Math.ceilDiv(n, 8)));
-    long exports = Math.multiplyExact(pixels, 26L + attributes + (o.writePly ? 27L + attributes : 0));
+    // Cameras in flight: up to that many raw maps (16 bytes per pixel) exist ahead of their first reader.
+    int inFlight = mvs.camerasInFlight(frames, cameraCount);
+    if (inFlight > 1) {
+      long largest = 0;
+      for (int c = 0; c < n; c++)
+        if (eligible[c]) largest = Math.max(largest, 16L * widths[c] * heights[c] + 4L * DepthMapFile.HEADER);
+      mapDisk = Math.addExact(mapDisk, Math.multiplyExact(largest, (long) inFlight));
+    }
     long retained = retainSource ? graph.sourcePeakBytes : 0;
-    if (o.diagnostics) retained = Math.addExact(retained, Math.multiplyExact(pixels, 2048L));
-    long need = Math.addExact(Math.max(Math.addExact(mapDisk, spool), Math.addExact(retained, Math.addExact(spool, exports))), records);
-    estimatedPeakBytes = Math.addExact(need, Math.max(256L << 20, need / 20));
-    checkDisk(o.output, estimatedPeakBytes, mapDisk, graph.peakCameras, cameraCount);
+    diskPlan = MvsgmDiskPlan.of(pixels, n, mapDisk, retained, o);
+    estimatedPeakBytes = diskPlan.worstCase();
+    checkDisk(o.output, diskPlan, graph.peakCameras, cameraCount);
+    o.outputDiskSpace = new OutputDiskSpace(o.output, diskPlan.headroom());
     planningStarts = new long[cameraCount + 1];
     int p = 0;
     for (int c = 0; c < n; c++) if (eligible[c]) {
@@ -119,6 +123,26 @@ final class MvsgmWindow implements AutoCloseable {
       t.setDaemon(true);
       return t;
     });
+    if (inFlight > 1) {
+      // Predicted request order of fusion: camera c with its matching neighbours, then the same
+      // for every camera that may overlap c. A wrong guess costs time only (see MvsgmCameraPool).
+      List<Integer> order = new ArrayList<>();
+      boolean[] listed = new boolean[n];
+      for (int c = 0; c < n; c++) {
+        if (!eligible[c]) continue;
+        predict(c, listed, order);
+        for (int j : graph.possible[c]) predict(j, listed, order);
+      }
+      pool = new MvsgmCameraPool(inFlight, o.cores, order.stream().mapToInt(Integer::intValue).toArray(), camera -> {
+        long clock = System.nanoTime();
+        MultiViewSgm.Plan plan = mvs.preparePlan(frames, headers[camera]);
+        OutputDiskSpace.require(o, 16L * frames.get(camera).width * frames.get(camera).height
+            + 4L * DepthMapFile.HEADER, "raw MVSGM maps for camera " + camera);
+        return mvs.computeCamera(frames, tracks, camera, plan, clock);
+      });
+      System.out.printf(Locale.ROOT, "mvsgm: %d cameras in flight (--mvsgm-cameras-in-flight), %d row workers each%n",
+          pool.inFlight, pool.rowCores);
+    } else pool = null;
     stereoWork = WorkProgress.start("Multi-view stereo window", 2L * cameraCount, "camera passes");
     mvs.handoff.window = this;
   }
@@ -137,6 +161,40 @@ final class MvsgmWindow implements AutoCloseable {
           + " MiB; free disk or lower --quality (no temporary maps were created)");
   }
 
+  static void checkDisk(Path output, MvsgmDiskPlan plan, int window, int total) throws IOException {
+    long available = OutputDiskSpace.available(output);
+    Json.write(output.resolve("05_stereo/mvsgm/disk_plan.json"), Json.object(
+        "map_working_set_upper_bytes", plan.maps(), "all_pixels_cloud_staging_upper_bytes", plan.spoolUpper(),
+        "all_pixels_exports_upper_bytes", plan.exportsUpper(), "all_pixels_records_upper_bytes", plan.recordsUpper(),
+        "deferred_records_reservation_bytes", plan.deferredUpper(), "diagnostics_reservation_bytes", plan.diagnosticsUpper(),
+        "all_pixels_peak_upper_bytes", plan.worstCase(), "startup_required_bytes", plan.startup(),
+        "safety_reserve_bytes", plan.headroom(), "available_bytes", available, "window_cameras", window,
+        "total_cameras", total, "actual_point_count_guards", true,
+        "scope", "Cloud upper bound assumes every processed pixel becomes a final point; startup admission reserves maps and fixed/deferred work, then guards actual staging and export growth"));
+    System.out.printf(Locale.ROOT,
+        "mvsgm overlap window: up to %d/%d cameras; maps upper estimate %,d MiB;"
+            + " startup disk reservation %,d MiB; available %,d MiB%n"
+            + "mvsgm cloud disk: all-pixels staging+exports upper bound %,d MiB"
+            + " (not a required output size); actual point-count checks enabled%n",
+        window, total, plan.maps() >> 20, plan.startup() >> 20, available >> 20,
+        (plan.spoolUpper() + plan.exportsUpper()) >> 20);
+    if (plan.startup() > available)
+      throw new IOException("mvsgm map/deferred-work startup reservation needs approximately "
+          + (plan.startup() >> 20) + " MiB, available " + (available >> 20)
+          + " MiB (no temporary maps were created; see 05_stereo/mvsgm/disk_plan.json)");
+  }
+
+  private void predict(int c, boolean[] listed, List<Integer> order) {
+    if (!eligible[c]) return;
+    SortedSet<Integer> requested = new TreeSet<>();
+    requested.add(c);
+    for (int j : mvs.info.get(c).neighbours()) if (eligible[j]) requested.add(j);
+    for (int j : requested) if (!listed[j]) {
+      listed[j] = true;
+      order.add(j);
+    }
+  }
+
   private void schedule(int camera) {
     if (next != null) return;
     nextCamera = camera;
@@ -149,6 +207,20 @@ final class MvsgmWindow implements AutoCloseable {
 
   private void rawCameras(SortedSet<Integer> requested) throws IOException {
     int[] missing = requested.stream().filter(c -> eligible[c] && !raw[c]).mapToInt(Integer::intValue).toArray();
+    if (pool != null) {
+      for (int camera : missing) {
+        long clock = System.nanoTime();
+        stereoWork.detail("depth camera " + camera);
+        reports[camera] = pool.await(camera);
+        depthNanos += System.nanoTime() - clock;
+        raw[camera] = true;
+        stereoWork.update(++depthCompleted + completed);
+        sourceBytes[camera] = 16L * frames.get(camera).width * frames.get(camera).height + 4L * DepthMapFile.HEADER;
+        currentSourceBytes += sourceBytes[camera];
+        peakSourceBytes = Math.max(peakSourceBytes, currentSourceBytes);
+      }
+      return;
+    }
     for (int i = 0; i < missing.length; i++) {
       int camera = missing[i];
       long clock = System.nanoTime();
@@ -169,6 +241,8 @@ final class MvsgmWindow implements AutoCloseable {
       }
       next = null;
       if (i + 1 < missing.length) schedule(missing[i + 1]);
+      OutputDiskSpace.require(o, 16L * frames.get(camera).width * frames.get(camera).height
+          + 4L * DepthMapFile.HEADER, "raw MVSGM maps for camera " + camera);
       try (var rows = StereoRows.open(Math.max(1, o.cores / 2))) {
         reports[camera] = mvs.computeCamera(frames, tracks, camera, plan, clock);
       }
@@ -267,16 +341,21 @@ final class MvsgmWindow implements AutoCloseable {
   }
 
   Object report() {
-    return Json.object("enabled", true, "peak_camera_bound", graph.peakCameras,
+    Map<String, Object> out = new LinkedHashMap<>(Json.object("enabled", true, "peak_camera_bound", graph.peakCameras,
         "camera_count", cameraCount, "peak_additional_disk_estimate", estimatedPeakBytes,
+        "peak_additional_disk_estimate_scope", "All-pixels cloud upper bound; streaming startup uses a separate reservation",
+        "startup_disk_reservation_bytes", diskPlan.startup(), "actual_point_count_disk_checks", true,
         "peak_source_map_bytes", peakSourceBytes, "remaining_source_map_bytes", currentSourceBytes,
         "stereo_depth_seconds", depthNanos / 1e9, "stereo_consistency_seconds", consistencyNanos / 1e9,
-        "precision_or_retention_requires_all_maps", retainFusion, "stage_times_overlap", true);
+        "precision_or_retention_requires_all_maps", retainFusion, "stage_times_overlap", true));
+    if (pool != null) out.put("cameras_in_flight", pool.report());
+    return out;
   }
 
   @Override public void close() {
     if (closed) return;
     closed = true;
+    if (pool != null) pool.close();
     preparer.shutdownNow();
     boolean interrupted = false;
     for (;;) try {

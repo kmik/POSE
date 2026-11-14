@@ -1968,8 +1968,8 @@ final class DenseReconstruction {
           b.gray.copyTo(out.rightGray);
           a.color.copyTo(out.leftColor);
           b.color.copyTo(out.rightColor);
-          a.validMask.copyTo(out.leftMask);
-          b.validMask.copyTo(out.rightMask);
+          a.maskTo(out.leftMask);
+          b.maskTo(out.rightMask);
           maskFootprint(out);
         }
         if (report && project != null) {
@@ -2092,7 +2092,12 @@ final class DenseReconstruction {
       Calib3d.initUndistortRectifyMap(k1, d, r1, p1, a.gray.size(), CvType.CV_32FC1, mapX, mapY);
       Imgproc.remap(a.gray, out.leftGray, mapX, mapY, Imgproc.INTER_LINEAR);
       Imgproc.remap(a.color, out.leftColor, mapX, mapY, Imgproc.INTER_LINEAR);
-      Imgproc.remap(a.validMask, out.leftMask, mapX, mapY, Imgproc.INTER_LINEAR);
+      Mat aMask = a.mask();
+      try {
+        Imgproc.remap(aMask, out.leftMask, mapX, mapY, Imgproc.INTER_LINEAR);
+      } finally {
+        a.releaseMask(aMask);
+      }
       remapNanos += System.nanoTime() - clock;
       clock = System.nanoTime();
       if (report && project != null)
@@ -2102,7 +2107,12 @@ final class DenseReconstruction {
       Calib3d.initUndistortRectifyMap(k2, d, r2, p2, b.gray.size(), CvType.CV_32FC1, mapX, mapY);
       Imgproc.remap(b.gray, out.rightGray, mapX, mapY, Imgproc.INTER_LINEAR);
       Imgproc.remap(b.color, out.rightColor, mapX, mapY, Imgproc.INTER_LINEAR);
-      Imgproc.remap(b.validMask, out.rightMask, mapX, mapY, Imgproc.INTER_LINEAR);
+      Mat bMask = b.mask();
+      try {
+        Imgproc.remap(bMask, out.rightMask, mapX, mapY, Imgproc.INTER_LINEAR);
+      } finally {
+        b.releaseMask(bMask);
+      }
       remapNanos += System.nanoTime() - clock;
       clock = System.nanoTime();
       if (report && project != null)

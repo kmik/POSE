@@ -40,6 +40,9 @@ final class FusionOutput implements AutoCloseable {
         new CloudWriter(
             options.output, options.scale, crs, options.pointAttributes.equals("surface"));
     cloud.writePly(options.writePly);
+    if (options.tiledLasOutput > 0)
+      cloud.tiles(options.tiledLasOutput, options.output.resolve("07_results/dense_tiles"));
+    cloud.diskSpace(options.outputDiskSpace);
     BufferedWriter openedDecisions = null;
     PointRecords.Writer openedRecords = null;
     SurfaceConsolidator openedSurface = null;
@@ -95,6 +98,11 @@ final class FusionOutput implements AutoCloseable {
     if (geometry == null) geometry = new DepthFusion.SurfaceSample(null, 0, 0);
     SurfaceConsolidator.Sample p =
         new SurfaceConsolidator.Sample(id, source, pixel, rgb, result, geometry);
+    if (options.outputDiskSpace != null && staged % OutputDiskSpace.BATCH == 0
+        && (records != null || cameraEmission != null || surface != null))
+      OutputDiskSpace.require(options,
+          OutputDiskSpace.BATCH * (256L + Math.ceilDiv(fusion.cameraCount(), 8)),
+          "fusion staging and confidence records");
     staged++;
     if (cameraEmission != null) {
       cameraEmission.add(p);

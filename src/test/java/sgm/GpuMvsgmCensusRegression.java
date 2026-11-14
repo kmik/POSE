@@ -237,8 +237,8 @@ final class GpuMvsgmCensusRegression {
         check(GpuMvsgmCensus.canvases==before,mode+" executes no device census");
         check(ref.census!=null && view.census!=null,mode+" materialises deferred CPU descriptors");
         if(mode.equals("sgm.cpuMvsgmCensus") || mode.equals("tiny"))
-          check(mv.lastBackend.equals("gpu"),mode+" disables census alone while this small SGM fits the device");
-        else check(mv.lastBackend.equals("cpu"),mode+" selects the CPU SGM path");
+          check(mv.lastBackend().equals("gpu"),mode+" disables census alone while this small SGM fits the device");
+        else check(mv.lastBackend().equals("cpu"),mode+" selects the CPU SGM path");
       } finally {
         if(flag!=null) {if(previous==null)System.clearProperty(flag);else System.setProperty(flag,previous);}
       }

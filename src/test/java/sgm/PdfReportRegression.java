@@ -81,7 +81,8 @@ final class PdfReportRegression {
       int surveyPages;
       try (PDDocument summary = Loader.loadPDF(summaryOut.resolve("processing-report.pdf").toFile())) {
         surveyPages = summary.getNumberOfPages();
-        check(surveyPages >= 3 && surveyPages <= 8, "survey report is a few pages: " + surveyPages);
+        // 9 since 14 November 2026: the image overlap figure added to Survey Data takes a page.
+        check(surveyPages >= 3 && surveyPages <= 9, "survey report is a few pages: " + surveyPages);
         String text = new PDFTextStripper().getText(summary);
         for (String section : List.of("Summary", "Quality flags", "Survey Data", "Digital Elevation Model", "Processing Parameters"))
           check(text.contains(section), "survey report section " + section);

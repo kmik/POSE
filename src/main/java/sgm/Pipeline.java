@@ -86,6 +86,8 @@ final class Pipeline {
     System.out.println("Pipeline step: " + step.name + " - " + step.description);
     // Every step starts from the same random state, whether chained or run separately.
     Core.setRNGSeed(1);
+    // Decoded images may be kept on disk while the steps up to dense run (ProcessedImageCache).
+    if (step.ordinal() <= Step.DENSE.ordinal()) ProcessedImageCache.open(options);
     String outcome;
     try {
       outcome =
@@ -109,6 +111,11 @@ final class Pipeline {
         frames.clear();
         features = null; // do not retain the previous graph while the next step restores it
         Geometry.releaseWorkspaces();
+        // Decoded images are reused up to and including the dense step (ProcessedImageCache).
+        if (step == Step.DENSE || step == Step.FINISH) {
+          ProcessedImageCache.open(options);
+          ProcessedImageCache.delete(options);
+        }
       }
     }
     state.mark(step, outcome, outcome.equals("waiting") ? state.string("gcp_waiting") : step.description);
@@ -220,6 +227,18 @@ final class Pipeline {
         Files.copy(file, project.run.resolve(name), StandardCopyOption.REPLACE_EXISTING);
       }
     }
+    // coordinates.json comes from the georeference step but a finished run keeps it in 07_results,
+    // which belongs to the dense step and is not carried when branching at dense or earlier.
+    // Without it the branch's report took the cloud for a local frame (no DSM, no orthomosaic).
+    if (from.ordinal() > Step.GEOREFERENCE.ordinal()
+        && !Files.isRegularFile(project.run.resolve("coordinates.json"))
+        && !Files.isRegularFile(project.run.resolve("07_results/coordinates.json")))
+      for (Path file :
+          new Path[] {source.resolve("coordinates.json"), source.resolve("07_results/coordinates.json")})
+        if (Files.isRegularFile(file)) {
+          Files.copy(file, project.run.resolve("coordinates.json"), StandardCopyOption.REPLACE_EXISTING);
+          break;
+        }
     // State, camera.txt and constraints.json exactly as they were after the step before 'from',
     // plus the earlier snapshots so the new run can be branched again.
     Path stateDir = project.run.resolve("state");
@@ -346,6 +365,8 @@ final class Pipeline {
     if (planningOnly()) return "skipped";
     paths = Main.images(options);
     OrientationIO.prepare(options, paths);
+    // Input provenance hashes for images.csv, in the background while calibration decodes.
+    if (project != null) project.data.hashSources(paths);
     int[] first = ResolutionPlan.originalSize(paths.get(0));
     calibration = ReuseCache.calibration(paths, options, null);
     if (calibration == null) {

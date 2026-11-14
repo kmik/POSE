@@ -114,6 +114,7 @@ the images have GPS). `--gcp-check auto` holds some points back as check points 
 | `--orthomosaic` | off | Full-resolution true orthomosaic. |
 | `--dense-method` | `sgm` | `mvsgm` matches several neighbouring images at once (needs `--fusion-mode image`). |
 | `--block-processing` | `off` | `auto` or `on` splits very large image sets into overlapping blocks. |
+| `--tiled-las-output` | `0` | Size of square LAS tiles in output units (for example `1000`); `0` writes one `dense.las`. |
 | `--compute` | `auto` | `cpu` or `gpu` force one. |
 | `--cores` | half the CPUs | CPU threads. |
 | `--memory-mb` | `2048` | Processing buffer budget in MiB (not a total RAM limit). |

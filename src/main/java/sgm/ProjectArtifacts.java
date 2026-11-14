@@ -42,7 +42,12 @@ final class ProjectArtifacts implements AutoCloseable {
         image(dir.resolve("undistorted_color.png"), frame.color);
       if ((options.diagnostics && options.storage.equals("debug"))) {
         image(dir.resolve("undistorted_gray.png"), frame.gray);
-        image(dir.resolve("valid_mask.png"), frame.validMask);
+        Mat mask = frame.mask();
+        try {
+          image(dir.resolve("valid_mask.png"), mask);
+        } finally {
+          frame.releaseMask(mask);
+        }
       }
       Json.write(
           dir.resolve("image.json"),
@@ -116,7 +121,7 @@ final class ProjectArtifacts implements AutoCloseable {
             + ","
             + Files.size(path)
             + ","
-            + Project.sha256(path)
+            + sourceHash(path)
             + ","
             + width
             + ","
@@ -151,6 +156,56 @@ final class ProjectArtifacts implements AutoCloseable {
     if (calibration != null) sourceCalibration = calibration;
   }
 
+  // Input SHA-256 for images.csv, started in the background for all photographs at the start of
+  // the calibrate step (up to 4 files at once, overlapping decoding and features). Identical
+  // values; source() waits for its own file's hash.
+  private final Map<Path, java.util.concurrent.Future<String>> sourceHashes =
+      new java.util.concurrent.ConcurrentHashMap<>();
+  private java.util.concurrent.ExecutorService hashPool;
+
+  private String sourceHash(Path path) throws IOException {
+    var hash = sourceHashes.remove(path);
+    if (hash == null) return Project.sha256(path);
+    try {
+      return hash.get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Input hashing interrupted", e);
+    } catch (java.util.concurrent.ExecutionException e) {
+      if (e.getCause() instanceof IOException io) throw io;
+      throw new IOException(e.getCause());
+    } finally {
+      if (sourceHashes.isEmpty() && hashPool != null) {
+        hashPool.shutdown();
+        hashPool = null;
+      }
+    }
+  }
+
+  void hashSources(List<Path> paths) {
+    int threads = Math.min(paths.size(), Math.max(1, Math.min(4, options.cores)));
+    if (threads < 2 || hashPool != null) return;
+    hashPool =
+        java.util.concurrent.Executors.newFixedThreadPool(
+            threads,
+            r -> {
+              Thread t = new Thread(r, "input-sha256");
+              t.setDaemon(true);
+              return t;
+            });
+    for (Path p : paths)
+      sourceHashes.computeIfAbsent(
+          p,
+          key ->
+              hashPool.submit(
+                  () -> {
+                    long started = System.nanoTime();
+                    String h = Project.sha256(key);
+                    RunTelemetry.record("Input SHA-256 " + key.getFileName(), started);
+                    return h;
+                  }));
+  }
+
   void inputs(List<ImageFrame> frames, Calibration calibration) throws IOException {
     this.frames = frames;
     sourceCalibration = calibration;
@@ -162,7 +217,12 @@ final class ProjectArtifacts implements AutoCloseable {
         image(dir.resolve("undistorted_color.png"), frame.color);
       if ((options.diagnostics && options.storage.equals("debug"))) {
         image(dir.resolve("undistorted_gray.png"), frame.gray);
-        image(dir.resolve("valid_mask.png"), frame.validMask);
+        Mat mask = frame.mask();
+        try {
+          image(dir.resolve("valid_mask.png"), mask);
+        } finally {
+          frame.releaseMask(mask);
+        }
       }
       Camera c = frame.camera;
       Json.write(

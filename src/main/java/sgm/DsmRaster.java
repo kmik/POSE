@@ -11,28 +11,14 @@ import javax.imageio.ImageIO;
 final class DsmRaster {
   static Map<String, Object> create(Path run, Path out, Options o, Map<String, Object> coordinates)
       throws IOException {
-    Object epsgValue = coordinates.get("epsg");
-    int epsg = epsgValue instanceof Number n ? n.intValue() : 0;
+    int epsg = epsg(coordinates);
     boolean projected = Boolean.TRUE.equals(coordinates.get("georeferenced")) && epsg > 0;
     if (!projected && !o.reportLocalDsm)
-      return Json.object(
-          "status",
-          "unavailable",
-          "reason",
-          "No established projected elevation frame; use --report-local-dsm only when local XY/Z is"
-              + " meaningful");
-    Path path = run.resolve("07_results/dense.ply");
-    if (!Files.isRegularFile(path)) path = run.resolve("dense.ply");
-    PlyStream cloud;
-    if (Files.isRegularFile(path)) cloud = new PlyStream(path);
-    else {
-      // --ply off: the LAS cloud (same points, coordinates quantized to the LAS scale).
-      Path las = run.resolve("07_results/dense.las");
-      if (!Files.isRegularFile(las)) las = run.resolve("dense.las");
-      if (!Files.isRegularFile(las))
-        return Json.object("status", "unavailable", "reason", "No final PLY/LAS cloud");
-      cloud = PlyStream.las(las);
-    }
+      return Json.object("status", "unavailable", "reason", frameProblem(coordinates));
+    // dense.ply; with --ply off the LAS cloud or its tiles (coordinates quantized to the LAS scale).
+    PlyStream cloud = PlyStream.finalCloud(run);
+    if (cloud == null)
+      return Json.object("status", "unavailable", "reason", "No final PLY/LAS cloud");
     double[] bounds = {
       Double.POSITIVE_INFINITY,
       Double.POSITIVE_INFINITY,
@@ -241,6 +227,85 @@ final class DsmRaster {
   }
 
   // GeoTIFF pixel-is-area, north-up; Float32 single strip and explicit NaN nodata.
+  /** EPSG code of a run's coordinates.json: "epsg", else parsed from "horizontal_crs"; 0 = none. */
+  static int epsg(Map<String, Object> coordinates) {
+    if (coordinates.get("epsg") instanceof Number n && n.intValue() > 0) return n.intValue();
+    if (coordinates.get("horizontal_crs") instanceof String name && !name.isBlank())
+      try {
+        return new Crs(name).epsg;
+      } catch (RuntimeException unknown) {
+        return 0;
+      }
+    return 0;
+  }
+
+  /** Why a run has no projected frame for the report DSM and orthomosaic (one sentence or two). */
+  static String frameProblem(Map<String, Object> coordinates) {
+    String local = " Use --report-local-dsm for a DSM in local reconstruction units.";
+    if (coordinates.isEmpty())
+      return "The run has no coordinates.json, so its coordinate frame is unknown. Branches made"
+          + " at the dense step before 14 November 2026 lost this file: copy"
+          + " 07_results/coordinates.json from the source run and regenerate with --export-report."
+          + local;
+    if (!Boolean.TRUE.equals(coordinates.get("georeferenced")))
+      return "The cloud is in its local reconstruction frame (not georeferenced"
+          + (coordinates.get("reason") instanceof String r && !r.isBlank() ? ": " + r : "")
+          + ")." + local;
+    return "The cloud is georeferenced but without a known EPSG code ("
+        + coordinates.getOrDefault("horizontal_crs", "no horizontal CRS")
+        + "), so no projected map can be drawn." + local;
+  }
+
+  /** Heights of a float GeoTIFF written by writeTiff: {width, height} and row-major values. */
+  record Heights(int width, int height, float[] z) {}
+
+  /**
+   * Reads a DSM written by writeTiff (little-endian, one uncompressed strip of 32-bit floats).
+   * ImageIO's TIFF reader (TwelveMonkeys) returned 1.0 for every finite height of these files,
+   * which put the report orthomosaic's ground about 90 m too low (shifted blocks between
+   * cameras); the files themselves are correct.
+   */
+  static Heights readTiff(Path path) throws IOException {
+    try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(path)) {
+      ByteBuffer head = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN);
+      ch.read(head, 0);
+      if (head.get(0) != 'I' || head.get(1) != 'I' || head.getShort(2) != 42)
+        throw new IOException("Not a little-endian classic TIFF: " + path);
+      long ifd = head.getInt(4) & 0xffffffffL;
+      ByteBuffer count = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN);
+      ch.read(count, ifd);
+      int n = count.getShort(0) & 0xffff;
+      ByteBuffer tags = ByteBuffer.allocate(n * 12).order(ByteOrder.LITTLE_ENDIAN);
+      ch.read(tags, ifd + 2);
+      long width = -1, height = -1, offset = -1, bits = -1, format = -1, compression = 1, bands = 1;
+      for (int i = 0; i < n; i++) {
+        int id = tags.getShort(i * 12) & 0xffff, type = tags.getShort(i * 12 + 2) & 0xffff;
+        long value = type == 3 ? tags.getShort(i * 12 + 8) & 0xffff : tags.getInt(i * 12 + 8) & 0xffffffffL;
+        switch (id) {
+          case 256 -> width = value;
+          case 257 -> height = value;
+          case 258 -> bits = value;
+          case 259 -> compression = value;
+          case 273 -> offset = value;
+          case 277 -> bands = value;
+          case 339 -> format = value;
+          default -> {}
+        }
+      }
+      if (width < 1 || height < 1 || offset < 0 || bits != 32 || format != 3 || compression != 1
+          || bands != 1 || width * height > Integer.MAX_VALUE / 4)
+        throw new IOException("Unsupported DSM TIFF layout: " + path);
+      int w = (int) width, h = (int) height;
+      ByteBuffer data = ByteBuffer.allocate(w * h * 4).order(ByteOrder.LITTLE_ENDIAN);
+      while (data.hasRemaining())
+        if (ch.read(data, offset + data.position()) < 0) throw new IOException("Truncated DSM: " + path);
+      float[] z = new float[w * h];
+      data.flip();
+      data.asFloatBuffer().get(z);
+      return new Heights(w, h, z);
+    }
+  }
+
   static void writeTiff(
       Path path, int w, int h, float[] z, double x, double y, double cell, int epsg)
       throws IOException {
