@@ -45,6 +45,9 @@ public final class Options {
   // --processed-image-cache auto|on|off: decoded processed images kept on disk for reuse
   // (ProcessedImageCache). denseOptions: the full options behind an alignment copy.
   public String processedImageCache = "auto";
+  // --fusion-gpu-normals on: image-fusion normals and surface attributes on the GPU (GpuNormals;
+  // last-bit differences from the CPU). Default off.
+  public boolean fusionGpuNormals;
   Options denseOptions;
   Path processedImageCacheDir;
   Map<String, Camera> calibrationPoses = Collections.emptyMap();
@@ -75,6 +78,14 @@ public final class Options {
   public int gcpPort = 8765;
   public String gcpCheck = "none";
   public String gcpCheckIds = "";
+  // Lidar-referenced georeferencing (step 'lidar', LidarReference): ALS LAS/LAZ file or folder,
+  // scale on/off, search ranges, surface cell, canopy weight, residual limit, weak limit, margin,
+  // declared CRS / vertical datum for files that do not state them.
+  public Path lidarReference;
+  public boolean lidarScale;
+  public double lidarSearchShift = 10, lidarSearchAngle = 3, lidarCell = 2, lidarCanopyWeight = .1,
+      lidarOutlier = 2, lidarWeakLimit = .25, lidarMargin = 10, lidarChangeLimit = 1;
+  public String lidarCrs, lidarVerticalDatum;
   // Height sigma of the GPS camera prior: auto (0.2 m for DJI barometric heights, else gpsSigma).
   public String gpsHeightSigma = "auto";
   double gpsHeightSigmaValue = 2;
@@ -82,6 +93,12 @@ public final class Options {
   double rollingShutterReadout;
   // T1: off | report (default) | exclude flagged cameras from dense matching.
   public String cameraScreening = "report";
+  // Tie-point cleanup step (TiePointCleanup): off, auto (automatic limits), custom (limits below)
+  // or pause (choose in POSE). tiePointLimitsGiven: a limit was given on the command line.
+  public String tiePointCleanup = "off";
+  public double tiePointMaxError = 0, tiePointMinAngle = 1, tiePointMaxRemoved = 20;
+  public int tiePointMinViews = 2;
+  public boolean tiePointLimitsGiven;
   // S1: stereo pairs computed concurrently; 1 = serial (default), 0 = auto.
   public int stereoPairsInFlight = 0; // 0 = auto (one per 3 cores, at most 6, memory-checked); output equals serial
   public double gpsSigma = 2;
@@ -665,6 +682,9 @@ public final class Options {
         case "--fusion-mode":
           o.fusionMode = v.toLowerCase(Locale.ROOT);
           break;
+        case "--fusion-gpu-normals":
+          o.fusionGpuNormals = onOff(v, "--fusion-gpu-normals");
+          break;
         case "--processed-image-cache":
           o.processedImageCache = v.toLowerCase(Locale.ROOT);
           break;
@@ -859,6 +879,25 @@ public final class Options {
         case "--stereo-pairs-in-flight":
           o.stereoPairsInFlight = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
           break;
+        case "--tie-point-cleanup":
+          o.tiePointCleanup = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--tie-point-max-error":
+          o.tiePointMaxError = v.equalsIgnoreCase("auto") ? 0 : number(v);
+          o.tiePointLimitsGiven = true;
+          break;
+        case "--tie-point-min-views":
+          o.tiePointMinViews = Integer.parseInt(v);
+          o.tiePointLimitsGiven = true;
+          break;
+        case "--tie-point-min-angle":
+          o.tiePointMinAngle = number(v);
+          o.tiePointLimitsGiven = true;
+          break;
+        case "--tie-point-max-removed":
+          o.tiePointMaxRemoved = number(v);
+          o.tiePointLimitsGiven = true;
+          break;
         case "--camera-screening":
           o.cameraScreening = v.toLowerCase(Locale.ROOT);
           break;
@@ -912,6 +951,42 @@ public final class Options {
           break;
         case "--gcp-check-ids":
           o.gcpCheckIds = v.trim();
+          break;
+        case "--lidar-reference":
+          o.lidarReference = Path.of(v);
+          break;
+        case "--lidar-scale":
+          o.lidarScale = onOff(v, "--lidar-scale");
+          break;
+        case "--lidar-search-shift":
+          o.lidarSearchShift = number(v);
+          break;
+        case "--lidar-search-angle":
+          o.lidarSearchAngle = number(v);
+          break;
+        case "--lidar-cell":
+          o.lidarCell = number(v);
+          break;
+        case "--lidar-canopy-weight":
+          o.lidarCanopyWeight = number(v);
+          break;
+        case "--lidar-outlier":
+          o.lidarOutlier = number(v);
+          break;
+        case "--lidar-change-limit":
+          o.lidarChangeLimit = number(v);
+          break;
+        case "--lidar-weak-limit":
+          o.lidarWeakLimit = number(v);
+          break;
+        case "--lidar-margin":
+          o.lidarMargin = number(v);
+          break;
+        case "--lidar-crs":
+          o.lidarCrs = Crs.normalize(v);
+          break;
+        case "--lidar-vertical-datum":
+          o.lidarVerticalDatum = v.trim();
           break;
         case "--gcp-port":
           o.gcpPort = Integer.parseInt(v);
@@ -1586,6 +1661,14 @@ public final class Options {
     choice(o.fusionStrategy, "--fusion-strategy", "owner", "owner-consume", "graph-average");
     choice(o.gpsBundle, "--gps-bundle", "off", "prior");
     choice(o.cameraScreening, "--camera-screening", "off", "report", "exclude");
+    choice(o.tiePointCleanup, "--tie-point-cleanup", "off", "auto", "custom", "pause");
+    if (o.tiePointCleanup.equals("auto") && o.tiePointLimitsGiven)
+      throw new IllegalArgumentException("--tie-point-cleanup auto uses the automatic limits; to set --tie-point-max-error,"
+          + " --tie-point-min-views, --tie-point-min-angle or --tie-point-max-removed use --tie-point-cleanup custom");
+    if (!(o.tiePointMaxError >= 0) || o.tiePointMinViews < 2 || !(o.tiePointMinAngle >= 0 && o.tiePointMinAngle < 90)
+        || !(o.tiePointMaxRemoved > 0 && o.tiePointMaxRemoved <= 100))
+      throw new IllegalArgumentException("--tie-point-max-error must be 0 (auto) or more, --tie-point-min-views at least 2,"
+          + " --tie-point-min-angle 0..90 degrees and --tie-point-max-removed 0..100 percent");
     if (o.stereoPairsInFlight < 0 || o.stereoPairsInFlight > 16)
       throw new IllegalArgumentException("--stereo-pairs-in-flight must be auto or 1..16");
     if (!(o.gpsSigma > 0)) throw new IllegalArgumentException("--gps-sigma must be positive");
@@ -1788,6 +1871,22 @@ public final class Options {
       throw new IllegalArgumentException("--gcp-check must be none, auto or a number of check points");
     if (o.gcpPort < 1 || o.gcpPort > 65535)
       throw new IllegalArgumentException("--gcp-port must be 1..65535");
+    if (o.lidarReference != null && !Files.exists(o.lidarReference))
+      throw new IllegalArgumentException("--lidar-reference not found: " + o.lidarReference);
+    if (!(o.lidarSearchShift >= 0 && o.lidarSearchShift <= 50))
+      throw new IllegalArgumentException("--lidar-search-shift must be 0..50 metres");
+    if (!(o.lidarSearchAngle >= 0 && o.lidarSearchAngle <= 15))
+      throw new IllegalArgumentException("--lidar-search-angle must be 0..15 degrees");
+    if (!(o.lidarCell >= .25 && o.lidarCell <= 20))
+      throw new IllegalArgumentException("--lidar-cell must be 0.25..20 metres");
+    if (!(o.lidarCanopyWeight >= 0 && o.lidarCanopyWeight <= 1))
+      throw new IllegalArgumentException("--lidar-canopy-weight must be 0..1");
+    if (!(o.lidarOutlier >= .1 && o.lidarOutlier <= 50) || !(o.lidarChangeLimit >= .1 && o.lidarChangeLimit <= 50))
+      throw new IllegalArgumentException("--lidar-outlier and --lidar-change-limit must be 0.1..50 metres");
+    if (!(o.lidarWeakLimit > 0 && o.lidarWeakLimit <= 10))
+      throw new IllegalArgumentException("--lidar-weak-limit must be above 0 and at most 10 metres");
+    if (!(o.lidarMargin >= 0 && o.lidarMargin <= 1000))
+      throw new IllegalArgumentException("--lidar-margin must be 0..1000 metres");
     if (!(o.groundMaxObject >= 1 && o.groundMaxObject <= 500))
       throw new IllegalArgumentException("--ground-max-object must be 1..500 metres");
     if (o.gpsAdjustmentRounds < 1 || o.gpsAdjustmentRounds > 20)
@@ -1989,14 +2088,17 @@ Pipeline steps (run one by one, or chained; the state is saved after each step):
   photogrammetry -i IMAGES -o PROJECT [options]
       All steps in one process (as before).
   photogrammetry STEP [STEP ...] -o PROJECT [options]
-      Only the named steps, in order: inputs, calibrate, match, align, georeference,
-      gcp, dense, ground, finish. 'inputs' starts a new run (needs -i); the other
-      steps continue the latest run with the options saved by 'inputs'; options given
-      here are added and override them. 'finish' writes the report and final files.
-      'gcp' and 'ground' are optional: without --gcp (or without ground options) they
-      need not be named and are skipped when a later step runs. With --gcp, 'gcp' ends
-      as 'waiting' until enough markers are pinned: pin them with gcp-edit, then run
-      gcp again.
+      Only the named steps, in order: inputs, calibrate, match, align, cleanup,
+      georeference, lidar, gcp, dense, ground, finish. 'inputs' starts a new run (needs
+      -i); the other steps continue the latest run with the options saved by 'inputs';
+      options given here are added and override them. 'finish' writes the report and
+      final files. 'cleanup', 'lidar', 'gcp' and 'ground' are optional: without
+      --tie-point-cleanup, --lidar-reference, --gcp or ground options they need not be
+      named and are skipped when a later step runs. With --gcp, 'gcp' ends as
+      'waiting' until enough markers are pinned: pin them with gcp-edit, then run gcp
+      again. With
+      --tie-point-cleanup pause, 'cleanup' ends as 'waiting' until the limits are chosen
+      in the POSE window (or the step is run again with --tie-point-cleanup auto|off).
   --run ID
       Continue (or branch from) this run instead of the latest one.
   --branch
@@ -2005,13 +2107,20 @@ Pipeline steps (run one by one, or chained; the state is saved after each step):
       The source run is not changed.
   photogrammetry status -o PROJECT [--run ID]
       Show which steps of a run are done and the next one.
-  photogrammetry gcp-edit -o PROJECT [--run ID] [--gcp-port N]
-      Open the ground control point editor in the browser (local only). Click a GCP,
-      then click its exact position in an image; the other images are then refined by
-      patch matching (blue markers: check and accept with A, or accept all). Images
-      whose view of the GCP is blocked by the tie points (canopy, roofs) are listed as
-      probably hidden. Markers are saved as you go to 04_geometry/gcp/markers.json.
-      Press Done, then run the gcp step again.
+  photogrammetry gui [PROJECT]
+      Open the POSE desktop window (also pose-gui.bat / pose-gui.sh): start runs with
+      the common options as fields, follow their steps and log, manage the runs of a
+      project (continue, branch, GCP markers, report again). It starts this same
+      command line for the processing. Needs a display; see GUI.md.
+  photogrammetry gcp-edit -o PROJECT [--run ID] [--browser] [--no-continue] [--gcp-port N]
+      Open the ground control point editor in a window. Click a GCP, then click its
+      exact position in an image; the other images are then refined by patch matching
+      (blue markers: check and accept with A, or accept all). Images whose view of the
+      GCP is blocked by the tie points (canopy, roofs) are listed as probably hidden.
+      Markers are saved as you go to 04_geometry/gcp/markers.json. Done continues the
+      run with the gcp step once enough markers are pinned (not with --no-continue).
+      --browser (or a machine without a display) uses the local web page instead
+      (http://127.0.0.1:PORT); there, press Done, then run the gcp step again.
 
 Inputs and project output:
   -h, --help, -help
@@ -2586,6 +2695,30 @@ Georeferencing and output coordinates:
       Disable automatic GPS alignment; conflicts with --gps.
   --gps-threshold N
       GPS camera-center RANSAC inlier tolerance in metres (default: 10; positive).
+  --tie-point-cleanup off|auto|custom|pause
+      Tie-point cleanup by quality after alignment (step 'cleanup', like gradual
+      selection): tie points with a large reprojection error, seen in too few images or
+      with a small intersection angle are removed, worst first, and the block is
+      adjusted again before georeferencing. off (default): no cleanup. auto: the
+      automatic limits (largest error three times the median, 2 images, 1 degree, at
+      most 20%), without stopping. custom: the limits given with the four options below
+      (any not given keeps its default), without stopping. pause: the run stops
+      ('waiting') after the measures are written (04_geometry/tie_points/metrics.csv);
+      choose the limits with the histograms in the POSE window (Project tab, Clean tie
+      points; it starts from the limits below), which then continues the run. Report:
+      04_geometry/tie_points/cleanup.json.
+  --tie-point-max-error PX|auto
+      With custom (or as the pause window's start): remove tie points whose largest
+      reprojection error exceeds PX processed pixels (default: auto = three times the
+      median of the points' largest errors, at least 0.5).
+  --tie-point-min-views N
+      Remove tie points seen in fewer than N registered images (default: 2, i.e. none).
+  --tie-point-min-angle DEG
+      Remove tie points whose largest intersection angle between two viewing rays is
+      below DEG degrees: their depth is uncertain (default: 1).
+  --tie-point-max-removed PERCENT
+      Remove at most this share of the tie points, worst first (most limits failed,
+      then largest error; default: 20). A camera always keeps at least 15 tie points.
   --camera-screening off|report|exclude
       After alignment, flag cameras whose sparse reprojection RMS or GPS residual is far
       above the block's (>1.6x median or >4 robust deviations) or that were taken in
@@ -2687,6 +2820,53 @@ Ground control points (the gcp step):
   is already GPS-georeferenced). It moves the block onto the GCP datum, adjusts it
   with the GCPs as weighted points (GPS fixes then get a datum offset) and writes
   04_geometry/gcp/gcp_report.json and gcp_residuals.csv.
+  --lidar-reference FILE|FOLDER
+      Georeference the block to an airborne laser scanning (ALS) reference instead of
+      ground control (step 'lidar', after georeference): one LAS/LAZ file or a folder
+      of tiles. After the GPS fit, a rigid transformation (roll, pitch, heading and
+      three shifts about the block centre; scale with --lidar-scale on) is estimated
+      that puts the tie points onto the lidar surface (coarse search from the GPS
+      solution, then robust coarse-to-fine surface matching; open ground and roofs
+      weigh more than canopy; changed areas are rejected). Cameras and tie points are
+      moved before dense matching, so all products are in the lidar's frame and
+      height datum. The step first checks that the lidar points cover the block plus
+      --lidar-margin and stops with what is missing otherwise. Weakly determined
+      parameters (e.g. shifts over flat terrain) are left at the GPS values and
+      reported. Report: 04_geometry/lidar/lidar_reference.json; PDF report section.
+  --lidar-scale on|off
+      Also estimate a scale factor (default: off; rotation and shift only).
+  --lidar-search-shift M
+      Horizontal search range around the GPS solution (default: 10 metres; heights are
+      found without a limit).
+  --lidar-search-angle DEG
+      Heading search range around the GPS solution (default: 3 degrees); the tilts are
+      refined from the GPS values.
+  --lidar-cell M
+      Cell of the lidar surface grids (default: 2 metres; coarser levels 4x and 2x).
+  --lidar-canopy-weight W
+      Weight of tie points on canopy (lidar surface more than 2 m above its ground)
+      relative to open ground and roofs (default: 0.1; 0 uses stable areas only).
+  --lidar-outlier M
+      Largest accepted surface distance of a tie point after the fit (default: 2 m).
+  --lidar-change-limit M
+      20 m patches whose ground or roof residuals (median) differ from the block's by more
+      than this are treated as changed (new buildings, earthworks) and left out (default:
+      1 m). Canopy growth or felling since the lidar is handled anyway: canopy height is free
+      per 20 m patch and ground counts only where the images also see ground.
+  --lidar-weak-limit M
+      A parameter is weakly determined when its standard deviation, as a movement at
+      the block edge, exceeds M (default: 0.25 m); it is then not estimated.
+  --lidar-margin M
+      Margin around the tie-point area that the lidar must also cover, for the GPS
+      error (default: 10 m).
+  --lidar-crs EPSG:CODE
+      Horizontal CRS of lidar files whose own CRS is missing or has no EPSG code. It
+      must equal --crs. Without it, files with no CRS at all are taken to be in --crs
+      (with a warning) and files with a WKT but no EPSG code are refused. Files that
+      declare a different EPSG code than --crs are always refused (reproject them first).
+  --lidar-vertical-datum NAME
+      Name of the lidar height datum when the files do not declare it (e.g. N2000);
+      written to coordinates.json and the report.
   --scale N
       Multiply final LAS/PLY coordinates by N (default: 1; positive). Camera CSV,
       sparse CSV and --max-depth remain in pre-multiplier reconstruction units.
@@ -2896,6 +3076,13 @@ Additional workflow controls:
       GPU depth-evidence layout for fusion (default: auto). resident keeps all pair
       evidence on the GPU; windowed uses bounded regional evidence windows (see
       --fusion-window-mb); auto uses regional windows only when full evidence cannot fit.
+  --fusion-gpu-normals on|off
+      Default off. on computes image-fusion surface normals and surface attributes
+      (--point-attributes surface) on the GPU in batches. Not bit-identical to the
+      CPU: normals and attributes differ in the last bits, and a point on a test
+      threshold can rarely keep or lose its normal. The first batch is checked
+      against the CPU; a larger difference, no FP64 device or --compute cpu falls
+      back to the CPU.
   --stereo-pairs-in-flight N|auto
       Compute N stereo pairs concurrently (default: auto = one per 3 cores, at most 6,
       when the per-pair memory estimate fits the heap allowance; never fewer than one per

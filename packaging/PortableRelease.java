@@ -125,7 +125,7 @@ public class PortableRelease {
       if (linux && jar.startsWith("opencv-")) patch(source, nativeFile, destination);
       else Files.copy(source, destination);
     }
-    for (String name : List.of("pose.sh", "photogrammetry.sh", "pose.bat", "photogrammetry.bat",
+    for (String name : List.of("pose.sh", "photogrammetry.sh", "pose.bat", "photogrammetry.bat", "pose-gui.sh", "pose-gui.bat",
         "README.md", "THIRD_PARTY_NOTICES.md", "PORTABLE_INSTALL.md"))
       Files.copy(root.resolve(name), out.resolve(name));
     Files.createDirectories(out.resolve("scripts"));

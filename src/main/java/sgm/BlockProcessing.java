@@ -141,7 +141,7 @@ final class BlockProcessing {
     long pixels = (long) size[0] * size[1];
     boolean filter = DepthOutlierFilter.enabled(o);
     long perCamera = (filter ? 8 : 4) * pixels + (o.fusionLocalSigma > 0 ? 4 * pixels : 0);
-    long cache = filter ? 4096L * SurfacePatchGrid.cacheCells(o, n) : 0;
+    long cache = filter ? (long) SurfacePatchGrid.CELL_BYTES * SurfacePatchGrid.cacheCells(o, n) : 0;
     int words = (n + 63) / 64;
     // Incoming overlap/GPS choices can concentrate on one camera, even with small K.
     long pairsPerCamera = o.pairSelection.equals("sequential")

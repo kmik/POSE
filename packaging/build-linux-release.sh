@@ -83,8 +83,8 @@ mkdir -p "$stage/lib" "$stage/scripts" "$stage/packaging"
 cp -R "$root/src" "$stage/src"
 cp -R "$root/docs" "$stage/docs"
 cp "$root/"*.md "$stage/"
-cp "$root/build.sh" "$root/pose.sh" "$root/photogrammetry.sh" \
-  "$root/pose.bat" "$root/photogrammetry.bat" "$stage/"
+cp "$root/build.sh" "$root/pose.sh" "$root/photogrammetry.sh" "$root/pose-gui.sh" \
+  "$root/pose.bat" "$root/photogrammetry.bat" "$root/pose-gui.bat" "$stage/"
 cp "$root/scripts/java-env.sh" "$stage/scripts/"
 cp "$root/packaging/PortableRelease.java" "$stage/packaging/"
 upstream="$root/lib/opencv-4.9.0-0.jar"
@@ -125,7 +125,7 @@ env -u JAVA_HOME -u POSE_JAVA_HOME bash "$probe/pose.sh" \
   > "$output/release-validation/relocated-smoke.log" 2>&1
 # Extra evidence files are added above; regenerate the final manifest in place.
 "$jdk/bin/java" "$root/packaging/PortableRelease.java" seal "$output"
-chmod +x "$output/pose.sh" "$output/photogrammetry.sh"
+chmod +x "$output/pose.sh" "$output/photogrammetry.sh" "$output/pose-gui.sh"
 tar -czf "$output.tar.gz" -C "$root/dist" "$(basename -- "$output")"
 (cd "$root/dist" && sha256sum "$(basename -- "$output.tar.gz")" > "$(basename -- "$output.tar.gz.sha256")")
 echo "READY: $output.tar.gz"

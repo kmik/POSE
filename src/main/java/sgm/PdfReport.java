@@ -117,6 +117,7 @@ final class PdfReport implements AutoCloseable {
       pdf.calibration(survey);
       pdf.cameraLocations(survey);
       pdf.groundControl(survey);
+      pdf.lidarReference(data, out);
       pdf.denseCloud(data, survey, out);
       pdf.elevation(data, survey, out);
       pdf.parameters(data, survey, stages);
@@ -169,6 +170,9 @@ final class PdfReport implements AutoCloseable {
     var gcp = ProcessingReport.object(survey.get("gcp"));
     if (!gcp.isEmpty())
       facts.add(new String[] {"Ground control", gcpLine(gcp)});
+    var lidarRef = ProcessingReport.object(ProcessingReport.object(data.get("lidar")).get("reference"));
+    if (!lidarRef.isEmpty())
+      facts.add(new String[] {"Lidar reference", lidarLine(lidarRef)});
     String ground = ground(ProcessingReport.object(data.get("ground")));
     if (ground != null) facts.add(new String[] {"Ground", ground});
     facts.add(new String[] {"Total processing time", telemetry.get("elapsed_wall_seconds") instanceof Number n ? clock(n.doubleValue()) : "Unavailable"});
@@ -392,6 +396,100 @@ final class PdfReport implements AutoCloseable {
             + " are an independent accuracy estimate. Image error is the RMS marker residual in source pixels"
             + (gcp.get("marker_pixel_rms") instanceof Number m ? String.format(Locale.ROOT, " (all markers %.2f px)", m.doubleValue()) : "")
             + ".");
+  }
+
+  /** Lidar reference page: transformation, its uncertainty, coverage, residuals, difference maps. */
+  private void lidarReference(Map<String, Object> data, Path out) throws IOException {
+    var lidar = ProcessingReport.object(data.get("lidar"));
+    var ref = ProcessingReport.object(lidar.get("reference"));
+    if (ref.isEmpty()) return;
+    page("Lidar Reference");
+    var source = ProcessingReport.object(ref.get("lidar"));
+    var area = ProcessingReport.object(ref.get("area"));
+    var coverage = ProcessingReport.object(ref.get("coverage"));
+    var fit = ProcessingReport.object(ref.get("fit"));
+    var search = ProcessingReport.object(ref.get("coarse_search"));
+    int files = source.get("files") instanceof List<?> l ? l.size() : 0;
+    List<String[]> facts = new ArrayList<>();
+    facts.add(new String[] {"Lidar files", files + " (" + count(source.get("points_used")) + " points in the area)"});
+    facts.add(new String[] {"Horizontal CRS", pdf(source.get("horizontal_crs"))});
+    facts.add(new String[] {"Height datum of the result", pdf(ref.getOrDefault("height_datum", source.get("vertical_datum")))});
+    facts.add(new String[] {"Coverage", Boolean.TRUE.equals(coverage.get("complete"))
+        ? String.format(Locale.ROOT, "complete (%.2f ha incl. margin)", number(coverage.get("area_m2")) / 1e4) : "incomplete"});
+    facts.add(new String[] {"Tie points on the lidar", count(fit.get("tie_points_on_lidar")) + String.format(Locale.ROOT,
+        "; used %.0f%%, outliers %.0f%%, in changed areas %s", 100 * number(fit.get("used_share")), 100 * number(fit.get("outlier_share")), count(fit.get("changed_points")))});
+    facts.add(new String[] {"Stable areas", String.format(Locale.ROOT, "%s points on open ground or roofs, %s on ground under canopy, %s on canopy;"
+        + " %.0f%% of the weight", count(fit.get("stable_points")), count(fit.get("ground_under_canopy_points")), count(fit.get("canopy_points")),
+        100 * number(fit.get("stable_weight_share")))});
+    var change = ProcessingReport.object(ref.get("change_since_lidar"));
+    if (!change.isEmpty()) {
+      facts.add(new String[] {"Lidar acquired / images taken", pdf(change.getOrDefault("lidar_acquired", "unknown")) + " / " + pdf(change.getOrDefault("images_taken", "unknown"))
+          + (change.get("lidar_age_years") instanceof Number age ? String.format(Locale.ROOT, " (lidar %.1f years older)", age.doubleValue()) : "")});
+      var growth = ProcessingReport.object(change.get("canopy_height_change_metres"));
+      facts.add(new String[] {"Change since the lidar", String.format(Locale.ROOT,
+          "canopy %s m per 20 m patch (median; 10-90%%: %s to %s m); %s tie points on ground under the lidar's canopy, %s on vegetation"
+              + " over the lidar's open ground (left out)", growth.isEmpty() ? "-" : String.format(Locale.ROOT, "%+.1f", number(growth.get("median"))),
+          fixed(growth.get("p10"), 1), fixed(growth.get("p90"), 1), count(change.get("ground_under_lidar_canopy_points")), count(change.get("vegetation_on_lidar_open_ground_points")))});
+    }
+    facts.add(new String[] {"Coarse search", String.format(Locale.ROOT, "correlation %.3f, contrast %.1f%s", number(search.get("correlation")),
+        number(search.get("contrast")), Boolean.TRUE.equals(search.get("ambiguous")) ? " (weak)" : "")});
+    table(new String[] {"Item", "Value"}, new float[] {150, 357}, facts);
+    heading("Transformation (GPS solution to lidar)");
+    List<String[]> rows = new ArrayList<>();
+    for (Object item : ref.get("parameters") instanceof List<?> l ? l : List.of()) {
+      var p = ProcessingReport.object(item);
+      boolean on = Boolean.TRUE.equals(p.get("estimated"));
+      String unit = String.valueOf(p.get("unit")).equals("degrees") ? " deg" : String.valueOf(p.get("unit")).equals("ppm") ? " ppm" : " m";
+      int digits = unit.equals(" deg") ? 4 : unit.equals(" ppm") ? 0 : 3;
+      rows.add(new String[] {
+        String.valueOf(p.get("name")).replace('_', ' '),
+        on ? fixed(p.get("value"), digits) + unit : "fixed (GPS)",
+        on ? fixed(p.get("sigma"), digits) + unit : "-",
+        on && p.get("effect_at_edge_metres") instanceof Number e ? String.format(Locale.ROOT, "%.3f m", e.doubleValue()) : "-",
+        on ? (Boolean.TRUE.equals(p.get("significant")) ? "yes" : "no") : "-"
+      });
+    }
+    table(new String[] {"Parameter", "Value", "Std. dev.", "Std. dev. at edge", "Significant"}, new float[] {110, 110, 100, 110, 77}, rows);
+    paragraph(pdf(ref.get("convention")) + " Standard deviations are the larger of the formal and a spatial jackknife (16 equal groups"
+        + " of tie points) estimate; significant: value above three standard deviations.");
+    for (Object w : ref.get("warnings") instanceof List<?> l ? l : List.of()) paragraph("Warning: " + pdf(w));
+    heading("Tie-point distances to the lidar surface");
+    var before = ProcessingReport.object(ref.get("residuals_before"));
+    var after = ProcessingReport.object(ref.get("residuals_after"));
+    List<String[]> res = new ArrayList<>();
+    for (String[] k : new String[][] {{"stable_all", "Stable, GPS solution", "b"}, {"total_all", "All, GPS solution", "b"},
+        {"stable_within_limit", "Stable, lidar-referenced", "a"}, {"total_within_limit", "All, lidar-referenced", "a"}}) {
+      var s = ProcessingReport.object((k[2].equals("b") ? before : after).get(k[0]));
+      res.add(new String[] {k[1], count(s.get("points")), fixed(s.get("mean_metres"), 3), fixed(s.get("median_metres"), 3),
+          fixed(s.get("rms_metres"), 3), fixed(s.get("nmad_metres"), 3)});
+    }
+    table(new String[] {"Points", "Count", "Mean (m)", "Median (m)", "RMS (m)", "NMAD (m)"}, new float[] {137, 70, 75, 75, 75, 75}, res);
+    paragraph("Surface-normal distances (tie point above the lidar: positive). Stable: open ground, ground under canopy and roofs."
+        + " Lidar-referenced rows leave out changed areas and distances beyond --lidar-outlier.");
+    var deformation = ProcessingReport.object(ref.get("deformation"));
+    if ("measured".equals(deformation.get("status")))
+      paragraph(String.format(Locale.ROOT, "Block deformation left after the rigid fit: the median stable residual of %.0f m cells ranges"
+          + " over %.2f m; the bowl/saddle part of a quadratic surface over %.2f m.", number(deformation.get("grid_cell_metres")),
+          number(deformation.get("cell_median_range_metres")), number(deformation.get("curvature_range_metres"))));
+    var comparison = ProcessingReport.object(lidar.get("comparison"));
+    for (String[] k : new String[][] {{"dsm", "dsm_map", "Surface model"}, {"dtm", "dtm_map", "Terrain model"}}) {
+      var d = ProcessingReport.object(comparison.get(k[0]));
+      if (!d.containsKey("total")) continue;
+      ensure(330);
+      heading(k[2] + " difference, photogrammetry minus lidar");
+      Path map = out.resolve(String.valueOf(comparison.get(k[1])));
+      figure(map, 260);
+      paragraph(fig() + pdf(d.get("definition")) + ". " + pdf(comparison.get("colour_scale")) + ".");
+      List<String[]> drows = new ArrayList<>();
+      for (String[] g : new String[][] {{"stable", "Open ground and roofs"}, {"open_ground", "Open ground"}, {"low_vegetation", "Low vegetation"},
+          {"canopy", "Canopy"}, {"roof", "Roofs"}, {"total", "All"}}) {
+        var s = ProcessingReport.object(d.get(g[0]));
+        if (!(s.get("points") instanceof Number n) || n.longValue() == 0) continue;
+        drows.add(new String[] {g[1], String.format(Locale.ROOT, "%.2f ha", number(s.get("area_m2")) / 1e4), fixed(s.get("mean_metres"), 3),
+            fixed(s.get("median_metres"), 3), fixed(s.get("rms_metres"), 3), fixed(s.get("nmad_metres"), 3)});
+      }
+      table(new String[] {"Lidar surface", "Area", "Mean (m)", "Median (m)", "RMS (m)", "NMAD (m)"}, new float[] {137, 70, 75, 75, 75, 75}, drows);
+    }
   }
 
   /** Rejection reasons of image-space fusion: counter in image_fusion.json, label. */
@@ -921,6 +1019,7 @@ final class PdfReport implements AutoCloseable {
     }
     if (gcp.get("marker_pixel_rms") instanceof Number px && px.doubleValue() > 2)
       flags.add(String.format(Locale.ROOT, "GCP marker RMS %.1f px: check the pinned markers (gcp-edit).", px.doubleValue()));
+    flags.addAll(lidarFlags(ProcessingReport.object(data.get("lidar"))));
     var screening = ProcessingReport.object(data.get("camera_screening"));
     if (screening.get("flagged") instanceof Number flagged && flagged.intValue() > 0) {
       List<String> named = new ArrayList<>();
@@ -1042,6 +1141,63 @@ final class PdfReport implements AutoCloseable {
     }
   }
 
+  static final double LIDAR_STABLE_RMS_FLAG = .5, LIDAR_DEFORMATION_FLAG = .5, LIDAR_DSM_MEDIAN_FLAG = .3;
+
+  /** Quality flags of a lidar-referenced run (empty without a lidar reference). */
+  static List<String> lidarFlags(Map<String, Object> lidar) {
+    List<String> flags = new ArrayList<>();
+    var ref = ProcessingReport.object(lidar.get("reference"));
+    if (ref.isEmpty()) return flags;
+    for (Object w : ref.get("warnings") instanceof List<?> l ? l : List.of())
+      if (String.valueOf(w).contains("kept at the GPS value")) flags.add("Lidar reference: " + w + ".");
+    var search = ProcessingReport.object(ref.get("coarse_search"));
+    if (Boolean.TRUE.equals(search.get("ambiguous")))
+      flags.add(String.format(Locale.ROOT, "Lidar reference: the coarse search peak is weak (contrast %.1f): the horizontal position may be"
+          + " uncertain; check the difference maps.", number(search.get("contrast"))));
+    var stable = ProcessingReport.object(ProcessingReport.object(ref.get("residuals_after")).get("stable_within_limit"));
+    if (stable.get("rms_metres") instanceof Number rms && rms.doubleValue() > LIDAR_STABLE_RMS_FLAG)
+      flags.add(String.format(Locale.ROOT, "Lidar reference: tie points on stable ground lie %.2f m RMS from the lidar surface after the fit"
+          + " (vegetation on the ground, an interpolated lidar terrain or block deformation).", rms.doubleValue()));
+    var deformation = ProcessingReport.object(ref.get("deformation"));
+    if (deformation.get("cell_median_range_metres") instanceof Number d && d.doubleValue() > LIDAR_DEFORMATION_FLAG)
+      flags.add(String.format(Locale.ROOT, "Lidar reference: after the rigid fit the block still departs from the lidar by a range of %.2f m"
+          + " between areas (median residual per %.0f m cell): the block bends, which one rigid transformation cannot correct.",
+          d.doubleValue(), number(deformation.get("grid_cell_metres"))));
+    var dsm = ProcessingReport.object(ProcessingReport.object(lidar.get("comparison")).get("dsm"));
+    var open = ProcessingReport.object(dsm.get("stable"));
+    if (open.get("median_metres") instanceof Number m && open.get("points") instanceof Number n && n.longValue() >= 50
+        && Math.abs(m.doubleValue()) > LIDAR_DSM_MEDIAN_FLAG)
+      flags.add(String.format(Locale.ROOT, "Lidar reference: on open ground the photogrammetric surface lies %+.2f m from the lidar (median):"
+          + " a height offset remains.", m.doubleValue()));
+    var source = ProcessingReport.object(ref.get("lidar"));
+    if ("not declared".equals(source.get("vertical_datum_source")))
+      flags.add("Lidar reference: the lidar files do not declare their height datum; the result's heights are the lidar's (name the datum"
+          + " with --lidar-vertical-datum).");
+    return flags;
+  }
+
+  /** Title-page line of the lidar reference: estimated parameters, stable RMS, fallback. */
+  static String lidarLine(Map<String, Object> ref) {
+    StringBuilder s = new StringBuilder();
+    for (Object item : ref.get("parameters") instanceof List<?> l ? l : List.of()) {
+      var p = ProcessingReport.object(item);
+      if (!Boolean.TRUE.equals(p.get("estimated"))) continue;
+      String name = String.valueOf(p.get("name")), unit = String.valueOf(p.get("unit"));
+      if (s.length() > 0) s.append(", ");
+      String label = switch (name) {
+        case "shift_east" -> "E";
+        case "shift_north" -> "N";
+        case "shift_up" -> "U";
+        default -> name;
+      };
+      s.append(label).append(' ').append(String.format(Locale.ROOT, unit.equals("degrees") ? "%+.3f deg" : unit.equals("ppm") ? "%+.0f ppm" : "%+.2f m", number(p.get("value"))));
+    }
+    var after = ProcessingReport.object(ProcessingReport.object(ref.get("residuals_after")).get("stable_within_limit"));
+    if (after.get("rms_metres") instanceof Number rms) s.append(String.format(Locale.ROOT, "; stable RMS %.2f m", rms.doubleValue()));
+    if (Boolean.TRUE.equals(ref.get("fallback"))) s.append("; fewer parameters (weak)");
+    return s.toString();
+  }
+
   private static String gcpLine(Map<String, Object> gcp) {
     var control = ProcessingReport.object(gcp.get("control_rms_metres"));
     var check = ProcessingReport.object(gcp.get("check_rms_metres"));
@@ -1127,7 +1283,9 @@ final class PdfReport implements AutoCloseable {
       if (c.get("gps_inliers") instanceof Number in && c.get("gps_controls") instanceof Number all)
         s.append(String.format(Locale.ROOT, " (%d/%d cameras)", in.intValue(), all.intValue()));
     }
-    if (c.get("vertical_crs") == null)
+    if ("lidar reference".equals(c.get("datum")))
+      s.append("; heights: ").append(c.getOrDefault("vertical_datum", "the lidar reference's"));
+    else if (c.get("vertical_crs") == null)
       s.append(c.get("datum") != null ? "; heights from the GCPs" : "; heights: GPS altitude, vertical datum unspecified");
     return s.toString();
   }

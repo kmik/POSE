@@ -110,7 +110,12 @@ final class MultiViewSgm {
   private void annotateNeighborSelection(int camera, Map<String, Object> report) {
     if (o.mvsgmOptimalNeighbors)
       report.put("neighbor_selection", neighborSelectionReports.get(camera));
+    if (droppedNeighbours.containsKey(camera))
+      report.put("dropped_neighbours", droppedNeighbours.get(camera));
   }
+
+  /** Neighbours dropped from a camera's plan because their sweep canvas was too large (images). */
+  final Map<Integer, List<String>> droppedNeighbours = new ConcurrentHashMap<>();
 
   /** The inverse-depth labels of a reference camera: q(l) = low + l * step. */
   record Labels(double low, double step, int count, double sparseLow, double sparseHigh, int samples) {
@@ -276,8 +281,9 @@ final class MultiViewSgm {
       Camera ref, int rw, int rh, Labels labels, int id, Camera other, byte[] gray, byte[] mask,
       int ow, int oh, int window, boolean defer) {
     int[] canvas = canvas(ref, other, 0, 0, rw, rh, labels, window);
-    if ((long) canvas[2] * canvas[3] > 4L * rw * rh)
-      throw new IllegalArgumentException("mvsgm: neighbour canvas too large for image ");
+    if (canvasTooLarge(canvas, rw, rh))
+      throw new IllegalArgumentException("mvsgm: neighbour canvas too large: image " + id + " seen from a "
+          + rw + "x" + rh + " reference needs " + canvas[2] + "x" + canvas[3] + " (misaligned camera?)");
     return warp(ref, other, id, canvas, gray, mask, 0, 0, ow, oh, window, defer);
   }
 
@@ -601,7 +607,51 @@ final class MultiViewSgm {
       skipped.put(c, e.getMessage());
       return null;
     }
+    // A neighbour whose sweep canvas would exceed 4x the image (its pose does not fit the depth
+    // range, e.g. a misaligned camera) is dropped, and the labels are derived again without it.
+    // Cameras without such a neighbour keep exactly the plan they had before.
+    List<String> dropped = new ArrayList<>();
+    while (true) {
+      List<Neighbor> kept = new ArrayList<>();
+      for (Neighbor nb : chosen) {
+        ImageFrame of = frames.get(nb.id());
+        if (canvasTooLarge(canvas(rf.camera, of.camera, 0, 0, rf.width, rf.height, labels, census), rf.width, rf.height))
+          dropped.add(name(of));
+        else kept.add(nb);
+      }
+      if (kept.size() == chosen.size()) break;
+      chosen = kept;
+      if (chosen.isEmpty()) {
+        skipped.put(c, "every neighbour (" + String.join(", ", dropped) + ") would need a sweep canvas over 4x the"
+            + " image; the pose of " + name(rf) + " or of its neighbours does not fit its sparse depth range"
+            + " (misaligned camera? see 04_geometry/camera_screening.json)");
+        System.out.println("mvsgm image " + c + " (" + name(rf) + "): skipped; " + skipped.get(c));
+        return null;
+      }
+      shifts = new double[chosen.size()][];
+      for (int i = 0; i < shifts.length; i++) shifts[i] = shift(rf.camera, frames.get(chosen.get(i).id()).camera);
+      try {
+        labels = labels(rf, tracks, frames, shifts);
+      } catch (IllegalArgumentException e) {
+        skipped.put(c, e.getMessage());
+        return null;
+      }
+    }
+    if (!dropped.isEmpty()) {
+      droppedNeighbours.put(c, List.copyOf(dropped));
+      System.out.println("mvsgm image " + c + " (" + name(rf) + "): dropped neighbour(s) " + String.join(", ", dropped)
+          + "; sweep canvas over 4x the image (misaligned camera? see 04_geometry/camera_screening.json)");
+    }
     return Plan.header(c, chosen, labels);
+  }
+
+  /** The limit of {@link #warp}: a neighbour canvas larger than 4x the reference image. */
+  static boolean canvasTooLarge(int[] canvas, int rw, int rh) {
+    return (long) canvas[2] * canvas[3] > 4L * rw * rh;
+  }
+
+  static String name(ImageFrame f) {
+    return f.path == null ? "image " + f.id : f.path.getFileName().toString();
   }
 
   Plan preparePlan(List<ImageFrame> frames, Plan header) throws IOException {

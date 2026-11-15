@@ -186,6 +186,13 @@ final class ProcessingReport {
     } catch (IOException | RuntimeException unavailable) {
       System.err.println("Report dense-cloud data unavailable: " + unavailable.getMessage());
     }
+    // Lidar reference (only runs made with --lidar-reference have it).
+    try {
+      Map<String, Object> lidar = LidarComparison.collect(run, out);
+      if (lidar != null) data.put("lidar", lidar);
+    } catch (IOException | RuntimeException unavailable) {
+      System.err.println("Report lidar comparison unavailable: " + unavailable.getMessage());
+    }
     Map<String, Map<String, Object>> stageIndex = new LinkedHashMap<>();
     for (Object item : stages) stageIndex.put(String.valueOf(object(item).get("stage")), object(item));
     data.put("quality_flags", PdfReport.flags(data, maps, stageIndex));

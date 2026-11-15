@@ -52,6 +52,9 @@ public final class SelfTest {
     checks += GroundClassificationRegression.run(root.resolve("ground"));
     checks += GroundStuffRegression.run(root.resolve("ground-stuff"));
     checks += GcpRegression.run(root.resolve("gcp"));
+    checks += TiePointCleanupRegression.run(root.resolve("tie points"));
+    checks += LidarRegression.run(root.resolve("lidar"));
+    checks += GuiRegression.run(root.resolve("gui"));
     checks += GpuStereoFiltersRegression.run();
     checks += GpuDepthOutlierRegression.run();
     checks += GpuRangeGuardRegression.run();
@@ -90,6 +93,8 @@ public final class SelfTest {
     checks += TwoViewConfidenceRegression.run(root.resolve("two-view-confidence"));
     checks += PdfReportRegression.run(root.resolve("pdf-report"));
     checks += ReportFixesRegression.run(root.resolve("report-fixes"));
+    checks += CrossCheckFixesRegression.run();
+    checks += GpuNormalsRegression.run();
     checks += WorkflowRegression.run(root);
     checks += StorageGpuRegression.run(root);
     checks += DepthIoRegression.run(root);

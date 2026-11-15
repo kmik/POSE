@@ -106,6 +106,8 @@ public final class Main {
   }
 
   public static int run(String[] args) {
+    // The desktop window; processing runs in child processes it starts (PoseProcess).
+    if (args.length > 0 && args[0].equals("gui")) return PoseWindow.start(Arrays.copyOfRange(args, 1, args.length));
     Command c;
     try {
       c = command(args);

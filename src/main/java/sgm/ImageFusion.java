@@ -149,24 +149,24 @@ final class ImageFusion {
     }
 
     float get(long i) {
-      return a != null ? a[(int) i] : s.getAtIndex(MappedFiles.FLOAT, i);
+      return a != null ? a[(int) i] : s.get(MappedFiles.FLOAT, 4L * i);
     }
 
     void set(long i, float v) {
       if (a != null) a[(int) i] = v;
-      else s.setAtIndex(MappedFiles.FLOAT, i, v);
+      else s.set(MappedFiles.FLOAT, 4L * i, v);
     }
 
     /** Copies count values from offset into dst[at..]. */
     void read(long offset, float[] dst, int at, int count) {
       if (a != null) System.arraycopy(a, (int) offset, dst, at, count);
-      else java.lang.foreign.MemorySegment.copy(s, MappedFiles.FLOAT, 4 * offset, dst, at, count);
+      else MappedFiles.copy(s, 4 * offset, dst, at, count);
     }
 
     /** Copies src[at..at + count) to offset. */
     void write(long offset, float[] src, int at, int count) {
       if (a != null) System.arraycopy(src, at, a, (int) offset, count);
-      else java.lang.foreign.MemorySegment.copy(src, at, s, MappedFiles.FLOAT, 4 * offset, count);
+      else MappedFiles.copy(src, at, s, 4 * offset, count);
     }
   }
 
@@ -186,13 +186,13 @@ final class ImageFusion {
     }
 
     boolean get(int q) {
-      long word = a != null ? a[q >>> 6] : s.getAtIndex(MappedFiles.LONG, q >>> 6);
+      long word = a != null ? a[q >>> 6] : s.get(MappedFiles.LONG, 8L * (q >>> 6));
       return (word & 1L << (q & 63)) != 0;
     }
 
     void set(int q) {
       if (a != null) a[q >>> 6] |= 1L << (q & 63);
-      else s.setAtIndex(MappedFiles.LONG, q >>> 6, s.getAtIndex(MappedFiles.LONG, q >>> 6) | 1L << (q & 63));
+      else s.set(MappedFiles.LONG, 8L * (q >>> 6), s.get(MappedFiles.LONG, 8L * (q >>> 6)) | 1L << (q & 63));
     }
   }
 
@@ -236,6 +236,8 @@ final class ImageFusion {
   private final long speckleBudget;
   // Surface-patch cache cells per camera (SurfacePatchGrid.cacheCells, or the whole grid).
   private int gridCells;
+  // --fusion-gpu-normals on: normals of each band in a GPU batch (GpuNormals).
+  private boolean gpuNormals;
   private final long workingBytes;
   static final long EMISSION_BYTES = 640;
   private final boolean[] hasMap, spilledMaps;
@@ -364,6 +366,7 @@ final class ImageFusion {
     // 06_fusion and only the camera being fused and its overlapping cameras are resident; the
     // operating system's file cache then uses whatever RAM is free. Neither changes any result.
     gridCells = SurfacePatchGrid.cacheCells(o, Math.max(1, mapWindowCameras));
+    gpuNormals = GpuNormals.requested(o) && (o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal"));
     long[] plannedMaps = new long[cameras];
     long worstCamera = 0, worstPixels = 0, speckleWork = 0, speckleLimit = Long.MAX_VALUE;
     int threads = Math.max(1, o.cores), speckleThreads = threads;
@@ -427,7 +430,7 @@ final class ImageFusion {
         pairData = Math.max(pairData, bytes);
       }
       long perPixel = 27 + 8L * words + 16L * pairsMax + 1 + (maps != null ? 36 + 4L * fields : 0) + (normalCache ? 24 : 0);
-      long fixed = (DepthOutlierFilter.enabled(o) ? 4096L * gridCells * mapWindowCameras : 0) + (maps == null ? pairData : 0);
+      long fixed = (DepthOutlierFilter.enabled(o) ? (long) SurfacePatchGrid.CELL_BYTES * gridCells * mapWindowCameras : 0) + (maps == null ? pairData : 0);
       long left = avail - fixed;
       bandPixels = bandFor(left / 4);
       left -= 3L * bandPixels * EMISSION_BYTES;
@@ -462,7 +465,7 @@ final class ImageFusion {
         int full = 16;
         for (int c = 0; c < cameras; c++)
           full = Math.max(full, Math.ceilDiv(fusion.width(c), 16) * Math.ceilDiv(fusion.height(c), 16));
-        long extra = 4096L * Math.max(0, full - gridCells) * mapWindowCameras;
+        long extra = (long) SurfacePatchGrid.CELL_BYTES * Math.max(0, full - gridCells) * mapWindowCameras;
         if (extra > 0 && allMapBytes + extra + base + minEmit + worstCamera <= avail) {
           gridCells = full;
           allMapBytes += extra;
@@ -596,7 +599,7 @@ final class ImageFusion {
     if (localSigma > 0) bytes += 4 * pixels;
     if (o.fusionStrategy.equals("owner-consume") || o.fusionStrategy.equals("graph-average")) bytes += pixels / 8 + 64;
     if (o.fusionStrategy.equals("owner-consume")) bytes += pixels / 8 + 64;
-    if (DepthOutlierFilter.enabled(o)) bytes += 4096L * gridCells;
+    if (DepthOutlierFilter.enabled(o)) bytes += (long) SurfacePatchGrid.CELL_BYTES * gridCells;
     return bytes;
   }
 
@@ -625,7 +628,7 @@ final class ImageFusion {
     final float[] array = compact[c].a;
     final java.lang.foreign.MemorySegment mapped = compact[c].s;
     surfaceContext[c] = new SurfacePatchGrid(fusion.width(c), fusion.height(c),
-        array != null ? p -> array[p] : p -> mapped.getAtIndex(MappedFiles.FLOAT, p), o.fusionRelative, gridCells);
+        array != null ? p -> array[p] : p -> mapped.get(MappedFiles.FLOAT, 4L * p), o.fusionRelative, gridCells);
   }
 
   /** Pass 2: camera c and the cameras it cross-checks become resident; others may be spilled. */
@@ -1030,13 +1033,13 @@ final class ImageFusion {
       float[][] v = rows.get();
       float[] zr = v[0], lrr = v[1], mr = v[2], sr = v[3], pr = v[4];
       int[] cr = colours.get();
-      java.lang.foreign.MemorySegment.copy(z, MappedFiles.FLOAT, 4 * at, zr, 0, w);
-      java.lang.foreign.MemorySegment.copy(lr, MappedFiles.FLOAT, 4 * at, lrr, 0, w);
+      MappedFiles.copy(z, 4 * at, zr, 0, w);
+      MappedFiles.copy(lr, 4 * at, lrr, 0, w);
       if (full) {
-        java.lang.foreign.MemorySegment.copy(margin, MappedFiles.FLOAT, 4 * at, mr, 0, w);
-        java.lang.foreign.MemorySegment.copy(sharp, MappedFiles.FLOAT, 4 * at, sr, 0, w);
-        java.lang.foreign.MemorySegment.copy(photo, MappedFiles.FLOAT, 4 * at, pr, 0, w);
-        java.lang.foreign.MemorySegment.copy(rgb, MappedFiles.INT, 4 * at, cr, 0, w);
+        MappedFiles.copy(margin, 4 * at, mr, 0, w);
+        MappedFiles.copy(sharp, 4 * at, sr, 0, w);
+        MappedFiles.copy(photo, 4 * at, pr, 0, w);
+        MappedFiles.copy(rgb, 4 * at, cr, 0, w);
       }
       for (int x = 0; x < w; x++) {
         float zp = zr[x];
@@ -1230,7 +1233,7 @@ final class ImageFusion {
         checkWorkingSet();
       }
       RunTelemetry.record("Image fusion: camera overlap", clock);
-      long remergeNanos = 0, checkNanos = 0, outputNanos = 0, outputWaitNanos = 0;
+      long remergeNanos = 0, checkNanos = 0, outputNanos = 0, outputWaitNanos = 0, normalNanos = 0;
       // Pass 2: re-merge one camera at a time (identical), cross-check, own and emit, in row bands.
       // --fusion-seed-order precision repeats it per precision tier (precise seeds first).
       // Ownership marks (used/emitted) are applied after each band, before the next band or camera
@@ -1279,11 +1282,17 @@ final class ImageFusion {
         long base = (long) r0 * m.w;
         for (int p = 0; p < m.z.length; p++) if (kept.get(base + p) <= 0) m.z[p] = 0;
         remergeNanos += System.nanoTime() - clock;
-        double[] points = pointCache(c, m);
+        // GPU normals back-project on the device; the CPU fallback computes the same values directly.
+        double[] points = gpuNormals ? null : pointCache(c, m);
         int w = m.w, bandRows = Math.max(1, bandPixels / Math.max(1, w));
         for (int y0 = s0; y0 < s1; y0 += bandRows) {
           clock = System.nanoTime();
           Emission[][] rows = crossCheck(c, m, splats, counters, tier, points, y0, Math.min(s1, y0 + bandRows));
+          if (gpuNormals) {
+            long normalStarted = System.nanoTime();
+            fillNormals(c, m, rows, points);
+            normalNanos += System.nanoTime() - normalStarted;
+          }
           checkNanos += System.nanoTime() - clock;
           for (Emission[] row : rows)
             if (row != null)
@@ -1353,6 +1362,7 @@ final class ImageFusion {
       RunTelemetry.recordTotal("Image fusion: pass 1 spike filter (within the filter time)", spikeNanos.get(), cameras);
       RunTelemetry.recordTotal("Image fusion: pass 2 pair reads and re-merge", remergeNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: cross-check, ownership, normals", checkNanos, cameras);
+      if (gpuNormals) RunTelemetry.recordTotal("Image fusion: normals in GPU batches (--fusion-gpu-normals)", normalNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: candidate output staging", outputNanos, cameras);
       RunTelemetry.recordTotal("Image fusion: cross-check blocked on the output writer", outputWaitNanos, cameras);
       progress.done();
@@ -1463,6 +1473,7 @@ final class ImageFusion {
       int n = splats.length;
       int[] samples = new int[n], from = new int[n];
       double[] depth = new double[n], weight = new double[n], offsetX = new double[n], offsetY = new double[n];
+      boolean[] agrees = new boolean[n * n];
       for (int x = 0; x < w; x++) {
         int p = y * w + x, found = 0;
         for (int s = 0; s < n; s++) {
@@ -1495,14 +1506,22 @@ final class ImageFusion {
           found++;
         }
         if (found == 0) continue;
-        // Largest tolerance cluster (ties: larger weight), as DepthFusion.mode.
+        // Largest tolerance cluster (ties: larger weight), as DepthFusion.mode. agree() is exactly
+        // symmetric in its two depths and two weights (min, |a - b| and 1/wa + 1/wb do not
+        // depend on the order), so each pair is tested once and the matrix reused below.
+        for (int a = 0; a < found; a++)
+          for (int b = a; b < found; b++) {
+            boolean ok = agree(depth[b], depth[a], weight[b], weight[a], focal);
+            agrees[a * n + b] = ok;
+            agrees[b * n + a] = ok;
+          }
         int bestCenter = -1, bestCount = 0;
         double bestWeight = 0;
         for (int a = 0; a < found; a++) {
           int members = 0;
           double weights = 0;
           for (int b = 0; b < found; b++)
-            if (agree(depth[b], depth[a], weight[b], weight[a], focal)) {
+            if (agrees[a * n + b]) {
               members++;
               weights += weight[b];
             }
@@ -1524,7 +1543,7 @@ final class ImageFusion {
         int chosen = -1, members = 0;
         boolean allNarrow = seedMinSine > 0;
         for (int b = 0; b < found; b++) {
-          if (!agree(depth[b], center, weight[b], weight[bestCenter], focal)) continue;
+          if (!agrees[bestCenter * n + b]) continue; // = agree(depth[b], center, ...)
           if (allNarrow) {
             PairData member = splats[from[b]].data();
             allNarrow = member.sinef[samples[b]] < member.narrowSinef;
@@ -1973,8 +1992,11 @@ final class ImageFusion {
     double focal = Math.min(cam.fx, cam.fy);
     Raster best = localBest[c];
     Bits taken = consume || graph ? used[c] : null;
-    Map<Integer, PairData> byPair = new HashMap<>();
-    for (Splat s : splats) byPair.put(s.data().pair, s.data());
+    // Pair id -> its data, as an array (a boxed HashMap lookup per pixel was ~3% of the phase).
+    int maxPair = -1;
+    for (Splat s : splats) maxPair = Math.max(maxPair, s.data().pair);
+    PairData[] byPair = new PairData[maxPair + 1];
+    for (Splat s : splats) byPair[s.data().pair] = s.data();
     Emission[][] rows = new Emission[y1 - y0][];
     long[][] tallies = new long[y1 - y0][20];
     parallel(y1 - y0, rowInBand -> {
@@ -1996,7 +2018,7 @@ final class ImageFusion {
         }
         int agreed = 0;
         boolean duplicate = false;
-        PairData data = byPair.get(m.repPair[q]);
+        PairData data = byPair[m.repPair[q]];
         int rep = m.repIndex[q];
         // FP64 back-projection along the representative's ray at the merged depth.
         double u = x + m.du[q], v = y + m.dv[q];
@@ -2245,7 +2267,9 @@ final class ImageFusion {
         r.confidence = PointConfidence.finalScore(r.matchingConfidence, r.relativeSigma);
         if (!r.accepted()) t[5]++;
         DepthFusion.SurfaceSample geometry =
-            surface && r.accepted() ? surfaceSample(c, m, X, mz, x, y - m.row0, points) : null;
+            surface && r.accepted()
+                ? (gpuNormals ? PENDING_NORMAL : surfaceSample(c, m, X, mz, x, y - m.row0, points))
+                : null;
         if (list == null) list = new ArrayList<>();
         list.add(
             new Emission(
@@ -2362,7 +2386,7 @@ final class ImageFusion {
    * (strips), with both held in locals by the caller so the resident path reads the array directly.
    */
   private static float at(float[] a, java.lang.foreign.MemorySegment s, int i) {
-    return a != null ? a[i] : s.getAtIndex(MappedFiles.FLOAT, i);
+    return a != null ? a[i] : s.get(MappedFiles.FLOAT, 4L * i);
   }
 
   private boolean reliable(float[] a, java.lang.foreign.MemorySegment s, int w, int x, int y) {
@@ -2377,6 +2401,61 @@ final class ImageFusion {
         hi = Math.max(hi, value);
       }
     return valid >= 7 && hi - lo <= o.fusionRelative * lo;
+  }
+
+  /** Placeholder of an emission whose normal comes from the batch after the cross-check. */
+  private static final DepthFusion.SurfaceSample PENDING_NORMAL =
+      new DepthFusion.SurfaceSample(null, Double.NaN, Double.NaN);
+
+  /**
+   * --fusion-gpu-normals on: the normals of a band's emissions in one GpuNormals batch (last-bit
+   * differences from surfaceSample, see GpuNormals), or with surfaceSample when the GPU path does
+   * not apply. Emissions are rebuilt with their samples in place of PENDING_NORMAL.
+   */
+  private void fillNormals(int c, Merged m, Emission[][] rows, double[] points) {
+    int count = 0, minY = Integer.MAX_VALUE, maxY = -1;
+    for (Emission[] row : rows)
+      if (row != null)
+        for (Emission e : row)
+          if (e != null && e.geometry() == PENDING_NORMAL) {
+            count++;
+            int y = e.cameraPixel() / m.w - m.row0;
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+          }
+    if (count == 0) return;
+    int[] xs = new int[count], ys = new int[count];
+    double[] ps = new double[3 * count];
+    int k = 0;
+    for (Emission[] row : rows)
+      if (row != null)
+        for (Emission e : row)
+          if (e != null && e.geometry() == PENDING_NORMAL) {
+            xs[k] = e.cameraPixel() % m.w;
+            ys[k] = e.cameraPixel() / m.w - m.row0;
+            System.arraycopy(e.result().point, 0, ps, 3 * k, 3);
+            k++;
+          }
+    java.util.function.IntFunction<DepthFusion.SurfaceSample> cpu =
+        i -> surfaceSample(c, m, new double[] {ps[3 * i], ps[3 * i + 1], ps[3 * i + 2]},
+            m.z[ys[i] * m.w + xs[i]], xs[i], ys[i], points);
+    int from = Math.max(0, minY - GpuNormals.HALO), to = Math.min(m.h, maxY + GpuNormals.HALO + 1);
+    DepthFusion.SurfaceSample[] samples =
+        GpuNormals.compute(o, fusion.camera(c), m.z, m.du, m.dv, m.w, m.h, m.row0, from, to, xs, ys, ps, cpu);
+    if (samples == null) {
+      DepthFusion.SurfaceSample[] onCpu = new DepthFusion.SurfaceSample[count];
+      parallel(count, i -> onCpu[i] = cpu.apply(i));
+      samples = onCpu;
+    }
+    k = 0;
+    for (Emission[] row : rows)
+      if (row != null)
+        for (int j = 0; j < row.length; j++) {
+          Emission e = row[j];
+          if (e == null || e.geometry() != PENDING_NORMAL) continue;
+          row[j] = new Emission(e.candidate(), e.pair(), e.pixel(), e.rgb(), e.result(), samples[k++],
+              e.cameraPixel(), e.agreements(), e.agreementDepths());
+        }
   }
 
   /** Plane fit on the owner's merged map; mirrors DepthFusion.surfaceSample. */

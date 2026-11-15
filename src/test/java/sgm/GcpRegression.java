@@ -170,7 +170,7 @@ final class GcpRegression {
         new Thread(
             () -> {
               try {
-                GcpEditor.serve(Main.command(new String[] {"gcp-edit", "-o", waitingProject.toString(), "--gcp-port", "" + port}));
+                GcpEditor.serve(Main.command(new String[] {"gcp-edit", "-o", waitingProject.toString(), "--browser", "--gcp-port", "" + port}));
               } catch (Exception e) {
                 throw new RuntimeException(e);
               }
@@ -211,6 +211,8 @@ final class GcpRegression {
     editor.join(20000);
     check(!editor.isAlive(), "editor stops on done");
     check(GroundControl.load(GroundControl.markersFile(waitingRun)).marker(first.gcp, first.image).pinned(), "pin saved to markers.json");
+    checks += nativeEditorActions(waitingProject, waitingRun, first);
+    checks += GuiRegression.realProject(waitingProject);
 
     // 3. With pins: datum onto the GCPs, small residuals, later steps run.
     Path markersFile = root.resolve("markers.json");
@@ -252,6 +254,66 @@ final class GcpRegression {
     check(((Number) JsonRead.object(held.get("check_rms_metres")).get("points")).intValue() == 3, "three check points on the branch");
     check(((Number) JsonRead.object(held.get("check_rms_metres")).get("total")).doubleValue() < .4, "check RMS with G1 held back");
     return checks;
+  }
+
+  /**
+   * The actions behind the native editor window, without a window: open a session, read the
+   * typed model, pin / accept all / reject / unpin, crops; changes saved to markers.json.
+   */
+  static int nativeEditorActions(Path project, Path run, GroundControl.Marker first) throws Exception {
+    int before = checks;
+    try (GcpEditor.Session s = GcpEditor.open(Main.command(new String[] {"gcp-edit", "-o", project.toString(), "--no-continue", "--browser"}))) {
+      check(s.run().equals(run.toAbsolutePath().normalize()) && s.nextStep().equals(List.of("gcp", "-o", project.toAbsolutePath().normalize().toString(), "--run", run.getFileName().toString())), "session opens the latest run; next step continues it");
+      GcpEditorModel m = new GcpEditorModel(s.editor().state());
+      check(m.gcps.size() == s.markers().gcps.size() && m.images.size() == s.frames().size(), "model lists all GCPs and images");
+      List<GcpEditorModel.Marker> cards = m.cards(first.gcp);
+      check(!cards.isEmpty() && cards.get(0).pinned() && cards.get(0).image() == first.image, "pinned marker shown first");
+      for (int i = 1; i < m.shown(first.gcp).size(); i++) {
+        String a = m.shown(first.gcp).get(i - 1).status(), b = m.shown(first.gcp).get(i).status();
+        check(rank(a) <= rank(b), "cards ordered pinned, refined, predicted, rejected");
+      }
+      check(m.cards(first.gcp).size() == m.shown(first.gcp).size() + m.hidden(first.gcp).size(), "cards = shown + probably hidden");
+      check(m.hidden(first.gcp).stream().allMatch(k -> k.hidden() && !k.pinned()), "hidden section has only unpinned hidden markers");
+      check(GcpEditorModel.grade(.5).equals("good") && GcpEditorModel.grade(2.).equals("mid") && GcpEditorModel.grade(5.).equals("bad") && GcpEditorModel.grade(null) == null, "residual grades");
+      check(m.readiness().equals(s.readiness() == null ? "Ready for the gcp step." : "Still needed: " + s.readiness()), "readiness text follows the markers");
+      // Pin a predicted marker of another GCP where it is predicted; the editor saves it and refines the rest.
+      GcpEditorModel start = m;
+      GcpEditorModel.Gcp other = m.gcps.stream().filter(g -> !g.id().equals(first.gcp) && !start.shown(g.id()).isEmpty()).findFirst().orElseThrow();
+      GcpEditorModel.Marker target = m.shown(other.id()).get(0);
+      m = new GcpEditorModel(s.editor().mark(other.id(), target.image(), "pinned", target.u() + .5, target.v()));
+      check(m.marker(other.id(), target.image()).pinned() && Math.abs(m.marker(other.id(), target.image()).u() - target.u() - .5) < 1e-9, "pin by click");
+      check(GroundControl.load(s.file()).marker(other.id(), target.image()).pinned(), "pin saved at once");
+      s.editor().settle();
+      m = new GcpEditorModel(s.editor().state());
+      check(!m.refining, "refinement finished");
+      int acceptable = m.acceptable(other.id());
+      m = new GcpEditorModel(s.editor().acceptAll(other.id()));
+      check(m.acceptable(other.id()) == 0 && m.gcp(other.id()).pins() >= 1 + acceptable, "accept all pins the well-correlated refined markers");
+      GcpEditorModel.Marker last = m.cards(other.id()).get(m.cards(other.id()).size() - 1);
+      if (!last.pinned()) {
+        m = new GcpEditorModel(s.editor().mark(other.id(), last.image(), "rejected", null, null));
+        check(m.marker(other.id(), last.image()).status().equals("rejected"), "reject");
+        m = new GcpEditorModel(s.editor().mark(other.id(), last.image(), "predicted", null, null));
+        GcpEditorModel.Marker back = m.marker(other.id(), last.image());
+        check(back.status().equals("predicted") && back.predictedU() != null && Math.abs(back.u() - back.predictedU()) < 1e-9, "unpin returns to the prediction");
+      }
+      check(GcpEditorModel.info(m.marker(other.id(), target.image())).startsWith("pinned"), "marker info text");
+      var crop = s.editor().crop(target.image(), target.u(), target.v(), 200, 120);
+      check(crop.getWidth() == 120 && crop.getHeight() == 120, "crop size");
+      var whole = s.editor().whole(target.image(), 300);
+      check(Math.max(whole.getWidth(), whole.getHeight()) == 300, "whole-image preview size");
+      check(GcpEditorWindow.downsample(whole, 100).getWidth() <= 100, "viewer preview downsampling");
+    }
+    return checks - before;
+  }
+
+  static int rank(String status) {
+    return switch (status) {
+      case "pinned" -> 0;
+      case "refined" -> 1;
+      case "predicted" -> 2;
+      default -> 3;
+    };
   }
 
   static double[] meanCentre(List<ImageFrame> frames) {

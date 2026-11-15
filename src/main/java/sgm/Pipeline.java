@@ -15,7 +15,9 @@ import org.opencv.core.*;
  * calibrate    01  interior orientation (supplied, EXIF or automatic), alignment frames
  * match        02-03 features, pair matching, tracks (supplied poses are read here)
  * align        04  relative orientation: SfM, bundle adjustment, sparse cleanup, lens refinement
+ * cleanup      04  optional tie-point cleanup by quality (--tie-point-cleanup) and adjustment
  * georeference 04  GPS similarity, GPS-weighted adjustment, camera screening, final exports
+ * lidar        04  optional: block moved onto an ALS reference surface (--lidar-reference)
  * gcp          04  ground control points: predicted markers; after pinning, the GCP adjustment
  * dense        05-06 dense matching and fusion, dense.las / dense.ply, report.txt
  * ground       07  optional ground classification, pair correction, ground-aware fusion
@@ -30,7 +32,9 @@ final class Pipeline {
     CALIBRATE("calibrate", "Interior orientation and alignment images"),
     MATCH("match", "Features, pair matching and tracks"),
     ALIGN("align", "Camera alignment and sparse reconstruction"),
+    CLEANUP("cleanup", "Tie-point cleanup by quality and adjustment (optional)"),
     GEOREFERENCE("georeference", "GPS georeferencing, GPS-weighted adjustment and camera screening"),
+    LIDAR("lidar", "Lidar-referenced georeferencing (optional)"),
     GCP("gcp", "Ground control points: markers, adjustment and residuals (optional)"),
     DENSE("dense", "Dense matching and fusion"),
     GROUND("ground", "Ground classification (optional)"),
@@ -96,7 +100,9 @@ final class Pipeline {
             case CALIBRATE -> calibrate();
             case MATCH -> match();
             case ALIGN -> align();
+            case CLEANUP -> cleanup();
             case GEOREFERENCE -> georeference();
+            case LIDAR -> lidar();
             case GCP -> gcp();
             case DENSE -> dense();
             case GROUND -> ground();
@@ -118,7 +124,7 @@ final class Pipeline {
         }
       }
     }
-    state.mark(step, outcome, outcome.equals("waiting") ? state.string("gcp_waiting") : step.description);
+    state.mark(step, outcome, outcome.equals("waiting") ? state.string(step.name + "_waiting") : step.description);
     if (!outcome.equals("waiting")) state.snapshot(step);
   }
 
@@ -130,7 +136,7 @@ final class Pipeline {
     for (int i = 1; i < steps.size(); i++)
       if (steps.get(i).ordinal() <= steps.get(i - 1).ordinal())
         throw new IllegalArgumentException(
-            "Give the steps in pipeline order: inputs calibrate match align georeference gcp dense ground finish");
+            "Give the steps in pipeline order: inputs calibrate match align cleanup georeference lidar gcp dense ground finish");
     Set<Step> planned = EnumSet.copyOf(steps);
     for (Step step : steps) {
       String current = state.status(step);
@@ -157,10 +163,17 @@ final class Pipeline {
   static boolean notRequested(Step step, Options o) {
     if (o == null) return false;
     return switch (step) {
+      case CLEANUP -> o.tiePointCleanup.equals("off");
+      case LIDAR -> o.lidarReference == null;
       case GCP -> o.gcp == null;
       case GROUND -> !(o.classifyGround || o.groundPairCorrection || o.groundAwareFusion);
       default -> false;
     };
+  }
+
+  /** Steps that run only when asked for (notRequested can be true). */
+  static boolean optional(Step step) {
+    return step == Step.CLEANUP || step == Step.LIDAR || step == Step.GCP || step == Step.GROUND;
   }
 
   /** First step that is neither complete nor skipped (nor an optional step not asked for), or null. */
@@ -179,7 +192,7 @@ final class Pipeline {
       case INPUTS -> List.of("00_inputs");
       case CALIBRATE -> List.of("00_inputs", "01_calibration");
       case MATCH -> List.of("02_features", "03_matches");
-      case ALIGN, GEOREFERENCE, GCP -> List.of("04_geometry");
+      case ALIGN, CLEANUP, GEOREFERENCE, LIDAR, GCP -> List.of("04_geometry");
       case DENSE -> List.of("05_stereo", "06_fusion", "07_results");
       case GROUND -> List.of("07_results");
       case FINISH -> List.of();
@@ -199,11 +212,17 @@ final class Pipeline {
     for (Step prior : Step.values()) {
       if (prior == from) break;
       String status = original.status(prior);
-      if (!status.equals("complete") && !status.equals("skipped"))
+      if (!status.equals("complete") && !status.equals("skipped") && !(status.equals("pending") && optional(prior)))
         throw new IllegalArgumentException(
             "Cannot branch at '" + from.name + "': step '" + prior.name + "' of the source run is " + status);
     }
+    // The state after the step before 'from'; an optional step without a saved state (skipped in a
+    // run made before the step existed, or pending and not asked for) changed nothing, so the state
+    // after the step before it is the same.
     Step before = Step.values()[from.ordinal() - 1];
+    while (before.ordinal() > 0 && optional(before) && !Files.isDirectory(source.resolve("state/after-" + before.name))
+        && !original.status(before).equals("complete"))
+      before = Step.values()[before.ordinal() - 1];
     Path snapshot = source.resolve("state/after-" + before.name);
     if (!Files.isDirectory(snapshot))
       throw new IllegalArgumentException(
@@ -570,6 +589,98 @@ final class Pipeline {
     return "complete";
   }
 
+  /**
+   * Tie-point cleanup by quality (--tie-point-cleanup, TiePointCleanup). auto: the --tie-point-*
+   * limits are applied and the block adjusted again. pause: the first run writes the per-point
+   * measures and waits; the POSE window writes its choice (04_geometry/tie_points/selection.json)
+   * and runs the step again, which applies or skips it. A choice left in a run copied by --branch
+   * is ignored: only a choice made while this run waits counts.
+   */
+  private String cleanup() throws IOException {
+    if (planningOnly() || options.tiePointCleanup.equals("off")) return "skipped";
+    images();
+    loadFrames();
+    features = state.readTracks(options);
+    Path dir = options.output.resolve(TiePointCleanup.FOLDER);
+    Files.createDirectories(dir);
+    if (project != null) project.stage("04_geometry", "running", "Tie-point cleanup by quality");
+    // The per-point table is written first and read back: the window, the automatic limits and
+    // the selection all use the same (rounded) values.
+    TiePointCleanup.write(dir.resolve("metrics.csv"), TiePointCleanup.measure(frames, features.tracks));
+    TiePointCleanup.writeCameras(dir.resolve("cameras.csv"), frames);
+    List<TiePointCleanup.Point> points = TiePointCleanup.read(dir.resolve("metrics.csv"));
+    TiePointCleanup.Thresholds limits;
+    if (options.tiePointCleanup.equals("pause")) {
+      boolean waited = state.string("cleanup_waiting") != null;
+      TiePointCleanup.Choice choice = waited ? TiePointCleanup.readChoice(options.output) : null;
+      if (choice == null) {
+        Files.deleteIfExists(TiePointCleanup.choiceFile(options.output));
+        String root = project == null ? "PROJECT" : project.root.toString();
+        String message =
+            "Choose the tie-point cleanup limits: in the POSE window (Project tab, Clean tie points), or run"
+                + " 'photogrammetry cleanup -o " + root + " --tie-point-cleanup auto' (automatic limits) or '--tie-point-cleanup custom [--tie-point-max-error PX"
+                + " --tie-point-min-views N --tie-point-min-angle DEG]' (--tie-point-cleanup off skips it). "
+                + String.format(Locale.ROOT, "%,d tie points measured.", points.size());
+        state.put("cleanup_waiting", message);
+        System.out.println(message);
+        return "waiting";
+      }
+      state.json.remove("cleanup_waiting");
+      if (!choice.apply()) {
+        Json.write(dir.resolve("cleanup.json"), Json.object("mode", "pause", "action", "skipped by the user",
+            "points", points.size()));
+        System.out.println("Tie-point cleanup skipped (chosen in the POSE window).");
+        return "skipped";
+      }
+      limits = choice.thresholds();
+    } else {
+      state.json.remove("cleanup_waiting");
+      // auto: the automatic limits; custom: the --tie-point-* limits (unset ones at their defaults).
+      limits = options.tiePointCleanup.equals("custom") ? TiePointCleanup.thresholds(options, points) : TiePointCleanup.automatic(points);
+    }
+    TiePointCleanup.Selection s = TiePointCleanup.select(points, frames.size(), limits);
+    double before = GpsAdjustment.reprojectionRms(frames, features.tracks, null);
+    int registeredBefore = (int) frames.stream().filter(f -> f.camera.registered).count();
+    for (int i = 0; i < points.size(); i++)
+      if (s.remove()[i]) features.tracks.get(points.get(i).track()).point = null;
+    if (s.removed() > 0) {
+      BundleAdjuster.optimize(frames, features.tracks, options.iterations, options.reprojection, project);
+      // As at the end of align: points the adjustment could not fit are dropped.
+      for (FeatureTracks.Track t : features.tracks)
+        if (t.point != null && t.prior == null && !Geometry.valid(frames, t, t.point, options.reprojection * 2)) t.point = null;
+    }
+    double after = GpsAdjustment.reprojectionRms(frames, features.tracks, null);
+    int registeredAfter = (int) frames.stream().filter(f -> f.camera.registered).count();
+    long remaining = features.tracks.stream().filter(t -> t.point != null && t.prior == null).count();
+    String summary = String.format(Locale.ROOT,
+        "Tie-point cleanup (%s): removed %,d of %,d tie points (error > %.2f px: %,d; views < %d: %,d; angle < %.1f deg: %,d;"
+            + " kept for camera support: %,d; over the %.0f%% limit: %,d); reprojection RMS %.3f -> %.3f px",
+        options.tiePointCleanup, s.removed(), points.size(), limits.maxError(), s.byError(), limits.minViews(), s.byViews(),
+        limits.minAngle(), s.byAngle(), s.protectedBySupport(), limits.maxRemovedPercent(), s.capped(), before, after);
+    System.out.println(summary);
+    Map<String, Object> report = new LinkedHashMap<>();
+    report.put("mode", options.tiePointCleanup);
+    report.put("limits", limits.json());
+    report.put("points_before", points.size());
+    report.put("removed", s.removed());
+    report.put("failing_max_error", s.byError());
+    report.put("failing_min_views", s.byViews());
+    report.put("failing_min_angle", s.byAngle());
+    report.put("kept_for_camera_support", s.protectedBySupport());
+    report.put("kept_over_removal_limit", s.capped());
+    report.put("points_after_adjustment", remaining);
+    report.put("reprojection_rms_before_pixels", before);
+    report.put("reprojection_rms_after_pixels", after);
+    report.put("registered_cameras_before", registeredBefore);
+    report.put("registered_cameras_after", registeredAfter);
+    report.put("summary", summary);
+    Json.write(dir.resolve("cleanup.json"), report);
+    state.put("tie_point_cleanup", summary);
+    saveFrames();
+    state.writeTracks(features);
+    return "complete";
+  }
+
   private String georeference() throws IOException {
     if (planningOnly()) return "skipped";
     images();
@@ -611,6 +722,58 @@ final class Pipeline {
     state.put("crs", georeference.crs == null ? null : georeference.crs.name);
     state.put("georeference_description", georeference.description);
     state.put("geometry_quality", geometryQuality);
+    saveFrames();
+    state.writeTracks(features);
+    return "complete";
+  }
+
+  /**
+   * Lidar-referenced georeferencing (--lidar-reference, LidarReference): checks that the lidar
+   * covers the block, estimates the rigid transformation onto the ALS surface and moves cameras and
+   * tie points with it, so dense matching and all products are in the lidar's frame and height
+   * datum. A separate step (not part of georeference) so it can be redone with other settings by
+   * --branch without repeating the GPS adjustment, and so a missing tile stops the run before the
+   * dense step with a clear message.
+   */
+  private String lidar() throws IOException {
+    if (planningOnly() || options.lidarReference == null) return "skipped";
+    images();
+    loadFrames();
+    features = state.readTracks(options);
+    Crs crs = crs();
+    if (crs == null)
+      throw new IllegalArgumentException(
+          "--lidar-reference needs a block georeferenced in a projected CRS first (GPS positions in the images, or supplied"
+              + " orientations with --orientation-crs); the georeference step left it in a local frame: "
+              + state.string("georeference_description"));
+    if (project != null) project.stage("04_geometry", "running", "Lidar-referenced georeferencing");
+    LidarReference.Result result =
+        LidarReference.run(frames, features.tracks, options, crs, options.output.resolve(LidarReference.FOLDER), System.out::println);
+    String vertical = result.source().vertical();
+    String coordinates = crs.name + " easting/northing, metres; heights: " + vertical + "; datum from the lidar reference. " + result.summary();
+    int verticalEpsg = 0;
+    for (LasFile.Header h : result.source().files()) verticalEpsg = Math.max(verticalEpsg, h.crs().vertical());
+    Json.write(
+        options.output.resolve("coordinates.json"),
+        Json.object(
+            "georeferenced", true,
+            "horizontal_crs", crs.name,
+            "epsg", crs.epsg,
+            "xy_order", "easting,northing",
+            "xyz_units", "metres",
+            "vertical_crs", verticalEpsg > 0 && options.lidarVerticalDatum == null ? "EPSG:" + verticalEpsg : null,
+            "vertical_datum", vertical,
+            "height_note", "Heights follow the lidar reference: " + vertical + ".",
+            "datum", "lidar reference",
+            "lidar_report", LidarReference.FOLDER + "/lidar_reference.json",
+            "coordinate_multiplier", 1));
+    if (project != null) project.data.snapshot("final", frames, features.tracks, coordinates);
+    PoseIO.write(options.output.resolve("cameras.csv"), frames);
+    writeSparse(features.tracks);
+    state.put("geometry_quality", GeometryQuality.write(options.output, frames, features.tracks));
+    if (project != null) project.stage("04_geometry", "complete", coordinates);
+    state.put("coordinates", coordinates);
+    state.put("lidar_summary", result.summary());
     saveFrames();
     state.writeTracks(features);
     return "complete";

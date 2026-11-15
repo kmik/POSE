@@ -18,11 +18,13 @@ Java, uses OpenCL for dense matching and depth fusion, and runs on its own or as
 
 - Camera alignment and bundle adjustment, with automatic or supplied calibration and poses.
 - Georeferencing from image GPS, and from ground control points pinned in a browser editor.
+- Georeferencing to an airborne lidar reference (LAS or LAZ), without ground control points.
 - Dense matching (semi-global matching, optionally multi-view) with multi-view depth fusion.
 - Ground classification with a terrain model and a canopy height model.
 - Full-resolution true orthomosaic as a tiled GeoTIFF.
 - LAS and PLY point clouds, DSM, DTM and a PDF processing report.
 - The pipeline runs in one go or one step at a time.
+- A desktop window (`pose-gui.bat`, `pose-gui.sh`) to start, follow and inspect runs, with a 3D view.
 
 ## Build
 
@@ -65,7 +67,9 @@ Each step saves its state, so the next one can run later or with different setti
 | `calibrate` | camera calibration (supplied, from EXIF, or estimated) |
 | `match` | features, image pairs and tie points |
 | `align` | camera alignment and bundle adjustment |
+| `cleanup` | tie-point cleanup by quality (only with `--tie-point-cleanup`) |
 | `georeference` | GPS georeferencing and the GPS-weighted adjustment |
+| `lidar` | moves the block onto a lidar surface (only with `--lidar-reference`) |
 | `gcp` | ground control points (only with `--gcp`) |
 | `dense` | dense matching and fusion: the point cloud |
 | `ground` | ground classification (only with `--classify-ground`) |
@@ -100,6 +104,17 @@ G2,605553.10,6938371.44,88.10,,,,check
 At least three control points pinned in two or more images each are needed (one is enough when
 the images have GPS). `--gcp-check auto` holds some points back as check points automatically.
 
+## Lidar reference
+
+`--lidar-reference FILE|FOLDER` (LAS or LAZ tiles, for example national airborne laser scanning)
+georeferences the block to the lidar instead of ground control: after the GPS fit, the shifts,
+tilts and heading that put the tie points onto the lidar surface are estimated (scale with
+`--lidar-scale on`) and applied before dense matching, so all products are in the lidar's
+coordinate system and height datum. The lidar must cover the whole block; open ground and roofs
+count more than canopy, canopy height may differ (older lidar), and parameters the terrain cannot
+determine stay at their GPS values. The report shows the parameters with their uncertainty and
+difference maps against the lidar. Options: `photogrammetry --help lidar`.
+
 ## Common options
 
 | Option | Default | Effect |
@@ -129,13 +144,15 @@ into that root, and build the module. The Java entry point is `photogrammetry`.
 ## Limitations
 
 - Automatic calibration needs good overlap and camera geometry; otherwise supply a calibration.
-- With GPS only, heights follow the EXIF GPS altitude (no geoid conversion). Use GCPs for a
-  surveyed height datum.
+- With GPS only, heights follow the EXIF GPS altitude (no geoid conversion). Use GCPs or a lidar
+  reference for a surveyed height datum.
+- A lidar reference corrects the block as a whole (one rigid transformation), not its bending.
 - Under closed canopy the terrain is interpolated from the nearest visible ground.
 
 ## Documentation
 
 - [Pipeline steps and ground control points](docs/PIPELINE_STEPS.md)
+- [Desktop window](docs/GUI.md)
 - [Project layout](docs/PROJECT_FORMAT.md)
 - [Orientation formats](docs/ORIENTATIONS.md)
 - [Ground classification](docs/GROUND_CLASSIFICATION.md)

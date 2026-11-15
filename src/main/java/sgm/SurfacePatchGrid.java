@@ -14,6 +14,8 @@ final class SurfacePatchGrid {
     double at(double x,double y){return a*x+b*y+c;}
   }
   private static final int CELL=16;
+  /** Planned heap per cached cell (measured mean 465, maximum about 770 bytes). */
+  static final int CELL_BYTES=1024;
   private final int width,height,columns;
   private final double relative;
   private final IntToDoubleFunction depth;
@@ -32,9 +34,15 @@ final class SurfacePatchGrid {
     int cells=columns*Math.ceilDiv(height,CELL);
     models=new java.util.concurrent.atomic.AtomicReferenceArray<>(Math.max(16,Math.min(cells,cacheCells)));
   }
+  /**
+   * Cache slots per grid: 1/16 of the memory budget over the resident grids. A cached cell was
+   * measured at 465 bytes on average and at most about 770 with its entry (large-format block,
+   * 14 November 2026), so 1,024 bytes per cell (was 4,096, with at most 65,536 cells) keeps the
+   * same budget; there, 55% of the builds had been rebuilds of evicted cells.
+   */
   static int cacheCells(Options o,int rasters) {
     long budget=Math.min(o.memoryMb*1048576L,Runtime.getRuntime().maxMemory());
-    return (int)Math.max(16,Math.min(1<<16,budget/16/Math.max(1,rasters)/4096));
+    return (int)Math.max(16,Math.min(1<<20,budget/16/Math.max(1,rasters)/CELL_BYTES));
   }
 
   /** 0 unknown/protected, 1 compatible surface, 2 in front of model, 3 behind model. */
@@ -88,8 +96,9 @@ final class SurfacePatchGrid {
         x[n]=xx;y[n]=yy;q[n++]=1/z;
       }
       if(n<18)continue;
-      double[] sorted=Arrays.copyOf(q,n);Arrays.sort(sorted);
-      double tolerance=Math.max(1e-12,sorted[n/2]*Math.max(.0005,relative*.35));
+      // Medians by selection: the same element value as after a full sort (finite positive values).
+      double median=kth(Arrays.copyOf(q,n),n,n/2);
+      double tolerance=Math.max(1e-12,median*Math.max(.0005,relative*.35));
       boolean[] used=new boolean[n];
       for(int layer=0;layer<3;layer++) {
         int best=0;double a=0,b=0,c=0;
@@ -124,7 +133,7 @@ final class SurfacePatchGrid {
           used[i]=true;inliers.add(new double[]{x[i],y[i]});residual[m++]=Math.abs(q[i]-a*x[i]-b*y[i]-c);
         }
         if(m<12)continue;
-        Arrays.sort(residual,0,m);double sigma=Math.max(mq*.00025,1.4826*residual[m/2]);
+        double sigma=Math.max(mq*.00025,1.4826*kth(residual,m,m/2));
         double[] hull=hull(inliers);
         if(hull.length<6)continue;
         // Broad models must actually occupy a 2-D patch, not a line or a narrow edge.
@@ -133,6 +142,25 @@ final class SurfacePatchGrid {
       }
     }
     return result.toArray(Plane[]::new);
+  }
+
+  /**
+   * The k-th smallest of a[0, n) (rearranges a): the value a full sort puts at index k. Only for
+   * finite values without signed zeros, where every ordering of equal values gives that value.
+   */
+  static double kth(double[] a,int n,int k) {
+    int lo=0,hi=n-1;
+    while(lo<hi) {
+      double pivot=a[lo+(hi-lo)/2];
+      int i=lo,j=hi;
+      while(i<=j) {
+        while(a[i]<pivot)i++;
+        while(a[j]>pivot)j--;
+        if(i<=j){double t=a[i];a[i]=a[j];a[j]=t;i++;j--;}
+      }
+      if(k<=j)hi=j;else if(k>=i)lo=i;else return a[k];
+    }
+    return a[k];
   }
 
   private boolean thin(double x,double y,double z,Plane plane) {

@@ -18,11 +18,47 @@ import javax.imageio.ImageIO;
  * pinned or rejected. Every change is saved to the run's 04_geometry/gcp/markers.json; once a GCP
  * has two pins its other predictions follow the triangulated point and each pin shows its
  * residual. "Done" stops the editor; then run the gcp step again.
+ *
+ * <p>With a display, gcp-edit opens the same editor as a native window ({@link GcpEditorWindow});
+ * the web page remains for headless machines and with --browser.
  */
 final class GcpEditor {
   private GcpEditor() {}
 
-  static int serve(Main.Command c) throws IOException {
+  /** Flags of gcp-edit itself (not processing options). */
+  static final String BROWSER = "--browser", NO_CONTINUE = "--no-continue";
+
+  /** An opened run with its markers predicted and the editor actions ready; no window. */
+  record Session(
+      Path root, String id, Path run, List<ImageFrame> frames, GroundControl.Markers markers, Path file, boolean georeferenced, Editor editor, int port)
+      implements AutoCloseable {
+    String readiness() {
+      synchronized (editor) {
+        return GroundControl.readiness(markers, georeferenced);
+      }
+    }
+
+    /** The step that continues the run once the markers are ready. */
+    List<String> nextStep() {
+      return List.of("gcp", "-o", root.toString(), "--run", id);
+    }
+
+    @Override
+    public void close() {
+      editor.close();
+      for (ImageFrame f : frames) f.close();
+    }
+  }
+
+  /** The command without gcp-edit's own flags. */
+  static Main.Command withoutEditorFlags(Main.Command c) {
+    String[] rest = Arrays.stream(c.rest()).filter(a -> !a.equals(BROWSER) && !a.equals(NO_CONTINUE)).toArray(String[]::new);
+    return new Main.Command(c.steps(), c.status(), rest, c.runId(), c.branch(), c.editor());
+  }
+
+  /** Opens a run for marker editing: frames, markers (predicted and saved), editor actions. */
+  static Session open(Main.Command c) throws IOException {
+    c = withoutEditorFlags(c);
     Path root = Main.projectRoot(c.rest());
     String id = c.runId() == null ? Main.latestRun(root) : c.runId();
     Path run = root.resolve("runs").resolve(id);
@@ -42,12 +78,30 @@ final class GcpEditor {
     GroundControl.Occlusion occlusion = georeferenced ? GroundControl.Occlusion.of(state.readTracks().tracks) : null;
     GroundControl.predict(markers, frames, georeferenced, occlusion);
     GroundControl.save(markers, file, frames);
-    Editor editor = new Editor(frames, markers, file, georeferenced, occlusion);
-    HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), options.gcpPort), 0);
+    return new Session(root, id, run, frames, markers, file, georeferenced, new Editor(frames, markers, file, georeferenced, occlusion), options.gcpPort);
+  }
+
+  /**
+   * gcp-edit: the native window when a display is available (unless --browser), else the local
+   * web page. In the window, Done continues the run with the gcp step when the markers are ready
+   * (unless --no-continue is given or the box in the window is cleared).
+   */
+  static int serve(Main.Command c) throws IOException {
+    boolean asked = Arrays.asList(c.rest()).contains(BROWSER);
+    if (!asked && !GraphicsEnvironment.isHeadless()) return window(c, !Arrays.asList(c.rest()).contains(NO_CONTINUE));
+    if (!asked) System.out.println("No display: using the browser editor instead of the native window.");
+    Session session = open(c);
+    String id = session.id();
+    Path root = session.root();
+    Path file = session.file();
+    GroundControl.Markers markers = session.markers();
+    boolean georeferenced = session.georeferenced();
+    Editor editor = session.editor();
+    HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), session.port()), 0);
     Object done = new Object();
     server.createContext("/", ex -> editor.handle(ex, done));
     server.start();
-    String url = "http://127.0.0.1:" + options.gcpPort + "/";
+    String url = "http://127.0.0.1:" + session.port() + "/";
     System.out.println("GCP marker editor for run " + id + ": " + url + "  (press Done in the page to finish)");
     try {
       if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE))
@@ -63,8 +117,7 @@ final class GcpEditor {
       }
     }
     server.stop(0);
-    editor.close();
-    for (ImageFrame f : frames) f.close();
+    session.close();
     String ready = GroundControl.readiness(markers, georeferenced);
     System.out.println(
         "Markers saved to "
@@ -73,6 +126,31 @@ final class GcpEditor {
                 ? ". Next: photogrammetry gcp -o " + root
                 : ". Still needed: " + ready + "."));
     return 0;
+  }
+
+  private static int window(Main.Command c, boolean proceed) throws IOException {
+    boolean run;
+    String ready;
+    Session session = open(c);
+    try {
+      System.out.println("GCP marker editor for run " + session.id() + " (finish with Done)");
+      run = GcpEditorWindow.showAndWait(session, proceed);
+      ready = session.readiness();
+    } finally {
+      session.close();
+    }
+    System.out.println("Markers saved to " + session.file() + (ready == null ? "." : ". Still needed: " + ready + "."));
+    if (ready != null || !run) {
+      if (ready == null) System.out.println("Next: photogrammetry gcp -o " + session.root() + " --run " + session.id());
+      return 0;
+    }
+    System.out.println("Continuing the run: photogrammetry " + String.join(" ", session.nextStep()));
+    try {
+      return PoseProcess.start(session.nextStep(), null).waitFor();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return 130;
+    }
   }
 
   static final class Editor {
@@ -270,6 +348,23 @@ final class GcpEditor {
       }
     }
 
+    /** Pins (u, v given), accepts (pinned without u, v), rejects or unpins one marker. */
+    Map<String, Object> mark(String gcp, int image, String status, Double u, Double v) throws IOException {
+      Map<String, Object> body = new HashMap<>();
+      body.put("gcp", gcp);
+      body.put("image", image);
+      body.put("status", status);
+      if (u != null && v != null) {
+        body.put("u", u);
+        body.put("v", v);
+      }
+      return update(body);
+    }
+
+    boolean refining() {
+      return refining.get() > 0;
+    }
+
     synchronized Map<String, Object> update(Map<String, Object> body) throws IOException {
       String gcp = String.valueOf(body.get("gcp"));
       int image = ((Number) body.get("image")).intValue();
@@ -302,33 +397,40 @@ final class GcpEditor {
 
     void image(HttpExchange ex, Map<String, String> q) throws IOException {
       int id = Integer.parseInt(q.get("id"));
-      BufferedImage source = photo(id);
       int out = Integer.parseInt(q.getOrDefault("out", "512"));
-      BufferedImage result;
-      if (q.containsKey("cx")) {
-        // Square window of 'size' source pixels around (cx, cy), drawn at out x out.
-        double cx = Double.parseDouble(q.get("cx")), cy = Double.parseDouble(q.get("cy"));
-        int size = Integer.parseInt(q.getOrDefault("size", "512"));
-        result = new BufferedImage(out, out, BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = result.createGraphics();
-        g.setColor(Color.DARK_GRAY);
-        g.fillRect(0, 0, out, out);
-        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, size > out ? RenderingHints.VALUE_INTERPOLATION_BILINEAR : RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-        int x0 = (int) Math.round(cx - size / 2.), y0 = (int) Math.round(cy - size / 2.);
-        g.drawImage(source, 0, 0, out, out, x0, y0, x0 + size, y0 + size, null);
-        g.dispose();
-      } else {
-        // Whole photograph, longest side 'out'.
-        double s = out / (double) Math.max(source.getWidth(), source.getHeight());
-        result = new BufferedImage(Math.max(1, (int) (source.getWidth() * s)), Math.max(1, (int) (source.getHeight() * s)), BufferedImage.TYPE_INT_RGB);
-        Graphics2D g = result.createGraphics();
-        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-        g.drawImage(source, 0, 0, result.getWidth(), result.getHeight(), null);
-        g.dispose();
-      }
+      BufferedImage result =
+          q.containsKey("cx")
+              ? crop(id, Double.parseDouble(q.get("cx")), Double.parseDouble(q.get("cy")), Integer.parseInt(q.getOrDefault("size", "512")), out)
+              : whole(id, out);
       ByteArrayOutputStream bytes = new ByteArrayOutputStream();
       ImageIO.write(result, "jpg", bytes);
       send(ex, 200, "image/jpeg", bytes.toByteArray());
+    }
+
+    /** Square window of {@code size} source pixels around (cx, cy), drawn at out x out. */
+    BufferedImage crop(int id, double cx, double cy, int size, int out) throws IOException {
+      BufferedImage source = photo(id);
+      BufferedImage result = new BufferedImage(out, out, BufferedImage.TYPE_INT_RGB);
+      Graphics2D g = result.createGraphics();
+      g.setColor(Color.DARK_GRAY);
+      g.fillRect(0, 0, out, out);
+      g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, size > out ? RenderingHints.VALUE_INTERPOLATION_BILINEAR : RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+      int x0 = (int) Math.round(cx - size / 2.), y0 = (int) Math.round(cy - size / 2.);
+      g.drawImage(source, 0, 0, out, out, x0, y0, x0 + size, y0 + size, null);
+      g.dispose();
+      return result;
+    }
+
+    /** Whole photograph, longest side {@code out}. */
+    BufferedImage whole(int id, int out) throws IOException {
+      BufferedImage source = photo(id);
+      double s = out / (double) Math.max(source.getWidth(), source.getHeight());
+      BufferedImage result = new BufferedImage(Math.max(1, (int) (source.getWidth() * s)), Math.max(1, (int) (source.getHeight() * s)), BufferedImage.TYPE_INT_RGB);
+      Graphics2D g = result.createGraphics();
+      g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+      g.drawImage(source, 0, 0, result.getWidth(), result.getHeight(), null);
+      g.dispose();
+      return result;
     }
 
     BufferedImage photo(int id) throws IOException {

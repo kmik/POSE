@@ -93,6 +93,7 @@ final class OptimalMvsgmNeighborsRegression {
       check(!optimal.neighborSelectionReports.isEmpty(), "Opt-in reports its selection decisions");
       concurrentPlanning(frames, tracks, o);
       quality(frames, tracks, o, truth, root);
+      misalignedNeighbour(frames, tracks, o);
       Camera weak = MultiViewSgmRegression.camera(1, 0, false);
       ImageFrame lowScore = new ImageFrame(10, frames.getFirst().path,
           frames.getFirst().calibration, o, true);
@@ -117,6 +118,83 @@ final class OptimalMvsgmNeighborsRegression {
           MultiViewSgm.neighbours(frames, tracks, 0, 6)), "Disabling after use restores legacy selection");
     } finally { for (ImageFrame f : frames) f.close(); GpuSgm.closeSession(); }
     return checks;
+  }
+
+  /**
+   * A neighbour whose pose does not fit the reference's depth range (here 20 m above the near
+   * plane, like a camera aligned tens of metres off) would need a sweep canvas over 4x the image:
+   * it is dropped from the plan, the labels are derived again without it, and the plan's images
+   * can be warped. When every neighbour is like that the camera is skipped with a reason that names
+   * the images, instead of failing the dense step.
+   */
+  private static void misalignedNeighbour(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, Options o)
+      throws Exception {
+    boolean optimal = o.mvsgmOptimalNeighbors;
+    o.mvsgmOptimalNeighbors = false; // score-only selection keeps the fixture's neighbour choice simple
+    try {
+      misalignedNeighbourScoreOnly(frames, tracks, o);
+    } finally {
+      o.mvsgmOptimalNeighbors = optimal;
+    }
+  }
+
+  private static void misalignedNeighbourScoreOnly(List<ImageFrame> frames, List<FeatureTracks.Track> tracks,
+      Options o) throws Exception {
+    MultiViewSgm before = new MultiViewSgm(o);
+    MultiViewSgm.Plan normal = before.headerPlan(frames, tracks, 0);
+    check(before.droppedNeighbours.isEmpty(), "Consistent poses drop no neighbour");
+    int bad = normal.neighbours.getFirst().id();
+    Camera camera = frames.get(bad).camera;
+    double[] keep = camera.translation.clone();
+    try {
+      double[] centre = camera.center();
+      camera.translation = Math3.times(Math3.mv(camera.rotation, new double[] {centre[0], centre[1], 24}), -1);
+      ImageFrame rf = frames.get(0);
+      check(MultiViewSgm.neighbours(frames, tracks, 0, o.mvsgmNeighbors).stream().anyMatch(n -> n.id() == bad),
+          "Fixture: the moved neighbour is still selected");
+      MultiViewSgm.Labels wide = before.labels(rf, tracks, frames, normal.neighbours.stream()
+          .map(n -> MultiViewSgm.shift(rf.camera, frames.get(n.id()).camera)).toArray(double[][]::new));
+      check(MultiViewSgm.canvasTooLarge(MultiViewSgm.canvas(rf.camera, camera, 0, 0, rf.width, rf.height, wide,
+          before.census), rf.width, rf.height), "Fixture: the moved neighbour needs an oversized canvas");
+      MultiViewSgm mv = new MultiViewSgm(o);
+      MultiViewSgm.Plan header = mv.headerPlan(frames, tracks, 0);
+      check(header != null, "A camera with one misaligned neighbour still gets a plan");
+      check(header.neighbours.stream().noneMatch(n -> n.id() == bad), "The misaligned neighbour is dropped");
+      check(header.neighbours.size() >= 1, "The other neighbours stay");
+      check(mv.droppedNeighbours.get(0).equals(List.of(MultiViewSgm.name(frames.get(bad)))),
+          "The dropped neighbour is recorded by image name");
+      double[][] shifts = header.neighbours.stream()
+          .map(n -> MultiViewSgm.shift(rf.camera, frames.get(n.id()).camera)).toArray(double[][]::new);
+      check(header.labels.equals(mv.labels(rf, tracks, frames, shifts)),
+          "Labels are derived again without the dropped neighbour");
+      for (MultiViewSgm.Neighbor n : header.neighbours)
+        check(!MultiViewSgm.canvasTooLarge(MultiViewSgm.canvas(rf.camera, frames.get(n.id()).camera, 0, 0,
+            rf.width, rf.height, header.labels, mv.census), rf.width, rf.height), "Kept neighbours fit the limit");
+      check(mv.preparePlan(frames, header) != null, "The plan's neighbour images warp without error");
+      // Every neighbour misaligned: the camera is skipped with a reason, nothing is thrown.
+      double[][] all = new double[frames.size()][];
+      for (int i = 1; i < frames.size(); i++) {
+        Camera ci = frames.get(i).camera;
+        all[i] = ci.translation.clone();
+        double[] c = ci.center();
+        ci.translation = Math3.times(Math3.mv(ci.rotation, new double[] {c[0], c[1], 24}), -1);
+      }
+      try {
+        MultiViewSgm none = new MultiViewSgm(o);
+        check(none.headerPlan(frames, tracks, 0) == null, "A camera with only misaligned neighbours is skipped");
+        String reason = none.skipped.get(0);
+        check(reason != null && reason.contains("4x the image") && reason.contains(MultiViewSgm.name(frames.get(bad)))
+            && reason.contains(MultiViewSgm.name(rf)), "The skip reason names the images: " + reason);
+      } finally {
+        for (int i = 1; i < frames.size(); i++) frames.get(i).camera.translation = all[i];
+      }
+    } finally {
+      camera.translation = keep;
+    }
+    MultiViewSgm after = new MultiViewSgm(o);
+    MultiViewSgm.Plan again = after.headerPlan(frames, tracks, 0);
+    check(again.neighbours.equals(normal.neighbours) && again.labels.equals(normal.labels)
+        && after.droppedNeighbours.isEmpty(), "Restored poses give the unchanged plan");
   }
 
   private static void concurrentPlanning(List<ImageFrame> frames,

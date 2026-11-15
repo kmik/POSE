@@ -24,3 +24,9 @@ in a copy of the OpenPnP JAR; OpenCV and third-party source notices are retained
 under `legal/opencv-4.9.0/`. Java bindings and other JAR resources remain unchanged.
 
 The example point-cloud image has no separate license.
+
+LAZ decompression (`src/main/java/sgm/LazDecoder.java`) is a Java port of parts of
+[laz-rs](https://github.com/laz-rs/laz-rs) (Apache License 2.0; itself a port of LASzip by
+Martin Isenburg, rapidlasso GmbH, and laz-perf by Uday Verma, Hobu Inc.). Test data in
+`src/test/resources/lidar` comes from laz-rs (Apache License 2.0) and laspy (BSD 2-Clause);
+see the NOTICE.md there.
