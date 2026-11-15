@@ -529,7 +529,7 @@ final class ProjectArtifacts implements AutoCloseable {
             + used
             + ","
             + csv(pair.reason));
-    Files.write(project.run.resolve("03_matches/pairs.csv"), pairRows);
+    writePairRows();
     double[]
         ka =
             {
@@ -621,6 +621,22 @@ final class ProjectArtifacts implements AutoCloseable {
     }
   }
 
+  /**
+   * pairs.csv after a new row: the first row writes the header and row (replacing any older file),
+   * later rows are appended. Same file as rewriting every row each time, without the quadratic
+   * I/O on blocks with tens of thousands of pairs.
+   */
+  private void writePairRows() throws IOException {
+    Path file = project.run.resolve("03_matches/pairs.csv");
+    if (pairRows.size() <= 2) Files.write(file, pairRows);
+    else
+      Files.write(
+          file,
+          List.of(pairRows.get(pairRows.size() - 1)),
+          StandardOpenOption.CREATE,
+          StandardOpenOption.APPEND);
+  }
+
   private void compactMatches(
       ImageFrame a, ImageFrame b, FeatureTracks.Pair pair, int queries, int ransac, int cheirality)
       throws IOException {
@@ -641,7 +657,7 @@ final class ProjectArtifacts implements AutoCloseable {
             + pair.matches.size()
             + ","
             + csv(pair.reason));
-    Files.write(project.run.resolve("03_matches/pairs.csv"), pairRows);
+    writePairRows();
     if (!options.diagnostics || options.storage.equals("minimal")) return;
     Path dir = directory("03_matches/" + pairId(a.id, b.id));
     try (BufferedWriter out = gzip(dir.resolve("accepted_matches.csv.gz"))) {

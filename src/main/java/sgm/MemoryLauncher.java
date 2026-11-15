@@ -106,7 +106,10 @@ final class MemoryLauncher {
                 + "(processing allowance up to 65%% of heap; native memory separate)%n",
             budget,
             target);
-        Process process = new ProcessBuilder(command).inheritIO().start();
+        ProcessBuilder builder = new ProcessBuilder(command).inheritIO();
+        // As in photogrammetry.sh: bound glibc's per-thread malloc arenas (native memory growth).
+        builder.environment().putIfAbsent("MALLOC_ARENA_MAX", "4");
+        Process process = builder.start();
         Thread forward =
             new Thread(
                 () -> {

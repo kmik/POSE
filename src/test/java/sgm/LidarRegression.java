@@ -43,6 +43,8 @@ final class LidarRegression {
     flatTerrain(root.resolve("flat"));
     coverage(root.resolve("coverage"));
     reportHelpers(root.resolve("report"));
+    preflight(root.resolve("preflight"));
+    guiHelpers(root.resolve("gui"));
     options(root);
     realProject(root.resolve("real"));
     return checks;
@@ -669,6 +671,62 @@ final class LidarRegression {
     List<String> flags = PdfReport.lidarFlags(Json.object("reference", ref, "comparison", Json.object("dsm", Json.object("stable", Json.object("median_metres", .8, "points", 90)))));
     check(flags.size() == 6, "lidar flags: weak parameter, weak search, stable RMS, deformation, height offset, undeclared datum: " + flags);
     check(PdfReport.lidarFlags(Map.of()).isEmpty(), "no lidar: no flags");
+  }
+
+  /** The coverage check before a run, on footprints: inside a tile covered, beyond its edge not. */
+  static void preflight(Path dir) throws Exception {
+    Files.createDirectories(dir);
+    List<Pt> pts = new ArrayList<>();
+    Random rnd = new Random(5);
+    for (int i = 0; i < 120000; i++) {
+      double x = rnd.nextDouble() * W, y = rnd.nextDouble() * W;
+      pts.add(new Pt(X0 + x, Y0 + y, terrain(x, y), 2));
+    }
+    Path las = dir.resolve("tile.las");
+    writeLas(las, 2, 1, pts, 3067, 0, null, false, 0);
+    LidarReference.Settings set = settings(las);
+    Crs crs = new Crs("EPSG:3067");
+    List<double[]> inside = List.of(new double[] {X0 + 150, Y0 + 200, 40}, new double[] {X0 + 230, Y0 + 200, 40});
+    LidarPreflight.Result ok = LidarPreflight.check(inside, las, crs, set, 2, new ArrayList<>());
+    check(ok.complete() && ok.message().startsWith("The lidar covers the area of all 2 images") && ok.map() != null, "preflight: covered " + ok.message());
+    List<double[]> beyond = List.of(new double[] {X0 + 200, Y0 + 200, 40}, new double[] {X0 + 380, Y0 + 200, 60});
+    LidarPreflight.Result no = LidarPreflight.check(beyond, las, crs, set, 2, new ArrayList<>());
+    check(!no.complete() && no.message().contains("estimated footprints") && no.message().contains("east"), "preflight: the missing eastern part named: " + no.message());
+    LidarPreflight.Result none = LidarPreflight.check(List.of(), las, crs, set, 3, new ArrayList<>());
+    check(!none.complete() && none.message().contains("GPS"), "preflight without GPS");
+    List<double[]> away = List.of(new double[] {X0 + 2000, Y0 + 2000, 40});
+    check(LidarPreflight.check(away, las, crs, set, 1, new ArrayList<>()).message().contains("does not overlap"), "preflight: no overlap at all said plainly");
+  }
+
+  /** GUI helpers: lidar fields only with a lidar file, the command line, cleanup and lidar texts. */
+  static void guiHelpers(Path dir) throws Exception {
+    Map<String, String> values = new HashMap<>(Map.of("-i", "imgs", "--lidar-search-shift", "15", "--lidar-scale", "on"));
+    check(!GuiOptions.arguments(values, "").contains("--lidar-search-shift"), "lidar settings left out without a lidar file");
+    values.put("--lidar-reference", "tiles");
+    List<String> a = GuiOptions.arguments(values, "");
+    check(a.contains("--lidar-search-shift") && a.contains("15") && a.contains("--lidar-scale"), "lidar settings passed with a lidar file: " + a);
+    check(GuiOptions.field("--lidar-canopy-weight") != null && GuiOptions.LIDAR_OPTIONS.size() == 5, "five lidar fields");
+    ProjectFiles.Run run = new ProjectFiles.Run("r1", dir, null, "complete", List.of(), null, List.of(), List.of(),
+        List.of("-i", "C:\\my images", "-o", "out", "--min-views", "3", "--quick-calibration", "-o", "out", "--min-views", "2", "--lidar-reference", "a b.laz",
+            "--lidar-search-shift", "15", "--gps-threshold", "-1"));
+    String cmd = ProjectFiles.command(run);
+    check(cmd.equals("photogrammetry -i \"C:\\my images\" -o out --min-views 2 --quick-calibration --lidar-reference \"a b.laz\" --lidar-search-shift 15 --gps-threshold -1"),
+        "command line: later values win in place, quoting, negative numbers: " + cmd);
+    check(ProjectFiles.lidarOptions(run).equals("--lidar-search-shift 15"), "lidar options for a redo: " + ProjectFiles.lidarOptions(run));
+    Map<String, Object> cleanup = Json.object("mode", "auto", "points_before", 1000, "removed", 120, "reprojection_rms_before_pixels", .6, "reprojection_rms_after_pixels", .3,
+        "limits", Json.object("max_error_pixels", 1.5, "min_views", 2));
+    check(ProjectFiles.cleanupLine(cleanup).equals("auto: removed 120 of 1,000 tie points; reprojection RMS 0.600 -> 0.300 px"), "cleanup line");
+    check(PdfReport.cleanupText(cleanup).contains("limits: max error pixels 1.50, min views 2"), "cleanup text with limits: " + PdfReport.cleanupText(cleanup));
+    check(PdfReport.cleanupText(Json.object("mode", "pause", "action", "skipped by the user")).equals("not applied (skipped by the user)"), "skipped cleanup");
+    check(ProjectFiles.cleanupLine(Map.of()) == null, "no cleanup: no line");
+    Map<String, Object> ref = Json.object("status", "applied", "height_datum", "N2000",
+        "parameters", List.of(Json.object("name", "shift_up", "unit", "metres", "estimated", true, "value", 50.04, "sigma", .12, "significant", true),
+            Json.object("name", "heading", "unit", "degrees", "estimated", false)),
+        "change_since_lidar", Json.object("lidar_acquired", "2020-06-13", "images_taken", "2020-07-17", "lidar_age_years", .09),
+        "warnings", List.of("heading: weakly determined"));
+    String html = ProjectFiles.lidarHtml(ref);
+    check(html.contains("50.040 m") && html.contains("fixed (GPS)") && html.contains("2020-06-13 / 2020-07-17 (0.1 years)") && html.contains("weakly determined"), "lidar result html");
+    check(ProjectFiles.lidarHtml(Map.of()).contains("No lidar result"), "no lidar result");
   }
 
   static void options(Path root) throws IOException {

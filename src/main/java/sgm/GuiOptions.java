@@ -84,6 +84,11 @@ final class GuiOptions {
           new Field("--gcp", "GCP file (optional)", INPUT, Kind.FILE, List.of()),
           new Field("--gcp-check", "GCP check points", INPUT, Kind.CHOICE, List.of("", "none", "auto", "1", "2", "3", "4")),
           new Field("--lidar-reference", "Lidar reference (LAS/LAZ)", INPUT, Kind.FILE, List.of()),
+          new Field("--lidar-scale", "   Estimate scale", INPUT, Kind.CHOICE, List.of("", "off", "on")),
+          new Field("--lidar-search-shift", "   Search shift (m)", INPUT, Kind.TEXT, List.of()),
+          new Field("--lidar-search-angle", "   Search heading (degrees)", INPUT, Kind.TEXT, List.of()),
+          new Field("--lidar-canopy-weight", "   Canopy weight", INPUT, Kind.TEXT, List.of()),
+          new Field("--lidar-vertical-datum", "   Lidar height datum", INPUT, Kind.TEXT, List.of()),
           new Field("--crs", "Coordinate system (EPSG)", INPUT, Kind.TEXT, List.of()),
           new Field("--quality", "Quality", PROCESSING, Kind.CHOICE, List.of("", "ultra", "high", "medium", "low")),
           new Field("--max-dimension", "Max image dimension (px)", PROCESSING, Kind.TEXT, List.of()),
@@ -291,6 +296,13 @@ final class GuiOptions {
   static final List<String> TIE_POINT_LIMITS = List.of("--tie-point-max-error", "--tie-point-min-views", "--tie-point-min-angle", "--tie-point-max-removed");
 
   /** Whether the cleanup mode uses the limit fields (custom or pause); otherwise they are left out. */
+  /** The lidar settings: used only with a lidar reference (otherwise left out of the command). */
+  static final List<String> LIDAR_OPTIONS = List.of("--lidar-scale", "--lidar-search-shift", "--lidar-search-angle", "--lidar-canopy-weight", "--lidar-vertical-datum");
+
+  static boolean lidarUsed(Map<String, String> values) {
+    return !values.getOrDefault("--lidar-reference", "").isBlank();
+  }
+
   static boolean tiePointLimitsUsed(Map<String, String> values) {
     String mode = values.getOrDefault("--tie-point-cleanup", "");
     return mode.equals("custom") || mode.equals("pause");
@@ -302,6 +314,7 @@ final class GuiOptions {
       String v = values.get(f.flag);
       if (v == null || v.isBlank()) continue;
       if (TIE_POINT_LIMITS.contains(f.flag) && !tiePointLimitsUsed(values)) continue;
+      if (LIDAR_OPTIONS.contains(f.flag) && !lidarUsed(values)) continue;
       v = v.strip();
       if (f.kind == Kind.FLAG) {
         if (Boolean.parseBoolean(v)) out.add(f.flag);

@@ -186,6 +186,9 @@ final class ProcessingReport {
     } catch (IOException | RuntimeException unavailable) {
       System.err.println("Report dense-cloud data unavailable: " + unavailable.getMessage());
     }
+    // Tie-point cleanup (only runs made with --tie-point-cleanup that cleaned have it).
+    Path cleanup = run.resolve(TiePointCleanup.FOLDER).resolve("cleanup.json");
+    if (Files.isRegularFile(cleanup)) data.put("tie_point_cleanup", read(cleanup));
     // Lidar reference (only runs made with --lidar-reference have it).
     try {
       Map<String, Object> lidar = LidarComparison.collect(run, out);

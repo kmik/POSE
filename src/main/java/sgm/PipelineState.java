@@ -379,6 +379,7 @@ final class PipelineState {
     FeatureTracks.Pair p = new FeatureTracks.Pair(in.readInt(), in.readInt());
     int m = in.readInt();
     for (int k = 0; k < m; k++) p.matches.add(new FeatureTracks.Match(in.readInt(), in.readInt()));
+    p.matches.trim();
     p.rotation = readArray(in);
     p.translation = readArray(in);
     p.essential = readArray(in);

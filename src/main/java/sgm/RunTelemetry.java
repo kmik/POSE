@@ -38,7 +38,8 @@ final class RunTelemetry implements AutoCloseable {
   private static final java.util.concurrent.atomic.AtomicLong DEVICE =
       new java.util.concurrent.atomic.AtomicLong();
   private boolean closed;
-  private long lastSample, largestSamplingGap;
+  private long lastSample, largestSamplingGap, lastHostCheck;
+  private boolean lowMemoryWarned;
   // Latest sample, for the terminal status line.
   private static volatile long liveRss, liveVram = -1;
   private static volatile double liveGpu = -1, liveCpu = -1;
@@ -87,6 +88,26 @@ final class RunTelemetry implements AutoCloseable {
             });
     sample();
     sampler.scheduleWithFixedDelay(this::sample, 1, 1, TimeUnit.SECONDS);
+  }
+
+  /**
+   * The one-time warning when the host (or --ram-limit-mb) is nearly out of RAM: less than 5% of
+   * it, and under 2 GiB, still available. The kernel's out-of-memory killer ends a process without
+   * any message, so this line is the only trace such a run leaves. Null while memory is fine or
+   * unknown.
+   */
+  static String lowMemoryWarning(long total, long available, long rss) {
+    if (total <= 0 || available < 0) return null;
+    if (available >= total / 20 || available >= 2048L * MemorySafety.MIB) return null;
+    return String.format(
+        Locale.ROOT,
+        "Warning: host RAM nearly exhausted (%.1f of %.1f GB available; this process uses %.1f GB)."
+            + " The system may stop the run without a message. Lower --memory-mb or"
+            + " PHOTOGRAMMETRY_HEAP, --descriptor-memory-mb, --neighbors or --cores, or stop"
+            + " other jobs.",
+        available / 1e9,
+        total / 1e9,
+        Math.max(0, rss) / 1e9);
   }
 
   /** Short live resource summary (RAM, CPU, GPU, VRAM); empty before the first sample. */
@@ -146,6 +167,15 @@ final class RunTelemetry implements AutoCloseable {
       peakCommitted = Math.max(peakCommitted, mem.getCommitted());
       long[] process = processMemory();
       liveRss = process[0];
+      if (!lowMemoryWarned && now - lastHostCheck >= 5_000_000_000L) {
+        lastHostCheck = now;
+        var host = MemorySafety.limits(options.ramLimitMb);
+        String warning = lowMemoryWarning(host.total(), host.available(), process[0]);
+        if (warning != null) {
+          lowMemoryWarned = true;
+          System.out.println(warning);
+        }
+      }
       peakRss = Math.max(peakRss, process[0]);
       peakPrivate = Math.max(peakPrivate, process[1]);
       peakDevice = Math.max(peakDevice, DEVICE.get());

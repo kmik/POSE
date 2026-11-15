@@ -15,9 +15,52 @@ final class FeatureTracks {
     }
   }
 
+  /**
+   * The matches of one pair as packed keypoint ids (8 bytes per match instead of a Match object
+   * plus a list slot, about 32 bytes). Large blocks keep tens of millions of matches until
+   * alignment. Elements are created on read; Match has no identity, only its two ids.
+   */
+  static final class Matches extends AbstractList<Match> implements RandomAccess {
+    private int[] ids = new int[16];
+    private int size;
+
+    @Override
+    public Match get(int i) {
+      Objects.checkIndex(i, size);
+      return new Match(ids[2 * i], ids[2 * i + 1]);
+    }
+
+    @Override
+    public int size() {
+      return size;
+    }
+
+    @Override
+    public boolean add(Match m) {
+      if (2 * size + 2 > ids.length) ids = Arrays.copyOf(ids, Math.max(16, ids.length * 2));
+      ids[2 * size] = m.a;
+      ids[2 * size + 1] = m.b;
+      size++;
+      modCount++;
+      return true;
+    }
+
+    @Override
+    public void clear() {
+      ids = new int[16];
+      size = 0;
+      modCount++;
+    }
+
+    /** Releases the spare capacity once the pair is complete. */
+    void trim() {
+      if (ids.length > 2 * size) ids = Arrays.copyOf(ids, Math.max(2, 2 * size));
+    }
+  }
+
   static final class Pair {
     final int a, b;
-    final List<Match> matches = new ArrayList<>();
+    final Matches matches = new Matches();
     double[] rotation, translation;
     double[] essential;
     String reason = "not_estimated";
@@ -214,6 +257,7 @@ final class FeatureTracks {
           }
           if (result.reused) reused[0]++;
           if (pair.matches.size() < o.minMatches) return;
+          pair.matches.trim();
           pairs.add(pair);
           for (Match m : pair.matches) uf.join(offset[a] + m.a, offset[b] + m.b);
           System.out.printf(
@@ -229,13 +273,22 @@ final class FeatureTracks {
           reused[0],
           reusable);
     if (project != null) PairMatching.clear();
+    // Unmatched keypoints form one-keypoint components that are never kept. Only the debug
+    // export lists them, so other runs skip their objects (one per unmatched keypoint of every
+    // image); the kept tracks and their order are the same either way.
+    boolean allComponents = project != null && o.diagnostics && o.storage.equals("debug");
+    int unmatched = 0;
     Map<Integer, Track> groups = new TreeMap<>();
     for (int i = 0; i < frames.size(); i++)
       for (int k = 0; k < frames.get(i).keypoints.length; k++) {
         int root = uf.find(offset[i] + k);
+        if (!allComponents && uf.size[root] < 2) {
+          unmatched++;
+          continue;
+        }
         groups.computeIfAbsent(root, r -> new Track()).observations.add(new Observation(i, k));
       }
-    int conflicts = 0, singletons = 0;
+    int conflicts = 0, singletons = unmatched;
     for (Track track : groups.values()) {
       Set<Integer> seen = new HashSet<>();
       boolean conflict = false;

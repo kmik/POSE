@@ -91,6 +91,7 @@ final class PoseLauncherPanel {
   void changedNow() {
     if (loading) return;
     tiePointFields();
+    lidarFields();
     updatePreview();
     validateLater.restart();
     if (advancedOptions != null) advancedOptions.refresh();
@@ -128,6 +129,18 @@ final class PoseLauncherPanel {
         p.add(browse, c);
       }
       row++;
+      if (f.flag().equals("--lidar-reference")) {
+        c.gridx = 1;
+        c.gridy = row;
+        c.weightx = 0;
+        c.gridwidth = 2;
+        c.fill = GridBagConstraints.NONE;
+        lidarCheck.setToolTipText("<html>Checks now, before any processing, that the lidar covers the images: their GPS positions and<br>"
+            + "estimated ground footprints (DJI height above ground, 35 mm focal length) plus the margin.</html>");
+        lidarCheck.addActionListener(e -> checkLidarCoverage());
+        p.add(lidarCheck, c);
+        row++;
+      }
     }
     c.gridy = row;
     c.weighty = 1;
@@ -322,9 +335,91 @@ final class PoseLauncherPanel {
       loading = false;
     }
     tiePointFields();
+    lidarFields();
     updatePreview();
     validateNow();
     if (advancedOptions != null) advancedOptions.refresh();
+  }
+
+  final JButton lidarCheck = new JButton("Check lidar coverage");
+
+  /** The lidar settings and the coverage check are used only with a lidar reference. */
+  void lidarFields() {
+    boolean used = GuiOptions.lidarUsed(values());
+    for (String flag : GuiOptions.LIDAR_OPTIONS) {
+      JComponent c = inputs.get(flag);
+      if (c != null) c.setEnabled(used);
+    }
+    if (!lidarCheck.getText().startsWith("Checking")) lidarCheck.setEnabled(used);
+  }
+
+  /** --lidar-margin from the advanced arguments, else the default 10 m. */
+  double lidarMargin() {
+    List<String> extra = GuiOptions.split(advancedText());
+    int at = extra.indexOf("--lidar-margin");
+    if (at >= 0 && at + 1 < extra.size())
+      try {
+        return Double.parseDouble(extra.get(at + 1));
+      } catch (NumberFormatException e) {
+        // the default
+      }
+    return 10;
+  }
+
+  /** Runs LidarPreflight in the background and shows its answer with the coverage map. */
+  void checkLidarCoverage() {
+    Map<String, String> v = values();
+    String images = v.getOrDefault("-i", "").strip(), lidar = v.getOrDefault("--lidar-reference", "").strip(), crs = v.getOrDefault("--crs", "").strip();
+    if (images.isEmpty() || !Files.isDirectory(Path.of(images))) {
+      JOptionPane.showMessageDialog(panel, "Choose the image folder first: the check uses the images' GPS positions.", "Check lidar coverage", JOptionPane.INFORMATION_MESSAGE);
+      return;
+    }
+    double margin = lidarMargin();
+    lidarCheck.setEnabled(false);
+    lidarCheck.setText("Checking...");
+    Thread t = new Thread(() -> {
+      String text;
+      java.awt.image.BufferedImage map = null;
+      boolean ok = false;
+      try {
+        LidarPreflight.Result r = LidarPreflight.check(Path.of(images), Path.of(lidar), crs, margin);
+        ok = r.complete();
+        map = r.map();
+        text = r.message() + String.format(Locale.ROOT, "%n%nImages with GPS: %d of %d.", r.withGps(), r.images())
+            + (r.assumptions().isEmpty() ? "" : "\n" + String.join("\n", r.assumptions()));
+      } catch (Exception | OutOfMemoryError e) {
+        text = "The check failed: " + e.getMessage();
+      }
+      String message = text;
+      java.awt.image.BufferedImage picture = map;
+      boolean covered = ok;
+      SwingUtilities.invokeLater(() -> {
+        lidarCheck.setText("Check lidar coverage");
+        lidarFields();
+        showCoverage(panel, message, picture, covered);
+      });
+    }, "pose-lidar-check");
+    t.setDaemon(true);
+    t.start();
+  }
+
+  /** The coverage answer with its map (dark green: images, light green: margin, blue: gaps, red: missing). */
+  static void showCoverage(Component parent, String message, java.awt.image.BufferedImage picture, boolean covered) {
+    JTextArea area = new JTextArea(message, 8, 60);
+    area.setEditable(false);
+    area.setLineWrap(true);
+    area.setWrapStyleWord(true);
+    JPanel content = new JPanel(new BorderLayout(6, 6));
+    content.add(new JScrollPane(area), BorderLayout.NORTH);
+    if (picture != null) {
+      int side = Math.max(picture.getWidth(), picture.getHeight());
+      double s = Math.min(6, 420.0 / Math.max(1, side));
+      Image scaled = picture.getScaledInstance(Math.max(1, (int) (picture.getWidth() * s)), Math.max(1, (int) (picture.getHeight() * s)), Image.SCALE_FAST);
+      JLabel img = new JLabel(new ImageIcon(scaled));
+      img.setToolTipText("Dark green: the images' area, light green: margin covered, blue: no returns inside the tiles, red: missing.");
+      content.add(img, BorderLayout.CENTER);
+    }
+    JOptionPane.showMessageDialog(parent, content, covered ? "Lidar covers the images" : "Lidar coverage", covered ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE);
   }
 
   /** The cleanup limit fields are used with custom (and as the pause window's start) only. */

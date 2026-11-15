@@ -556,6 +556,10 @@ final class LidarReference {
             + " points, mostly in the %s part (missing cells span E %.0f..%.0f, N %.0f..%.0f). Add the lidar tiles covering that"
             + " area (several files or a folder are allowed). Lidar files read:%s",
         missing, 100 * missing / areaM2, margin, where, box[0], box[2], box[1], box[3], extents);
+    if (missing > .99 * areaM2)
+      message = String.format(Locale.ROOT,
+          "The lidar reference does not overlap the tie-point area at all (%.0f m2 with its %.0f m margin, E %.0f..%.0f, N %.0f..%.0f):"
+              + " wrong tiles or a different coordinate system? Lidar files read:%s", areaM2, margin, box[0], box[2], box[1], box[3], extents);
     return new Coverage(false, areaM2, missing, gaps, box, where, message, map);
   }
 
@@ -1022,6 +1026,13 @@ final class LidarReference {
   private static void evaluate(
       Points p, Surfaces s, Level level, Transform t, boolean[] active, Settings set, double limit, boolean[] changed,
       double[][] normal, double[] rhs, double[] stats, Fit fit) {
+    evaluate(p, s, level, t, active, set, limit, changed, normal, rhs, stats, fit, true);
+  }
+
+  /** As above; {@code blunders} false keeps points far below the lidar terrain (the GPS solution before the height is known). */
+  private static void evaluate(
+      Points p, Surfaces s, Level level, Transform t, boolean[] active, Settings set, double limit, boolean[] changed,
+      double[][] normal, double[] rhs, double[] stats, Fit fit, boolean blunders) {
     int n = p.size();
     double[] res = new double[n], base = new double[n];
     double[][] jac = new double[n][];
@@ -1045,7 +1056,7 @@ final class LidarReference {
       if (dsm == null || dtm == null) continue;
       double[] surface;
       // More than 3 m below the lidar terrain cannot be a real surface point (gross blunder).
-      if (q[2] < dtm[0] - BELOW_GROUND_LIMIT) {
+      if (blunders && q[2] < dtm[0] - BELOW_GROUND_LIMIT) {
         cat[i] = BELOW_GROUND;
         continue;
       }
@@ -1542,7 +1553,7 @@ final class LidarReference {
   static Map<String, Object> residuals(Points p, Surfaces s, Transform t, Settings set, boolean[] changed) {
     Level base = Level.of(s, 1);
     Fit f = new Fit();
-    evaluate(p, s, base, t, new boolean[7], set, Double.POSITIVE_INFINITY, new boolean[p.size()], null, null, null, f);
+    evaluate(p, s, base, t, new boolean[7], set, Double.POSITIVE_INFINITY, new boolean[p.size()], null, null, null, f, changed != null);
     List<Double> stable = new ArrayList<>(), all = new ArrayList<>(), canopy = new ArrayList<>(), stableUsed = new ArrayList<>(), allUsed = new ArrayList<>();
     for (int i = 0; i < p.size(); i++) {
       if (f.category[i] == SKIP || f.category[i] >= REGROWTH) continue;
@@ -1644,6 +1655,11 @@ final class LidarReference {
 
   /** Coverage / kind map PNG of the area grid (green covered, blue gaps, red missing, grey other lidar). */
   static void coverageImage(Coverage c, Area a, Path file) throws IOException {
+    ImageIO.write(coverageMap(c, a), "png", file.toFile());
+  }
+
+  /** The coverage map: green covered (dark: the tie-point area), blue enclosed gaps, red missing, grey other lidar. */
+  static BufferedImage coverageMap(Coverage c, Area a) {
     Grid g = a.grid();
     BufferedImage im = new BufferedImage(g.w, g.h, BufferedImage.TYPE_INT_RGB);
     int[] colours = {0xffffff, 0x4caf50, 0x64b5f6, 0xe53935, 0xd0d0d0};
@@ -1654,7 +1670,7 @@ final class LidarReference {
         if (a.core()[p] && c.map()[p] == 1) rgb = 0x2e7d32;
         im.setRGB(col, r, rgb);
       }
-    ImageIO.write(im, "png", file.toFile());
+    return im;
   }
 
   // ---- The step.

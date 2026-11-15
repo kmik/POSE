@@ -170,6 +170,8 @@ final class PdfReport implements AutoCloseable {
     var gcp = ProcessingReport.object(survey.get("gcp"));
     if (!gcp.isEmpty())
       facts.add(new String[] {"Ground control", gcpLine(gcp)});
+    var cleanup = ProcessingReport.object(data.get("tie_point_cleanup"));
+    if (!cleanup.isEmpty()) facts.add(new String[] {"Tie-point cleanup", cleanupText(cleanup)});
     var lidarRef = ProcessingReport.object(ProcessingReport.object(data.get("lidar")).get("reference"));
     if (!lidarRef.isEmpty())
       facts.add(new String[] {"Lidar reference", lidarLine(lidarRef)});
@@ -1139,6 +1141,19 @@ final class PdfReport implements AutoCloseable {
             "Ran on the CPU although a GPU was selected: " + String.join("; ", onCpu)
                 + ". Same result, slower; check the GPU memory budget (--gpu-memory-mb) and the console log.");
     }
+  }
+
+  /** The tie-point cleanup result with its limits (cleanup.json), or that it was skipped. */
+  static String cleanupText(Map<String, Object> c) {
+    String line = ProjectFiles.cleanupLine(c);
+    if (line == null) return "not applied" + (c.get("action") != null ? " (" + c.get("action") + ")" : "");
+    var limits = ProcessingReport.object(c.get("limits"));
+    StringBuilder s = new StringBuilder(line);
+    List<String> parts = new ArrayList<>();
+    for (var e : limits.entrySet())
+      if (e.getValue() instanceof Number n) parts.add(e.getKey().replace('_', ' ') + " " + (n.doubleValue() == Math.rint(n.doubleValue()) ? String.valueOf(n.longValue()) : String.format(Locale.ROOT, "%.2f", n.doubleValue())));
+    if (!parts.isEmpty()) s.append("; limits: ").append(String.join(", ", parts));
+    return s.toString();
   }
 
   static final double LIDAR_STABLE_RMS_FLAG = .5, LIDAR_DEFORMATION_FLAG = .5, LIDAR_DSM_MEDIAN_FLAG = .3;

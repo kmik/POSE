@@ -211,12 +211,129 @@ final class ProjectFiles {
     add(out, "Dense points", count(points(report)));
     add(out, "Coordinate system", Boolean.TRUE.equals(coordinates.get("georeferenced")) ? String.valueOf(coordinates.get("horizontal_crs")) : "local (not georeferenced)");
     add(out, "GPS fit RMS", number(coordinates.get("inlier_rms_metres"), "%.2f m"));
+    add(out, "Tie-point cleanup", cleanupLine(map(report.get("tie_point_cleanup"))));
     Map<String, Object> lidar = map(map(report.get("lidar")).get("reference"));
     if (!lidar.isEmpty()) {
       add(out, "Lidar reference", PdfReport.lidarLine(lidar));
       add(out, "Heights", coordinates.get("vertical_datum") instanceof String v ? v : null);
     }
     return out;
+  }
+
+  /**
+   * The run's options as one command line (to run it again elsewhere, e.g. on a server): the
+   * saved arguments, where an option given again later (to a later step or a branch) replaces
+   * its earlier value in place. Values with spaces or shell characters are quoted.
+   */
+  static String command(Run r) {
+    LinkedHashMap<String, String> options = new LinkedHashMap<>();
+    List<String> a = r.arguments();
+    for (int i = 0; i < a.size(); i++) {
+      String t = a.get(i);
+      if (!t.startsWith("-") || t.matches("-\\d.*")) continue; // stray value
+      String value = i + 1 < a.size() && (!a.get(i + 1).startsWith("-") || a.get(i + 1).matches("-\\d.*")) ? a.get(++i) : null;
+      options.put(t, value); // a later value replaces the earlier one, keeping its place
+    }
+    StringBuilder s = new StringBuilder("photogrammetry");
+    for (var e : options.entrySet()) {
+      s.append(' ').append(e.getKey());
+      if (e.getValue() != null) s.append(' ').append(quote(e.getValue()));
+    }
+    return s.toString();
+  }
+
+  static String quote(String v) {
+    return v.isEmpty() || v.matches(".*[\\s\"'&|<>()$`;*?].*") ? "\"" + v.replace("\"", "\\\"") + "\"" : v;
+  }
+
+  /** One line for the tie-point cleanup (cleanup.json), or null when the step did not clean. */
+  static String cleanupLine(Map<String, Object> c) {
+    if (!(c.get("removed") instanceof Number removed) || !(c.get("points_before") instanceof Number before)) return null;
+    return String.format(Locale.ROOT, "%s: removed %,d of %,d tie points; reprojection RMS %.3f -> %.3f px", c.getOrDefault("mode", "?"), removed.longValue(),
+        before.longValue(), c.get("reprojection_rms_before_pixels") instanceof Number a ? a.doubleValue() : Double.NaN,
+        c.get("reprojection_rms_after_pixels") instanceof Number b ? b.doubleValue() : Double.NaN);
+  }
+
+  /** The lidar step's report of a run (04_geometry/lidar/lidar_reference.json), or empty. */
+  static Map<String, Object> lidar(Run r) {
+    return map(r.dir().resolve(LidarReference.FOLDER).resolve("lidar_reference.json"));
+  }
+
+  /** Lidar images of a run: {title, file} for the coverage map and the difference maps that exist. */
+  static List<Object[]> lidarImages(Run r) {
+    List<Object[]> out = new ArrayList<>();
+    Path c = r.dir().resolve(LidarReference.FOLDER).resolve("coverage.png");
+    if (Files.isRegularFile(c)) out.add(new Object[] {"Coverage (dark green: tie points, light green: margin, blue: no returns inside the tiles, red: missing)", c});
+    for (String[] f : new String[][] {{"lidar-dsm-difference.png", "Surface model, photogrammetry minus lidar (blue below, red above, +-1.5 m)"},
+        {"lidar-dtm-difference.png", "Terrain model, photogrammetry minus lidar (blue below, red above, +-1.5 m)"}}) {
+      Path again = r.results().resolve("report").resolve(f[0]), first = r.results().resolve(f[0]);
+      Path p = Files.isRegularFile(again) ? again : first;
+      if (Files.isRegularFile(p)) out.add(new Object[] {f[1], p});
+    }
+    return out;
+  }
+
+  /** The lidar result as HTML: status, dates, the transformation table, warnings, distances, change. */
+  static String lidarHtml(Map<String, Object> ref) {
+    StringBuilder h = new StringBuilder("<html><body style='font-family:sans-serif'>");
+    if (ref.isEmpty()) return h.append("No lidar result in this run.</body></html>").toString();
+    h.append("<b>Lidar reference</b> - ").append(GuiOptions.escape(String.valueOf(ref.get("status")))).append("<br>");
+    Map<String, Object> cov = map(ref.get("coverage")), src = map(ref.get("lidar")), change = map(ref.get("change_since_lidar")), fit = map(ref.get("fit"));
+    if (cov.get("message") != null) h.append("<p>").append(GuiOptions.escape(String.valueOf(cov.get("message")))).append("</p>");
+    h.append("<table>");
+    row(h, "Height datum", ref.getOrDefault("height_datum", src.get("vertical_datum")));
+    row(h, "Lidar acquired / images taken", change.isEmpty() ? null : change.getOrDefault("lidar_acquired", "unknown") + " / " + change.getOrDefault("images_taken", "unknown")
+        + (change.get("lidar_age_years") instanceof Number age ? String.format(Locale.ROOT, " (%.1f years)", age.doubleValue()) : ""));
+    if (map(change.get("canopy_height_change_metres")).get("median") instanceof Number g)
+      row(h, "Canopy change since the lidar", String.format(Locale.ROOT, "%+.1f m per 20 m patch (median)", g.doubleValue()));
+    if (fit.get("used") instanceof Number used)
+      row(h, "Tie points used", String.format(Locale.ROOT, "%,d of %,d (%.0f%% outliers)", used.longValue(), ((Number) fit.getOrDefault("tie_points_on_lidar", 0)).longValue(),
+          100 * (fit.get("outlier_share") instanceof Number o ? o.doubleValue() : 0)));
+    h.append("</table>");
+    if (ref.get("parameters") instanceof List<?> params) {
+      h.append("<p><b>Transformation (GPS to lidar)</b><table border='0' cellpadding='2'><tr><th align='left'>Parameter</th><th>Value</th><th>Std. dev.</th><th>Significant</th></tr>");
+      for (Object o : params) {
+        Map<String, Object> p = map(o);
+        boolean on = Boolean.TRUE.equals(p.get("estimated"));
+        String unit = "degrees".equals(p.get("unit")) ? " deg" : "ppm".equals(p.get("unit")) ? " ppm" : " m";
+        String fmt = unit.equals(" deg") ? "%.4f" : unit.equals(" ppm") ? "%.0f" : "%.3f";
+        h.append("<tr><td>").append(String.valueOf(p.get("name")).replace('_', ' ')).append("</td><td align='right'>")
+            .append(on && p.get("value") instanceof Number v ? String.format(Locale.ROOT, fmt, v.doubleValue()) + unit : "fixed (GPS)").append("</td><td align='right'>")
+            .append(on && p.get("sigma") instanceof Number s ? String.format(Locale.ROOT, fmt, s.doubleValue()) + unit : "-").append("</td><td>")
+            .append(on ? (Boolean.TRUE.equals(p.get("significant")) ? "yes" : "no") : "-").append("</td></tr>");
+      }
+      h.append("</table></p>");
+    }
+    if (ref.get("warnings") instanceof List<?> w && !w.isEmpty()) {
+      h.append("<p><b>Warnings</b><ul>");
+      for (Object o : w) h.append("<li><font color='#b45309'>").append(GuiOptions.escape(String.valueOf(o))).append("</font></li>");
+      h.append("</ul></p>");
+    }
+    Map<String, Object> before = map(map(ref.get("residuals_before")).get("stable_all")), after = map(map(ref.get("residuals_after")).get("stable_within_limit"));
+    if (after.get("rms_metres") instanceof Number rms)
+      h.append(String.format(Locale.ROOT, "<p>Tie points on stable ground to the lidar: median %.2f m before (GPS), %.3f m after; RMS after %.2f m.</p>",
+          before.get("median_metres") instanceof Number b ? b.doubleValue() : Double.NaN, after.get("median_metres") instanceof Number a ? a.doubleValue() : Double.NaN, rms.doubleValue()));
+    Map<String, Object> d = map(ref.get("deformation"));
+    if (d.get("cell_median_range_metres") instanceof Number range)
+      h.append(String.format(Locale.ROOT, "<p>Block bending left after the fit: %.2f m (range of the median residual per cell).</p>", range.doubleValue()));
+    return h.append("</body></html>").toString();
+  }
+
+  private static void row(StringBuilder h, String label, Object value) {
+    if (value == null) return;
+    h.append("<tr><td>").append(GuiOptions.escape(label)).append("</td><td><b>").append(GuiOptions.escape(String.valueOf(value))).append("</b></td></tr>");
+  }
+
+  /** The lidar options of a run's arguments (without the reference itself), for a redo. */
+  static String lidarOptions(Run r) {
+    List<String> out = new ArrayList<>();
+    List<String> a = r.arguments();
+    for (int i = 0; i < a.size(); i++)
+      if (a.get(i).startsWith("--lidar-") && !a.get(i).equals("--lidar-reference")) {
+        out.add(a.get(i));
+        if (i + 1 < a.size() && !a.get(i + 1).startsWith("--")) out.add(quote(a.get(++i)));
+      }
+    return String.join(" ", out);
   }
 
   private static void add(List<String[]> out, String label, String value) {

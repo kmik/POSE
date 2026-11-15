@@ -54,6 +54,7 @@ public final class SelfTest {
     checks += GcpRegression.run(root.resolve("gcp"));
     checks += TiePointCleanupRegression.run(root.resolve("tie points"));
     checks += LidarRegression.run(root.resolve("lidar"));
+    checks += MatchMemoryRegression.run();
     checks += GuiRegression.run(root.resolve("gui"));
     checks += GpuStereoFiltersRegression.run();
     checks += GpuDepthOutlierRegression.run();

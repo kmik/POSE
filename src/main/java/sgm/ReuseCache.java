@@ -511,6 +511,7 @@ final class ReuseCache {
               int n = in.readInt();
               for (int j = 0; j < n; j++)
                 p.matches.add(new FeatureTracks.Match(in.readInt(), in.readInt()));
+              p.matches.trim();
               features.pairs.add(p);
             }
             int nt = in.readInt();

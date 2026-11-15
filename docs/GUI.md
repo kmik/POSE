@@ -56,8 +56,14 @@ heap. The console shows the exact command first; you can copy it and run it in a
   file or folder), optional GCP file and check points, optional **Lidar reference (LAS/LAZ)**
   (`--lidar-reference`: one .las/.laz file or a folder of tiles; the "..." chooser shows LAS/LAZ
   files and accepts a folder), coordinate system. The lidar field is checked like the others
-  (the file or folder must exist); the further `--lidar-*` settings are on the Advanced options
-  tab. A run with a lidar reference gets the extra step `lidar` after `georeference` (see
+  (the file or folder must exist); under it, the main lidar settings (estimate scale, search shift and heading,
+  canopy weight, height datum name) are enabled only when a lidar is chosen; the others are on
+  the Advanced options tab. **Check lidar coverage** checks at once, before any processing,
+  whether the lidar covers the images: from their GPS positions and estimated ground footprints
+  (DJI height above ground and 35 mm focal length; 100 m and 24 mm assumed when missing) plus the
+  margin, with the same test as the lidar step and a map (dark green images, light green margin,
+  blue no returns inside the tiles, red missing). It reads only the lidar near the images (a few
+  seconds per tile). A run with a lidar reference gets the extra step `lidar` after `georeference` (see
   `photogrammetry --help lidar`); if the lidar does not cover the block, that step fails
   and its error (Project tab, step details) says which part is missing. The run summary then
   shows a "Lidar reference" line (estimated shifts and angles, stable-area RMS, whether fewer
@@ -167,6 +173,16 @@ project folder. While idle, the console shows the newest run of the project.
   system) and its quality flags, plus the run's saved arguments. A failed run shows its error
   in red. **Copy run details** opens the run's status, steps, failed step, error, arguments and
   the end of its log as text to copy (for debugging or a bug report).
+  **Copy command** copies the run's options as one command line (`photogrammetry ...`; an
+  option given again later, to a step or a branch, replaces its earlier value), e.g. to run the
+  same on a server; adjust the paths there. The summary also shows the tie-point cleanup result
+  (removed points, reprojection RMS before and after) and, for a lidar-referenced run, the lidar
+  line and the height datum.
+- **Lidar result...** (runs made with a lidar reference) shows the lidar step's result without
+  the PDF: coverage, dates and age of the lidar, the transformation with standard deviations and
+  significance, warnings, distances to the lidar and the remaining bending, beside the coverage
+  map and the surface and terrain difference maps. **Redo lidar with other settings...** opens
+  the redo dialog from `lidar` up to `finish`, with the run's lidar options filled in to change.
 - **Step details:** double-click a step (or right-click > Show details) for its full message;
   for a failed step also the run's error, the error lines of `logs/console.log` and its end.
   The text can be selected and copied (**Copy**). Right-click > Copy (or Ctrl+C) copies the

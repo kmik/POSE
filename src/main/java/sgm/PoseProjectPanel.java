@@ -28,6 +28,7 @@ final class PoseProjectPanel {
   final JButton gcps = new JButton("Edit GCPs"), report = new JButton("Report again"), ortho = new JButton("Orthomosaic again");
   final JButton pdf = new JButton("Report PDF"), html = new JButton("Report HTML"), results = new JButton("07_results"), folder = new JButton("Run folder"), refresh = new JButton("Refresh");
   final JButton images = new JButton("Images..."), view3d = new JButton("3D view..."), copyRun = new JButton("Copy run details");
+  final JButton lidar = new JButton("Lidar result..."), copyCommand = new JButton("Copy command");
   List<ProjectFiles.Run> runs = List.of();
   boolean filling;
 
@@ -97,6 +98,7 @@ final class PoseProjectPanel {
     for (JButton b : List.of(pdf, html, results, folder)) runButtons.add(b);
     runButtons.add(images);
     runButtons.add(view3d);
+    runButtons.add(lidar);
     runsPanel.add(runButtons, BorderLayout.SOUTH);
 
     JPanel stepsPanel = new JPanel(new BorderLayout(4, 4));
@@ -133,7 +135,10 @@ final class PoseProjectPanel {
     JPanel summaryPanel = new JPanel(new BorderLayout());
     summaryPanel.setBorder(new TitledBorder("Summary and quality flags"));
     summaryPanel.add(new JScrollPane(summary), BorderLayout.CENTER);
-    summaryPanel.add(copyRun, BorderLayout.SOUTH);
+    JPanel copyButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+    copyButtons.add(copyRun);
+    copyButtons.add(copyCommand);
+    summaryPanel.add(copyButtons, BorderLayout.SOUTH);
 
     JSplitPane lower = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, stepsPanel, summaryPanel);
     lower.setResizeWeight(.6);
@@ -169,6 +174,16 @@ final class PoseProjectPanel {
     view3d.addActionListener(e -> withRun(r -> CloudWindow.open(panel, r)));
     copyRun.setToolTipText("Copy the run's status, failed step, error, arguments and the end of its log (for debugging).");
     copyRun.addActionListener(e -> withRun(r -> GuiSupport.textDialog(panel, "Run " + r.id(), ProjectFiles.runDetails(r))));
+    copyCommand.setToolTipText("<html>Copy the run's options as one command line (options given later replace earlier ones),<br>e.g. to run it again on a server. Adjust the paths there.</html>");
+    copyCommand.addActionListener(e -> withRun(r -> {
+      GuiSupport.copy(ProjectFiles.command(r));
+      copyCommand.setText("Copied");
+      javax.swing.Timer t = new javax.swing.Timer(1500, a -> copyCommand.setText("Copy command"));
+      t.setRepeats(false);
+      t.start();
+    }));
+    lidar.setToolTipText("The lidar referencing of the run (--lidar-reference): transformation, uncertainty, coverage and difference maps.");
+    lidar.addActionListener(e -> withRun(r -> LidarResultWindow.open(panel, r, () -> branchRun(r, List.of("lidar", "finish"), ProjectFiles.lidarOptions(r)))));
     updateButtons();
   }
 
@@ -307,17 +322,21 @@ final class PoseProjectPanel {
    * pending to be run (or not) afterwards. The source run is not changed.
    */
   void branchRun(ProjectFiles.Run r) {
+    branchRun(r, selectedSteps(), extra.getText());
+  }
+
+  /** The redo dialog with these steps (from, until) and these options already filled in. */
+  void branchRun(ProjectFiles.Run r, List<String> chosen, String startOptions) {
     List<String> allowed = ProjectFiles.branchable(r);
     if (allowed.isEmpty()) {
       JOptionPane.showMessageDialog(panel, "No step of this run can be redone yet: the steps before it must be complete.", "Redo steps", JOptionPane.INFORMATION_MESSAGE);
       return;
     }
-    List<String> chosen = selectedSteps();
     String from = !chosen.isEmpty() && allowed.contains(chosen.get(0)) ? chosen.get(0) : allowed.contains("dense") ? "dense" : allowed.get(allowed.size() - 1);
     String until = chosen.size() > 1 && ProjectFiles.STEPS.indexOf(chosen.get(chosen.size() - 1)) >= ProjectFiles.STEPS.indexOf(from) ? chosen.get(chosen.size() - 1) : from;
     JComboBox<String> fromBox = new JComboBox<>(allowed.toArray(String[]::new)), untilBox = new JComboBox<>();
     fromBox.setSelectedItem(from);
-    JTextField options = new JTextField(extra.getText(), 40);
+    JTextField options = new JTextField(startOptions, 40);
     JTextArea preview = new JTextArea(3, 60);
     preview.setEditable(false);
     preview.setLineWrap(true);
@@ -440,6 +459,8 @@ final class PoseProjectPanel {
     branch.setEnabled(idle && pipeline);
     gcps.setEnabled(idle && waiting);
     tiePoints.setEnabled(idle && r != null && r.waitingForCleanup());
+    lidar.setEnabled(r != null && !ProjectFiles.lidar(r).isEmpty());
+    copyCommand.setEnabled(r != null && !r.arguments().isEmpty());
     report.setEnabled(idle && r != null && Files.isRegularFile(r.dir().resolve("run.json")));
     ortho.setEnabled(idle && r != null && Files.isRegularFile(r.dir().resolve("07_results/coordinates.json")));
     pdf.setEnabled(r != null && Files.isRegularFile(r.report("pdf")));
