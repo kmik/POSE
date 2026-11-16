@@ -233,6 +233,8 @@ public final class Options {
   public double registrationBundleGrowth = 15;
   /** New sparse points: drop observations that disagree, or reject the whole track. */
   public String triangulationOutliers = "drop";
+  /** Cells along the longer image side for spread feature selection; 0 = strongest N overall. */
+  public int featureGrid = 0;
   boolean alignmentCalibration, alignmentCalibrationDone;
   public boolean resume, tiled, diskDepth = true;
   public String storage = "standard", compute = "auto";
@@ -742,6 +744,11 @@ public final class Options {
           break;
         case "--sift-contrast":
           o.siftContrast = number(v);
+          break;
+        case "--feature-grid":
+          o.featureGrid = Integer.parseInt(v);
+          if (o.featureGrid != 0 && (o.featureGrid < 2 || o.featureGrid > 256))
+            throw new IllegalArgumentException("--feature-grid must be 0 (off) or 2..256");
           break;
         case "--sift-edge-threshold":
           o.siftEdgeThreshold = number(v);
@@ -3190,6 +3197,12 @@ Additional workflow controls:
       the earlier single RNG stream across pairs (reproduces pre-revision results).
   --sift-contrast N
       SIFT contrast threshold (default: 0.04; positive). Lower retains weaker features.
+  --feature-grid N
+      Spread the --features keypoints over the image: N cells along the longer side, each
+      cell first gets its share of its strongest keypoints, the rest go to the strongest
+      remaining ones (default: 0 = strongest N overall; 2..256, e.g. 16). Same feature count
+      and matching cost; detection and description are separate passes, so extraction is
+      somewhat slower.
   --sift-edge-threshold N
       SIFT edge rejection threshold (default: 10; positive). Higher retains more edges.
   --orb-fast-threshold N

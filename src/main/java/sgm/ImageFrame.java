@@ -250,6 +250,10 @@ final class ImageFrame implements AutoCloseable {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+    if (options.featureGrid > 0) {
+      extractGrid(maximum);
+      return;
+    }
     org.opencv.features2d.Feature2D sift = FeatureAlgorithms.detector(options, maximum);
     MatOfKeyPoint kp = new MatOfKeyPoint();
     Mat mask = new Mat();
@@ -285,6 +289,29 @@ final class ImageFrame implements AutoCloseable {
       // while the native SIFT is still running (use-after-free; SIGSEGV seen on Linux at ~1,400
       // of 3,000 images).
       java.lang.ref.Reference.reachabilityFence(sift);
+    }
+  }
+
+  /**
+   * --feature-grid: detect every candidate (no strongest-N cap), choose maximum of them spread
+   * over the grid (FeatureGrid), then describe only the chosen ones.
+   */
+  private void extractGrid(int maximum) {
+    int candidates = options.matchingAlgorithm.equals("orb") ? Math.multiplyExact(maximum, 4) : 0;
+    org.opencv.features2d.Feature2D detector = FeatureAlgorithms.detector(options, candidates);
+    MatOfKeyPoint kp = new MatOfKeyPoint();
+    Mat mask = new Mat();
+    try {
+      detector.detect(gray, kp, mask);
+      KeyPoint[] chosen =
+          FeatureGrid.select(kp.toArray(), width, height, options.featureGrid, maximum);
+      kp.fromArray(chosen);
+      detector.compute(gray, kp, descriptors);
+      keypoints = kp.toArray();
+    } finally {
+      kp.release();
+      mask.release();
+      java.lang.ref.Reference.reachabilityFence(detector); // see extract()
     }
   }
 

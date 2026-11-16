@@ -478,6 +478,7 @@ final class ReuseCache {
         "matchingAlgorithm",
         "features",
         "siftContrast",
+        "featureGrid",
         "siftEdgeThreshold",
         "orbFastThreshold",
         "briskThreshold",

@@ -226,19 +226,14 @@ final class Geometry {
           bundleNanos / 1e9);
     index = null; // released before the bundle adjustment
     long registered = frames.stream().filter(f -> f.camera.registered).count();
-    if (registered != frames.size()) {
-      List<String> missing = new ArrayList<>();
-      for (ImageFrame f : frames)
-        if (!f.camera.registered) missing.add(f.path.getFileName().toString());
-      System.err.println(
-          "Some images could not be registered ("
+    // The final count (and the warning) comes after the retry pass below, which can add images.
+    if (registered != frames.size())
+      System.out.println(
+          "Incremental registration: "
               + registered
               + "/"
               + frames.size()
-              + "). Missing: "
-              + missing
-              + ". They will be excluded from dense reconstruction.");
-    }
+              + " images; the rest are retried after the bundle adjustment.");
     if (registered < 2) throw new IllegalArgumentException("Fewer than two cameras registered");
     List<Object> status = new ArrayList<>();
     for (ImageFrame frame : frames)
@@ -291,6 +286,18 @@ final class Geometry {
             features.tracks,
             "after registration recovery and bundle refinement");
     }
+    List<String> missing = new ArrayList<>();
+    for (ImageFrame f : frames)
+      if (!f.camera.registered) missing.add(f.path.getFileName().toString());
+    if (!missing.isEmpty())
+      System.err.println(
+          "Some images could not be registered ("
+              + (frames.size() - missing.size())
+              + "/"
+              + frames.size()
+              + "). Missing: "
+              + missing
+              + ". They will be excluded from dense reconstruction.");
     status.clear();
     for (ImageFrame frame : frames)
       status.add(

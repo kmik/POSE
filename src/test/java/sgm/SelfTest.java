@@ -56,6 +56,7 @@ public final class SelfTest {
     checks += LidarRegression.run(root.resolve("lidar"));
     checks += MatchMemoryRegression.run();
     checks += RegistrationDriftRegression.run(root.resolve("registration-drift"));
+    checks += FeatureGridRegression.run(root.resolve("feature-grid"));
     checks += GuiRegression.run(root.resolve("gui"));
     checks += GpuStereoFiltersRegression.run();
     checks += GpuDepthOutlierRegression.run();
