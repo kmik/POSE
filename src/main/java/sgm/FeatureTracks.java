@@ -225,9 +225,7 @@ final class FeatureTracks {
     List<int[]> edges = PairSelection.select(frames, o, project);
     WorkProgress matching = WorkProgress.start("Matching image pairs", edges.size(), "pairs");
     long[] consumed = {0};
-    PairMatching.ordered(
-        edges,
-        PairMatching.threads(o),
+    PairMatching.Task<Result> task =
         edge -> {
           try (WorkProgress work =
               WorkProgress.start("Match/verify pair " + edge[0] + "-" + edge[1], 0, "matches")) {
@@ -235,7 +233,8 @@ final class FeatureTracks {
             work.done();
             return result;
           }
-        },
+        };
+    PairMatching.Sink<Result> sink =
         (edge, result) -> {
           int a = edge[0], b = edge[1];
           Pair pair = result.pair;
@@ -262,7 +261,9 @@ final class FeatureTracks {
           for (Match m : pair.matches) uf.join(offset[a] + m.a, offset[b] + m.b);
           System.out.printf(
               Locale.ROOT, "Pair %d-%d: %d geometric inliers%n", a, b, pair.matches.size());
-        });
+        };
+    PairMatching.ordered(edges, PairMatching.threads(o), task, sink);
+    if (o.matchRepair.equals("on")) repair(frames, edges, o, task, sink);
     GpuHamming.close();
     matching.done();
     matching.close();
@@ -312,6 +313,98 @@ final class FeatureTracks {
           pairs.size() + " accepted stereo pairs; " + tracks.size() + " retained tracks");
     }
     if (project != null) ReuseCache.matches(frames, this, o, true);
+  }
+
+  /**
+   * --match-repair: one extra round of matching for weak images (MatchRepair.plan). The pairs go
+   * through the same verification and join the same tracks; 03_matches/match_repair.json lists
+   * the weak images, the pairs tried and which were accepted.
+   */
+  private void repair(
+      List<ImageFrame> frames,
+      List<int[]> evaluated,
+      Options o,
+      PairMatching.Task<Result> task,
+      PairMatching.Sink<Result> sink)
+      throws IOException {
+    long started = System.nanoTime();
+    MatchRepair.Plan plan = MatchRepair.plan(frames, pairs, evaluated, o);
+    Set<Long> before = new HashSet<>();
+    for (Pair p : pairs) before.add(PairSelection.key(p.a, p.b));
+    System.out.printf(
+        Locale.ROOT,
+        "Match repair: %d weak images (match graph: %d parts, largest %d of %d images); %d extra"
+            + " pairs%n",
+        plan.weak().size(),
+        plan.components(),
+        plan.largestComponent(),
+        frames.size(),
+        plan.edges().size());
+    if (!plan.edges().isEmpty())
+      try (WorkProgress work = WorkProgress.start("Match repair", plan.edges().size(), "pairs")) {
+        PairMatching.ordered(plan.edges(), PairMatching.threads(o), task, sink);
+        work.done();
+      }
+    Map<Long, Integer> added = new HashMap<>();
+    for (Pair p : pairs) {
+      long key = PairSelection.key(p.a, p.b);
+      if (!before.contains(key)) added.put(key, p.matches.size());
+    }
+    int[] after = MatchRepair.components(frames.size(), pairs);
+    int parts = 0, largest = 0;
+    for (int c : after) parts = Math.max(parts, c + 1);
+    for (int c : after) if (c == 0) largest++;
+    List<Object> weak = new ArrayList<>();
+    for (MatchRepair.Weak w : plan.weak()) {
+      List<Object> tried = new ArrayList<>();
+      for (int other : w.candidates()) {
+        Integer matches = added.get(PairSelection.key(w.image(), other));
+        tried.add(
+            Json.object(
+                "image_id", other,
+                "filename", frames.get(other).path.getFileName().toString(),
+                "accepted", matches != null,
+                "matches", matches == null ? 0 : matches));
+      }
+      weak.add(
+          Json.object(
+              "image_id", w.image(),
+              "filename", frames.get(w.image()).path.getFileName().toString(),
+              "reason", w.reason(),
+              "accepted_pairs_before", w.acceptedPairs(),
+              "component_before", w.component(),
+              "candidates", tried));
+    }
+    double seconds = (System.nanoTime() - started) / 1e9;
+    java.nio.file.Path file = o.output.resolve("03_matches/match_repair.json");
+    java.nio.file.Files.createDirectories(file.getParent());
+    Json.write(
+        file,
+        Json.object(
+            "min_accepted_pairs", o.matchRepairMinPairs,
+            "candidates_per_image", o.matchRepairCandidates,
+            "candidate_order",
+                frames.stream().allMatch(f -> f.gps != null && f.gps.usable())
+                    ? "gps_horizontal_distance"
+                    : "filename_order",
+            "weak_images", weak,
+            "extra_pairs", plan.edges().size(),
+            "accepted_extra_pairs", added.size(),
+            "components_before", plan.components(),
+            "largest_component_before", plan.largestComponent(),
+            "components_after", parts,
+            "largest_component_after", largest,
+            "seconds", seconds));
+    System.out.printf(
+        Locale.ROOT,
+        "Match repair: %d of %d extra pairs accepted; match graph now %d parts, largest %d of %d"
+            + " images (%.1f s)%n",
+        added.size(),
+        plan.edges().size(),
+        parts,
+        largest,
+        frames.size(),
+        seconds);
   }
 
   /** One verified pair plus the nearest-neighbor decisions its export needs. */

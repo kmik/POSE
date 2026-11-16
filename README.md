@@ -130,7 +130,12 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | `--dense-method` | `sgm` | `mvsgm` matches several neighbouring images at once (needs `--fusion-mode image`). |
 | `--block-processing` | `off` | `auto` or `on` splits very large image sets into overlapping blocks. |
 | `--registration-bundle-growth` | `15` | Bundle adjustment during camera registration each time the registered set has grown by this percent; `0` turns it off. |
+| `--pair-selection` | `auto` | Which image pairs are matched. `auto` uses the nearest GPS images when every image has GPS (spread over at least 20 m), otherwise a visual search; also `overlap`, `gps`, `sequential`, `all`. |
+| `--gps-neighbors` | `0` | Also match each image with its N nearest GPS images, on top of `--pair-selection`. |
 | `--feature-grid` | `0` | Spread the `--features` keypoints over N grid cells along the longer image side (for example `16`) instead of keeping the strongest overall. |
+| `--match-repair` | `off` | `on` matches weakly connected images (few accepted pairs, or a separate part of the match graph) against more nearby images. |
+| `--registration-recovery` | `off` | `on` grows further models from unregistered images and merges them via shared images or GPS, then tries GPS-checked PnP. Reasons per image are always in `04_geometry/registration.json`. |
+| `--registration-pose-check` | `off` | `on` (needs GPS) rejects camera poses that land far from their GPS position or are tilted beyond the rest of the block, during registration and after each bundle adjustment. |
 | `--tiled-las-output` | `0` | Size of square LAS tiles in output units (for example `1000`); `0` writes one `dense.las`. |
 | `--compute` | `auto` | `cpu` or `gpu` force one. |
 | `--cores` | half the CPUs | CPU threads. |

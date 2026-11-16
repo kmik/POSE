@@ -116,6 +116,7 @@ final class PdfReport implements AutoCloseable {
       pdf.surveyData(data, survey, out);
       pdf.calibration(survey);
       pdf.cameraLocations(survey);
+      pdf.registration(data, out);
       pdf.groundControl(survey);
       pdf.lidarReference(data, out);
       pdf.denseCloud(data, survey, out);
@@ -331,6 +332,65 @@ final class PdfReport implements AutoCloseable {
       rows.add(new String[] {String.valueOf(c[0]), length(e[0], units, 3), length(e[1], units, 3), length(e[2], units, 3), length(norm(e), units, 3)});
     }
     table(new String[] {"Label", "X error", "Y error", "Z error", "Total"}, new float[] {147, 90, 90, 90, 90}, rows);
+  }
+
+  /**
+   * Camera registration page: shown when images stayed unregistered, or when recovery or match
+   * repair ran. Why each unregistered image failed, how images were registered, and the map.
+   */
+  private void registration(Map<String, Object> data, Path out) throws IOException {
+    var reg = ProcessingReport.object(data.get("registration"));
+    if (reg.isEmpty()) return;
+    int images = (int) number(reg.get("images")), registered = (int) number(reg.get("registered"));
+    var recovery = ProcessingReport.object(reg.get("recovery"));
+    var repair = ProcessingReport.object(reg.get("match_repair"));
+    if (registered >= images && recovery.isEmpty() && repair.isEmpty()) return;
+    page("Camera Registration");
+    row("Images / registered", count(images) + " / " + count(registered));
+    var by = ProcessingReport.object(reg.get("registered_by"));
+    List<String> how = new ArrayList<>();
+    for (var e : by.entrySet()) how.add(e.getKey() + ": " + count(e.getValue()));
+    if (!how.isEmpty()) row("Registered by", String.join("; ", how));
+    row("Match graph", count(reg.get("match_graph_components")) + " connected part(s)");
+    if (!repair.isEmpty())
+      row(
+          "Match repair",
+          count(repair.get("weak_image_count")) + " weak images, " + count(repair.get("accepted_extra_pairs"))
+              + " of " + count(repair.get("extra_pairs")) + " extra pairs accepted; match graph "
+              + count(repair.get("components_before")) + " -> " + count(repair.get("components_after"))
+              + " parts");
+    if (!recovery.isEmpty())
+      row(
+          "Registration recovery",
+          count(recovery.get("registered_before")) + " -> " + count(recovery.get("registered_after"))
+              + " registered; " + count(recovery.get("models_merged")) + " models merged, "
+              + count(recovery.get("models_rejected")) + " rejected, "
+              + count(recovery.get("gps_checked_pnp")) + " by GPS-checked PnP");
+    var reasons = ProcessingReport.object(reg.get("unregistered_reasons"));
+    List<String[]> reasonRows = new ArrayList<>();
+    for (var e : reasons.entrySet())
+      if (number(e.getValue()) > 0)
+        reasonRows.add(new String[] {e.getKey().replace('_', ' '), count(e.getValue()), RegistrationDiagnostics.explanation(e.getKey())});
+    if (!reasonRows.isEmpty()) {
+      heading("Why images were not registered");
+      table(new String[] {"Reason", "Images", "Meaning"}, new float[] {150, 50, 307}, reasonRows);
+    }
+    if (reg.get("unregistered_images") instanceof List<?> list && !list.isEmpty()) {
+      heading(list.size() <= 30 ? "Unregistered images" : "Unregistered images (first 30 of " + list.size() + ")");
+      List<String[]> rows = new ArrayList<>();
+      for (Object item : list.subList(0, Math.min(30, list.size()))) {
+        var r = ProcessingReport.object(item);
+        rows.add(new String[] {String.valueOf(r.get("filename")), String.valueOf(r.get("reason")).replace('_', ' '),
+            count(r.get("accepted_pairs")), count(r.get("registered_tie_points")),
+            r.get("last_pnp_inliers") == null ? "-" : count(r.get("last_pnp_inliers"))});
+      }
+      table(new String[] {"Image", "Reason", "Pairs", "Tie points", "PnP inliers"}, new float[] {140, 167, 50, 75, 75}, rows);
+      paragraph("All images with their counts: 04_geometry/registration.json. Options that may help: --registration-recovery on, --match-repair on, --feature-grid 16, more --neighbors.");
+    }
+    if (reg.get("map_file") != null) {
+      paragraph(fig() + "Images at their GPS positions: registered (teal dots), unregistered (crosses coloured by reason); lines are accepted image pairs, darker with more matches.");
+      figure(out.resolve(String.valueOf(reg.get("map_file"))), 330);
+    }
   }
 
   private void groundControl(Map<String, Object> survey) throws IOException {
@@ -791,8 +851,8 @@ final class PdfReport implements AutoCloseable {
   private static final String[][][] STEP_OPTIONS = {
     {{"inputs"}, {"quality", "--quality"}, {"maxDimension", "--max-dimension"}, {"calibration", "--calibration"}, {"focal", "--focal"}},
     {{"calibrate"}, {"calibrationPipeline", "--calibration-pipeline"}, {"quickCalibration", "--quick-calibration"}, {"selfCalibration", "self calibration"}, {"intrinsicsMode", "--intrinsics-mode"}, {"refineIntrinsics", "--refine-intrinsics"}},
-    {{"match"}, {"pairSelection", "--pair-selection"}, {"neighbors", "--neighbors"}, {"matchingAlgorithm", "--matching-algorithm"}, {"features", "--features"}, {"ratio", "--ratio"}, {"minMatches", "--min-matches"}, {"pairCandidates", "--pair-candidates"}},
-    {{"align"}, {"iterations", "--bundle-iterations"}, {"reprojection", "--reprojection"}, {"trackMinViews", "--track-min-views"}, {"trackMaxError", "--track-max-error"}, {"registrationBundleGrowth", "--registration-bundle-growth"}, {"triangulationOutliers", "--triangulation-outliers"}, {"cameraScreening", "--camera-screening"}},
+    {{"match"}, {"pairSelection", "--pair-selection"}, {"neighbors", "--neighbors"}, {"matchingAlgorithm", "--matching-algorithm"}, {"features", "--features"}, {"ratio", "--ratio"}, {"minMatches", "--min-matches"}, {"pairCandidates", "--pair-candidates"}, {"gpsNeighbors", "--gps-neighbors"}, {"matchRepair", "--match-repair"}},
+    {{"align"}, {"iterations", "--bundle-iterations"}, {"reprojection", "--reprojection"}, {"trackMinViews", "--track-min-views"}, {"trackMaxError", "--track-max-error"}, {"registrationBundleGrowth", "--registration-bundle-growth"}, {"triangulationOutliers", "--triangulation-outliers"}, {"registrationPoseCheck", "--registration-pose-check"}, {"registrationRecovery", "--registration-recovery"}, {"cameraScreening", "--camera-screening"}},
     {{"georeference"}, {"crs", "--crs"}, {"gpsBundle", "--gps-bundle"}, {"gpsSigma", "--gps-sigma"}, {"gpsHeightSigma", "--gps-height-sigma"}, {"gpsIntrinsics", "--gps-intrinsics"}, {"gpsFocalPrior", "--gps-focal-prior"}, {"gpsTimeOffset", "--gps-time-offset"}, {"gpsLeverArm", "--gps-lever-arm"}, {"rollingShutter", "--rolling-shutter"}},
     {{"gcp"}, {"gcp", "--gcp"}, {"gcpSigma", "--gcp-sigma"}, {"gcpHeightSigma", "--gcp-height-sigma"}},
     {{"dense"}, {"denseMethod", "--dense-method"}, {"disparities", "--disparities"}, {"correlation", "--min-correlation"}, {"minViews", "--min-views"}, {"filtering", "--filtering"}, {"fusionMode", "--fusion-mode"}},
@@ -965,7 +1025,14 @@ final class PdfReport implements AutoCloseable {
     if (maps.get("input_images") instanceof Number in
         && maps.get("registered_cameras") instanceof Number reg
         && reg.intValue() < in.intValue())
-      flags.add((in.intValue() - reg.intValue()) + " of " + in.intValue() + " images were not registered.");
+    {
+      List<String> why = new ArrayList<>();
+      var reasons = ProcessingReport.object(ProcessingReport.object(data.get("registration")).get("unregistered_reasons"));
+      for (var e : reasons.entrySet())
+        if (number(e.getValue()) > 0) why.add(count(e.getValue()) + " " + e.getKey().replace('_', ' '));
+      flags.add((in.intValue() - reg.intValue()) + " of " + in.intValue() + " images were not registered"
+          + (why.isEmpty() ? "." : ": " + String.join(", ", why) + " (see Camera Registration)."));
+    }
     // The GPS camera fit: the camera location error after the GPS-weighted adjustment (the same
     // number as the Camera Locations page), else the similarity fit of coordinates.json.
     Object similarity = ProcessingReport.object(data.get("coordinates")).get("inlier_rms_metres");

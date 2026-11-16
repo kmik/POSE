@@ -21,9 +21,11 @@ final class PairSelectionRegression {
   static int run(Path root) throws Exception {
     checks = 0;
     Files.createDirectories(root);
-    check(new Options().pairSelection.equals("overlap"), "Production default selects overlap");
-    check(Options.parse(new String[] {"-i", root.toString(), "--neighbors", "5"}).pairSelection.equals("overlap"),
-        "CLI neighbors retains overlap default");
+    check(new Options().pairSelection.equals("auto"), "Production default selects auto");
+    check(Options.parse(new String[] {"-i", root.toString(), "--neighbors", "5"}).pairSelection.equals("auto"),
+        "CLI neighbors retains auto default");
+    check(Math.abs(PairSelection.spread(new double[][] {{0, 0, 0}, {30, 0, 5}, {0, 40, 9}, {30, 40, 2}}) - 25) < 1e-9,
+        "GPS spread is the horizontal RMS distance to the centroid");
     Options o = new Options(); o.output = Files.createDirectories(root.resolve("pairs"));
     o.neighbors = 1; o.pairCandidates = 2; o.memoryMb = 512; o.descriptorMemoryMb = 1;
     Path image = image(root);
@@ -48,6 +50,9 @@ final class PairSelectionRegression {
         o.pairSelection = "gps";
         check(Json.string(pairs).equals(Json.string(PairSelection.select(frames, o, null))),
             "Missing GPS uses visual evidence");
+        o.pairSelection = "auto";
+        check(Json.string(pairs).equals(Json.string(PairSelection.select(frames, o, null))),
+            "auto without GPS uses the same visual evidence as overlap");
         o.pairSelection = "sequential";
         List<int[]> sequential = PairSelection.select(frames, o, null);
         check(sequential.size() == 19 && has(sequential, 0, 1) && !has(sequential, 0, 10),

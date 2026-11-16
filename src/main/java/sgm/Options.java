@@ -221,7 +221,7 @@ public final class Options {
   public boolean maxDimensionExplicit, estimateMemory;
   public String matchingAlgorithm = "sift",
       descriptorMatcher = "auto",
-      pairSelection = "overlap",
+      pairSelection = "auto",
       pairMatching = "parallel";
   public String alignmentQuality = "same", intrinsicsMode = "fixed", extrinsicsMode = "fixed";
   public String refineIntrinsics = "f,k1,k2,k3,cx,cy,p1,p2", rerunFrom = "none";
@@ -235,6 +235,15 @@ public final class Options {
   public String triangulationOutliers = "drop";
   /** Cells along the longer image side for spread feature selection; 0 = strongest N overall. */
   public int featureGrid = 0;
+  /** Unregistered images after alignment: off, or further models merged into the main one. */
+  public String registrationRecovery = "off";
+  /** After matching: match weakly connected images against more candidates. */
+  public String matchRepair = "off";
+  public int matchRepairCandidates = 8, matchRepairMinPairs = 2;
+  /** Pair selection: also match each image with its N nearest GPS neighbours (0 = off). */
+  public int gpsNeighbors = 0;
+  /** Incremental registration: reject PnP poses far from GPS or tilted beyond the block. */
+  public String registrationPoseCheck = "off";
   boolean alignmentCalibration, alignmentCalibrationDone;
   public boolean resume, tiled, diskDepth = true;
   public String storage = "standard", compute = "auto";
@@ -865,6 +874,36 @@ public final class Options {
           if (!(o.registrationBundleGrowth >= 0) || Double.isInfinite(o.registrationBundleGrowth))
             throw new IllegalArgumentException(
                 "--registration-bundle-growth must be a percentage >= 0 (0 disables)");
+          break;
+        case "--registration-recovery":
+          if (!v.equals("off") && !v.equals("on"))
+            throw new IllegalArgumentException("--registration-recovery requires off|on");
+          o.registrationRecovery = v;
+          break;
+        case "--match-repair":
+          if (!v.equals("off") && !v.equals("on"))
+            throw new IllegalArgumentException("--match-repair requires off|on");
+          o.matchRepair = v;
+          break;
+        case "--gps-neighbors":
+          o.gpsNeighbors = Integer.parseInt(v);
+          if (o.gpsNeighbors < 0 || o.gpsNeighbors > 64)
+            throw new IllegalArgumentException("--gps-neighbors must be 0..64");
+          break;
+        case "--registration-pose-check":
+          if (!v.equals("off") && !v.equals("on"))
+            throw new IllegalArgumentException("--registration-pose-check requires off|on");
+          o.registrationPoseCheck = v;
+          break;
+        case "--match-repair-candidates":
+          o.matchRepairCandidates = Integer.parseInt(v);
+          if (o.matchRepairCandidates < 1 || o.matchRepairCandidates > 200)
+            throw new IllegalArgumentException("--match-repair-candidates must be 1..200");
+          break;
+        case "--match-repair-min-pairs":
+          o.matchRepairMinPairs = Integer.parseInt(v);
+          if (o.matchRepairMinPairs < 1 || o.matchRepairMinPairs > 50)
+            throw new IllegalArgumentException("--match-repair-min-pairs must be 1..50");
           break;
         case "--triangulation-outliers":
           if (!v.equals("drop") && !v.equals("reject"))
@@ -1678,7 +1717,7 @@ public final class Options {
       throw new IllegalArgumentException("Invalid feature detector thresholds");
     choice(o.matchingAlgorithm, "--matching-algorithm", "sift", "orb", "akaze", "kaze", "brisk");
     choice(o.descriptorMatcher, "--descriptor-matcher", "auto", "bruteforce", "flann");
-    choice(o.pairSelection, "--pair-selection", "sequential", "overlap", "gps", "all");
+    choice(o.pairSelection, "--pair-selection", "auto", "sequential", "overlap", "gps", "all");
     choice(o.pairMatching, "--pair-matching", "parallel", "serial");
     choice(o.fusionStrategy, "--fusion-strategy", "owner", "owner-consume", "graph-average");
     choice(o.gpsBundle, "--gps-bundle", "off", "prior");
@@ -3214,14 +3253,22 @@ Additional workflow controls:
   --kaze-threshold N
       KAZE detector response threshold (default: 0.001; positive).
       Thresholds apply to their selected algorithm, including calibration/previews.
-  --pair-selection sequential|overlap|gps|all
-      Default overlap ranks shared ground footprints when poses and a scene plane
-      are known; otherwise ranks reciprocal visual support and spatial coverage.
-      Large visual searches use an approximate global descriptor index, then exact
-      preview scoring. Scores estimate overlap, not a guaranteed physical percentage.
-      No filename edges are added. sequential explicitly uses filename neighbors.
+  --pair-selection auto|overlap|gps|sequential|all
+      Default auto: shared ground footprints when poses and a scene plane are known;
+      else nearest GPS cameras when every image has GPS spread over at least 20 m;
+      else visual search (as overlap). Visual ranking can miss the neighbours along a
+      flight line over uniform texture (forest canopy); GPS ranking cannot.
+      overlap ranks shared ground footprints when poses and a scene plane are known;
+      otherwise ranks reciprocal visual support and spatial coverage. Large visual
+      searches use an approximate global descriptor index, then exact preview scoring.
+      Scores estimate overlap, not a guaranteed physical percentage.
       gps ranks nearest GPS cameras, using visual search if coordinates are missing.
-      all considers every pair, ignoring --neighbors.
+      sequential uses the next filename-sorted images. all considers every pair,
+      ignoring --neighbors. No filename edges are added except with sequential.
+  --gps-neighbors N
+      Also match each image with its N nearest GPS neighbours (default: 0 = off; 0..64), on
+      top of --pair-selection. Guarantees the neighbours along each flight line are tried when
+      visual ranking misses them (uniform canopy). Needs GPS on every image.
   --pair-candidates N
       Extra visual retrieval candidates before selecting --neighbors (default: 6;
       positive). Increase for broader search; N >= image count requests exhaustive
@@ -3270,6 +3317,31 @@ Additional workflow controls:
       When a new sparse point disagrees with some of its registered observations: drop
       those observations and keep the point supported by the most views (drop, default),
       or reject the whole track as before (reject).
+  --registration-recovery off|on
+      Images still unregistered after alignment (default: off). on: grow further models from
+      seed pairs among them, merge each into the main model through images both contain or,
+      without those, through GPS positions, then retry the rest with PnP checked against GPS
+      (fewer inliers accepted when the camera lands where its GPS says). The reason for every
+      unregistered image is in 04_geometry/registration.json either way.
+  --registration-pose-check off|on
+      Incremental registration (default: off). on, when every image has GPS: a camera solved
+      by PnP is rejected (and retried later) if it lands more than max(3 x fit RMS, 3 m) from
+      its GPS position under a similarity fit of the registered cameras to GPS, or if the
+      block is near-nadir and its view axis is tilted more than max(10, 3 x the block's 90th
+      percentile) degrees from the block's mean axis. The same checks run on every registered
+      camera after each bundle adjustment during alignment: a camera the bundle moved off is
+      un-registered and solved again (twice at most), and its tie points without two registered
+      views are cleared. Catches weakly tied cameras that settle on a tilted, shifted pose.
+      Rejections and removals are in 04_geometry/registration.json.
+  --match-repair off|on
+      After pair matching (default: off). on: images with fewer than --match-repair-min-pairs
+      accepted pairs, and images outside the largest connected part of the match graph, are
+      matched against their --match-repair-candidates nearest images not tried yet (GPS
+      distance, else filename order). Details in 03_matches/match_repair.json.
+  --match-repair-candidates N
+      Extra pairs tried per weak image (default: 8; 1..200).
+  --match-repair-min-pairs N
+      An image with fewer accepted pairs is repaired (default: 2; 1..50).
   --tiled
       Use bounded disk-backed cost-volume tiles with continuous global SGM paths.
       Avoids full disparity-volume heap allocation; requires temporary disk space.

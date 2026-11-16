@@ -50,9 +50,21 @@ final class Geometry {
   static void reconstruct(
       List<ImageFrame> frames, FeatureTracks features, Options o, Project project)
       throws IOException {
+    LOG = new RegistrationDiagnostics(frames.size());
+    POSE_CHECK = RegistrationPoseCheck.create(frames, features.tracks, o);
     try { reconstructImpl(frames, features, o, project); }
-    finally { releaseWorkspaces(); }
+    finally {
+      LOG = null;
+      POSE_CHECK = null;
+      releaseWorkspaces();
+    }
   }
+
+  /** Registration outcome per image during reconstruct (single-threaded); null otherwise. */
+  static RegistrationDiagnostics LOG;
+
+  /** --registration-pose-check for the main model's PnP; null when off or during recovery. */
+  static RegistrationPoseCheck POSE_CHECK;
 
   private static void reconstructImpl(
       List<ImageFrame> frames, FeatureTracks features, Options o, Project project)
@@ -117,6 +129,8 @@ final class Geometry {
     }
     b.registered = true;
     b.fixed = true;
+    LOG.registered(seed.a, "seed", 0);
+    LOG.registered(seed.b, "seed", 0);
     int triangulation = outlierMode(o);
     for (FeatureTracks.Track track : features.tracks)
       if (track.point == null) triangulateTrack(frames, track, o.reprojection, triangulation);
@@ -141,89 +155,7 @@ final class Geometry {
     // former whole-track scans per step, without images x tracks work per registration.
     TrackIndex index = new TrackIndex(frames, features.tracks, o);
     index.triangulation = triangulation;
-    // Periodic joint bundle adjustment while the model grows (--registration-bundle-growth): PnP
-    // places each camera against points that are never refined otherwise, so on long chains the
-    // accumulated drift exceeds the reprojection threshold and registration stalls.
-    double growth = o.registrationBundleGrowth / 100;
-    int registeredCameras = 2, lastBundle = 2, bundles = 0;
-    long bundleNanos = 0;
-    while (true) {
-      int best = -1, most = 0;
-      for (ImageFrame f : frames)
-        if (!f.camera.registered) {
-          int n = index.triangulated[f.id];
-          if (n > most) {
-            most = n;
-            best = f.id;
-          }
-        }
-      if (best < 0 || most < Math.max(8, o.minMatches / 2)) break;
-      ImageFrame next = frames.get(best);
-      int added = best;
-      if (!register(next, index, o, project)) {
-        // Try all currently registerable views before declaring the graph disconnected.
-        boolean registered = false;
-        for (ImageFrame candidate : frames)
-          if (!candidate.camera.registered
-              && candidate.id != best
-              && register(candidate, index, o, project)) {
-            registered = true;
-            added = candidate.id;
-            break;
-          }
-        if (!registered) break;
-      }
-      // Only the new camera changed since the previous triangulation (no pose moved).
-      triangulateNew(frames, index, added, o.reprojection);
-      registeredCameras++;
-      if (growth > 0
-          && registeredCameras < frames.size()
-          && registeredCameras >= Math.ceil(lastBundle * (1 + growth) - 1e-9)) {
-        long start = System.nanoTime();
-        int before = triangulatedCount(features.tracks);
-        BundleAdjuster.optimizeImpl(
-            frames, features.tracks, o.iterations, o.reprojection, null, seed.a, seed.b, null);
-        // Poses and points moved: retry the tracks that failed to triangulate so far.
-        triangulateAll(frames, index, o.reprojection);
-        long elapsed = System.nanoTime() - start;
-        bundleNanos += elapsed;
-        bundles++;
-        int after = triangulatedCount(features.tracks);
-        System.out.printf(
-            Locale.ROOT,
-            "Registration bundle %d at %d cameras: %.1f s; re-triangulated %d tracks%n",
-            bundles,
-            registeredCameras,
-            elapsed / 1e9,
-            after - before);
-        if (project != null)
-          project.event(
-              "registration_bundle",
-              Json.object(
-                  "cameras",
-                  registeredCameras,
-                  "previous_bundle_cameras",
-                  lastBundle,
-                  "seconds",
-                  elapsed / 1e9,
-                  "retriangulated_tracks",
-                  after - before));
-        lastBundle = registeredCameras;
-      }
-      if (project != null)
-        project.data.snapshot(
-            "registration_" + frames.stream().filter(f -> f.camera.registered).count(),
-            frames,
-            features.tracks,
-            "seed-camera frame");
-    }
-    if (bundles > 0)
-      System.out.printf(
-          Locale.ROOT,
-          "Registration bundles: %d (growth %.4g%%), %.1f s in total%n",
-          bundles,
-          o.registrationBundleGrowth,
-          bundleNanos / 1e9);
+    grow(frames, features, index, o, project, seed.a, seed.b, null);
     index = null; // released before the bundle adjustment
     long registered = frames.stream().filter(f -> f.camera.registered).count();
     // The final count (and the warning) comes after the retry pass below, which can add images.
@@ -253,10 +185,12 @@ final class Geometry {
     BundleAdjuster.optimize(
         frames, features.tracks, o.iterations, o.reprojection, project, seed.a, seed.b);
     SparseCleanup.run(frames, features.tracks, o, project, seed.a, seed.b);
+    if (POSE_CHECK != null) POSE_CHECK.screen("the bundle adjustment");
     boolean recovered = false;
     // Rebuilt after the bundle and cleanup (they edit observations and move poses): the first
     // triangulation after them covers all tracks, later ones only the newly registered camera.
     TrackIndex retry = null;
+    LOG.stage = "retry";
     for (int pass = 0; pass < frames.size(); pass++) {
       boolean changed = false;
       for (ImageFrame frame : frames) {
@@ -279,12 +213,36 @@ final class Geometry {
       BundleAdjuster.optimize(
           frames, features.tracks, o.iterations, o.reprojection, null, seed.a, seed.b);
       SparseCleanup.run(frames, features.tracks, o, null, seed.a, seed.b);
+      if (POSE_CHECK != null) POSE_CHECK.screen("the retry bundle adjustment");
       if (project != null)
         project.data.snapshot(
             "registration_retry",
             frames,
             features.tracks,
             "after registration recovery and bundle refinement");
+    }
+    // Recovery grows separate models in their own frames and has its own GPS checks.
+    RegistrationPoseCheck poseCheck = POSE_CHECK;
+    POSE_CHECK = null;
+    boolean recoveredModels;
+    try {
+      recoveredModels =
+          o.registrationRecovery.equals("on")
+              && frames.stream().anyMatch(f -> !f.camera.registered)
+              && RegistrationRecovery.run(frames, features, o, project, seed.a, seed.b, triangulation);
+    } finally {
+      POSE_CHECK = poseCheck;
+    }
+    if (recoveredModels) {
+      BundleAdjuster.optimize(
+          frames, features.tracks, o.iterations, o.reprojection, null, seed.a, seed.b);
+      SparseCleanup.run(frames, features.tracks, o, null, seed.a, seed.b);
+      if (project != null)
+        project.data.snapshot(
+            "registration_recovery",
+            frames,
+            features.tracks,
+            "after --registration-recovery and bundle refinement");
     }
     List<String> missing = new ArrayList<>();
     for (ImageFrame f : frames)
@@ -298,17 +256,8 @@ final class Geometry {
               + "). Missing: "
               + missing
               + ". They will be excluded from dense reconstruction.");
-    status.clear();
-    for (ImageFrame frame : frames)
-      status.add(
-          Json.object(
-              "image_id",
-              frame.id,
-              "filename",
-              frame.path.getFileName().toString(),
-              "registered",
-              frame.camera.registered));
-    Json.write(statusFile, status);
+    if (POSE_CHECK != null) LOG.poseCheck = POSE_CHECK.summary();
+    LOG.write(frames, features, o, project);
     if (project != null)
       project.data.snapshot(
           "post_bundle_before_track_filter", frames, features.tracks, "seed-camera frame");
@@ -317,6 +266,124 @@ final class Geometry {
       if (project != null) project.data.trackFilter(track, frames, keep);
       if (track.point != null && !keep) track.point = null;
     }
+  }
+
+  /**
+   * Incremental registration from the registered cameras: repeatedly registers the image that
+   * sees the most triangulated tracks, with periodic joint bundles (--registration-bundle-growth:
+   * PnP places each camera against points that are never refined otherwise, so on long chains
+   * the accumulated drift exceeds the reprojection threshold and registration stalls). Only
+   * images with {@code allowed} true (all when null) are considered. Returns the number added.
+   */
+  static int grow(
+      List<ImageFrame> frames,
+      FeatureTracks features,
+      TrackIndex index,
+      Options o,
+      Project project,
+      int anchor,
+      int scale,
+      Gate allowed)
+      throws IOException {
+    double growth = o.registrationBundleGrowth / 100;
+    int registeredCameras = 0;
+    for (ImageFrame f : frames) if (f.camera.registered) registeredCameras++;
+    int lastBundle = registeredCameras, bundles = 0, added = 0;
+    long bundleNanos = 0;
+    while (true) {
+      int best = -1, most = 0;
+      for (ImageFrame f : frames)
+        if (!f.camera.registered && (allowed == null || allowed.allowed(f.id))) {
+          int n = index.triangulated[f.id];
+          if (n > most) {
+            most = n;
+            best = f.id;
+          }
+        }
+      if (best < 0 || most < Math.max(8, o.minMatches / 2)) break;
+      ImageFrame next = frames.get(best);
+      int newest = best;
+      if (!register(next, index, o, project)) {
+        // Try all currently registerable views before declaring the graph disconnected.
+        boolean registered = false;
+        for (ImageFrame candidate : frames)
+          if (!candidate.camera.registered
+              && candidate.id != best
+              && (allowed == null || allowed.allowed(candidate.id))
+              && register(candidate, index, o, project)) {
+            registered = true;
+            newest = candidate.id;
+            break;
+          }
+        if (!registered) break;
+      }
+      // Only the new camera changed since the previous triangulation (no pose moved).
+      if (allowed != null) allowed.registered(newest);
+      triangulateNew(frames, index, newest, o.reprojection);
+      registeredCameras++;
+      added++;
+      if (growth > 0
+          && registeredCameras < frames.size()
+          && registeredCameras >= Math.ceil(lastBundle * (1 + growth) - 1e-9)) {
+        long start = System.nanoTime();
+        int before = triangulatedCount(features.tracks);
+        BundleAdjuster.optimizeImpl(
+            frames, features.tracks, o.iterations, o.reprojection, null, anchor, scale, null);
+        // Poses and points moved: retry the tracks that failed to triangulate so far.
+        triangulateAll(frames, index, o.reprojection);
+        long elapsed = System.nanoTime() - start;
+        bundleNanos += elapsed;
+        bundles++;
+        int after = triangulatedCount(features.tracks);
+        System.out.printf(
+            Locale.ROOT,
+            "Registration bundle %d at %d cameras: %.1f s; re-triangulated %d tracks%n",
+            bundles,
+            registeredCameras,
+            elapsed / 1e9,
+            after - before);
+        if (project != null)
+          project.event(
+              "registration_bundle",
+              Json.object(
+                  "cameras",
+                  registeredCameras,
+                  "previous_bundle_cameras",
+                  lastBundle,
+                  "seconds",
+                  elapsed / 1e9,
+                  "retriangulated_tracks",
+                  after - before));
+        lastBundle = registeredCameras;
+        RegistrationPoseCheck check = POSE_CHECK;
+        if (check != null) {
+          int removed = check.screen("registration bundle " + bundles);
+          if (removed > 0) {
+            index.recount();
+            registeredCameras -= removed;
+            lastBundle = registeredCameras;
+          }
+        }
+      }
+      if (project != null)
+        project.data.snapshot(
+            "registration_" + registeredCameras, frames, features.tracks, "seed-camera frame");
+    }
+    if (bundles > 0)
+      System.out.printf(
+          Locale.ROOT,
+          "Registration bundles: %d (growth %.4g%%), %.1f s in total%n",
+          bundles,
+          o.registrationBundleGrowth,
+          bundleNanos / 1e9);
+    return added;
+  }
+
+  /** Which images grow() may register, and a notice for each one it registers. */
+  interface Gate {
+    boolean allowed(int image);
+
+    default void registered(int image) {}
   }
 
   static double seedScore(FeatureTracks.Pair pair, List<ImageFrame> frames) {
@@ -457,6 +524,22 @@ final class Geometry {
       ImageFrame frame, List<FeatureTracks.Track> tracks, TrackIndex index, Options o,
       Project project, boolean quiet)
       throws IOException {
+    // Not for quiet seed trials: their trial models are discarded.
+    RegistrationPoseCheck check = quiet ? null : POSE_CHECK;
+    return register(frame, tracks, index, o, project, quiet, Math.max(8, o.minMatches / 2),
+        check == null ? null : check.forImage(frame.id));
+  }
+
+  /**
+   * PnP registration with {@code minimum} RANSAC and consistent inliers; {@code accept}, when
+   * given, must also approve the solved camera (GPS-checked recovery). Records the attempt in LOG
+   * unless quiet.
+   */
+  static boolean register(
+      ImageFrame frame, List<FeatureTracks.Track> tracks, TrackIndex index, Options o,
+      Project project, boolean quiet, int minimum, java.util.function.Predicate<Camera> accept)
+      throws IOException {
+    RegistrationDiagnostics log = quiet ? null : LOG;
     List<Point3> xyz = new ArrayList<>();
     List<Point> uv = new ArrayList<>();
     List<FeatureTracks.Track> usedTracks = new ArrayList<>();
@@ -482,7 +565,8 @@ final class Geometry {
           usedTracks.add(track);
         }
       }
-    if (xyz.size() < 8) {
+    if (xyz.size() < Math.min(8, minimum)) {
+      if (log != null) log.attempt(frame.id, xyz.size(), 0, 0);
       if (project != null) project.data.pnp(frame, usedTracks, uv, new int[0], null, null, false);
       return false;
     }
@@ -511,7 +595,10 @@ final class Geometry {
               .999,
               inliers,
               Calib3d.SOLVEPNP_EPNP)
-          || inliers.total() < Math.max(8, o.minMatches / 2)) return false;
+          || inliers.total() < minimum) {
+        if (log != null) log.attempt(frame.id, xyz.size(), (int) inliers.total(), 0);
+        return false;
+      }
       List<Point3> good3 = new ArrayList<>();
       List<Point> good2 = new ArrayList<>();
       int[] indices = new int[(int) inliers.total()];
@@ -537,10 +624,13 @@ final class Geometry {
             && Math.hypot(predicted[0] - observed.x, predicted[1] - observed.y)
                 <= o.reprojection * 2) consistent++;
       }
-      if (consistent < Math.max(8, o.minMatches / 2)) return false;
+      if (log != null) log.attempt(frame.id, xyz.size(), indices.length, consistent);
+      if (consistent < minimum) return false;
+      if (accept != null && !accept.test(candidate)) return false;
       frame.camera.rotation = candidate.rotation;
       frame.camera.translation = candidate.translation;
       frame.camera.registered = true;
+      if (log != null) log.registered(frame.id);
       if (!quiet)
         System.out.printf(
             Locale.ROOT,

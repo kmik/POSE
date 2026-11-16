@@ -29,6 +29,7 @@ final class PoseProjectPanel {
   final JButton pdf = new JButton("Report PDF"), html = new JButton("Report HTML"), results = new JButton("07_results"), folder = new JButton("Run folder"), refresh = new JButton("Refresh");
   final JButton images = new JButton("Images..."), view3d = new JButton("3D view..."), copyRun = new JButton("Copy run details");
   final JButton lidar = new JButton("Lidar result..."), copyCommand = new JButton("Copy command");
+  final JButton registration = new JButton("Registration...");
   List<ProjectFiles.Run> runs = List.of();
   boolean filling;
 
@@ -99,6 +100,7 @@ final class PoseProjectPanel {
     runButtons.add(images);
     runButtons.add(view3d);
     runButtons.add(lidar);
+    runButtons.add(registration);
     runsPanel.add(runButtons, BorderLayout.SOUTH);
 
     JPanel stepsPanel = new JPanel(new BorderLayout(4, 4));
@@ -184,6 +186,10 @@ final class PoseProjectPanel {
     }));
     lidar.setToolTipText("The lidar referencing of the run (--lidar-reference): transformation, uncertainty, coverage and difference maps.");
     lidar.addActionListener(e -> withRun(r -> LidarResultWindow.open(panel, r, () -> branchRun(r, List.of("lidar", "finish"), ProjectFiles.lidarOptions(r)))));
+    registration.setToolTipText("How the images were registered, why the others were not, and the GPS map (04_geometry/registration.json).");
+    registration.addActionListener(e -> withRun(r -> RegistrationWindow.open(panel, r,
+        () -> branchRun(r, List.of("align", "finish"), "--registration-recovery on"),
+        () -> branchRun(r, List.of("match", "finish"), "--match-repair on --registration-recovery on"))));
     updateButtons();
   }
 
@@ -460,6 +466,7 @@ final class PoseProjectPanel {
     gcps.setEnabled(idle && waiting);
     tiePoints.setEnabled(idle && r != null && r.waitingForCleanup());
     lidar.setEnabled(r != null && !ProjectFiles.lidar(r).isEmpty());
+    registration.setEnabled(RegistrationWindow.available(r));
     copyCommand.setEnabled(r != null && !r.arguments().isEmpty());
     report.setEnabled(idle && r != null && Files.isRegularFile(r.dir().resolve("run.json")));
     ortho.setEnabled(idle && r != null && Files.isRegularFile(r.dir().resolve("07_results/coordinates.json")));

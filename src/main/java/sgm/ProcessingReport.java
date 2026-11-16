@@ -40,6 +40,45 @@ final class ProcessingReport {
     generate(o, run, out);
   }
 
+  /**
+   * Registration outcome for the report: 04_geometry/registration_summary.json, the unregistered
+   * images with their reasons (registration.json), the match repair summary and the map (copied
+   * next to the report as registration-map.png). Null for runs made before these files existed.
+   */
+  static Map<String, Object> registration(Path run, Path out) throws IOException {
+    Path summary = run.resolve("04_geometry/registration_summary.json");
+    if (!Files.isRegularFile(summary)) return null;
+    Map<String, Object> result = new LinkedHashMap<>(map(summary));
+    List<Object> missing = new ArrayList<>();
+    if (read(run.resolve("04_geometry/registration.json")) instanceof List<?> rows)
+      for (Object item : rows) {
+        var row = object(item);
+        if (Boolean.FALSE.equals(row.get("registered")))
+          missing.add(
+              Json.object(
+                  "filename", row.get("filename"),
+                  "reason", row.get("reason"),
+                  "accepted_pairs", row.get("accepted_pairs"),
+                  "registered_tie_points", row.get("registered_tie_points"),
+                  "last_pnp_inliers", row.get("last_pnp_inliers")));
+      }
+    result.put("unregistered_images", missing);
+    Path repair = run.resolve("03_matches/match_repair.json");
+    if (Files.isRegularFile(repair)) {
+      Map<String, Object> r = new LinkedHashMap<>(map(repair));
+      Object weak = r.remove("weak_images");
+      r.put("weak_image_count", weak instanceof List<?> list ? list.size() : 0);
+      result.put("match_repair", r);
+    }
+    Path png = run.resolve("04_geometry/registration_map.png");
+    if (Files.isRegularFile(png) && out != null) {
+      Files.createDirectories(out);
+      Files.copy(png, out.resolve("registration-map.png"), StandardCopyOption.REPLACE_EXISTING);
+      result.put("map_file", "registration-map.png");
+    }
+    return result;
+  }
+
   static void generate(Options o, Path run, Path out) throws IOException {
     Files.createDirectories(out);
     System.out.println(
@@ -169,6 +208,8 @@ final class ProcessingReport {
     if (Files.isRegularFile(screening)) data.put("camera_screening", read(screening));
     Path ground = run.resolve("07_results/ground.json");
     if (Files.isRegularFile(ground)) data.put("ground", read(ground));
+    Map<String, Object> registration = registration(run, out);
+    if (registration != null) data.put("registration", registration);
     Map<String, Object> maps;
     try {
       maps = ReportMaps.create(run, out, o, dsm, coordinate, parameters);

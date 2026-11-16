@@ -57,6 +57,8 @@ public final class SelfTest {
     checks += MatchMemoryRegression.run();
     checks += RegistrationDriftRegression.run(root.resolve("registration-drift"));
     checks += FeatureGridRegression.run(root.resolve("feature-grid"));
+    checks += RegistrationRecoveryRegression.run(root.resolve("registration-recovery"));
+    checks += RegistrationPoseCheckRegression.run(root.resolve("pose-check"));
     checks += GuiRegression.run(root.resolve("gui"));
     checks += GpuStereoFiltersRegression.run();
     checks += GpuDepthOutlierRegression.run();

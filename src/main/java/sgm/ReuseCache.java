@@ -457,7 +457,11 @@ final class ReuseCache {
                 "minPairOverlap",
                 "overlapGroundZ",
                 "flightHeading",
-                "overlapUnknown"));
+                "overlapUnknown",
+                "matchRepair",
+                "matchRepairCandidates",
+                "matchRepairMinPairs",
+                "gpsNeighbors"));
     key.append(featureSettings(o));
     // Overlap ranking/filtering can depend on supplied exterior orientations.
     if (o.poses != null) key.append(hash(o.poses));
@@ -865,6 +869,8 @@ final class ReuseCache {
                     "trackMinAngle",
                     "registrationBundleGrowth",
                     "triangulationOutliers",
+                    "registrationRecovery",
+                    "registrationPoseCheck",
                     "extrinsicsMode",
                     "positionSigma",
                     "rotationSigma",
@@ -902,6 +908,10 @@ final class ReuseCache {
                 "neighbors",
                 "pairSelection",
                 "pairCandidates",
+                "matchRepair",
+                "matchRepairCandidates",
+                "matchRepairMinPairs",
+                "gpsNeighbors",
                 "iterations",
                 "baseline",
                 "intrinsicsMode",
@@ -917,6 +927,8 @@ final class ReuseCache {
                 "trackMinAngle",
                 "registrationBundleGrowth",
                 "triangulationOutliers",
+                "registrationRecovery",
+                "registrationPoseCheck",
                 "rectified"));
     b.append(featureSettings(o));
     for (Path p : paths) {

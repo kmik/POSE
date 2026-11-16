@@ -183,6 +183,14 @@ project folder. While idle, the console shows the newest run of the project.
   significance, warnings, distances to the lidar and the remaining bending, beside the coverage
   map and the surface and terrain difference maps. **Redo lidar with other settings...** opens
   the redo dialog from `lidar` up to `finish`, with the run's lidar options filled in to change.
+- **Registration...** (runs whose align step wrote `04_geometry/registration_summary.json`)
+  shows how many images were registered and how (seed, incremental, retry, a merged further
+  model, GPS-checked PnP), why each unregistered image failed (no accepted pairs, separate part
+  of the match graph, too few registered tie points, PnP rejected), match repair and recovery
+  results, beside the map of the images at their GPS positions with the accepted pairs.
+  **Redo matching with repair...** opens the redo dialog from `match` with
+  `--match-repair on --registration-recovery on`; **Redo alignment with recovery...** from
+  `align` with `--registration-recovery on`.
 - **Step details:** double-click a step (or right-click > Show details) for its full message;
   for a failed step also the run's error, the error lines of `logs/console.log` and its end.
   The text can be selected and copied (**Copy**). Right-click > Copy (or Ctrl+C) copies the
