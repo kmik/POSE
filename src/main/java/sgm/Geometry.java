@@ -117,7 +117,9 @@ final class Geometry {
     }
     b.registered = true;
     b.fixed = true;
-    triangulateTracks(frames, features.tracks, o.reprojection);
+    int triangulation = outlierMode(o);
+    for (FeatureTracks.Track track : features.tracks)
+      if (track.point == null) triangulateTrack(frames, track, o.reprojection, triangulation);
     if (project != null) {
       project.event(
           "seed_pair",
@@ -138,6 +140,13 @@ final class Geometry {
     // Per-image track lists and triangulated-track counts (see TrackIndex): same choices as the
     // former whole-track scans per step, without images x tracks work per registration.
     TrackIndex index = new TrackIndex(frames, features.tracks, o);
+    index.triangulation = triangulation;
+    // Periodic joint bundle adjustment while the model grows (--registration-bundle-growth): PnP
+    // places each camera against points that are never refined otherwise, so on long chains the
+    // accumulated drift exceeds the reprojection threshold and registration stalls.
+    double growth = o.registrationBundleGrowth / 100;
+    int registeredCameras = 2, lastBundle = 2, bundles = 0;
+    long bundleNanos = 0;
     while (true) {
       int best = -1, most = 0;
       for (ImageFrame f : frames)
@@ -166,6 +175,41 @@ final class Geometry {
       }
       // Only the new camera changed since the previous triangulation (no pose moved).
       triangulateNew(frames, index, added, o.reprojection);
+      registeredCameras++;
+      if (growth > 0
+          && registeredCameras < frames.size()
+          && registeredCameras >= Math.ceil(lastBundle * (1 + growth) - 1e-9)) {
+        long start = System.nanoTime();
+        int before = triangulatedCount(features.tracks);
+        BundleAdjuster.optimizeImpl(
+            frames, features.tracks, o.iterations, o.reprojection, null, seed.a, seed.b, null);
+        // Poses and points moved: retry the tracks that failed to triangulate so far.
+        triangulateAll(frames, index, o.reprojection);
+        long elapsed = System.nanoTime() - start;
+        bundleNanos += elapsed;
+        bundles++;
+        int after = triangulatedCount(features.tracks);
+        System.out.printf(
+            Locale.ROOT,
+            "Registration bundle %d at %d cameras: %.1f s; re-triangulated %d tracks%n",
+            bundles,
+            registeredCameras,
+            elapsed / 1e9,
+            after - before);
+        if (project != null)
+          project.event(
+              "registration_bundle",
+              Json.object(
+                  "cameras",
+                  registeredCameras,
+                  "previous_bundle_cameras",
+                  lastBundle,
+                  "seconds",
+                  elapsed / 1e9,
+                  "retriangulated_tracks",
+                  after - before));
+        lastBundle = registeredCameras;
+      }
       if (project != null)
         project.data.snapshot(
             "registration_" + frames.stream().filter(f -> f.camera.registered).count(),
@@ -173,6 +217,13 @@ final class Geometry {
             features.tracks,
             "seed-camera frame");
     }
+    if (bundles > 0)
+      System.out.printf(
+          Locale.ROOT,
+          "Registration bundles: %d (growth %.4g%%), %.1f s in total%n",
+          bundles,
+          o.registrationBundleGrowth,
+          bundleNanos / 1e9);
     index = null; // released before the bundle adjustment
     long registered = frames.stream().filter(f -> f.camera.registered).count();
     if (registered != frames.size()) {
@@ -215,7 +266,10 @@ final class Geometry {
       boolean changed = false;
       for (ImageFrame frame : frames) {
         if (frame.camera.registered) continue;
-        if (retry == null) retry = new TrackIndex(frames, features.tracks, o);
+        if (retry == null) {
+          retry = new TrackIndex(frames, features.tracks, o);
+          retry.triangulation = triangulation;
+        }
         if (register(frame, retry, o, project)) {
           if (!recovered) triangulateAll(frames, retry, o.reprojection);
           else triangulateNew(frames, retry, frame.id, o.reprojection);
@@ -301,6 +355,9 @@ final class Geometry {
     List<Object> audit = new ArrayList<>();
     // Observations do not change between trials (only points and poses are reset).
     TrackIndex trial = new TrackIndex(frames, features.tracks, o);
+    // Trials share the tracks, so they must not remove observations: they accept the same points
+    // as the real run would but leave the outlier observations in place.
+    trial.triangulation = outlierMode(o) == TRIANGULATE_DROP ? TRIANGULATE_KEEP : TRIANGULATE_STRICT;
     try {
       for (var pair : candidates.subList(0, Math.min(8, candidates.size()))) {
         for (ImageFrame f : frames) {
@@ -402,6 +459,7 @@ final class Geometry {
         FeatureTracks.Track track = index.tracks.get(t);
         if (track.point == null) continue;
         FeatureTracks.Observation observation = observation(track, frame.id);
+        if (observation == null) continue; // dropped as a triangulation outlier
         double[] p = track.point;
         xyz.add(new Point3(p[0], p[1], p[2]));
         uv.add(frame.keypoints[observation.feature].pt);
@@ -519,6 +577,8 @@ final class Geometry {
     final List<FeatureTracks.Track> tracks;
     final int[][] byImage;
     final int[] triangulated;
+    /** TRIANGULATE_* mode used by triangulateNew / triangulateAll. */
+    int triangulation = TRIANGULATE_STRICT;
 
     TrackIndex(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, Options o) {
       this.tracks = tracks;
@@ -578,14 +638,35 @@ final class Geometry {
       List<ImageFrame> frames, TrackIndex index, int image, double maxError) {
     for (int t : index.byImage[image]) {
       FeatureTracks.Track track = index.tracks.get(t);
-      if (track.point == null && triangulateTrack(frames, track, maxError)) index.added(track);
+      if (track.point == null && triangulateTrack(frames, track, maxError, index.triangulation))
+        index.added(track);
     }
   }
 
   /** triangulateTracks over all tracks, keeping the index counts. */
   static void triangulateAll(List<ImageFrame> frames, TrackIndex index, double maxError) {
     for (FeatureTracks.Track track : index.tracks)
-      if (track.point == null && triangulateTrack(frames, track, maxError)) index.added(track);
+      if (track.point == null && triangulateTrack(frames, track, maxError, index.triangulation))
+        index.added(track);
+  }
+
+  static int triangulatedCount(List<FeatureTracks.Track> tracks) {
+    int n = 0;
+    for (FeatureTracks.Track track : tracks) if (track.point != null) n++;
+    return n;
+  }
+
+  /** Every registered observation must reproject within the limit, or the track gets no point. */
+  static final int TRIANGULATE_STRICT = 0;
+  /** Accept the point supported by the most observations; outlier observations stay (trials). */
+  static final int TRIANGULATE_KEEP = 1;
+  /** As KEEP, but the outlier observations of registered images are removed from the track. */
+  static final int TRIANGULATE_DROP = 2;
+  /** Two-view hypotheses tried per track when the widest-baseline pair has outliers. */
+  private static final int TRIANGULATION_TRIALS = 8;
+
+  static int outlierMode(Options o) {
+    return o.triangulationOutliers.equals("drop") ? TRIANGULATE_DROP : TRIANGULATE_STRICT;
   }
 
   static FeatureTracks.Observation observation(FeatureTracks.Track track, int image) {
@@ -602,37 +683,124 @@ final class Geometry {
   /** One track of triangulateTracks (point == null); true when it received a point. */
   static boolean triangulateTrack(
       List<ImageFrame> frames, FeatureTracks.Track track, double maxError) {
-    {
-      FeatureTracks.Observation first = null, second = null;
-      double baseline = 0;
-      for (FeatureTracks.Observation a : track.observations)
-        if (frames.get(a.image).camera.registered)
-          for (FeatureTracks.Observation b : track.observations)
-            if (b.image > a.image && frames.get(b.image).camera.registered) {
-              double distance =
-                  Math3.norm(
-                      Math3.sub(
-                          frames.get(a.image).camera.center(),
-                          frames.get(b.image).camera.center()));
-              if (distance > baseline) {
-                baseline = distance;
-                first = a;
-                second = b;
-              }
+    return triangulateTrack(frames, track, maxError, TRIANGULATE_STRICT);
+  }
+
+  /**
+   * Triangulates from the widest-baseline registered pair. When that point fits every registered
+   * observation it is accepted (all modes give the same result). Otherwise STRICT rejects the
+   * track, while KEEP / DROP try further two-view hypotheses and accept the one supported by the
+   * most observations (at least two); DROP then removes the unsupported registered observations.
+   */
+  static boolean triangulateTrack(
+      List<ImageFrame> frames, FeatureTracks.Track track, double maxError, int mode) {
+    FeatureTracks.Observation first = null, second = null;
+    double baseline = 0;
+    for (FeatureTracks.Observation a : track.observations)
+      if (frames.get(a.image).camera.registered)
+        for (FeatureTracks.Observation b : track.observations)
+          if (b.image > a.image && frames.get(b.image).camera.registered) {
+            double distance =
+                Math3.norm(
+                    Math3.sub(
+                        frames.get(a.image).camera.center(),
+                        frames.get(b.image).camera.center()));
+            if (distance > baseline) {
+              baseline = distance;
+              first = a;
+              second = b;
             }
-      if (first == null) return false;
-      ImageFrame fa = frames.get(first.image), fb = frames.get(second.image);
-      Point ua = FeatureTracks.normalize(fa.camera, fa.keypoints[first.feature].pt),
-          ub = FeatureTracks.normalize(fb.camera, fb.keypoints[second.feature].pt);
-      double[] point = triangulate(fa.camera, fb.camera, ua, ub);
-      if (point != null
-          && baseline / Math.max(1e-9, Math3.norm(Math3.sub(point, fa.camera.center()))) > .002
-          && valid(frames, track, point, maxError)) {
-        track.point = point;
-        return true;
-      }
-      return false;
+          }
+    if (first == null) return false;
+    double[] point = twoView(frames, first, second, baseline);
+    if (point != null && valid(frames, track, point, maxError)) {
+      track.point = point;
+      return true;
     }
+    if (mode == TRIANGULATE_STRICT) return false;
+    return triangulateRobust(frames, track, maxError, mode == TRIANGULATE_DROP);
+  }
+
+  /** The two-view point of a pair, or null when it fails or the ray angle is too small. */
+  private static double[] twoView(
+      List<ImageFrame> frames,
+      FeatureTracks.Observation first,
+      FeatureTracks.Observation second,
+      double baseline) {
+    ImageFrame fa = frames.get(first.image), fb = frames.get(second.image);
+    Point ua = FeatureTracks.normalize(fa.camera, fa.keypoints[first.feature].pt),
+        ub = FeatureTracks.normalize(fb.camera, fb.keypoints[second.feature].pt);
+    double[] point = triangulate(fa.camera, fb.camera, ua, ub);
+    if (point == null
+        || !(baseline / Math.max(1e-9, Math3.norm(Math3.sub(point, fa.camera.center()))) > .002))
+      return null;
+    return point;
+  }
+
+  /**
+   * Deterministic hypothesis search over registered pairs, widest baseline first: pairs that share
+   * no observation with an earlier trial go first (so one bad observation cannot spoil every
+   * trial), then the remaining pairs, at most TRIANGULATION_TRIALS in all.
+   */
+  private static boolean triangulateRobust(
+      List<ImageFrame> frames, FeatureTracks.Track track, double maxError, boolean drop) {
+    List<FeatureTracks.Observation> seen = new ArrayList<>();
+    for (FeatureTracks.Observation ob : track.observations)
+      if (frames.get(ob.image).camera.registered) seen.add(ob);
+    int n = seen.size();
+    if (n < 3) return false; // two observations: the only pair already failed
+    double[][] centers = new double[n][];
+    for (int i = 0; i < n; i++) centers[i] = frames.get(seen.get(i).image).camera.center();
+    List<double[]> pairs = new ArrayList<>(); // {baseline, i, j}, in the same order as the scan
+    for (int i = 0; i < n; i++)
+      for (int j = 0; j < n; j++)
+        if (seen.get(j).image > seen.get(i).image) {
+          double distance = Math3.norm(Math3.sub(centers[i], centers[j]));
+          if (distance > 0) pairs.add(new double[] {distance, i, j});
+        }
+    pairs.sort((x, y) -> Double.compare(y[0], x[0])); // stable: ties keep scan order
+    boolean[] used = new boolean[n], tried = new boolean[pairs.size()];
+    boolean[] best = null, inlier = new boolean[n];
+    double[] bestPoint = null;
+    int bestCount = 1, trials = 0;
+    search:
+    for (int pass = 0; pass < 2; pass++)
+      for (int k = 0; k < pairs.size(); k++) {
+        if (trials >= TRIANGULATION_TRIALS) break search;
+        int i = (int) pairs.get(k)[1], j = (int) pairs.get(k)[2];
+        if (tried[k] || pass == 0 && (used[i] || used[j])) continue;
+        tried[k] = true;
+        used[i] = used[j] = true;
+        trials++;
+        double[] point = twoView(frames, seen.get(i), seen.get(j), pairs.get(k)[0]);
+        if (point == null) continue;
+        int count = 0;
+        for (int m = 0; m < n; m++) {
+          FeatureTracks.Observation ob = seen.get(m);
+          ImageFrame f = frames.get(ob.image);
+          double[] predicted = f.camera.project(point);
+          Point actual = f.keypoints[ob.feature].pt;
+          inlier[m] =
+              predicted != null
+                  && Math.hypot(predicted[0] - actual.x, predicted[1] - actual.y) <= maxError;
+          if (inlier[m]) count++;
+        }
+        if (count > bestCount && inlier[i] && inlier[j]) {
+          bestCount = count;
+          bestPoint = point;
+          best = inlier.clone();
+          if (count == n) break search;
+        }
+      }
+    if (bestPoint == null) return false;
+    if (drop) {
+      // Remove exactly the registered observations outside the accepted hypothesis.
+      IdentityHashMap<FeatureTracks.Observation, Boolean> outliers = new IdentityHashMap<>();
+      for (int m = 0; m < n; m++) if (!best[m]) outliers.put(seen.get(m), Boolean.TRUE);
+      track.observations.removeIf(outliers::containsKey);
+    }
+    track.point = bestPoint;
+    return true;
   }
 
   static double[] triangulate(Camera a, Camera b, Point u, Point v) {

@@ -862,6 +862,8 @@ final class ReuseCache {
                     "trackMinViews",
                     "trackMaxError",
                     "trackMinAngle",
+                    "registrationBundleGrowth",
+                    "triangulationOutliers",
                     "extrinsicsMode",
                     "positionSigma",
                     "rotationSigma",
@@ -912,6 +914,8 @@ final class ReuseCache {
                 "trackMinViews",
                 "trackMaxError",
                 "trackMinAngle",
+                "registrationBundleGrowth",
+                "triangulationOutliers",
                 "rectified"));
     b.append(featureSettings(o));
     for (Path p : paths) {

@@ -129,6 +129,7 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | `--orthomosaic` | off | Full-resolution true orthomosaic. |
 | `--dense-method` | `sgm` | `mvsgm` matches several neighbouring images at once (needs `--fusion-mode image`). |
 | `--block-processing` | `off` | `auto` or `on` splits very large image sets into overlapping blocks. |
+| `--registration-bundle-growth` | `15` | Bundle adjustment during camera registration each time the registered set has grown by this percent; `0` turns it off. |
 | `--tiled-las-output` | `0` | Size of square LAS tiles in output units (for example `1000`); `0` writes one `dense.las`. |
 | `--compute` | `auto` | `cpu` or `gpu` force one. |
 | `--cores` | half the CPUs | CPU threads. |

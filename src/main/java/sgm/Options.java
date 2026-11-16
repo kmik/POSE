@@ -229,6 +229,10 @@ public final class Options {
   public int pyramidLevels = 1, pyramidRadius = 16, cleanupPasses = 1, trackMinViews = 2;
   public double focalSigma = .05, radialSigma = .05, positionSigma = 10, rotationSigma = 10;
   public double trackMaxError = 4, trackMinAngle = .1;
+  /** Joint bundle during incremental registration each time the model grew by this percent. */
+  public double registrationBundleGrowth = 15;
+  /** New sparse points: drop observations that disagree, or reject the whole track. */
+  public String triangulationOutliers = "drop";
   boolean alignmentCalibration, alignmentCalibrationDone;
   public boolean resume, tiled, diskDepth = true;
   public String storage = "standard", compute = "auto";
@@ -848,6 +852,17 @@ public final class Options {
           break;
         case "--track-min-angle":
           o.trackMinAngle = number(v);
+          break;
+        case "--registration-bundle-growth":
+          o.registrationBundleGrowth = number(v);
+          if (!(o.registrationBundleGrowth >= 0) || Double.isInfinite(o.registrationBundleGrowth))
+            throw new IllegalArgumentException(
+                "--registration-bundle-growth must be a percentage >= 0 (0 disables)");
+          break;
+        case "--triangulation-outliers":
+          if (!v.equals("drop") && !v.equals("reject"))
+            throw new IllegalArgumentException("--triangulation-outliers requires drop|reject");
+          o.triangulationOutliers = v;
           break;
         case "--rerun-from":
           o.rerunFrom = v.toLowerCase(Locale.ROOT);
@@ -3233,6 +3248,15 @@ Additional workflow controls:
       Sparse observation cleanup threshold in processed alignment pixels (default: 4).
   --track-min-angle N
       Minimum sparse triangulation angle, degrees (default: 0.1; 0 <= N < 90).
+  --registration-bundle-growth PCT
+      During incremental camera registration, run a joint bundle adjustment (poses and
+      points) each time the number of registered cameras has grown by PCT percent since
+      the previous one, then re-triangulate tracks that had failed (default: 15; 0 disables).
+      Limits drift on large sets; smaller values cost more time.
+  --triangulation-outliers drop|reject
+      When a new sparse point disagrees with some of its registered observations: drop
+      those observations and keep the point supported by the most views (drop, default),
+      or reject the whole track as before (reject).
   --tiled
       Use bounded disk-backed cost-volume tiles with continuous global SGM paths.
       Avoids full disparity-volume heap allocation; requires temporary disk space.
