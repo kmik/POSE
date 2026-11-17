@@ -52,6 +52,35 @@ final class ReportSurvey {
     }
     if (!first.isEmpty()) camera.put("resolution", new Object[] {first.get("width"), first.get("height")});
     camera.put("groups", groups.size());
+    // Several cameras (camera groups): one calibration per camera, named, from cameras.json.
+    Map<String, String> imageCamera = new HashMap<>();
+    Map<String, Object> cameraGroups = ProcessingReport.map(run.resolve("01_calibration/cameras.json"));
+    List<Object> cameraList = list(cameraGroups.get("cameras"));
+    if (cameraList.size() > 1) {
+      List<Object> named = new ArrayList<>();
+      for (Object item : cameraList) {
+        var g = ProcessingReport.object(item);
+        var c = ProcessingReport.object(g.get("calibration"));
+        if (c.isEmpty()) continue;
+        Map<String, Object> entry = new LinkedHashMap<>(c);
+        entry.put("camera", g.get("id"));
+        entry.put("label", g.get("label"));
+        entry.put("images", g.get("images"));
+        entry.put("policy", g.get("policy"));
+        entry.put("initialization", g.get("initialization"));
+        named.add(entry);
+        for (Object image : list(g.get("image_names"))) imageCamera.put(String.valueOf(image), String.valueOf(g.get("id")));
+      }
+      groups = named;
+      camera.put("groups", named.size());
+      camera.put("model", named.size() + " cameras");
+      s.put("image_cameras", imageCamera);
+      // The lens refinement in alignment: which cameras stayed at their calibration and why.
+      List<Object> lens = new ArrayList<>();
+      for (Object item : list(ProcessingReport.map(geometry.resolve("bundle/shared_calibration.json")).get("cameras")))
+        lens.add(item);
+      if (!lens.isEmpty()) s.put("camera_lens_refinement", lens);
+    }
     s.put("camera", camera);
     s.put("calibrations", groups);
 
@@ -71,6 +100,19 @@ final class ReportSurvey {
     if (images > 0) {
       s.put("images", images);
       s.put("aligned", centres.size());
+    }
+    if (!imageCamera.isEmpty()) {
+      // Registered images per camera.
+      Map<String, int[]> perCamera = new LinkedHashMap<>();
+      for (var e : names.entrySet()) {
+        int[] counts = perCamera.computeIfAbsent(imageCamera.getOrDefault(e.getValue(), "?"), k -> new int[2]);
+        counts[0]++;
+        if (centres.containsKey(e.getKey())) counts[1]++;
+      }
+      List<Object> rows = new ArrayList<>();
+      for (var e : perCamera.entrySet())
+        rows.add(Json.object("camera", e.getKey(), "images", e.getValue()[0], "aligned", e.getValue()[1]));
+      s.put("camera_registration", rows);
     }
 
     // Tie points, projections, reprojection error and the image residual grid.
@@ -173,6 +215,7 @@ final class ReportSurvey {
       s.put("gps_model", gps.get("gps_model"));
       s.put("rolling_shutter", gps.get("rolling_shutter"));
       s.put("gps_intrinsics", gps.get("intrinsics"));
+      if (gps.get("camera_groups") != null) s.put("gps_cameras", gps.get("camera_groups"));
       s.put("gps_position_sigma", gps.get("position_sigma_metres"));
       s.put("gps_height_sigma", gps.get("height_sigma_metres"));
       List<Object> rows = new ArrayList<>();
@@ -183,11 +226,13 @@ final class ReportSurvey {
         if (r == null || r.length < 3) continue;
         int id = (int) num(c.get("image_id"));
         double[] xyz = centres.get(id);
-        rows.add(
+        Map<String, Object> row =
             Json.object(
                 "image", names.getOrDefault(id, "" + id),
                 "position", xyz,
-                "error", r));
+                "error", r);
+        if (!imageCamera.isEmpty()) row.put("camera", imageCamera.get(names.getOrDefault(id, "" + id)));
+        rows.add(row);
         sums[0] += r[0] * r[0];
         sums[1] += r[1] * r[1];
         sums[2] += r[2] * r[2];

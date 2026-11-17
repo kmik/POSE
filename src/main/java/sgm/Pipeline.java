@@ -126,6 +126,8 @@ final class Pipeline {
     }
     state.mark(step, outcome, outcome.equals("waiting") ? state.string(step.name + "_waiting") : step.description);
     if (!outcome.equals("waiting")) state.snapshot(step);
+    // The step's workers freed their native buffers; give glibc's cached pages back (Linux).
+    NativeMemory.trim("after the " + step.name + " step");
   }
 
   /**
@@ -330,6 +332,12 @@ final class Pipeline {
     @SuppressWarnings("unchecked")
     Map<String, Calibration> perImage = (Map<String, Calibration>) saved[1];
     if (!perImage.isEmpty()) options.orientationCalibrations = perImage;
+    // A run made before camera groups existed holds one camera.
+    CameraGroups groups = (CameraGroups) saved[2];
+    if (groups == null)
+      groups =
+          CameraGroups.legacy(paths.stream().map(p -> p.getFileName().toString()).toList(), calibration);
+    options.cameraGroups = groups;
     Map<String, Camera> poses = state.readPoses("calibration_poses.bin");
     if (!poses.isEmpty()) options.calibrationPoses = poses;
   }
@@ -346,8 +354,20 @@ final class Pipeline {
   }
 
   private void saveFrames() throws IOException {
+    CameraGroups groups = options.cameraGroups;
+    if (groups != null && groups.multiple()) {
+      // Every image keeps its own camera's calibration, also after an adjustment refitted lenses,
+      // so frames rebuilt later (dense step) never see a stale or another camera's calibration.
+      Map<String, Calibration> updated = new LinkedHashMap<>();
+      for (ImageFrame f : frames) updated.put(f.path.getFileName().toString(), f.calibration);
+      options.orientationCalibrations = updated;
+    }
+    if (groups != null) {
+      groups.refresh(frames);
+      groups.export(options, options.output);
+    }
     state.writeFrames(frames);
-    state.writeCalibrations("calibration.bin", calibration, options.orientationCalibrations);
+    state.writeCalibrations("calibration.bin", calibration, options.orientationCalibrations, groups);
     state.writePoses("calibration_poses.bin", options.calibrationPoses);
   }
 
@@ -386,6 +406,11 @@ final class Pipeline {
     OrientationIO.prepare(options, paths);
     // Input provenance hashes for images.csv, in the background while calibration decodes.
     if (project != null) project.data.hashSources(paths);
+    CameraGroups groups =
+        CameraGroups.resolve(options, paths, options.importedCameraIds, options.importedPixelSizes);
+    options.cameraGroups = groups;
+    groups.checkImported(options);
+    if (groups.multiple()) return calibrateCameras(groups);
     int[] first = ResolutionPlan.originalSize(paths.get(0));
     calibration = ReuseCache.calibration(paths, options, null);
     if (calibration == null) {
@@ -432,6 +457,219 @@ final class Pipeline {
             "note",
             "Fixed parameters remain exact; prior uncertainties are assumptions, not measured"
                 + " accuracy. Rejected guarded fits retain supplied calibration."));
+    CameraGroups.Group camera = groups.get(0);
+    camera.supplied = options.calibration != null;
+    camera.initialization =
+        options.calibration != null
+            ? "supplied"
+            : !Double.isNaN(options.focal) ? "focal_and_sensor_width" : "automatic";
+    return framesAndSettings();
+  }
+
+  /**
+   * Interior orientation of every camera group (two or more cameras), each in its own source
+   * pixels. Per camera, the first source that applies: imported orientation, --calibration
+   * CAMERA=FILE, --focal/--s_w (CAMERA= or plain), then automatic: the focal bootstrap from image
+   * pairs, or for a camera with fewer than {@link #BOOTSTRAP_MIN_IMAGES} images its EXIF/XMP
+   * focal. The guarded bootstrap refinement follows as for one camera. Working files of each
+   * camera: 01_calibration/cameras/ID/.
+   */
+  /**
+   * The calibration of one camera from --calibration CAMERA=FILE, in any supported format
+   * (--calibration-format, default auto): POSE camera.txt or the 14-number calib.result, or a
+   * foreign file (OpenCV, Metashape, MicMac, COLMAP, INPHO, ...). The file must describe one
+   * camera: its image-less (shared) calibration, else the calibration of this camera's images in
+   * it, else its only calibration. A file with several different ones is an error.
+   */
+  static Calibration cameraFile(Path file, CameraGroups.Group g, List<Path> members, Options go)
+      throws IOException {
+    Map<String, int[]> sizes = new LinkedHashMap<>();
+    for (Path p : members) sizes.put(p.getFileName().toString(), new int[] {g.width, g.height});
+    // A one-camera INPHO file: --orientation-pixel-size CAMERA=MM of this camera applies.
+    Double pixel = go.orientationPixelSizes.get(g.id);
+    if (pixel != null) go.orientationPixelSize = pixel;
+    OrientationIO.Model m = OrientationIO.read(file, go.calibrationFormat, sizes, go);
+    List<Calibration> found = new ArrayList<>();
+    OrientationIO.View shared = m.views.get("*");
+    if (shared != null && shared.calibration() != null) found.add(shared.calibration());
+    else {
+      for (var e : m.views.entrySet())
+        if (sizes.containsKey(e.getKey()) && e.getValue().calibration() != null) found.add(e.getValue().calibration());
+      if (found.isEmpty())
+        for (OrientationIO.View v : m.views.values()) if (v.calibration() != null) found.add(v.calibration());
+    }
+    List<Calibration> distinct = new ArrayList<>();
+    for (Calibration c : found) if (distinct.stream().noneMatch(d -> sameCalibration(c, d))) distinct.add(c);
+    if (distinct.isEmpty())
+      throw new IllegalArgumentException("--calibration " + g.id + "=" + file + ": no interior orientation in the file");
+    if (distinct.size() > 1)
+      throw new IllegalArgumentException(
+          "--calibration " + g.id + "=" + file + " holds " + distinct.size() + " different calibrations;"
+              + " give a file of this camera only, or the whole file with --orientation-input"
+              + " (its camera IDs then name the cameras)");
+    return distinct.getFirst();
+  }
+
+  private static boolean sameCalibration(Calibration a, Calibration b) {
+    return a.fx == b.fx && a.fy == b.fy && a.cx == b.cx && a.cy == b.cy && a.width == b.width
+        && a.height == b.height && Arrays.equals(a.distortion, b.distortion);
+  }
+
+  private String calibrateCameras(CameraGroups groups) throws IOException {
+    if (options.calibration != null && options.importedCalibrations.isEmpty())
+      throw new IllegalArgumentException(
+          "--calibration FILE describes one camera, but the images come from "
+              + groups.size()
+              + " cameras "
+              + groups.groups.stream().map(g -> g.id + " (" + g.label + ")").toList()
+              + ": give each its own file with --calibration CAMERA=FILE");
+    Map<String, Calibration> perImage = new LinkedHashMap<>();
+    Map<String, Camera> seedPoses = Map.of();
+    int seedPoseCount = 0;
+    boolean joint = options.calibrationPipeline.equals("joint");
+    List<Object> summary = new ArrayList<>();
+    for (CameraGroups.Group g : groups.groups) {
+      List<Path> members = new ArrayList<>();
+      for (Path p : paths) if (groups.index(p) == groups.groups.indexOf(g)) members.add(p);
+      String policy = CameraGroups.policy(g, options);
+      Path dir = options.output.resolve("01_calibration/cameras/" + CameraGroups.safe(g.id));
+      Files.createDirectories(dir);
+      Options go = options.copy();
+      go.output = dir;
+      go.calibration = null;
+      go.focal = Double.NaN;
+      go.sensorWidth = Double.NaN;
+      go.orientationCalibrations = Map.of();
+      go.calibrationPoses = Map.of();
+      // The camera's own images are calibrated as a one-camera block.
+      go.cameraGroups = new CameraGroups(List.of(g));
+      go.intrinsicsMode = policy.equals("free") ? options.intrinsicsMode : policy;
+      boolean imported =
+          !policy.equals("free")
+              && members.stream()
+                  .allMatch(p -> options.importedCalibrations.containsKey(p.getFileName().toString()));
+      Path file = options.calibrationFiles.get(g.id);
+      double focal = options.focalByCamera.getOrDefault(g.id, options.focal),
+          sensor = options.sensorWidthByCamera.getOrDefault(g.id, options.sensorWidth);
+      Calibration c;
+      if (imported) {
+        for (Path p : members) {
+          String name = p.getFileName().toString();
+          perImage.put(name, options.importedCalibrations.get(name).atSize(g.width, g.height));
+        }
+        c = perImage.get(members.getFirst().getFileName().toString());
+        // Marks the camera as supplied for the guarded refinement and the bundle priors.
+        go.calibration = options.calibration;
+        g.supplied = true;
+        g.initialization = "imported";
+      } else if (file != null) {
+        go.calibration = file;
+        c = cameraFile(file, g, members, go).atSize(g.width, g.height);
+        g.supplied = true;
+        g.initialization = "supplied_file";
+      } else if (!Double.isNaN(focal)) {
+        go.focal = focal;
+        go.sensorWidth = sensor;
+        c = Calibration.load(go, g.width, g.height);
+        g.initialization = "focal_and_sensor_width";
+      } else if (members.size() >= BOOTSTRAP_MIN_IMAGES) {
+        c = AutomaticCalibration.estimate(go, members, g.width, g.height, null);
+        g.initialization = "automatic";
+      } else {
+        c = exifCalibration(g, members);
+        g.initialization = "exif_prior_small_camera";
+      }
+      if (!imported && !g.supplied && !Double.isNaN(go.focal) && !joint)
+        c = SelfCalibration.refine(c, members, go, null);
+      if (g.supplied && !policy.equals("fixed") && !joint)
+        c = SelfCalibration.refine(c, members, go, null);
+      g.calibration = c;
+      if (!imported) for (Path p : members) perImage.put(p.getFileName().toString(), c);
+      // Bootstrap poses seed alignment; poses of different cameras are in different frames, so
+      // only one camera's (the one with most of them) are kept.
+      if (go.calibrationPoses.size() > seedPoseCount) {
+        seedPoses = go.calibrationPoses;
+        seedPoseCount = seedPoses.size();
+      }
+      c.write(dir.resolve("camera.txt"), "Camera " + g.id + " initial calibration (" + g.initialization + ")");
+      summary.add(
+          Json.object(
+              "camera", g.id, "label", g.label, "images", members.size(), "policy", policy,
+              "initialization", g.initialization, "focal_pixels", c.fx, "distortion", c.distortion,
+              "width", c.width, "height", c.height));
+      System.out.printf(
+          Locale.ROOT,
+          "Camera %s (%s): %d images, %s, f=%.3f px%n",
+          g.id,
+          g.label,
+          members.size(),
+          g.initialization,
+          c.fx);
+    }
+    options.orientationCalibrations = perImage;
+    options.calibrationPoses = seedPoses;
+    calibration = groups.get(0).calibration;
+    calibration.write(
+        options.output.resolve("camera.txt"),
+        "Applied calibration of camera " + groups.get(0).id + " (first image); "
+            + groups.size() + " cameras: see 01_calibration/cameras.json");
+    Path constraints = options.output.resolve("01_calibration/constraints.json");
+    Json.write(
+        constraints,
+        Json.object(
+            "mode", "camera_groups",
+            "refined_parameters", options.refineIntrinsics,
+            "focal_relative_sigma", options.focalSigma,
+            "radial_coefficient_sigma", options.radialSigma,
+            "supplied_file", options.calibration == null ? null : options.calibration.toString(),
+            "applied_focal", calibration.fx,
+            "applied_distortion", calibration.distortion,
+            "camera_groups", "01_calibration/cameras.json",
+            "cameras", summary,
+            "note",
+            "Several cameras: applied_* describe the first image's camera. Fixed parameters remain"
+                + " exact; prior uncertainties are assumptions, not measured accuracy."));
+    return framesAndSettings();
+  }
+
+  static final int BOOTSTRAP_MIN_IMAGES = 3;
+
+  /** A small camera's start: EXIF 35 mm equivalent, else the DJI XMP calibrated focal. */
+  private static Calibration exifCalibration(CameraGroups.Group g, List<Path> members) throws IOException {
+    List<Double> equivalent = new ArrayList<>(), xmp = new ArrayList<>();
+    for (Path p : members) {
+      Exif.Metadata m = Exif.read(p);
+      if (m.focal35Mm > 0) equivalent.add(m.focal35Mm / Math.hypot(36, 24) * Math.hypot(g.width, g.height));
+      if (m.calibratedFocal > 0) xmp.add(m.calibratedFocal);
+    }
+    double f = !equivalent.isEmpty() ? median(equivalent) : !xmp.isEmpty() ? median(xmp) : Double.NaN;
+    if (!(f > 0))
+      throw new IllegalArgumentException(
+          "Camera "
+              + g.id
+              + " ("
+              + g.label
+              + ") has "
+              + members.size()
+              + " image(s): too few for automatic calibration, and no EXIF 35 mm focal length. Supply"
+              + " --calibration "
+              + g.id
+              + "=FILE, or --focal "
+              + g.id
+              + "=MM --s_w "
+              + g.id
+              + "=MM");
+    return new Calibration(f, f, (g.width - 1) / 2., (g.height - 1) / 2., new double[5], g.width, g.height);
+  }
+
+  private static double median(List<Double> values) {
+    List<Double> v = new ArrayList<>(values);
+    Collections.sort(v);
+    return v.get(v.size() / 2);
+  }
+
+  /** Alignment frames, run settings and inventory once the calibrations are known. */
+  private String framesAndSettings() throws IOException {
     Options alignment = alignment();
     for (Path path : paths) frames.add(new ImageFrame(frames.size(), path, calibration, alignment, true));
     writeSettings();
@@ -938,6 +1176,25 @@ final class Pipeline {
       if (features.pairs.isEmpty())
         throw new IllegalArgumentException(
             "No stereo pairs satisfy the enabled overlap thresholds; inspect overlap_dense.json");
+    }
+    if (!options.denseMethod.equals("mvsgm")) {
+      // Two-view rectification works on one image size; pairs of two cameras whose processed sizes
+      // differ are left out (each camera still pairs with itself; mvsgm uses every camera).
+      int before = features.pairs.size();
+      features.pairs.removeIf(
+          p -> frames.get(p.a).width != frames.get(p.b).width || frames.get(p.a).height != frames.get(p.b).height);
+      if (features.pairs.size() < before)
+        System.out.println(
+            "Dense pairs: "
+                + (before - features.pairs.size())
+                + " of "
+                + before
+                + " pairs join cameras of different image sizes and are left out of two-view stereo"
+                + " (--dense-method mvsgm uses them)");
+      if (features.pairs.isEmpty())
+        throw new IllegalArgumentException(
+            "No dense pair joins two images of the same size; with cameras of different image sizes use"
+                + " --dense-method mvsgm");
     }
     DenseReconstruction dense = new DenseReconstruction(options, frames, project, crs, features.tracks);
     long points = dense.run(features.pairs);

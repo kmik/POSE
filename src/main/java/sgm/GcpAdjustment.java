@@ -125,14 +125,18 @@ final class GcpAdjustment {
         report.put("gps_offset_to_gcp_datum_metres", total);
       } else {
         SharedCalibration lens = null;
-        boolean shared = true;
-        for (ImageFrame f : frames) shared &= SharedCalibration.same(frames.get(0).calibration, f.calibration);
-        if (shared && !o.rectified && !(o.calibration != null && o.intrinsicsMode.equals("fixed")) && !o.gpsIntrinsics.equals("none")) {
+        // One lens block per camera group; a camera whose supplied calibration is fixed keeps it.
+        int groups = SharedCalibration.groupCount(o);
+        boolean shared = SharedCalibration.homogeneous(frames), any = false;
+        for (int g = 0; g < groups; g++) any |= SharedCalibration.refinable(o, g);
+        if (shared && !o.rectified && any && !o.gpsIntrinsics.equals("none")) {
           lens = new SharedCalibration(frames);
-          for (String name : o.gpsIntrinsics.split(",")) {
-            int k = Arrays.asList(SharedCalibration.NAMES).indexOf(name.trim());
-            if (k >= 0) lens.active[k] = true;
-          }
+          for (int g = 0; g < groups; g++)
+            if (SharedCalibration.refinable(o, g))
+              for (String name : o.gpsIntrinsics.split(",")) {
+                int k = Arrays.asList(SharedCalibration.NAMES).indexOf(name.trim());
+                if (k >= 0) lens.active[g * SharedCalibration.SIZE + k] = true;
+              }
         }
         int anchor = -1, second = -1;
         for (ImageFrame f : frames)
@@ -143,7 +147,8 @@ final class GcpAdjustment {
         BundleAdjuster.optimizeImpl(frames, all, Math.max(o.iterations, 20), o.reprojection, null, anchor, second, lens);
         if (lens != null && lens.physical()) {
           Calibration result = lens.calibration();
-          for (ImageFrame f : frames) f.applyCalibration(result);
+          if (groups == 1) for (ImageFrame f : frames) f.applyCalibration(result);
+          else for (ImageFrame f : frames) f.applyCalibration(lens.calibration(f.group));
         }
         adjustment = "bundle adjustment with GCP priors" + (lens == null ? "" : " and shared lens " + String.join(",", lens.parameters()));
       }

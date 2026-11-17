@@ -13,7 +13,9 @@ final class OrientationJson {
     if (Files.isDirectory(path))
       path = path.resolve(format.equals("openmvg") ? "sfm_data.json" : "reconstruction.json");
     Object root = JsonRead.read(path);
-    return format.equals("openmvg") ? openmvg(JsonRead.object(root), o) : opensfm(root, o);
+    return format.equals("openmvg")
+        ? openmvg(JsonRead.object(root), o, sidecar(path.toAbsolutePath().getParent()))
+        : opensfm(root, o);
   }
 
   private static double get(Map<String, Object> m, String name, double fallback) {
@@ -64,7 +66,8 @@ final class OrientationJson {
               c,
               pose(
                   Math3.rotation(JsonRead.numbers(shot.get("rotation"))),
-                  JsonRead.numbers(shot.get("translation")))));
+                  JsonRead.numbers(shot.get("translation"))),
+              cameraId(shot.get("camera").toString())));
     }
     model.notes.add(
         "OpenSfM component "
@@ -81,7 +84,7 @@ final class OrientationJson {
     return v;
   }
 
-  private static Model openmvg(Map<String, Object> root, Options o) {
+  private static Model openmvg(Map<String, Object> root, Options o, Map<String, String> groups) {
     Model model = new Model();
     Map<Integer, Calibration> cameras = new HashMap<>();
     Map<Integer, Camera> poses = new HashMap<>();
@@ -134,7 +137,8 @@ final class OrientationJson {
               name,
               Objects.requireNonNull(
                   cameras.get((int) num(v, "id_intrinsic")), "Unknown OpenMVG intrinsic"),
-              pose));
+              pose,
+              groups.getOrDefault(name(name), "openmvg_intrinsic_" + (int) num(v, "id_intrinsic"))));
     }
     return model;
   }
@@ -162,9 +166,13 @@ final class OrientationJson {
     if (format.equals("opensfm")) {
       Map<String, Object> cameras = new LinkedHashMap<>(), shots = new LinkedHashMap<>();
       int index = 0;
+      boolean grouped = m.grouped();
+      Map<String, String> entryOf = new HashMap<>();
+      if (grouped)
+        for (var e : cameras(m).entrySet()) for (View v : e.getValue()) entryOf.put(v.image(), e.getKey());
       for (View v : m.views.values()) {
         Calibration c = Objects.requireNonNull(v.calibration());
-        String id = "camera_" + (index++);
+        String id = grouped ? entryOf.get(v.image()) : "camera_" + (index++);
         double scale = Math.max(c.width, c.height);
         cameras.put(
             id,
@@ -214,6 +222,16 @@ final class OrientationJson {
           cameras = new ArrayList<>(),
           poses = new ArrayList<>();
       int id = 0;
+      boolean grouped = m.grouped();
+      Map<String, Integer> intrinsicOf = new HashMap<>();
+      Set<Integer> written = new HashSet<>();
+      if (grouped) {
+        int k = 0;
+        for (var e : cameras(m).entrySet()) {
+          for (View v : e.getValue()) intrinsicOf.put(v.image(), k);
+          k++;
+        }
+      }
       for (View v : m.views.values()) {
         Calibration c = Objects.requireNonNull(v.calibration());
         if (c.fx != c.fy) loss(m, o, "OpenMVG pinhole export has one focal; fx/fy averaged");
@@ -235,10 +253,12 @@ final class OrientationJson {
                   c.distortion[2],
                   c.distortion[3]
                 });
+        int intrinsic = grouped ? intrinsicOf.get(v.image()) : id;
+        if (!grouped || written.add(intrinsic))
         cameras.add(
             Json.object(
                 "key",
-                id,
+                intrinsic,
                 "value",
                 Json.object(
                     "polymorphic_id",
@@ -246,7 +266,7 @@ final class OrientationJson {
                     "polymorphic_name",
                     "pinhole_brown_t2",
                     "ptr_wrapper",
-                    Json.object("id", 2L * id + 2147483650L, "data", data))));
+                    Json.object("id", 2L * intrinsic + 2147483650L, "data", data))));
         views.add(
             Json.object(
                 "key",
@@ -272,7 +292,7 @@ final class OrientationJson {
                             "id_view",
                             id,
                             "id_intrinsic",
-                            id,
+                            intrinsic,
                             "id_pose",
                             id)))));
         if (v.pose() != null)

@@ -89,7 +89,7 @@ public final class Main {
     Path run = root.resolve("runs").resolve(id);
     if (!PipelineState.exists(run))
       throw new IllegalArgumentException("Run " + id + " has no saved pipeline state; start with the inputs step");
-    List<String> all = new ArrayList<>(PipelineState.load(run).arguments());
+    List<String> all = new ArrayList<>(Options.legacyQuickCalibration(PipelineState.load(run).arguments()));
     all.addAll(Arrays.asList(c.rest()));
     return all.toArray(String[]::new);
   }
@@ -146,6 +146,12 @@ public final class Main {
     try {
       String[] effective = fresh && !c.branch() ? c.rest() : continued(c);
       Options options = Options.parse(effective);
+      // A new run saves its quick-calibration choice, so that saved arguments without one are
+      // known to come from a run made before quick calibration became the default.
+      if (fresh && !c.branch() && !Options.namesQuickCalibration(Arrays.asList(effective))) {
+        effective = Arrays.copyOf(effective, effective.length + 1);
+        effective[effective.length - 1] = options.quickCalibrationArgument();
+      }
       if (options.help) {
         System.out.print(Options.help(options.helpTopic));
         return 0;

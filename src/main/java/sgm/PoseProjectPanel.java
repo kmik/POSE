@@ -271,6 +271,35 @@ final class PoseProjectPanel {
     return s.toString();
   }
 
+  /** Camera groups of a run: {ID, "label; N images; f px; initialization, policy"}; empty if unknown. */
+  static List<String[]> cameraGroups(java.nio.file.Path run) {
+    List<String[]> rows = new java.util.ArrayList<>();
+    java.nio.file.Path file = run == null ? null : run.resolve("01_calibration/cameras.json");
+    if (file == null || !java.nio.file.Files.isRegularFile(file)) return rows;
+    try {
+      for (Object item : JsonRead.array(JsonRead.object(JsonRead.read(file)).get("cameras"))) {
+        var g = JsonRead.object(item);
+        var c = g.get("calibration") == null ? null : JsonRead.object(g.get("calibration"));
+        rows.add(
+            new String[] {
+              String.valueOf(g.get("id")),
+              g.get("label")
+                  + "; "
+                  + ((Number) g.get("images")).intValue()
+                  + " images"
+                  + (c == null ? "" : String.format(java.util.Locale.ROOT, "; f %.1f px", JsonRead.number(c.get("fx"))))
+                  + "; "
+                  + String.valueOf(g.get("initialization")).replace('_', ' ')
+                  + ", "
+                  + g.get("policy")
+            });
+      }
+    } catch (java.io.IOException | RuntimeException e) {
+      rows.clear();
+    }
+    return rows;
+  }
+
   static String summaryHtml(ProjectFiles.Run r) {
     StringBuilder h = new StringBuilder("<html><body style='font-family:sans-serif'>");
     h.append("<b>Run ").append(GuiOptions.escape(r.id())).append("</b> - ").append(r.status()).append("<br>");
@@ -281,6 +310,14 @@ final class PoseProjectPanel {
       h.append("<table>");
       for (String[] row : r.summary()) h.append("<tr><td>").append(GuiOptions.escape(row[0])).append("</td><td><b>").append(GuiOptions.escape(row[1])).append("</b></td></tr>");
       h.append("</table>");
+    }
+    List<String[]> cameras = cameraGroups(r.dir());
+    if (!cameras.isEmpty()) {
+      // Read-only: the camera groups of this run (01_calibration/cameras.json).
+      h.append("<p><b>Cameras</b><table>");
+      for (String[] c : cameras)
+        h.append("<tr><td>").append(GuiOptions.escape(c[0])).append("</td><td>").append(GuiOptions.escape(c[1])).append("</td></tr>");
+      h.append("</table></p>");
     }
     h.append("<p><b>Quality flags</b>");
     if (r.flags().isEmpty()) h.append(r.summary().isEmpty() ? "<br>-" : "<br>None.");

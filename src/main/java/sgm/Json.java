@@ -62,6 +62,11 @@ final class Json {
       out.append('}');
       return;
     }
+    // A Path is Iterable over its name elements; write it as its text.
+    if (value instanceof Path) {
+      quote(out, value.toString());
+      return;
+    }
     if (value instanceof Iterable) {
       out.append('[');
       boolean first = true;

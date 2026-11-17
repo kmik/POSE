@@ -214,7 +214,11 @@ final class SelfCalibrationRegression {
               "8",
               "--cores",
               "1",
-              "--no-gps"
+              "--no-gps",
+              // This run covers the bootstrap path (its seed orientation is checked below);
+              // quick calibration is the default since 2026-11-17.
+              "--quick-calibration",
+              "off"
             });
     check(
         status == 0,

@@ -19,6 +19,8 @@ final class ImageFrame implements AutoCloseable {
   final int sourceWidth, sourceHeight;
   final Options options;
   Calibration calibration;
+  /** Camera group (options.cameraGroups); 0 with one camera. */
+  final int group;
 
   final int width, height;
   final boolean managedRasters;
@@ -43,9 +45,28 @@ final class ImageFrame implements AutoCloseable {
     this.path = path;
     this.options = options;
     this.managedRasters = managed;
+    group = options.cameraGroups == null ? 0 : options.cameraGroups.index(path);
     int[] size = ResolutionPlan.originalSize(path);
     sourceWidth = size[0];
     sourceHeight = size[1];
+    // With several cameras every calibration is in its own camera's source pixels. A calibration
+    // made for another image size would otherwise be rescaled to this one without any error.
+    if (options.cameraGroups != null
+        && options.cameraGroups.multiple()
+        && (calibration.width != sourceWidth || calibration.height != sourceHeight))
+      throw new IllegalArgumentException(
+          path.getFileName()
+              + " is "
+              + sourceWidth
+              + "x"
+              + sourceHeight
+              + " pixels but was given a calibration for "
+              + calibration.width
+              + "x"
+              + calibration.height
+              + " (camera "
+              + options.cameraGroups.get(group).id
+              + "); each camera needs its own calibration");
     bigTiff = BigTiffWindows.isBig(path);
     int[] processed = options.processedSize(sourceWidth, sourceHeight);
     width = processed[0];

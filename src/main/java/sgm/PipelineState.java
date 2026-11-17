@@ -407,7 +407,8 @@ final class PipelineState {
     return new Calibration(fx, fy, cx, cy, d, in.readInt(), in.readInt());
   }
 
-  void writeCalibrations(String name, Calibration main, Map<String, Calibration> perImage)
+  void writeCalibrations(
+      String name, Calibration main, Map<String, Calibration> perImage, CameraGroups groups)
       throws IOException {
     Path temp = directory.resolve(name + ".part");
     try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(temp)))) {
@@ -418,20 +419,23 @@ final class PipelineState {
         out.writeUTF(e.getKey());
         writeCalibration(out, e.getValue());
       }
+      // Camera groups follow as a trailer; runs made before them end here (one camera).
+      if (groups != null) groups.write(out);
     }
     CloudWriter.publish(temp, directory.resolve(name));
   }
 
-  /** {main calibration or null, per-image map}. */
+  /** {main calibration or null, per-image map, camera groups or null (older run)}. */
   Object[] readCalibrations(String name) throws IOException {
     Path file = directory.resolve(name);
-    if (!Files.isRegularFile(file)) return new Object[] {null, new LinkedHashMap<String, Calibration>()};
+    if (!Files.isRegularFile(file))
+      return new Object[] {null, new LinkedHashMap<String, Calibration>(), null};
     try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(file)))) {
       Calibration main = in.readBoolean() ? readCalibration(in) : null;
       Map<String, Calibration> map = new LinkedHashMap<>();
       int n = in.readInt();
       for (int i = 0; i < n; i++) map.put(in.readUTF(), readCalibration(in));
-      return new Object[] {main, map};
+      return new Object[] {main, map, CameraGroups.read(in)};
     }
   }
 

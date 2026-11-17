@@ -295,6 +295,152 @@ final class Orthomosaic {
       for (byte k : kind) if ((k & SOFT) != 0) soft++;
     }
 
+    /**
+     * The surface of a classic orthophoto (--orthomosaic-mode classic), in place of finish():
+     * despiked (median of the known cells in a 5 x 5 window), every unknown cell interpolated
+     * (push-pull over a pyramid: averages of the known cells, blended back down bilinearly, so a
+     * gap gets a smooth surface from its whole rim) and the whole surface smoothed (three box
+     * passes of the given radius in cells, about a Gaussian). Nothing stays unknown; the camera
+     * footprints bound the painted area. Interpolated cells are FILLED. Deterministic.
+     */
+    void finishClassic(int radius, int workers) {
+      kind = new byte[z.length];
+      long before = 0;
+      for (float v : z) if (!Float.isNaN(v)) before++;
+      if (before > 0) {
+        for (int p = 0; p < z.length; p++) if (Float.isNaN(z[p])) kind[p] = FILLED;
+        despike(workers);
+        pushPull();
+        for (int pass = 0; pass < 3 && radius > 0; pass++) {
+          blurRows(radius, workers);
+          blurColumns(radius, workers);
+        }
+        filled = z.length - before;
+      }
+      known = 0;
+      top = Float.NEGATIVE_INFINITY;
+      bottom = Float.POSITIVE_INFINITY;
+      for (float v : z)
+        if (!Float.isNaN(v)) {
+          known++;
+          top = Math.max(top, v);
+          bottom = Math.min(bottom, v);
+        }
+      soft = 0;
+    }
+
+    /** Median of the known cells in the 5 x 5 window of each known cell. */
+    private void despike(int workers) {
+      float[] out = z.clone();
+      Parallel.forEach(h, workers, y -> {
+        float[] window = new float[25];
+        for (int x = 0; x < w; x++) {
+          if (Float.isNaN(z[y * w + x])) continue;
+          int n = 0;
+          for (int yy = Math.max(0, y - 2); yy <= Math.min(h - 1, y + 2); yy++)
+            for (int xx = Math.max(0, x - 2); xx <= Math.min(w - 1, x + 2); xx++) {
+              float v = z[yy * w + xx];
+              if (!Float.isNaN(v)) window[n++] = v;
+            }
+          Arrays.sort(window, 0, n);
+          out[y * w + x] = n % 2 == 1 ? window[n / 2] : .5f * (window[n / 2 - 1] + window[n / 2]);
+        }
+      });
+      System.arraycopy(out, 0, z, 0, z.length);
+    }
+
+    /** Fills the unknown cells: push (weighted 2 x 2 averages up to one cell), pull (bilinear back down). */
+    private void pushPull() {
+      List<float[]> values = new ArrayList<>(), weights = new ArrayList<>();
+      List<int[]> sizes = new ArrayList<>();
+      float[] v0 = new float[z.length], w0 = new float[z.length];
+      for (int p = 0; p < z.length; p++)
+        if (!Float.isNaN(z[p])) {
+          v0[p] = z[p];
+          w0[p] = 1;
+        }
+      values.add(v0);
+      weights.add(w0);
+      sizes.add(new int[] {w, h});
+      while (sizes.get(sizes.size() - 1)[0] > 1 || sizes.get(sizes.size() - 1)[1] > 1) {
+        int[] fine = sizes.get(sizes.size() - 1);
+        int fw = fine[0], fh = fine[1], cw = (fw + 1) / 2, ch = (fh + 1) / 2;
+        float[] fv = values.get(values.size() - 1), fwt = weights.get(weights.size() - 1);
+        float[] cv = new float[cw * ch], cwt = new float[cw * ch];
+        for (int y = 0; y < ch; y++)
+          for (int x = 0; x < cw; x++) {
+            double sv = 0, sw = 0;
+            for (int yy = 2 * y; yy < Math.min(fh, 2 * y + 2); yy++)
+              for (int xx = 2 * x; xx < Math.min(fw, 2 * x + 2); xx++) {
+                float wt = fwt[yy * fw + xx];
+                sv += wt * fv[yy * fw + xx];
+                sw += wt;
+              }
+            cv[y * cw + x] = sw > 0 ? (float) (sv / sw) : 0;
+            cwt[y * cw + x] = (float) Math.min(1, sw);
+          }
+        values.add(cv);
+        weights.add(cwt);
+        sizes.add(new int[] {cw, ch});
+      }
+      for (int level = sizes.size() - 2; level >= 0; level--) {
+        int fw = sizes.get(level)[0], fh = sizes.get(level)[1], cw = sizes.get(level + 1)[0], ch = sizes.get(level + 1)[1];
+        float[] fv = values.get(level), fwt = weights.get(level), cv = values.get(level + 1);
+        for (int y = 0; y < fh; y++)
+          for (int x = 0; x < fw; x++) {
+            int p = y * fw + x;
+            float wt = fwt[p];
+            if (wt >= 1) continue;
+            double gx = Math.max(0, Math.min(cw - 1, (x + .5) / 2 - .5)), gy = Math.max(0, Math.min(ch - 1, (y + .5) / 2 - .5));
+            int ix = Math.min((int) gx, Math.max(0, cw - 2)), iy = Math.min((int) gy, Math.max(0, ch - 2));
+            double fx = cw > 1 ? gx - ix : 0, fy = ch > 1 ? gy - iy : 0;
+            int ix1 = Math.min(cw - 1, ix + 1), iy1 = Math.min(ch - 1, iy + 1);
+            double c = (1 - fy) * ((1 - fx) * cv[iy * cw + ix] + fx * cv[iy * cw + ix1]) + fy * ((1 - fx) * cv[iy1 * cw + ix] + fx * cv[iy1 * cw + ix1]);
+            fv[p] = (float) (wt * fv[p] + (1 - wt) * c);
+          }
+      }
+      System.arraycopy(values.get(0), 0, z, 0, z.length);
+    }
+
+    /** Box mean of radius r along each row (window clipped at the edges). */
+    private void blurRows(int r, int workers) {
+      Parallel.forEach(h, workers, y -> {
+        double[] prefix = new double[w + 1];
+        for (int x = 0; x < w; x++) prefix[x + 1] = prefix[x] + z[y * w + x];
+        for (int x = 0; x < w; x++) {
+          int a = Math.max(0, x - r), b = Math.min(w - 1, x + r);
+          z[y * w + x] = (float) ((prefix[b + 1] - prefix[a]) / (b - a + 1));
+        }
+      });
+    }
+
+    /**
+     * Box mean of radius r along each column, in bands of columns: running sums, with the
+     * original values of the last r + 1 rows kept in a ring (the rows above are overwritten).
+     */
+    private void blurColumns(int r, int workers) {
+      int band = 256, bands = Math.ceilDiv(w, band), slots = r + 1;
+      Parallel.forEach(bands, workers, b -> {
+        int xa = b * band, n = Math.min(w, xa + band) - xa;
+        double[] sum = new double[n];
+        float[] ring = new float[slots * n];
+        for (int y = 0; y < Math.min(h, r); y++)
+          for (int i = 0; i < n; i++) sum[i] += z[y * w + xa + i];
+        for (int y = 0; y < h; y++) {
+          int slot = (y % slots) * n;
+          if (y + r < h)
+            for (int i = 0; i < n; i++) sum[i] += z[(y + r) * w + xa + i];
+          if (y - r - 1 >= 0)
+            for (int i = 0; i < n; i++) sum[i] -= ring[slot + i]; // row y - r - 1 shares the slot of row y
+          int count = Math.min(h - 1, y + r) - Math.max(0, y - r) + 1;
+          for (int i = 0; i < n; i++) {
+            ring[slot + i] = z[y * w + xa + i];
+            z[y * w + xa + i] = (float) (sum[i] / count);
+          }
+        }
+      });
+    }
+
     static final int ROUGH_RADIUS = 10, ROUGH_DEPTH = 10, ROUGH_PAIRS = 6;
     static final double ROUGH_FRACTION = .1;
 
@@ -451,6 +597,18 @@ final class Orthomosaic {
       Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int width, int height,
       int workers, boolean occlusion, boolean canopy, GpuOrthomosaic gpu, TileSink sink)
       throws IOException {
+    return render(surface, views, photos, x0, yTop, cell, width, height, workers, occlusion, canopy, gpu, -1, sink);
+  }
+
+  /**
+   * feather >= 0: classic orthophoto (--orthomosaic-mode classic): no visibility test, the camera
+   * nearest its image centre, blended with the second nearest across a seam band of about
+   * 2 * feather pixels (chooseClassic); occlusion, canopy and gpu are then ignored.
+   */
+  static Result render(
+      Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int width, int height,
+      int workers, boolean occlusion, boolean canopy, GpuOrthomosaic gpu, double feather, TileSink sink)
+      throws IOException {
     Result result = new Result();
     result.pixels = new long[views.size()];
     double[] limit = {x0, yTop - height * cell, x0 + width * cell, yTop};
@@ -461,7 +619,7 @@ final class Orthomosaic {
       for (int by = 0; by < height; by += BLOCK)
         for (int bx = 0; bx < width; bx += BLOCK) {
           int bw = Math.min(BLOCK, width - bx), bh = Math.min(BLOCK, height - by);
-          block(surface, views, photos, x0, yTop, cell, bx, by, bw, bh, workers, occlusion, canopy, gpu, sink, result);
+          block(surface, views, photos, x0, yTop, cell, bx, by, bw, bh, workers, occlusion, canopy, gpu, feather, sink, result);
           work.update(++done);
         }
       work.done();
@@ -548,10 +706,67 @@ final class Orthomosaic {
     }
   }
 
+  /**
+   * Classic camera choice for row row of a block: the camera whose image holds the surface point
+   * nearest its centre (normalised radius r; equal: the earlier camera), no visibility test. The
+   * second nearest gets share 0.5 * (1 - (r2 - r1) / band) where positive: half at the seam, where
+   * r1 = r2, fading to none. band is the change of r2 - r1 over feather pixels for nadir views
+   * (cell / height above the point for each of the two). UNSEEN: in no photograph.
+   */
+  static void chooseClassic(
+      Surface surface, List<View> views, int[] candidates, double left, double upper, double cell, int bw, int row,
+      double feather, short[] chosen, short[] second, float[] share, float[] heights, byte[] state, int at) {
+    double[] uv = new double[2];
+    double y = upper - (row + .5) * cell;
+    for (int col = 0; col < bw; col++) {
+      int p = at + col;
+      chosen[p] = -1;
+      second[p] = -1;
+      share[p] = 0;
+      state[p] = PAINTED;
+      double x = left + (col + .5) * cell, v = surface.height(x, y);
+      heights[p] = (float) v;
+      if (Double.isNaN(v)) {
+        state[p] = UNKNOWN;
+        continue;
+      }
+      double r1 = Double.POSITIVE_INFINITY, r2 = Double.POSITIVE_INFINITY;
+      int k1 = -1, k2 = -1;
+      for (int k = 0; k < candidates.length; k++) {
+        View view = views.get(candidates[k]);
+        if (!view.project(x, y, v, uv) || uv[0] < 0 || uv[1] < 0 || uv[0] > view.width - 1 || uv[1] > view.height - 1) continue;
+        double a = (uv[0] - view.cx) / view.fx, b = (uv[1] - view.cy) / view.fy, r = Math.sqrt(a * a + b * b);
+        if (r < r1) {
+          r2 = r1;
+          k2 = k1;
+          r1 = r;
+          k1 = k;
+        } else if (r < r2) {
+          r2 = r;
+          k2 = k;
+        }
+      }
+      if (k1 < 0) {
+        state[p] = UNSEEN;
+        continue;
+      }
+      chosen[p] = (short) candidates[k1];
+      if (k2 < 0 || !(feather > 0)) continue;
+      double h1 = views.get(candidates[k1]).centre[2] - v, h2 = views.get(candidates[k2]).centre[2] - v;
+      if (!(h1 > 0 && h2 > 0)) continue;
+      double band = feather * cell * (1 / h1 + 1 / h2), s = .5 * (1 - (r2 - r1) / band);
+      if (s > 0) {
+        second[p] = (short) candidates[k2];
+        share[p] = (float) s;
+      }
+    }
+  }
+
   private static void block(
       Surface surface, List<View> views, Photos photos, double x0, double yTop, double cell, int bx, int by, int bw, int bh,
-      int workers, boolean occlusion, boolean canopy, GpuOrthomosaic gpu, TileSink sink, Result result)
+      int workers, boolean occlusion, boolean canopy, GpuOrthomosaic gpu, double feather, TileSink sink, Result result)
       throws IOException {
+    boolean classic = feather >= 0;
     double left = x0 + bx * cell, right = left + bw * cell, upper = yTop - by * cell, lower = upper - bh * cell;
     List<Integer> near = new ArrayList<>();
     for (int i = 0; i < views.size(); i++) {
@@ -564,7 +779,11 @@ final class Orthomosaic {
     float[] heights = new float[bw * bh];
     byte[] state = new byte[bw * bh];
     boolean relax = occlusion && canopy && surface.kind != null;
-    if (gpu == null || !gpu.choose(views, candidates, left, upper, cell, bw, bh, workers, occlusion, relax, chosen, heights, state))
+    short[] second = classic ? new short[bw * bh] : null;
+    float[] share = classic ? new float[bw * bh] : null;
+    if (classic)
+      Parallel.forEach(bh, workers, row -> chooseClassic(surface, views, candidates, left, upper, cell, bw, row, feather, chosen, second, share, heights, state, row * bw));
+    else if (gpu == null || !gpu.choose(views, candidates, left, upper, cell, bw, bh, workers, occlusion, relax, chosen, heights, state))
       Parallel.forEach(bh, workers, row -> chooseRow(surface, views, candidates, left, upper, cell, bw, row, occlusion, relax, chosen, heights, state, row * bw));
     long[] states = new long[4];
     for (byte s : state) states[s]++;
@@ -575,6 +794,9 @@ final class Orthomosaic {
     int[] rgba = new int[bw * bh];
     boolean[] used = new boolean[views.size()];
     for (short c : chosen) if (c >= 0) used[c] = true;
+    if (classic) for (short c : second) if (c >= 0) used[c] = true;
+    // classic: weighted colour sums (R, G, B, weight) of the two cameras of a seam pixel.
+    float[] blend = classic ? new float[4 * bw * bh] : null;
     for (int i : candidates) {
       if (!used[i]) continue;
       View view = views.get(i);
@@ -585,7 +807,7 @@ final class Orthomosaic {
         double y = upper - (row + .5) * cell;
         for (int col = 0; col < bw; col++) {
           int p = row * bw + col;
-          if (chosen[p] != i || !view.project(left + (col + .5) * cell, y, heights[p], uv)) continue;
+          if ((chosen[p] != i && (second == null || second[p] != i)) || !view.project(left + (col + .5) * cell, y, heights[p], uv)) continue;
           b[0] = Math.min(b[0], (int) uv[0]);
           b[1] = Math.min(b[1], (int) uv[1]);
           b[2] = Math.max(b[2], (int) uv[0] + 1);
@@ -611,7 +833,7 @@ final class Orthomosaic {
         double y = upper - (row + .5) * cell;
         for (int col = 0; col < bw; col++) {
           int p = row * bw + col;
-          if (chosen[p] != i || !view.project(left + (col + .5) * cell, y, heights[p], uv)) continue;
+          if ((chosen[p] != i && (second == null || second[p] != i)) || !view.project(left + (col + .5) * cell, y, heights[p], uv)) continue;
           double u = uv[0] - ou, v = uv[1] - ov;
           int iu = Math.min((int) u, ww - 2), iv = Math.min((int) v, wh - 2);
           if (ww < 2) iu = 0;
@@ -619,6 +841,17 @@ final class Orthomosaic {
           double fu = u - iu, fv = v - iv;
           int a = window[iv * ww + iu], b = window[iv * ww + Math.min(ww - 1, iu + 1)];
           int c = window[Math.min(wh - 1, iv + 1) * ww + iu], d = window[Math.min(wh - 1, iv + 1) * ww + Math.min(ww - 1, iu + 1)];
+          if (classic) {
+            float weight = chosen[p] == i ? 1 - share[p] : share[p];
+            for (int ch = 0, shift = 16; shift >= 0; ch++, shift -= 8) {
+              double upperRow = (1 - fu) * ((a >> shift) & 255) + fu * ((b >> shift) & 255);
+              double lowerRow = (1 - fu) * ((c >> shift) & 255) + fu * ((d >> shift) & 255);
+              blend[4 * p + ch] += (float) (weight * ((1 - fv) * upperRow + fv * lowerRow));
+            }
+            blend[4 * p + 3] += weight;
+            if (chosen[p] == i) counts[row]++;
+            continue;
+          }
           int colour = 0xff000000;
           for (int shift = 16; shift >= 0; shift -= 8) {
             double upperRow = (1 - fu) * ((a >> shift) & 255) + fu * ((b >> shift) & 255);
@@ -634,6 +867,17 @@ final class Orthomosaic {
         result.painted += n;
       }
     }
+    if (classic)
+      Parallel.forEach(bh, workers, row -> {
+        for (int p = row * bw; p < (row + 1) * bw; p++) {
+          float weight = blend[4 * p + 3];
+          if (!(weight > 0)) continue;
+          int colour = 0xff000000;
+          for (int ch = 0, shift = 16; shift >= 0; ch++, shift -= 8)
+            colour |= Math.min(255, Math.round(blend[4 * p + ch] / weight)) << shift;
+          rgba[p] = colour;
+        }
+      });
     // 3. Tiles of this block, compressed in parallel, delivered in row-major order.
     int tilesAcross = Math.ceilDiv(bw, TILE), tilesDown = Math.ceilDiv(bh, TILE);
     byte[][] packed = new byte[tilesAcross * tilesDown][];
@@ -853,8 +1097,18 @@ final class Orthomosaic {
     surfaceCell = Math.max(surfaceCell, Math.sqrt(area / maxCells));
     Surface surface = grid(bounds, surfaceCell);
     surface.add(cloud::scan, "Orthomosaic: surface");
+    boolean classic = "classic".equals(o.orthomosaicMode);
     int fill = o.orthomosaicFill < 0 ? 64 : (int) Math.ceil(o.orthomosaicFill / surfaceCell);
-    surface.finish(fill, Math.max(1, o.cores));
+    // Classic smoothing radius: auto = a tenth of the median camera height above the cloud. A
+    // canopy surface smoothed less is steeper than the oblique rays at the block edge, and the
+    // photographs fold over it (swirls, smeared rows); forest_9 (about 50 m): 2 m swirls, 5 m clean.
+    double[] above = new double[views.size()];
+    for (int i = 0; i < above.length; i++) above[i] = Math.abs(views.get(i).centre[2] - meanHeight);
+    Arrays.sort(above);
+    double smoothRadius = o.orthomosaicSmooth < 0 ? .1 * above[above.length / 2] : o.orthomosaicSmooth;
+    int smooth = (int) Math.min(Math.max(surface.w, surface.h), Math.round(smoothRadius / surfaceCell));
+    if (classic) surface.finishClassic(smooth, Math.max(1, o.cores));
+    else surface.finish(fill, Math.max(1, o.cores));
     if (surface.known == 0) return unavailable(out, "the surface is empty");
     boolean big = TiledGeoTiff.needsBig(width, height);
     System.out.printf(
@@ -870,9 +1124,10 @@ final class Orthomosaic {
     Result result;
     Path file = out.resolve("orthomosaic.tif");
     RunPhotos photos = new RunPhotos(files, widths, heights, cache);
-    GpuOrthomosaic gpu = GpuOrthomosaic.open(o, surface, (int) Math.min((long) BLOCK * BLOCK, (long) width * height));
+    GpuOrthomosaic gpu = classic ? null : GpuOrthomosaic.open(o, surface, (int) Math.min((long) BLOCK * BLOCK, (long) width * height));
     try (photos; gpu; TiledGeoTiff tiff = new TiledGeoTiff(file, width, height, TILE, x0, yTop, cell, projected ? epsg : 0, big)) {
-      result = render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), true, !o.orthomosaicStrict, gpu, tiff::write);
+      result = render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), !classic, !o.orthomosaicStrict, gpu,
+          classic ? o.orthomosaicFeather : -1, tiff::write);
     } catch (IOException | RuntimeException | Error failure) {
       Files.deleteIfExists(file);
       throw failure;
@@ -927,12 +1182,38 @@ final class Orthomosaic {
                 + " is in the way, the least obstructed camera paints the pixel unless strict; solid surfaces always"
                 + " hide. Pixels without a surface or seen by no camera are transparent. No seam blending, no"
                 + " radiometric balancing, no overviews.");
+    metadata.put("mode", classic ? "classic" : "true");
+    if (classic) {
+      metadata.remove("surface_fill_cells");
+      metadata.remove("strict");
+      metadata.remove("pixels_painted_through_canopy");
+      metadata.put("surface_smoothing_radius", smoothRadius);
+      metadata.put("surface_smoothing_radius_basis", o.orthomosaicSmooth < 0 ? "a tenth of the median camera height above the cloud" : "--orthomosaic-smooth");
+      metadata.put("surface_smoothing_radius_cells", smooth);
+      metadata.put("seam_feather_pixels", o.orthomosaicFeather);
+      metadata.put("pixels_outside_every_photograph", metadata.remove("pixels_seen_by_no_camera"));
+      metadata.put(
+          "method",
+          "Classic orthophoto: original photographs projected onto a smoothed surface of the final cloud (highest"
+              + " point per cell, 5 x 5 median despiking, every gap interpolated by push-pull, three box passes of the"
+              + " smoothing radius). Each pixel takes the camera that sees its surface point nearest the image centre,"
+              + " without a visibility test, blended with the second nearest across seams. Tall objects lean away from"
+              + " the image centre and may cover the ground beside them. Pixels in no photograph are transparent. No"
+              + " radiometric balancing, no overviews.");
+    }
     Json.write(out.resolve("orthomosaic.json"), metadata);
-    System.out.printf(
-        Locale.ROOT,
-        "Orthomosaic: %s, %,d MiB; %.1f%% of the pixels painted from %d of %d photographs (%.1f%% by the least obstructed camera; %.1f%% no surface, %.1f%% seen by no camera); %.1f s%n",
-        file, Files.size(file) >> 20, 100. * result.painted / total, contributing, views.size(), 100. * result.relaxed / total, 100. * result.unknown / total,
-        100. * result.unseen / total, (System.nanoTime() - clock) / 1e9);
+    if (classic)
+      System.out.printf(
+          Locale.ROOT,
+          "Orthomosaic (classic): %s, %,d MiB; %.1f%% of the pixels painted from %d of %d photographs (%.1f%% in no photograph); surface %.1f%% interpolated; %.1f s%n",
+          file, Files.size(file) >> 20, 100. * result.painted / total, contributing, views.size(), 100. * result.unseen / total,
+          100. * surface.filled / Math.max(1, surface.known), (System.nanoTime() - clock) / 1e9);
+    else
+      System.out.printf(
+          Locale.ROOT,
+          "Orthomosaic: %s, %,d MiB; %.1f%% of the pixels painted from %d of %d photographs (%.1f%% by the least obstructed camera; %.1f%% no surface, %.1f%% seen by no camera); %.1f s%n",
+          file, Files.size(file) >> 20, 100. * result.painted / total, contributing, views.size(), 100. * result.relaxed / total, 100. * result.unknown / total,
+          100. * result.unseen / total, (System.nanoTime() - clock) / 1e9);
     return metadata;
   }
 

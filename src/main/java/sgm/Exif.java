@@ -34,7 +34,7 @@ final class Exif {
   static final class Metadata {
     Gps gps;
     double focalMm = Double.NaN, focal35Mm = Double.NaN;
-    String make = "", model = "", captureTime = "", captureOffset = "", captureSubSec = "";
+    String make = "", model = "", serial = "", captureTime = "", captureOffset = "", captureSubSec = "";
     // DJI XMP (drone-dji): aircraft velocity north/east/down in m/s; focal length in source pixels.
     double speedNorth = Double.NaN, speedEast = Double.NaN, speedDown = Double.NaN;
     double calibratedFocal = Double.NaN, relativeAltitude = Double.NaN;
@@ -141,6 +141,7 @@ final class Exif {
       m.captureTime = t.text(e.get(0x9003));
       m.captureOffset = t.text(e.get(0x9011));
       m.captureSubSec = t.text(e.get(0x9291));
+      m.serial = t.text(e.get(0xa431)); // BodySerialNumber
       Entry focal = e.get(0x920a), equiv = e.get(0xa405);
       if (focal != null && focal.type == 5) m.focalMm = t.rational(focal.offset);
       if (equiv != null) {

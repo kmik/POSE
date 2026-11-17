@@ -2,6 +2,8 @@ package sgm;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.ForkJoinPool;
+import java.util.stream.IntStream;
 
 /**
  * Selectable costs, edge-aware Hirschmuller recurrence, 4/8 paths and LR validation. CPU primitive
@@ -1025,6 +1027,117 @@ public final class CensusSgm {
   }
 
   static long removeSpeckles(float[] a, int w, int h, int minimum, double range, int connectivity) {
+    if (minimum <= 1) return 0;
+    if ((long) w * h >= PARALLEL_SPECKLE_PIXELS && h >= 64 && !Boolean.getBoolean("sgm.sequentialSpeckles"))
+      return removeSpecklesParallel(a, w, h, minimum, range, connectivity);
+    return removeSpecklesSequential(a, w, h, minimum, range, connectivity);
+  }
+
+  /** Maps at least this large use the strip-parallel filter (same result). */
+  static final long PARALLEL_SPECKLE_PIXELS = 1L << 20;
+
+  /**
+   * removeSpecklesSequential with the same result: the connection rule (both finite, |difference|
+   * at most range, 4- or 8-neighbours) is symmetric, so the removed pixels are those of the
+   * graph's components smaller than minimum, whatever the scan order. Row strips are labelled in
+   * parallel (breadth-first within the strip), joined across strip borders with union-find, and
+   * pixels of too-small joined components are removed.
+   */
+  static long removeSpecklesParallel(float[] a, int w, int h, int minimum, double range, int connectivity) {
+    int threads = Math.max(1, Math.min(ForkJoinPool.getCommonPoolParallelism(), 16));
+    int rows = Math.max(16, Math.ceilDiv(h, 4 * threads)), strips = Math.ceilDiv(h, rows);
+    int[] label = new int[a.length];
+    int[] firstLabel = new int[strips + 1];
+    int[][] stripSizes = new int[strips][];
+    IntStream.range(0, strips).parallel().forEach(s -> {
+      int y0 = s * rows, y1 = Math.min(h, y0 + rows), base = y0 * w, end = y1 * w;
+      int[] queue = new int[end - base];
+      int[] sizes = new int[64];
+      int count = 0;
+      for (int start = base; start < end; start++) {
+        if (label[start] != 0 || !Float.isFinite(a[start])) continue;
+        int id = ++count, head = 0, tail = 0;
+        queue[tail++] = start;
+        label[start] = id;
+        while (head < tail) {
+          int p = queue[head++], x = p % w, y = p / w;
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              if (dx == 0 && dy == 0 || connectivity == 4 && dx != 0 && dy != 0) continue;
+              int xx = x + dx, yy = y + dy;
+              if (xx < 0 || xx >= w || yy < y0 || yy >= y1) continue;
+              int q = yy * w + xx;
+              if (label[q] != 0 || !Float.isFinite(a[q]) || Math.abs(a[q] - a[p]) > range) continue;
+              label[q] = id;
+              queue[tail++] = q;
+            }
+        }
+        if (id >= sizes.length) sizes = Arrays.copyOf(sizes, 2 * sizes.length);
+        sizes[id] = tail;
+      }
+      stripSizes[s] = Arrays.copyOf(sizes, count + 1);
+    });
+    // Global ids: strip s's local id k is firstLabel[s] + k (1-based locals, 0 = none).
+    for (int s = 0; s < strips; s++) firstLabel[s + 1] = firstLabel[s] + stripSizes[s].length - 1;
+    int total = firstLabel[strips];
+    int[] parent = new int[total + 1];
+    long[] size = new long[total + 1];
+    for (int s = 0; s < strips; s++)
+      for (int k = 1; k < stripSizes[s].length; k++) {
+        parent[firstLabel[s] + k] = firstLabel[s] + k;
+        size[firstLabel[s] + k] = stripSizes[s][k];
+      }
+    // Joins across each strip border (last row of strip s, first row of strip s + 1).
+    for (int s = 0; s + 1 < strips; s++) {
+      int y = (s + 1) * rows - 1;
+      if (y + 1 >= h) break;
+      for (int x = 0; x < w; x++) {
+        int p = y * w + x;
+        if (label[p] == 0) continue;
+        for (int dx = connectivity == 4 ? 0 : -1; dx <= (connectivity == 4 ? 0 : 1); dx++) {
+          int xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          int q = (y + 1) * w + xx;
+          if (label[q] == 0 || Math.abs(a[q] - a[p]) > range) continue;
+          int rp = find(parent, firstLabel[s] + label[p]), rq = find(parent, firstLabel[s + 1] + label[q]);
+          if (rp == rq) continue;
+          if (rp < rq) {
+            parent[rq] = rp;
+            size[rp] += size[rq];
+          } else {
+            parent[rp] = rq;
+            size[rq] += size[rp];
+          }
+        }
+      }
+    }
+    boolean[] small = new boolean[total + 1];
+    for (int g = 1; g <= total; g++) small[g] = size[find(parent, g)] < minimum;
+    long[] removed = new long[strips];
+    IntStream.range(0, strips).parallel().forEach(s -> {
+      int y0 = s * rows, y1 = Math.min(h, y0 + rows);
+      long n = 0;
+      for (int p = y0 * w; p < y1 * w; p++)
+        if (label[p] != 0 && small[firstLabel[s] + label[p]]) {
+          a[p] = Float.NaN;
+          n++;
+        }
+      removed[s] = n;
+    });
+    long rejected = 0;
+    for (long n : removed) rejected += n;
+    return rejected;
+  }
+
+  private static int find(int[] parent, int i) {
+    while (parent[i] != i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  }
+
+  static long removeSpecklesSequential(float[] a, int w, int h, int minimum, double range, int connectivity) {
     if (minimum <= 1) return 0;
     boolean[] seen = new boolean[a.length];
     int[] queue = new int[a.length];

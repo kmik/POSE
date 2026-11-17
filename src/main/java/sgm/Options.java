@@ -33,9 +33,35 @@ public final class Options {
   public String streamedProcessing = "auto";
   public Path exportConfidence;
   public boolean disparitiesExplicit, minDisparityExplicit, selfCalibration = true;
-  // --quick-calibration: EXIF/XMP focal initialization (joint pipeline, no bootstrap) and one GPS
-  // focal start. Changes the calibration path and therefore the geometry; opt-in.
-  public boolean quickCalibration;
+  // --quick-calibration on|off: EXIF/XMP focal initialization (joint pipeline, no bootstrap) and
+  // one GPS focal start. Default on since 2026-11-17 (the bootstrap focal start is the weaker one);
+  // runs saved before that continue with off (legacyQuickCalibration).
+  public boolean quickCalibration; // on by default in parse(); off for programmatic Options
+
+  /**
+   * Saved run arguments with the quick-calibration choice made explicit: new runs save it (Main
+   * appends the resolved value), so arguments without any --quick-calibration /
+   * --no-quick-calibration come from a run started before quick calibration became the default,
+   * and continue with it off, as they started.
+   */
+  static List<String> legacyQuickCalibration(List<String> saved) {
+    if (namesQuickCalibration(saved)) return saved;
+    List<String> out = new ArrayList<>(saved);
+    out.add("--no-quick-calibration");
+    return out;
+  }
+
+  /** The arguments give --quick-calibration (with or without a value) or --no-quick-calibration. */
+  static boolean namesQuickCalibration(List<String> args) {
+    for (String a : args)
+      if (a.equals("--quick-calibration") || a.startsWith("--quick-calibration=") || a.equals("--no-quick-calibration")) return true;
+    return false;
+  }
+
+  /** The resolved quick-calibration choice as an argument, saved with a new run. */
+  String quickCalibrationArgument() {
+    return quickCalibration ? "--quick-calibration" : "--no-quick-calibration";
+  }
   public boolean mvsgmOptimalNeighbors;
   // --ply off / --point-confidence off: skip writing dense.ply / 07_results/point-confidence.bin.
   public boolean writePly = true, writePointConfidence = true;
@@ -132,6 +158,10 @@ public final class Options {
   public boolean gpuQueuedUploads = true;
   public boolean gpuPackedSummaries;
   public int calibrationTrialIterations = 12;
+  // --calibration-trial-method full|subset|joint and --calibration-trial-cameras N (0 = auto):
+  // see SharedCalibration.refine and CalibrationSubset.
+  public String calibrationTrialMethod = "full";
+  public int calibrationTrialCameras;
   public double fusionSigmaK = 3, fusionSeedMinAngle = 0, fusionLocalSigma = 0;
   public int step = 2, cores = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
   public int boardColumns = 9, boardRows = 7;
@@ -192,6 +222,21 @@ public final class Options {
   public boolean orientationAllowLossy;
   public int orientationComponent = 0;
   Map<String, Calibration> orientationCalibrations = Collections.emptyMap();
+  // Camera groups (CameraGroups): --camera-grouping auto|single|per-image, --camera-groups FILE
+  // (CSV image,camera), and the per-camera forms CAMERA=VALUE of --intrinsics-mode, --calibration,
+  // --orientation-pixel-size, --focal and --s_w.
+  public String cameraGrouping = "auto";
+  public Path cameraGroupsFile;
+  public Map<String, String> intrinsicsModes = Map.of();
+  public Map<String, Path> calibrationFiles = Map.of();
+  public Map<String, Double> orientationPixelSizes = Map.of(), focalByCamera = Map.of(),
+      sensorWidthByCamera = Map.of();
+  CameraGroups cameraGroups;
+  // Camera ID per image and pixel size (mm) per camera ID of an imported orientation.
+  Map<String, String> importedCameraIds = Map.of();
+  Map<String, Double> importedPixelSizes = Map.of();
+  // Every imported per-image calibration (orientationCalibrations stays empty when they are all equal).
+  Map<String, Calibration> importedCalibrations = Map.of();
   Path stereoReportDirectory;
   public Path analyzeRun, analysisOutput;
   public int analysisSamples = 500000;
@@ -264,6 +309,9 @@ public final class Options {
   // Full-resolution true orthomosaic (ORTHOMOSAIC.md): off by default.
   public boolean orthomosaic, orthomosaicStrict;
   public double orthomosaicResolution = 0, orthomosaicSurfaceCell = 0, orthomosaicFill = -1;
+  // --orthomosaic-mode true|classic; classic: smoothed, fully filled surface, no visibility test.
+  public String orthomosaicMode = "true";
+  public double orthomosaicSmooth = -1, orthomosaicFeather = 16;
   public Path exportOrthomosaic, orthomosaicOutput;
   public boolean cache, listGpus;
   public int gpuDevice;
@@ -283,10 +331,12 @@ public final class Options {
 
   public static Options parse(String[] args) {
     Options o = new Options();
+    o.quickCalibration = true; // the command-line default
     o.help = args.length == 0;
     Set<String> explicitFiltering = new TreeSet<>();
     boolean cacheDisabled = false;
     boolean storageExplicit = false;
+    boolean quickExplicit = false, pipelineExplicit = false;
     for (int i = 0; i < args.length; i++) {
       String key = args[i], inline = null;
       int eq = key.indexOf('=');
@@ -406,8 +456,19 @@ public final class Options {
         case "--no-self-calibration":
           o.selfCalibration = false;
           continue;
-        case "--quick-calibration":
-          o.quickCalibration = true;
+        case "--quick-calibration": {
+          // Optional value: --quick-calibration, --quick-calibration on|off, --quick-calibration=off.
+          String quick = inline != null ? inline
+              : i + 1 < args.length && args[i + 1].matches("(?i)on|off|true|false") ? args[++i] : "on";
+          quick = quick.toLowerCase(Locale.ROOT);
+          choice(quick, "--quick-calibration", "on", "off", "true", "false");
+          o.quickCalibration = quick.equals("on") || quick.equals("true");
+          quickExplicit = true;
+          continue;
+        }
+        case "--no-quick-calibration":
+          o.quickCalibration = false;
+          quickExplicit = true;
           continue;
         case "--no-depth-refinement":
           o.depthRefinement = false;
@@ -611,7 +672,17 @@ public final class Options {
           o.orientationAngleUnit = v.toLowerCase(Locale.ROOT);
           break;
         case "--orientation-pixel-size":
-          o.orientationPixelSize = number(v);
+          {
+            String[] pair = cameraValue(v);
+            if (pair == null) o.orientationPixelSize = number(v);
+            else o.orientationPixelSizes = put(o.orientationPixelSizes, pair[0], number(pair[1]), "--orientation-pixel-size");
+          }
+          break;
+        case "--camera-grouping":
+          o.cameraGrouping = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--camera-groups":
+          o.cameraGroupsFile = Path.of(v);
           break;
         case "--orientation-crs":
           o.orientationCrs = v;
@@ -685,8 +756,18 @@ public final class Options {
         case "--calibration-trial-iterations":
           o.calibrationTrialIterations = Integer.parseInt(v);
           break;
+        case "--calibration-trial-method":
+          o.calibrationTrialMethod = v.toLowerCase(Locale.ROOT);
+          choice(o.calibrationTrialMethod, "--calibration-trial-method", "full", "subset", "joint");
+          break;
+        case "--calibration-trial-cameras":
+          o.calibrationTrialCameras = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
+          if (o.calibrationTrialCameras != 0 && o.calibrationTrialCameras < 4)
+            throw new IllegalArgumentException("--calibration-trial-cameras must be auto or at least 4");
+          break;
         case "--calibration-pipeline":
           o.calibrationPipeline = v.toLowerCase(Locale.ROOT);
+          pipelineExplicit = true;
           break;
         case "--fusion-emission":
           o.fusionEmission = v.toLowerCase(Locale.ROOT);
@@ -823,7 +904,11 @@ public final class Options {
           o.blockOverlap = number(v);
           break;
         case "--intrinsics-mode":
-          o.intrinsicsMode = v.toLowerCase(Locale.ROOT);
+          {
+            String[] pair = cameraValue(v);
+            if (pair == null) o.intrinsicsMode = v.toLowerCase(Locale.ROOT);
+            else o.intrinsicsModes = put(o.intrinsicsModes, pair[0], pair[1].toLowerCase(Locale.ROOT), key);
+          }
           break;
         case "--extrinsics-mode":
           o.extrinsicsMode = v.toLowerCase(Locale.ROOT);
@@ -925,7 +1010,11 @@ public final class Options {
         case "--calibration":
         case "-d":
         case "--dist":
-          o.calibration = Paths.get(v);
+          {
+            String[] pair = existingPath(v) ? null : cameraValue(v);
+            if (pair == null) o.calibration = Paths.get(v);
+            else o.calibrationFiles = put(o.calibrationFiles, pair[0], Paths.get(pair[1]), key);
+          }
           break;
         case "--poses":
           o.poses = Paths.get(v);
@@ -1232,10 +1321,18 @@ public final class Options {
           o.format = v.replace(".", "");
           break;
         case "--focal":
-          o.focal = number(v);
+          {
+            String[] pair = cameraValue(v);
+            if (pair == null) o.focal = number(v);
+            else o.focalByCamera = put(o.focalByCamera, pair[0], number(pair[1]), key);
+          }
           break;
         case "--s_w":
-          o.sensorWidth = number(v);
+          {
+            String[] pair = cameraValue(v);
+            if (pair == null) o.sensorWidth = number(v);
+            else o.sensorWidthByCamera = put(o.sensorWidthByCamera, pair[0], number(pair[1]), key);
+          }
           break;
         case "--baseline":
           o.baseline = number(v);
@@ -1333,6 +1430,15 @@ public final class Options {
         case "--orthomosaic-fill":
           o.orthomosaicFill = v.equalsIgnoreCase("auto") ? -1 : number(v);
           break;
+        case "--orthomosaic-mode":
+          o.orthomosaicMode = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--orthomosaic-smooth":
+          o.orthomosaicSmooth = v.equalsIgnoreCase("auto") ? -1 : number(v);
+          break;
+        case "--orthomosaic-feather":
+          o.orthomosaicFeather = number(v);
+          break;
         case "--orthomosaic-surface-cell":
           o.orthomosaicSurfaceCell = v.equalsIgnoreCase("auto") ? 0 : number(v);
           break;
@@ -1408,6 +1514,10 @@ public final class Options {
         > 1) throw new IllegalArgumentException("Choose one standalone export/analysis action");
     if (!(o.orthomosaicResolution >= 0) || !(o.orthomosaicSurfaceCell >= 0))
       throw new IllegalArgumentException("--orthomosaic-resolution and --orthomosaic-surface-cell must be auto or positive");
+    if (!o.orthomosaicMode.equals("true") && !o.orthomosaicMode.equals("classic"))
+      throw new IllegalArgumentException("--orthomosaic-mode must be true or classic");
+    if (!(o.orthomosaicSmooth >= 0 || o.orthomosaicSmooth == -1) || !(o.orthomosaicFeather >= 0))
+      throw new IllegalArgumentException("--orthomosaic-smooth must be auto or >= 0, --orthomosaic-feather >= 0");
     if (o.exportOrthomosaic != null) {
       if (!Files.isDirectory(o.exportOrthomosaic))
         throw new IllegalArgumentException("Choose a valid run directory for --export-orthomosaic");
@@ -1534,6 +1644,14 @@ public final class Options {
               + " reference, --fusion-emission pair, --surface-consolidation none,"
               + " --fusion-strategy owner, --voxel 0 and --windowed-mode off|auto. It uses bounded"
               + " block fusion, not image/incremental fusion or global consolidation.");
+    // An explicit --calibration-pipeline bootstrap asks for the bootstrap: it turns the default
+    // quick calibration off and conflicts with an explicit --quick-calibration on.
+    if (pipelineExplicit && o.calibrationPipeline.equals("bootstrap") && o.quickCalibration) {
+      if (quickExplicit)
+        throw new IllegalArgumentException(
+            "--calibration-pipeline bootstrap conflicts with --quick-calibration on; give --quick-calibration off");
+      o.quickCalibration = false;
+    }
     if (o.quickCalibration) o.calibrationPipeline = "joint";
     // The ground step reads point-confidence.bin (camera support for free-space checks, pair ids for
     // ground sheets); --diagnostics converts it to CSV. Keep it in those cases.
@@ -1745,6 +1863,28 @@ public final class Options {
         "medium",
         "low");
     choice(o.intrinsicsMode, "--intrinsics-mode", "fixed", "prior", "initial");
+    for (String mode : o.intrinsicsModes.values())
+      choice(mode, "--intrinsics-mode CAMERA=MODE", "fixed", "prior", "initial", "free");
+    choice(o.cameraGrouping, "--camera-grouping", "auto", "single", "per-image");
+    if (o.cameraGroupsFile != null && !Files.isRegularFile(o.cameraGroupsFile))
+      throw new IllegalArgumentException("--camera-groups file does not exist: " + o.cameraGroupsFile);
+    for (var e : o.calibrationFiles.entrySet())
+      if (!Files.exists(e.getValue()))
+        throw new IllegalArgumentException(
+            "--calibration " + e.getKey() + "=FILE: file does not exist: " + e.getValue());
+    for (var e : o.orientationPixelSizes.entrySet())
+      if (!(e.getValue() > 0))
+        throw new IllegalArgumentException("--orientation-pixel-size " + e.getKey() + "=MM must be positive");
+    for (String camera : o.focalByCamera.keySet())
+      if (!(o.focalByCamera.get(camera) > 0)
+          || !(o.sensorWidthByCamera.getOrDefault(camera, o.sensorWidth) > 0))
+        throw new IllegalArgumentException(
+            "--focal " + camera + "=MM needs a positive focal and --s_w " + camera + "=MM (or a plain --s_w)");
+    for (String camera : o.sensorWidthByCamera.keySet())
+      if (!(o.sensorWidthByCamera.get(camera) > 0)
+          || !(o.focalByCamera.getOrDefault(camera, o.focal) > 0))
+        throw new IllegalArgumentException(
+            "--s_w " + camera + "=MM needs a positive width and --focal " + camera + "=MM (or a plain --focal)");
     choice(o.extrinsicsMode, "--extrinsics-mode", "fixed", "prior", "initial");
     choice(
         o.rerunFrom,
@@ -1962,6 +2102,35 @@ public final class Options {
     };
   }
 
+  /** v names an existing file or directory (false for text that is not a valid path here). */
+  private static boolean existingPath(String v) {
+    try {
+      return Files.exists(Paths.get(v));
+    } catch (java.nio.file.InvalidPathException e) {
+      return false;
+    }
+  }
+
+  /**
+   * CAMERA=VALUE of the per-camera option forms: {camera, value}, or null for a plain value. The
+   * camera ID may not contain path separators, so a Windows drive path is never taken for one.
+   */
+  static String[] cameraValue(String v) {
+    int eq = v.indexOf('=');
+    if (eq <= 0 || eq == v.length() - 1) return null;
+    String camera = v.substring(0, eq).strip();
+    if (camera.isEmpty() || camera.contains("/") || camera.contains("\\") || camera.contains(":"))
+      return null;
+    return new String[] {camera, v.substring(eq + 1).strip()};
+  }
+
+  private static <T> Map<String, T> put(Map<String, T> map, String camera, T value, String flag) {
+    Map<String, T> out = new LinkedHashMap<>(map);
+    if (out.put(camera, value) != null)
+      throw new IllegalArgumentException(flag + " " + camera + "=... is given twice");
+    return Collections.unmodifiableMap(out);
+  }
+
   private static double number(String s) {
     double x = Double.parseDouble(s);
     if (!Double.isFinite(x)) throw new IllegalArgumentException("Expected a finite number: " + s);
@@ -2083,6 +2252,10 @@ public final class Options {
     out.runFeatureHits = runFeatureHits;
     out.projectDirectory = projectDirectory;
     out.orientationCalibrations = orientationCalibrations;
+    out.cameraGroups = cameraGroups;
+    out.importedCameraIds = importedCameraIds;
+    out.importedPixelSizes = importedPixelSizes;
+    out.importedCalibrations = importedCalibrations;
     out.orientationSourceUnits = orientationSourceUnits;
     out.orientationNotes = orientationNotes;
     out.stereoReportDirectory = stereoReportDirectory;
@@ -2212,13 +2385,54 @@ Calibration and reconstruction modes:
       are selected with --calibration-format below.
       Describes original raster intrinsics/distortion; fixed by default. See
       --intrinsics-mode to refine selected supplied parameters.
-      Without calibration/focal inputs, initialize focal from images or EXIF.
-  --focal MM
+      Without calibration/focal inputs, initialize focal from images or EXIF;
+      constrained parameter-wise refinement follows initialization, and alignment
+      uses the same data-support assessment.
+      --calibration CAMERA=FILE (repeatable) supplies one camera's calibration; see
+      "several calibrated cameras" below.
+  --focal MM, --focal CAMERA=MM
       Focal length in millimetres; requires --s_w. Initializes focal in pixels.
-  --s_w MM
+  --s_w MM, --s_w CAMERA=MM
       Physical sensor WIDTH in millimetres (not diagonal); requires --focal.
-      Without a calibration file, constrained parameter-wise bootstrap refinement
-      follows initialization. Alignment uses the same data-support assessment.
+      The CAMERA= forms apply to one camera group; plain values to every group
+      without its own calibration.
+  --camera-grouping auto|single|per-image
+      Which images share one interior orientation (default auto: camera IDs of an
+      imported orientation, else --camera-groups, else EXIF make, model, serial and
+      focal mm). single: one camera; per-image: every image its own camera. Images
+      of different pixel sizes are always separate cameras. Groups and their
+      calibrations: 01_calibration/cameras.json; with several cameras also
+      camera_ID.txt.
+  --camera-groups FILE
+      CSV image,camera that names the camera of every image (applies with auto).
+  --calibration CAMERA=FILE, --orientation-input FILE: several calibrated cameras
+      Each camera keeps its own calibration.
+      Camera IDs. With --camera-groups FILE they are your names; with EXIF grouping
+      they are camera_1, camera_2, ... in the order of each camera's first image. A run
+      prints them with make, model and focal and lists them in
+      01_calibration/cameras.json; an unknown CAMERA in an option is an error that
+      lists them.
+      Whole orientation in one file, cameras named in it: --orientation-input FILE.
+        INPHO .prj: one $CAMERA_DEFINITION per camera, each photo refers to one with
+          $CAMERA_ID; pixel size from the file, else --orientation-pixel-size
+          CAMERA=MM. Metashape cameras.xml: one <sensor> per camera (ID = its label
+          when the labels are unique, else sensor_N). COLMAP: CAMERA_ID. openMVG:
+          id_intrinsic. OpenSfM: camera key. POSE native/CSV: camera field/column.
+          Bundler has no camera IDs: put camera_groups.csv (image,camera) beside it or
+          give --camera-groups. A file that gives every photo its own camera (common
+          in exports) carries no grouping; then EXIF or --camera-groups decides.
+      One calibration file per camera: --calibration CAMERA=FILE, repeated. FILE may
+        be any calibration format holding one camera: POSE camera.txt, the 14-number
+        calib.result, OpenCV YAML/XML, Metashape <calibration>, MicMac, or a COLMAP,
+        INPHO or other orientation file with one camera (format: auto, or
+        --calibration-format; INPHO pixel size: --orientation-pixel-size CAMERA=MM).
+        Each camera's file is in that camera's own pixels. Cameras without a file
+        start from --focal/--s_w CAMERA=MM, else from the images (EXIF focal with
+        fewer than 3 images), and are calibrated automatically.
+      Example: --camera-groups cams.csv --calibration rgb=rgb.yaml
+        --calibration nir=nir_camera.txt --intrinsics-mode nir=prior
+      Supplied cameras are fixed by default; --intrinsics-mode CAMERA=prior|initial
+      refines one, CAMERA=free ignores its supplied values and calibrates it.
   --no-self-calibration
       Disable bootstrap and alignment self-calibration; retain initialized or supplied intrinsics.
   --poses FILE
@@ -2319,6 +2533,26 @@ Feature matching and final bundle adjustment:
       Final pose/point and GPS bundles keep their own convergence controls. 0 restores
       legacy proposal budgets (automatic convergence unless --bundle-iterations is set).
       Short proposals can change model selection; validate calibration and geometry.
+  --calibration-trial-method full|subset|joint
+      How the lens is refined after alignment (shared alignment calibration). full
+      (default) adds one parameter per trial (f from three starts, then k1, k2, cx, cy,
+      p1, p2, k3; a second sweep), each trial a bundle adjustment of the whole block,
+      kept only if two held-out track groups improve and the data support it. The
+      support check handles about 120 cameras per camera model: above that no trial
+      can be accepted, so full skips them and keeps the starting lens.
+      subset runs the same trials on a compact set of cameras near the block
+      centre (--calibration-trial-cameras; a block of at most that many cameras is
+      treated as with full), then fits the chosen model once to the
+      whole block and keeps it only if both held-out groups of the whole block improve.
+      joint drops the parameters without data support first (checked on the subset
+      for a large block), fits the rest together in one whole-block adjustment, drops
+      those that moved by less than three standard deviations and refits the rest,
+      accepts them with the same held-out tests, else retries once with f,k1,k2.
+      subset and joint are for large blocks (joint checks the whole block when it is
+      within the limit). joint uses one focal start.
+  --calibration-trial-cameras auto|N
+      Cameras in the subset of --calibration-trial-method subset|joint (default auto:
+      100), at most what the support check accepts (about 120 for one camera model).
 
 Dense stereo / SGM:
   --disparities N
@@ -3079,9 +3313,10 @@ Additional workflow controls:
       Coverage-mode minimum degree target per camera (default 3; 1..16).
       Sparse coverage cannot guarantee dense branch completeness; compare quality.
   --calibration-pipeline bootstrap|joint
-      Default bootstrap retains guarded focal/radial initialization. Experimental
-      joint uses a consistent EXIF focal as initialization and fits intrinsics in
-      the main alignment track graph. Missing EXIF falls back to the bootstrap.
+      joint (the default through --quick-calibration) uses a consistent EXIF focal as
+      initialization and fits intrinsics in the main alignment track graph; missing
+      EXIF falls back to the bootstrap. bootstrap estimates focal and radial
+      distortion from image pairs first; giving it turns --quick-calibration off.
   --ply on|off
       Default on writes 07_results/dense.ply next to dense.las (same points; double
       coordinates). off skips it: less disk and write time. The report DSM then reads
@@ -3097,16 +3332,17 @@ Additional workflow controls:
       cloud order, about 200 bytes per point). off skips it; the cloud is unchanged.
       Kept on when ground classification/correction or --diagnostics is requested (they
       read it); --export-confidence needs it.
-  --quick-calibration
-      Faster alternative calibration path (opt-in; changes the solved cameras and
-      therefore the cloud): the focal length is initialized from EXIF/XMP and the
+  --quick-calibration [on|off], --no-quick-calibration
+      Default on: the focal length is initialized from EXIF/XMP and the
       focal/distortion bootstrap is skipped (as --calibration-pipeline joint);
       intrinsics are still fitted parameter-wise during alignment, the
       GPS-weighted adjustment uses one focal start instead of up to two, and
       converging bundle adjustments stop when two successive iterations each
-      improve the objective by less than 1e-4 (default 1e-6). Without
-      a consistent EXIF focal it falls back to the bootstrap. Give it with the
-      first step (inputs/calibrate); see QUICK_CALIBRATION.md.
+      improve the objective by less than 1e-4 (off: 1e-6). Without a consistent
+      EXIF focal it falls back to the bootstrap. off (or --calibration-pipeline
+      bootstrap) restores the bootstrap path, the default before 2026-11-17. Give
+      it with the first step (inputs/calibrate); later steps reuse the saved
+      choice, and runs started before the change continue with off.
   --streamed-processing off|auto|on
       MVSGM image fusion uses an overlap window (default: auto). auto selects row
       strips only when required by the heap; on forces strips too. off keeps the
@@ -3193,6 +3429,9 @@ Additional workflow controls:
       Supplied calibration: fixed (default) preserves it; prior refines selected
       parameters with uncertainty penalties; initial uses it without those penalties.
       Guarded fits still require usable geometry and held-out improvement.
+      CAMERA=MODE (repeatable) sets one camera group's mode; it also accepts free:
+      that camera's supplied or imported intrinsics are ignored and it is calibrated
+      automatically.
   --extrinsics-mode fixed|prior|initial
       Supplied poses: fixed (default) preserves them; prior refines poses with position
       and rotation uncertainties; initial refines without measurement penalties.
@@ -3421,13 +3660,28 @@ Orthomosaic (ORTHOMOSAIC.md):
       Leave a pixel transparent whenever no camera passes the line-of-sight test.
       Default: where only canopy (rough surface) is in the way, the least obstructed
       camera paints it, so forest is not full of holes; solid roofs always hide.
+  --orthomosaic-mode true|classic
+      true (default): true orthomosaic as above, transparent where nothing is known.
+      classic: conventional orthophoto without holes inside the photographed area: the
+      surface is despiked, every gap is interpolated and the whole surface is smoothed;
+      each pixel takes the camera nearest its image centre with no visibility test, and
+      seams are feathered. Tall objects lean and may cover the ground beside them.
+  --orthomosaic-smooth auto|M
+      classic: radius of the surface smoothing in output units (default auto: a tenth
+      of the median camera height above the cloud; 0: despike and fill only). Less
+      smoothing keeps crowns closer to their place but folds the photographs over
+      steep canopy where the views are oblique.
+  --orthomosaic-feather N
+      classic: blend two photographs over about 2N pixels across each seam (default 16;
+      0: hard seams).
   --export-orthomosaic RUN_DIRECTORY
       Make the orthomosaic of a finished run without reprocessing; written to the
       run's 07_results or to --orthomosaic-output DIRECTORY.
 Orientation import/export (supported variants and conventions in ORIENTATIONS.md):
   --orientation-input FILE_OR_DIRECTORY
-      Combined interior/exterior source. Per-image intrinsics are supported;
-      distinct camera calibrations currently require --intrinsics-mode fixed.
+      Combined interior/exterior source. Per-image intrinsics are supported; the
+      file's camera IDs become camera groups. Images of one camera with different
+      intrinsics require --intrinsics-mode fixed (or CAMERA=fixed).
   --orientation-input-format NAME, --calibration-format NAME, --poses-format NAME
       Input format (default: auto). Choices: native, csv, csv-opk, inpho, bundler,
       colmap, openmvg, opensfm, metashape, micmac, opencv. --calibration and --poses
@@ -3463,9 +3717,10 @@ Orientation import/export (supported variants and conventions in ORIENTATIONS.md
   --orientation-angle-unit degrees|radians
       CSV omega/phi/kappa angle unit (default: degrees). R_camera_to_world_photo =
       Rz(kappa)*Ry(phi)*Rx(omega); another OPK convention requires explicit conversion.
-  --orientation-pixel-size MM
+  --orientation-pixel-size MM, --orientation-pixel-size CAMERA=MM
       Physical sensor pixel pitch for INPHO import when absent, required for INPHO
       export. No default: physical millimetres cannot be inferred from pixel focal length.
+      CAMERA=MM (repeatable) sets one camera's pitch; INPHO imports keep their own.
   --orientation-world-units auto|m|ft|mm
       Declare orientation coordinate units (default auto: preserve available metadata).
       Declaration does not rescale coordinates. INPHO local export needs known units;

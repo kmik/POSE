@@ -145,13 +145,13 @@ final class CalibrationDiagnostics {
           double[] uv = lens.project(f, t.point);
           if (uv == null) continue;
           Point p = lens.observed[f.id][ob.feature];
-          double x = (p.x + .5) * lens.initial.width / f.width - .5;
-          double y = (p.y + .5) * lens.initial.height / f.height - .5;
-          double dx = (uv[0] - p.x) * lens.initial.width / f.width;
-          double dy = (uv[1] - p.y) * lens.initial.height / f.height;
+          double x = (p.x + .5) * lens.initialOf(f).width / f.width - .5;
+          double y = (p.y + .5) * lens.initialOf(f).height / f.height - .5;
+          double dx = (uv[0] - p.x) * lens.initialOf(f).width / f.width;
+          double dy = (uv[1] - p.y) * lens.initialOf(f).height / f.height;
           double radius =
-              Math.hypot(x - lens.initial.cx, y - lens.initial.cy)
-                  / Math.hypot(lens.initial.width / 2., lens.initial.height / 2.);
+              Math.hypot(x - lens.initialOf(f).cx, y - lens.initialOf(f).cy)
+                  / Math.hypot(lens.initialOf(f).width / 2., lens.initialOf(f).height / 2.);
           double[] bin = radial[held.contains(t) ? 1 : 0][Math.clamp((int) (radius * 6), 0, 5)];
           bin[0]++;
           bin[1] += dx;
@@ -240,10 +240,11 @@ final class CalibrationDiagnostics {
   }
 
   static Object correctionUncertainty(
-      SharedCalibration lens, double[][] covariance, double coverage) {
+      SharedCalibration lens, double[][] covariance, double coverage, int group) {
     if (covariance == null) return null;
     double observed = 0, corners = 0;
-    Calibration c = lens.calibration();
+    Calibration c = lens.calibration(group);
+    int o = group * SharedCalibration.SIZE;
     for (int iy = 0; iy <= 12; iy++)
       for (int ix = 0; ix <= 16; ix++) {
         double u = ix * (c.width - 1.) / 16, v = iy * (c.height - 1.) / 12;
@@ -276,13 +277,13 @@ final class CalibrationDiagnostics {
         for (int row = 0; row < 2; row++)
           for (int a = 0; a < SharedCalibration.LENS; a++)
             for (int b = 0; b < SharedCalibration.LENS; b++)
-              variance += j[row][a] * covariance[a][b] * j[row][b];
+              variance += j[row][a] * covariance[o + a][o + b] * j[row][b];
         double sigma = Math.sqrt(Math.max(0, variance));
         corners = Math.max(corners, sigma);
         if (Math.hypot(u - c.cx, v - c.cy) <= coverage * Math.hypot(c.width / 2., c.height / 2.))
           observed = Math.max(observed, sigma);
       }
-    double[][] correlations = new double[SharedCalibration.SIZE][SharedCalibration.SIZE];
+    double[][] correlations = new double[covariance.length][covariance.length];
     for (int i = 0; i < correlations.length; i++)
       for (int j = 0; j < correlations.length; j++) {
         double d = Math.sqrt(covariance[i][i] * covariance[j][j]);

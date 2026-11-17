@@ -21,7 +21,7 @@ Java, uses OpenCL for dense matching and depth fusion, and runs on its own or as
 - Georeferencing to an airborne lidar reference (LAS or LAZ), without ground control points.
 - Dense matching (semi-global matching, optionally multi-view) with multi-view depth fusion.
 - Ground classification with a terrain model and a canopy height model.
-- Full-resolution true orthomosaic as a tiled GeoTIFF.
+- Full-resolution orthomosaic as a tiled GeoTIFF: true (no lean, gaps left open) or classic (no holes).
 - LAS and PLY point clouds, DSM, DTM and a PDF processing report.
 - The pipeline runs in one go or one step at a time.
 - A desktop window (`pose-gui.bat`, `pose-gui.sh`) to start, follow and inspect runs, with a 3D view.
@@ -125,8 +125,14 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | `--filtering` | `moderate` | `mild`, `moderate` or `aggressive` depth filtering. |
 | `--min-views` | `3` | Images that must agree on a point. |
 | `--crs` | `EPSG:3067` | Output coordinate system. |
+| `--camera-grouping` | `auto` | Which images share one camera calibration. `auto`: camera IDs of an imported orientation, else `--camera-groups`, else EXIF make, model, serial and focal length; also `single`, `per-image`. Images of different sizes are always separate cameras; the cameras are listed in `01_calibration/cameras.json`. |
+| `--camera-groups` | none | CSV `image,camera` naming the camera of every image. |
+| `--calibration CAMERA=FILE` | none | One camera's calibration (repeatable), in any supported calibration format holding one camera (POSE `camera.txt`, `calib.result`, OpenCV, Metashape, MicMac, one-camera COLMAP/INPHO). CAMERA is a `--camera-groups` name or `camera_1`, `camera_2`, ... (EXIF grouping). `--intrinsics-mode`, `--orientation-pixel-size`, `--focal` and `--s_w` also take `CAMERA=VALUE`; `--intrinsics-mode CAMERA=free` ignores that camera's supplied calibration. A multi-camera INPHO, Metashape, COLMAP, openMVG, OpenSfM or CSV file goes to `--orientation-input`; its camera IDs name the cameras. |
+| `--quick-calibration` | `on` | Focal starts from EXIF/XMP without the focal bootstrap; `off` (or `--calibration-pipeline bootstrap`) restores the earlier default. Runs started before the change continue with `off`. |
+| `--calibration-trial-method` | `full` | How the lens is refined after alignment. `full`: one parameter per trial, each a whole-block bundle adjustment (skipped above about 120 cameras per camera model, where none can be accepted). `subset`: the same trials on a compact set of cameras near the block centre (`--calibration-trial-cameras`, default 100), then one whole-block fit of the chosen model, kept only if it improves the whole block. `joint`: unsupported parameters dropped first, the rest fitted together once. Use `subset` or `joint` for large blocks. |
 | `--classify-ground` | off | Ground classes, `dtm.tif` and `chm.tif`. |
 | `--orthomosaic` | off | Full-resolution true orthomosaic. |
+| `--orthomosaic-mode` | `true` | `classic`: smoothed, gap-free surface and no visibility test, so no holes inside the photographed area; tall objects lean. |
 | `--dense-method` | `sgm` | `mvsgm` matches several neighbouring images at once (needs `--fusion-mode image`). |
 | `--block-processing` | `off` | `auto` or `on` splits very large image sets into overlapping blocks. |
 | `--registration-bundle-growth` | `15` | Bundle adjustment during camera registration each time the registered set has grown by this percent; `0` turns it off. |
@@ -139,7 +145,8 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | `--tiled-las-output` | `0` | Size of square LAS tiles in output units (for example `1000`); `0` writes one `dense.las`. |
 | `--compute` | `auto` | `cpu` or `gpu` force one. |
 | `--cores` | half the CPUs | CPU threads. |
-| `--memory-mb` | `2048` | Processing buffer budget in MiB (not a total RAM limit). |
+| `--memory-mb` | `2048` | Processing buffer budget in MiB, not a total RAM limit: the Java heap is set to about this / 0.65 (56000 gives an 84 GB heap), and native memory (OpenCV, SIFT, GPU buffers) comes on top. |
+| `--ram-limit-mb` | `0` | Total RAM to plan for (0 = detect the host or job limit). Caps the heap at 65% of it, and parallel feature extraction and pair matching wait instead of going over it. For about 52 GB in total: `--memory-mb 22000 --ram-limit-mb 52000`. |
 
 `--estimate-memory` shows the memory plan without processing.
 

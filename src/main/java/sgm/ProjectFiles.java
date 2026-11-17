@@ -119,6 +119,7 @@ final class ProjectFiles {
     String status = status(steps, String.valueOf(runJson.getOrDefault("status", "")), !state.isEmpty());
     List<String> arguments = new ArrayList<>();
     for (Object o : list(state.isEmpty() ? runJson.get("arguments") : state.get("arguments"))) arguments.add(String.valueOf(o));
+    if (!arguments.isEmpty()) arguments = Options.legacyQuickCalibration(arguments);
     List<String> flags = new ArrayList<>();
     for (Object o : list(report.get("quality_flags"))) flags.add(String.valueOf(o));
     return new Run(id, dir, started, status, steps, points(report), flags, summary(report), arguments);

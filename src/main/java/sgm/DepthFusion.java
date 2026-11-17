@@ -525,9 +525,9 @@ final class DepthFusion implements AutoCloseable {
                       },
                       camera.translation));
         }
+      if (n < 9) continue; // fails below whatever the fit gives (same result without the fit)
       SurfaceGeometry.Plane plane = SurfaceGeometry.plane(neighbors, n);
       if (plane == null
-          || n < 9
           || plane.middle() < footprint * footprint * .2
           || plane.smallest() > .12 * plane.middle()) continue;
       double[] normal = plane.normal();
@@ -541,9 +541,11 @@ final class DepthFusion implements AutoCloseable {
         if (Math.abs(SurfaceGeometry.distance(neighbors[i], plane.center(), normal)) <= band)
           neighbors[m++] = neighbors[i];
       if (m < n * .8) return new SurfaceSample(null, footprint, sigma);
-      plane = SurfaceGeometry.plane(neighbors, m);
-      if (plane == null || plane.smallest() > .12 * plane.middle()) continue;
-      normal = plane.normal();
+      if (m < n) { // nothing rejected: the refit would give the same, already accepted plane
+        plane = SurfaceGeometry.plane(neighbors, m);
+        if (plane == null || plane.smallest() > .12 * plane.middle()) continue;
+        normal = plane.normal();
+      }
       double centerError = Math.abs(SurfaceGeometry.distance(p, plane.center(), normal));
       // Use observed local scatter, not the often much larger geometric sigma, to
       // distinguish a noisy surface sample from a narrow foreground center.

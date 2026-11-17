@@ -108,7 +108,7 @@ final class Project {
                   .resolve(options.storage + (options.diagnostics ? "-diagnostics" : "-compact"))
               : null;
       if (options.cacheDirectory == null)
-        options.runFeatureDirectory = Files.createTempDirectory(run, ".feature-reuse-");
+        options.runFeatureDirectory = leftoverFeatures(run);
       marker.setProperty("latest_run", id);
       persistProject("running");
       Json.write(run.resolve("run.json"), runDescription("running", null));
@@ -756,6 +756,29 @@ final class Project {
       throw new IOException("Artifact changed during hashing: " + key);
     artifactHashes.put(key, new VerifiedHash(a.size(), a.lastModifiedTime(), a.fileKey(), hash));
     return hash;
+  }
+
+  /**
+   * The feature scratch of a continued run: a folder a killed process left behind (its entries are
+   * checksummed and keyed by pixels and detector settings, so finished images are reused), or a new
+   * one.
+   */
+  private static Path leftoverFeatures(Path run) throws IOException {
+    try (var list = Files.list(run)) {
+      Path newest = list.filter(p -> p.getFileName().toString().startsWith(".feature-reuse-") && Files.isDirectory(p))
+          .max(Comparator.comparing(p -> {
+            try {
+              return Files.getLastModifiedTime(p).toMillis();
+            } catch (IOException e) {
+              return 0L;
+            }
+          })).orElse(null);
+      if (newest != null) {
+        System.out.println("Continuing run: reusing features left by an earlier process in " + newest.getFileName());
+        return newest;
+      }
+    }
+    return Files.createTempDirectory(run, ".feature-reuse-");
   }
 
   private void cleanupRunFeatures() throws IOException {

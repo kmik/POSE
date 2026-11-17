@@ -79,6 +79,17 @@ final class Calibration {
     return new Camera(fx * sx, fy * sy, (cx + .5) * sx - .5, (cy + .5) * sy - .5);
   }
 
+  /**
+   * The same camera at another resolution of the same sensor (equal aspect ratio): this calibration
+   * when the size already matches. Used once, where a camera's calibration is fixed to its images'
+   * source size, never to carry one camera's calibration over to another.
+   */
+  Calibration atSize(int w, int h) {
+    if (w == width && h == height) return this;
+    Camera c = camera(w, h);
+    return new Calibration(c.fx, c.fy, c.cx, c.cy, distortion.clone(), w, h);
+  }
+
   void write(Path path, String comment) throws IOException {
     Properties p = new Properties();
     p.setProperty("width", String.valueOf(width));

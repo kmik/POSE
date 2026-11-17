@@ -365,6 +365,8 @@ final class RunTelemetry implements AutoCloseable {
         peakRss == 0 ? null : peakRss,
         "peak_sampled_process_private_bytes",
         peakPrivate == 0 ? null : peakPrivate,
+        "memory_governor",
+        MemoryGovernor.summary(),
         "peak_tracked_opencl_buffer_bytes",
         peakDevice,
         "peak_device_gpu_utilization_percent",
@@ -488,6 +490,11 @@ final class RunTelemetry implements AutoCloseable {
 
   static long residentBytes() {
     return processMemory()[0];
+  }
+
+  /** Resident and (Windows) private bytes of this process; 0 when unknown. */
+  static long[] processMemoryBytes() {
+    return processMemory();
   }
 
   private static final class WindowsMemory {

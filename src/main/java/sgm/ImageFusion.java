@@ -2461,7 +2461,7 @@ final class ImageFusion {
   /** Plane fit on the owner's merged map; mirrors DepthFusion.surfaceSample. */
   private static final class NormalScratch {
     final double[][] pool = new double[49][3], neighbors = new double[49][];
-    final double[] residuals = new double[49];
+    final double[] residuals = new double[49], distances = new double[49];
   }
 
   private static final ThreadLocal<NormalScratch> NORMAL_SCRATCH =
@@ -2493,25 +2493,30 @@ final class ImageFusion {
             neighbors[n++] = q;
           } else neighbors[n++] = backProject(camera, rotationT, xx + m.du[at], (yy + m.row0) + m.dv[at], z);
         }
+      // Fewer than 9 neighbours fail below whatever the fit gives: skip the fit (same result).
+      if (n < 9) continue;
       SurfaceGeometry.Plane plane = SurfaceGeometry.plane(neighbors, n);
       if (plane == null
-          || n < 9
           || plane.middle() < footprint * footprint * .2
           || plane.smallest() > .12 * plane.middle()) continue;
       double[] normal = plane.normal();
-      double[] residuals = scratch.residuals;
+      double[] residuals = scratch.residuals, distances = scratch.distances;
       for (int i = 0; i < n; i++)
-        residuals[i] = Math.abs(SurfaceGeometry.distance(neighbors[i], plane.center(), normal));
+        residuals[i] = distances[i] = Math.abs(SurfaceGeometry.distance(neighbors[i], plane.center(), normal));
+      // select() reorders residuals; distances keeps them in neighbour order for the filter.
       // The median residual by selection: the same order statistic as after Arrays.sort.
       double band = Math.max(footprint * .5, 3 * 1.4826 * select(residuals, n, n / 2));
       int kept = 0;
       for (int i = 0; i < n; i++)
-        if (Math.abs(SurfaceGeometry.distance(neighbors[i], plane.center(), normal)) <= band)
-          neighbors[kept++] = neighbors[i];
+        if (distances[i] <= band) neighbors[kept++] = neighbors[i];
       if (kept < n * .8) return new DepthFusion.SurfaceSample(null, footprint, sigma);
-      plane = SurfaceGeometry.plane(neighbors, kept);
-      if (plane == null || plane.smallest() > .12 * plane.middle()) continue;
-      normal = plane.normal();
+      // Nothing rejected: the same points in the same order give the same plane, which already
+      // passed the test below, so the refit is skipped (identical result).
+      if (kept < n) {
+        plane = SurfaceGeometry.plane(neighbors, kept);
+        if (plane == null || plane.smallest() > .12 * plane.middle()) continue;
+        normal = plane.normal();
+      }
       double centerError = Math.abs(SurfaceGeometry.distance(p, plane.center(), normal));
       if (centerError > Math.max(.75 * footprint, 2 * Math.sqrt(plane.smallest())))
         return new DepthFusion.SurfaceSample(null, footprint, sigma);

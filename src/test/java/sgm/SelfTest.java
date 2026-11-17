@@ -59,6 +59,8 @@ public final class SelfTest {
     checks += FeatureGridRegression.run(root.resolve("feature-grid"));
     checks += RegistrationRecoveryRegression.run(root.resolve("registration-recovery"));
     checks += RegistrationPoseCheckRegression.run(root.resolve("pose-check"));
+    checks += ExactSpeedupRegression.run(root.resolve("exact-speedup"));
+    checks += MemoryGovernorRegression.run(root.resolve("memory-governor"));
     checks += GuiRegression.run(root.resolve("gui"));
     checks += GpuStereoFiltersRegression.run();
     checks += GpuDepthOutlierRegression.run();
@@ -89,6 +91,7 @@ public final class SelfTest {
     checks += BundleSchurRegression.run(root);
     checks += SharedCalibrationRegression.run(root);
     checks += AdaptiveCalibrationRegression.run(root.resolve("adaptive-calibration"));
+    checks += MultiCameraRegression.run(root.resolve("multi-camera"));
     checks += ThroughputRegression.run(root.resolve("throughput"));
     checks += AlignmentMemoryRegression.run(root.resolve("alignment-memory"));
     checks += ConfidencePatchMatchRegression.run(root);

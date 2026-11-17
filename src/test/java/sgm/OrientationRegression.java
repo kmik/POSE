@@ -420,7 +420,12 @@ final class OrientationRegression {
     Options constrained = imported.copy();
     constrained.intrinsicsMode = "prior";
     rejects(
-        () -> prepare(constrained, images),
+        () -> {
+          // Checked once the camera groups are known (calibrate step): one camera, two calibrations.
+          prepare(constrained, images);
+          CameraGroups.resolve(constrained, images, constrained.importedCameraIds, constrained.importedPixelSizes)
+              .checkImported(constrained);
+        },
         "Shared intrinsics refinement cannot silently collapse distinct calibrations");
     Path bom = base.resolve("bom-poses.csv");
     Files.writeString(bom, "\ufeff" + PoseIO.HEADER + "\nexternal.jpg,1,0,0,0,1,0,0,0,1,2,3,4\n");

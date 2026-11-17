@@ -41,6 +41,15 @@ final class PairMatching {
   /** Runs {@code task} for each edge on up to {@code threads} workers; {@code sink} sees edges in order. */
   static <T> void ordered(List<int[]> edges, int threads, Task<T> task, Sink<T> sink)
       throws IOException {
+    ordered(edges, threads, 0, null, task, sink);
+  }
+
+  /**
+   * As above; with unitBytes > 0 each pair is admitted by MemoryGovernor first (the order of
+   * results is unchanged).
+   */
+  static <T> void ordered(List<int[]> edges, int threads, long unitBytes, Options o, Task<T> task, Sink<T> sink)
+      throws IOException {
     if (threads <= 1 || edges.size() < 2) {
       for (int[] edge : edges) sink.accept(edge, task.run(edge));
       return;
@@ -60,7 +69,11 @@ final class PairMatching {
         // Bounded look-ahead keeps finished-but-unconsumed match lists small.
         while (next < edges.size() && queue.size() < 2 * threads) {
           int[] edge = edges.get(next++);
-          queue.add(pool.submit(() -> task.run(edge)));
+          queue.add(pool.submit(() -> {
+            try (MemoryGovernor.Admission memory = MemoryGovernor.admit("pair matching", unitBytes, o)) {
+              return task.run(edge);
+            }
+          }));
         }
         sink.accept(edges.get(done), join(queue.poll()));
       }

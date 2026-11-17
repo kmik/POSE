@@ -97,6 +97,16 @@ final class BlockProcessing {
       System.out.println("Block processing (auto): the whole image set fits one block; running as usual.");
       return null;
     }
+    // The blocks share one calibration file (camera.txt of a central block). Several cameras would
+    // need one per camera, which block processing does not do: refuse before any work.
+    CameraGroups cameras = CameraGroups.resolve(o, paths, Map.of(), Map.of());
+    if (cameras.multiple())
+      throw new IllegalArgumentException(
+          "--block-processing shares one calibration between blocks, but the images come from "
+              + cameras.size()
+              + " cameras "
+              + cameras.groups.stream().map(g -> g.id + " (" + g.label + ")").toList()
+              + "; process them without --block-processing");
     Path root = Main.projectRoot(args);
     Files.createDirectories(root);
     List<Image> images = inventory(paths);
@@ -137,8 +147,12 @@ final class BlockProcessing {
   /** Bytes of the image-fusion heap for a block of n images (ImageFusion's own admission rule). */
   static long estimateFusion(Options o, List<Path> paths, int n) throws IOException {
     if (!o.fusionMode.equals("image")) return 0;
-    int[] size = o.processedSize(ResolutionPlan.originalSize(paths.get(0))[0], ResolutionPlan.originalSize(paths.get(0))[1]);
-    long pixels = (long) size[0] * size[1];
+    // The largest image (several cameras may differ in size).
+    long pixels = 0;
+    for (Path p : paths) {
+      int[] source = ResolutionPlan.originalSize(p), size = o.processedSize(source[0], source[1]);
+      pixels = Math.max(pixels, (long) size[0] * size[1]);
+    }
     boolean filter = DepthOutlierFilter.enabled(o);
     long perCamera = (filter ? 8 : 4) * pixels + (o.fusionLocalSigma > 0 ? 4 * pixels : 0);
     long cache = filter ? (long) SurfacePatchGrid.CELL_BYTES * SurfacePatchGrid.cacheCells(o, n) : 0;

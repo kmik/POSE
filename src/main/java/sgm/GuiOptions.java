@@ -90,12 +90,15 @@ final class GuiOptions {
           new Field("--lidar-canopy-weight", "   Canopy weight", INPUT, Kind.TEXT, List.of()),
           new Field("--lidar-vertical-datum", "   Lidar height datum", INPUT, Kind.TEXT, List.of()),
           new Field("--crs", "Coordinate system (EPSG)", INPUT, Kind.TEXT, List.of()),
+          new Field("--camera-grouping", "Camera grouping", INPUT, Kind.CHOICE, List.of("", "auto", "single", "per-image")),
+          new Field("--camera-groups", "   Camera of each image (CSV)", INPUT, Kind.FILE, List.of()),
           new Field("--quality", "Quality", PROCESSING, Kind.CHOICE, List.of("", "ultra", "high", "medium", "low")),
           new Field("--max-dimension", "Max image dimension (px)", PROCESSING, Kind.TEXT, List.of()),
           new Field("--dense-method", "Dense method", PROCESSING, Kind.CHOICE, List.of("", "sgm", "mvsgm", "patchmatch")),
           new Field("--filtering", "Filtering", PROCESSING, Kind.CHOICE, List.of("", "mild", "moderate", "aggressive")),
           new Field("--min-views", "Minimum views per point", PROCESSING, Kind.TEXT, List.of()),
           new Field("--quick-calibration", "Quick calibration", PROCESSING, Kind.FLAG, List.of()),
+          new Field("--calibration-trial-method", "Calibration trials", PROCESSING, Kind.CHOICE, List.of("", "full", "subset", "joint")),
           new Field("--tie-point-cleanup", "Tie-point cleanup", PROCESSING, Kind.CHOICE, List.of("", "off", "auto", "custom", "pause")),
           new Field("--tie-point-max-error", "   Largest error (px)", PROCESSING, Kind.SUGGEST, List.of("", "auto")),
           new Field("--tie-point-min-views", "   Fewest images", PROCESSING, Kind.TEXT, List.of()),
@@ -103,6 +106,7 @@ final class GuiOptions {
           new Field("--tie-point-max-removed", "   Most removed (%)", PROCESSING, Kind.TEXT, List.of()),
           new Field("--classify-ground", "Classify ground (DTM, CHM)", PROCESSING, Kind.FLAG, List.of()),
           new Field("--orthomosaic", "Orthomosaic", PROCESSING, Kind.FLAG, List.of()),
+          new Field("--orthomosaic-mode", "   Mode", PROCESSING, Kind.CHOICE, List.of("", "true", "classic")),
           new Field("--compute", "Compute device", COMPUTE, Kind.CHOICE, List.of("", "auto", "gpu", "cpu")),
           new Field("--gpu-device", "GPU index", COMPUTE, Kind.TEXT, List.of()),
           new Field("--gpu-memory-mb", "GPU memory (MiB)", COMPUTE, Kind.TEXT, List.of()),
@@ -146,7 +150,7 @@ final class GuiOptions {
   }
 
   /** Fields that name the user's files; kept by Reset options and across a defaults change. */
-  static final List<String> FOLDERS = List.of("-i", "--orientation-input", "--gcp", "--lidar-reference");
+  static final List<String> FOLDERS = List.of("-i", "--orientation-input", "--gcp", "--lidar-reference", "--camera-groups");
 
   static Field field(String flag) {
     for (Field f : all()) if (f.flag.equals(flag)) return f;
@@ -308,10 +312,21 @@ final class GuiOptions {
     return mode.equals("custom") || mode.equals("pause");
   }
 
+  /**
+   * Flags that are on in the CLI by default: a cleared box passes "FLAG off", so the box always
+   * shows what runs (a set box passes the bare flag, as before).
+   */
+  static final Set<String> ON_BY_DEFAULT = Set.of("--quick-calibration");
+
   static List<String> arguments(Map<String, String> values, String advanced) {
     List<String> out = new ArrayList<>();
     for (Field f : all()) {
       String v = values.get(f.flag);
+      if (ON_BY_DEFAULT.contains(f.flag) && (v == null || !Boolean.parseBoolean(v.strip()))) {
+        out.add(f.flag);
+        out.add("off");
+        continue;
+      }
       if (v == null || v.isBlank()) continue;
       if (TIE_POINT_LIMITS.contains(f.flag) && !tiePointLimitsUsed(values)) continue;
       if (LIDAR_OPTIONS.contains(f.flag) && !lidarUsed(values)) continue;

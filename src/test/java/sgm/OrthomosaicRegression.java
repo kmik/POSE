@@ -309,9 +309,92 @@ final class OrthomosaicRegression {
     check(parsed.orthomosaic && parsed.orthomosaicResolution == .05 && parsed.orthomosaicFill == 0 && !new Options().orthomosaic, "orthomosaic options; off by default");
     check(!parsed.orthomosaicStrict && Options.parse(new String[] {"-i", ".", "--orthomosaic", "--orthomosaic-strict"}).orthomosaicStrict, "--orthomosaic-strict; off by default");
 
+    Options classicOptions = Options.parse(new String[] {"-i", ".", "--orthomosaic", "--orthomosaic-mode", "classic", "--orthomosaic-smooth", "1.5", "--orthomosaic-feather", "0"});
+    check(classicOptions.orthomosaicMode.equals("classic") && classicOptions.orthomosaicSmooth == 1.5 && classicOptions.orthomosaicFeather == 0
+        && new Options().orthomosaicMode.equals("true") && new Options().orthomosaicSmooth == -1 && new Options().orthomosaicFeather == 16, "classic options; true mode by default");
+    boolean refused = false;
+    try {
+      Options.parse(new String[] {"-i", ".", "--orthomosaic-mode", "lean"});
+    } catch (IllegalArgumentException expected) {
+      refused = true;
+    }
+    check(refused, "unknown --orthomosaic-mode refused");
+    classic(views, memory, cloud);
+
     canopy();
     checkPoints();
     return checks;
+  }
+
+  /**
+   * Classic mode: the surface is despiked, fully interpolated and smoothed; the mosaic has no
+   * holes inside the photographs, ground away from the box is right, seams are blended.
+   */
+  private static void classic(List<Orthomosaic.View> views, Orthomosaic.Photos photos, Orthomosaic.Cloud cloud) throws Exception {
+    // A lone spike is removed; a ramp with a wide hole is interpolated within its range.
+    Orthomosaic.Surface spike = new Orthomosaic.Surface(9, 9, 0, 9, 1);
+    Arrays.fill(spike.z, 2);
+    spike.z[40] = 50;
+    spike.finishClassic(0, 2);
+    check(spike.z[40] == 2 && spike.filled == 0 && spike.top == 2, "spike removed by the median");
+    Orthomosaic.Surface ramp = new Orthomosaic.Surface(64, 64, 0, 64, 1);
+    for (int p = 0; p < ramp.z.length; p++) {
+      int x = p % 64, y = p / 64;
+      ramp.z[p] = x >= 20 && x < 44 && y >= 20 && y < 44 ? Float.NaN : x;
+    }
+    ramp.finishClassic(0, 4);
+    double worst = 0;
+    boolean monotone = true;
+    for (int y = 20; y < 44; y++)
+      for (int x = 20; x < 44; x++) {
+        float v = ramp.z[y * 64 + x];
+        worst = Math.max(worst, Math.abs(v - x));
+        if (x > 20 && v < ramp.z[y * 64 + x - 1] - 1e-4) monotone = false;
+      }
+    check(ramp.known == 64 * 64 && ramp.filled == 24 * 24 && (ramp.kind[32 * 64 + 32] & Orthomosaic.Surface.FILLED) != 0, "every cell known; hole cells FILLED");
+    check(worst < 6 && monotone, "hole filled smoothly across the ramp (worst " + worst + ")");
+    Orthomosaic.Surface flat = new Orthomosaic.Surface(40, 40, 0, 40, 1);
+    Arrays.fill(flat.z, 3);
+    flat.finishClassic(5, 4);
+    boolean same = true;
+    for (float v : flat.z) same &= Math.abs(v - 3) < 1e-5;
+    check(same, "smoothing keeps a flat surface flat (edges included)");
+    Orthomosaic.Surface step = new Orthomosaic.Surface(40, 1, 0, 1, 1);
+    for (int x = 0; x < 40; x++) step.z[x] = x < 20 ? 0 : 10;
+    step.finishClassic(3, 1);
+    check(step.z[19] > 0 && step.z[19] < 10 && step.z[0] == 0 && step.z[39] == 10, "a step is ramped by the smoothing");
+
+    // The test scene: gap beside the box, roof, ground; mosaic 500 x 480 pixels of 0.08 m (one tile).
+    Orthomosaic.Surface surface = new Orthomosaic.Surface(180, 180, 3, 42, .25);
+    surface.add(cloud, "classic surface");
+    surface.finishClassic(4, 4);
+    check(surface.known == 180L * 180 && surface.filled > 0, "classic surface fully known");
+    double x0 = 5, yTop = 38.8, cell = .08;
+    int width = 500, height = 480;
+    byte[][] tile = new byte[3][];
+    for (Orthomosaic.View v : views) v.reach = null;
+    Orthomosaic.Result r16 = Orthomosaic.render(surface, views, photos, x0, yTop, cell, width, height, 8, true, true, null, 16, (tx, ty, b) -> tile[0] = b);
+    Orthomosaic.Result r1 = Orthomosaic.render(surface, views, photos, x0, yTop, cell, width, height, 1, true, true, null, 16, (tx, ty, b) -> tile[1] = b);
+    Orthomosaic.Result hard = Orthomosaic.render(surface, views, photos, x0, yTop, cell, width, height, 8, true, true, null, 0, (tx, ty, b) -> tile[2] = b);
+    check(Arrays.equals(tile[0], tile[1]) && r16.painted == r1.painted, "classic tiles do not depend on the thread count");
+    check(r16.painted == (long) width * height && r16.unknown == 0 && r16.unseen == 0 && r16.relaxed == 0, "no holes: every pixel painted");
+    byte[] blended = inflate(tile[0]), seams = inflate(tile[2]);
+    long far = 0, right = 0, differ = 0;
+    for (int row = 0; row < height; row++)
+      for (int col = 0; col < width; col++) {
+        double x = x0 + (col + .5) * cell, y = yTop - (row + .5) * cell;
+        int at = 4 * (row * 512 + col);
+        int colour = (blended[at] & 255) << 16 | (blended[at + 1] & 255) << 8 | (blended[at + 2] & 255);
+        int other = (seams[at] & 255) << 16 | (seams[at + 1] & 255) << 8 | (seams[at + 2] & 255);
+        if (colour != other) differ++;
+        double outside = Math.max(Math.max(BX0 - x, x - BX1), Math.max(BY0 - y, y - BY1));
+        if (outside > 6) {
+          far++;
+          if (close(colour, ground(x, y), 8)) right++;
+        }
+      }
+    check(far > 100000 && right >= .995 * far, "ground away from the box is right: " + right + " of " + far);
+    check(differ > 0 && differ < .5 * width * height, "feathering changes only seam bands: " + differ);
   }
 
   /**

@@ -127,7 +127,9 @@ final class FeatureTracks {
             pool.submit(
                 () -> {
                   ImageFrame f = frames.get(index);
-                  try (WorkProgress work =
+                  try (MemoryGovernor.Admission memory =
+                          MemoryGovernor.admit("feature extraction", MemoryGovernor.featureBytes(f, o), o);
+                      WorkProgress work =
                       WorkProgress.start("Feature extraction " + f.path.getFileName(), 0, "keypoints")) {
                     ReuseCache.features(f, o);
                     work.done();
@@ -225,8 +227,19 @@ final class FeatureTracks {
     List<int[]> edges = PairSelection.select(frames, o, project);
     WorkProgress matching = WorkProgress.start("Matching image pairs", edges.size(), "pairs");
     long[] consumed = {0};
+    MatchCheckpoint checkpoint = MatchCheckpoint.open(o, project);
+    boolean matchingFinished = false;
+    try {
     PairMatching.Task<Result> task =
         edge -> {
+          if (checkpoint != null) {
+            MatchCheckpoint.Record record = checkpoint.get(frames.get(edge[0]), frames.get(edge[1]));
+            if (record != null) {
+              Result result = new Result(record.pair());
+              result.restored = record;
+              return result;
+            }
+          }
           try (WorkProgress work =
               WorkProgress.start("Match/verify pair " + edge[0] + "-" + edge[1], 0, "matches")) {
             Result result = match(frames.get(edge[0]), frames.get(edge[1]), o, work);
@@ -242,7 +255,10 @@ final class FeatureTracks {
           matching.detail("pair " + a + "-" + b);
           try {
             // Exports and track joins stay on this thread, in the original pair order.
-            if (project != null)
+            if (project != null && result.restored != null)
+              project.data.compactMatches(frames.get(a), frames.get(b), pair, result.restored.queries(),
+                  result.restored.ransac(), result.restored.cheirality());
+            else if (project != null)
               project.data.matches(
                   frames.get(a),
                   frames.get(b),
@@ -254,6 +270,9 @@ final class FeatureTracks {
           } finally {
             for (Mat m : result.forward) m.release();
           }
+          if (checkpoint != null && result.restored == null)
+            checkpoint.put(frames.get(a), frames.get(b), pair, result.forward.size(),
+                result.ransacFlags.size(), result.cheiralityFlags.size());
           if (result.reused) reused[0]++;
           if (pair.matches.size() < o.minMatches) return;
           pair.matches.trim();
@@ -262,8 +281,17 @@ final class FeatureTracks {
           System.out.printf(
               Locale.ROOT, "Pair %d-%d: %d geometric inliers%n", a, b, pair.matches.size());
         };
-    PairMatching.ordered(edges, PairMatching.threads(o), task, sink);
+    PairMatching.ordered(edges, PairMatching.threads(o), MemoryGovernor.pairBytes(o), o, task, sink);
     if (o.matchRepair.equals("on")) repair(frames, edges, o, task, sink);
+    matchingFinished = true;
+    } finally {
+      if (checkpoint != null) {
+        if (checkpoint.restored > 0)
+          System.out.printf(Locale.ROOT, "Pair matching: %,d pairs restored from the checkpoint, %,d matched%n",
+              checkpoint.restored, checkpoint.written);
+        checkpoint.close(matchingFinished);
+      }
+    }
     GpuHamming.close();
     matching.done();
     matching.close();
@@ -342,7 +370,7 @@ final class FeatureTracks {
         plan.edges().size());
     if (!plan.edges().isEmpty())
       try (WorkProgress work = WorkProgress.start("Match repair", plan.edges().size(), "pairs")) {
-        PairMatching.ordered(plan.edges(), PairMatching.threads(o), task, sink);
+        PairMatching.ordered(plan.edges(), PairMatching.threads(o), MemoryGovernor.pairBytes(o), o, task, sink);
         work.done();
       }
     Map<Long, Integer> added = new HashMap<>();
@@ -415,6 +443,8 @@ final class FeatureTracks {
     final Set<Integer> ransacFlags = new HashSet<>(), cheiralityFlags = new HashSet<>();
     final boolean[] reusedSearch = new boolean[1];
     boolean reused;
+    /** Set when the pair came from the step's checkpoint (no match lists then). */
+    MatchCheckpoint.Record restored;
 
     Result(Pair pair) {
       this.pair = pair;

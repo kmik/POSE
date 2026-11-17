@@ -637,7 +637,7 @@ final class ProjectArtifacts implements AutoCloseable {
           StandardOpenOption.APPEND);
   }
 
-  private void compactMatches(
+  void compactMatches(
       ImageFrame a, ImageFrame b, FeatureTracks.Pair pair, int queries, int ransac, int cheirality)
       throws IOException {
     if (pairRows.isEmpty())

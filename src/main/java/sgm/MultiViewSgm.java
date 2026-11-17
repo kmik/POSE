@@ -1101,6 +1101,22 @@ final class MultiViewSgm {
     }
   }
 
+  /** Waits for a map write; its I/O error is rethrown here. */
+  private static void finish(Future<?> pending) throws IOException {
+    if (pending == null) return;
+    try {
+      pending.get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new InterruptedIOException("interrupted while writing depth maps");
+    } catch (ExecutionException e) {
+      if (e.getCause() instanceof IOException io) throw io;
+      if (e.getCause() instanceof RuntimeException r) throw r;
+      if (e.getCause() instanceof Error r) throw r;
+      throw new IOException(e.getCause());
+    }
+  }
+
   /**
    * One large image solved tile by tile: each tile (TILE_SIZE plus TILE_OVERLAP on every side, so
    * SGM paths and filters start outside the tile core) gets its own reference crop and, per
@@ -1119,6 +1135,15 @@ final class MultiViewSgm {
     double[] seeds = seeds(rf, tracks, header.labels);
     long valid = 0, cells = 0, peak = 0;
     int tiles = 0;
+    // Tile cores go to the map files on a writer thread while the next tile is solved. At most one
+    // tile is being written (its arrays are not used again); every write ends before this returns.
+    ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
+      Thread t = new Thread(r, "mvsgm-map-writer");
+      t.setDaemon(true);
+      return t;
+    });
+    Future<?> pending = null;
+    try {
     for (int ty0 = 0; ty0 < H; ty0 += T)
       for (int tx0 = 0; tx0 < W; tx0 += T) {
         int cx1 = Math.min(W, tx0 + T), cy1 = Math.min(H, ty0 + T);
@@ -1149,15 +1174,28 @@ final class MultiViewSgm {
         Solved solved = solve(p, Arrays.copyOf(local, n));
         DepthMap m = select(p, solved.summary());
         float[][] maps = {m.depth(), m.margin(), m.sharpness(), m.photometric()};
-        for (int k = 0; k < kinds.length; k++)
-          DepthMapFile.writeRegion(dir.resolve("camera_" + c + kinds[k]), W, tx0, ty0, cx1 - tx0, cy1 - ty0,
-              maps[k], ew, tx0 - ex0, ty0 - ey0);
+        int wx0 = tx0, wy0 = ty0, cols = cx1 - tx0, rows = cy1 - ty0, sw = ew, sx0 = tx0 - ex0, sy0 = ty0 - ey0;
+        finish(pending);
+        pending = writer.submit(() -> {
+          for (int k = 0; k < kinds.length; k++)
+            DepthMapFile.writeRegion(dir.resolve("camera_" + c + kinds[k]), W, wx0, wy0, cols, rows, maps[k], sw, sx0, sy0);
+          return null;
+        });
         for (int y = ty0; y < cy1; y++)
           for (int x = tx0; x < cx1; x++) if (m.depth()[(y - ey0) * ew + x - ex0] > 0) valid++;
         cells += solved.bands().total();
         peak = Math.max(peak, solved.peakDeviceBytes());
         tiles++;
       }
+      finish(pending);
+    } finally {
+      writer.shutdown();
+      try {
+        writer.awaitTermination(10, TimeUnit.MINUTES);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
     Map<String, Object> report = new LinkedHashMap<>(Json.object(
         "tiled", true, "tile_size", T, "tile_overlap", O, "tiles", tiles, "packed_cells", cells,
         "peak_device_bytes", peak, "backend", backend.get(), "valid", valid,
@@ -1184,30 +1222,42 @@ final class MultiViewSgm {
     float[] label = new float[n], margin = new float[n], sharp = new float[n], photo = new float[n];
     Arrays.fill(label, Float.NaN);
     double rise = (double) o.directions * p1(), worst = o.directions * (double) penalty();
-    long none = 0, boundary = 0, ambiguous = 0, selected = 0;
-    for (int p = 0; p < n; p++) {
+    // Per-pixel and independent: row bands in parallel, counts summed per band (same values).
+    int bands = Math.min(h, 64), bandRows = Math.ceilDiv(h, bands);
+    long[] counts = new long[4 * bands];
+    final float[] labelOut = label;
+    parallel(bands, b -> {
+      for (int p = b * bandRows * w, end = Math.min(n, (b + 1) * bandRows * w); p < end; p++) {
       int s = 6 * p, best = summary[s], value = summary[s + 1], second = summary[s + 2];
       if (!ref.use[p]) continue;
       if (best < 0) {
-        none++;
+        counts[4 * b]++;
         continue;
       }
       if ((summary[s + 5] & 7) != 0) {
-        boundary++;
+        counts[4 * b + 1]++;
         continue;
       }
       if (second != Integer.MAX_VALUE && second - value <= Math.max(1, value * o.uniqueness)) {
-        ambiguous++;
+        counts[4 * b + 2]++;
         continue;
       }
       int before = summary[s + 3], after = summary[s + 4];
       double offset = before >= 0 && after >= 0 ? StereoCost.subpixel(o, before, value, after) : 0;
-      label[p] = (float) (best + offset);
+      labelOut[p] = (float) (best + offset);
       margin[p] = second == Integer.MAX_VALUE ? 1 : (float) ((second - value) / (double) second);
       int side = before >= 0 && after >= 0 ? Math.min(before, after) : Math.max(before, after);
       sharp[p] = side < 0 ? 0 : (float) Math.min(1, (side - value) / rise);
       photo[p] = (float) Math.max(0, Math.min(1, 1 - value / worst));
-      selected++;
+      counts[4 * b + 3]++;
+      }
+    });
+    long none = 0, boundary = 0, ambiguous = 0, selected = 0;
+    for (int b = 0; b < bands; b++) {
+      none += counts[4 * b];
+      boundary += counts[4 * b + 1];
+      ambiguous += counts[4 * b + 2];
+      selected += counts[4 * b + 3];
     }
     long median = 0;
     if (o.median > 1 && !o.medianMode.equals("off")) {
@@ -1219,12 +1269,19 @@ final class MultiViewSgm {
     }
     long speckles = CensusSgm.removeSpeckles(label, w, h, o.speckleSize, 1.0, o.speckleConnectivity);
     float[] depth = new float[n];
+    final float[] filtered = label;
+    long[] validBands = new long[bands];
+    parallel(bands, b -> {
+      long v = 0;
+      for (int p = b * bandRows * w, end = Math.min(n, (b + 1) * bandRows * w); p < end; p++)
+        if (Float.isFinite(filtered[p])) {
+          depth[p] = (float) (1 / labels.q(filtered[p]));
+          v++;
+        } else margin[p] = sharp[p] = photo[p] = 0;
+      validBands[b] = v;
+    });
     long valid = 0;
-    for (int p = 0; p < n; p++)
-      if (Float.isFinite(label[p])) {
-        depth[p] = (float) (1 / labels.q(label[p]));
-        valid++;
-      } else margin[p] = sharp[p] = photo[p] = 0;
+    for (long v : validBands) valid += v;
     Map<String, Object> report = Json.object(
         "used_pixels", count(ref.use), "no_winner", none, "range_or_band_edge_rejected", boundary,
         "uniqueness_rejected", ambiguous, "selected", selected, "median_changed", median,

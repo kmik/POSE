@@ -46,7 +46,7 @@ final class AdaptiveCalibrationRegression {
       frames.get(0).camera.fixed = true;
       lens.active[0] = true;
       lens.adaptivePriors = true;
-      lens.focalPrior = Math.log(650);
+      lens.focalPriors[0] = Math.log(650);
       lens.focalPriorSigma = 1e-9;
       var focal = CalibrationObservability.assess(frames, tracks, 2, lens, .35);
       check(focal.covariance() == null,

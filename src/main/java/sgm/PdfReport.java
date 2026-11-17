@@ -246,7 +246,11 @@ final class PdfReport implements AutoCloseable {
     int k = 0;
     for (Object item : groups) {
       var c = ProcessingReport.object(item);
-      heading(groups.size() > 1 ? "Camera model " + ++k : "Calibration coefficients");
+      k++;
+      heading(
+          c.get("camera") != null
+              ? "Camera " + c.get("camera") + (c.get("label") == null ? "" : " (" + c.get("label") + ")")
+              : groups.size() > 1 ? "Camera model " + k : "Calibration coefficients");
       double w = number(c.get("width")), h = number(c.get("height"));
       double[] d = c.get("distortion") instanceof List<?> dl ? dl.stream().mapToDouble(PdfReport::number).toArray() : new double[5];
       List<String[]> rows = new ArrayList<>();
@@ -258,6 +262,27 @@ final class PdfReport implements AutoCloseable {
       for (int i = 0; i < Math.min(5, d.length); i++)
         rows.add(new String[] {names[i], scientific(d[i]), "", i == 0 ? "Brown radial (K) and tangential (P)" : ""});
       table(new String[] {"Parameter", "Value", "Unit", "Note"}, new float[] {80, 120, 50, 257}, rows);
+      if (c.get("camera") != null) {
+        // Several cameras: this camera's images, start, policy and GPS-adjustment refit.
+        String gpsRefit = "";
+        for (Object g : survey.get("gps_cameras") instanceof List<?> l ? l : List.of()) {
+          var gc = ProcessingReport.object(g);
+          if (String.valueOf(c.get("camera")).equals(String.valueOf(gc.get("camera")))
+              && gc.get("refitted") instanceof List<?> r && !r.isEmpty())
+            gpsRefit = " Refitted in the GPS-weighted adjustment: " + String.join(", ", r.stream().map(String::valueOf).toList()) + ".";
+        }
+        paragraph(
+            String.format(
+                Locale.ROOT,
+                "Source images %s x %s px; %s images; initial calibration: %s; intrinsics: %s.%s",
+                count(c.get("width")),
+                count(c.get("height")),
+                count(c.get("images")),
+                String.valueOf(c.get("initialization")).replace('_', ' '),
+                c.get("policy"),
+                gpsRefit));
+        continue;
+      }
       paragraph(
           String.format(
               Locale.ROOT,
@@ -287,6 +312,23 @@ final class PdfReport implements AutoCloseable {
       if (survey.get("gps_position_sigma") instanceof Number s)
         rows.add(new String[] {"GPS accuracy (horizontal / vertical)", String.format(Locale.ROOT, "%.2f / %s m", s.doubleValue(), survey.get("gps_height_sigma") instanceof Number hs ? String.format(Locale.ROOT, "%.2f", hs.doubleValue()) : "-"), "weights"});
       table(new String[] {"Parameter", "Value", "Mode"}, new float[] {200, 180, 127}, rows);
+      if (survey.get("gps_cameras") instanceof List<?> cameras && cameras.size() > 1) {
+        List<String[]> perCamera = new ArrayList<>();
+        for (Object item : cameras) {
+          var gc = ProcessingReport.object(item);
+          double[] arm = numbers(gc.get("lever_arm_camera_metres"));
+          perCamera.add(
+              new String[] {
+                String.valueOf(gc.get("camera")),
+                gc.get("time_offset_seconds") instanceof Number dt ? String.format(Locale.ROOT, "%.3f s", dt.doubleValue()) : "-",
+                arm != null && arm.length == 3 ? String.format(Locale.ROOT, "%.3f, %.3f, %.3f m", arm[0], arm[1], arm[2]) : "-",
+                gc.get("rolling_shutter_readout_seconds") instanceof Number rs ? String.format(Locale.ROOT, "%.2f ms", 1000 * rs.doubleValue()) : "-",
+                Boolean.TRUE.equals(gc.get("fitted")) ? "fitted" : "kept"
+              });
+        }
+        paragraph("Per camera (the rows above describe the first camera):");
+        table(new String[] {"Camera", "Time offset", "Lever arm", "Readout", "Model"}, new float[] {110, 80, 160, 77, 80}, perCamera);
+      }
     }
   }
 
@@ -302,7 +344,7 @@ final class PdfReport implements AutoCloseable {
       var c = ProcessingReport.object(item);
       double[] xyz = numbers(c.get("position")), e = numbers(c.get("error"));
       if (e == null) continue;
-      cameras.add(new Object[] {c.get("image"), e});
+      cameras.add(new Object[] {c.get("image"), e, c.get("camera")});
       if (xyz != null) {
         at.add(xyz);
         error.add(e);
@@ -327,11 +369,17 @@ final class PdfReport implements AutoCloseable {
     boolean all = cameras.size() <= 40;
     heading(all ? "Cameras" : "Cameras with the largest errors");
     List<String[]> rows = new ArrayList<>();
+    boolean named = cameras.stream().anyMatch(c -> c[2] != null);
     for (Object[] c : cameras.subList(0, Math.min(cameras.size(), all ? 40 : 25))) {
       double[] e = (double[]) c[1];
-      rows.add(new String[] {String.valueOf(c[0]), length(e[0], units, 3), length(e[1], units, 3), length(e[2], units, 3), length(norm(e), units, 3)});
+      rows.add(
+          named
+              ? new String[] {String.valueOf(c[0]), String.valueOf(c[2]), length(e[0], units, 3), length(e[1], units, 3), length(e[2], units, 3), length(norm(e), units, 3)}
+              : new String[] {String.valueOf(c[0]), length(e[0], units, 3), length(e[1], units, 3), length(e[2], units, 3), length(norm(e), units, 3)});
     }
-    table(new String[] {"Label", "X error", "Y error", "Z error", "Total"}, new float[] {147, 90, 90, 90, 90}, rows);
+    if (named)
+      table(new String[] {"Label", "Camera", "X error", "Y error", "Z error", "Total"}, new float[] {117, 80, 77, 77, 77, 79}, rows);
+    else table(new String[] {"Label", "X error", "Y error", "Z error", "Total"}, new float[] {147, 90, 90, 90, 90}, rows);
   }
 
   /**
@@ -1107,6 +1155,28 @@ final class PdfReport implements AutoCloseable {
               + (named.size() > 12 ? "; ..." : "")
               + ". See 04_geometry/camera_screening.json.");
     }
+    // Several cameras: per-camera registration, small cameras and lenses kept at their start.
+    if (survey.get("camera_registration") instanceof List<?> perCamera)
+      for (Object item : perCamera) {
+        var r = ProcessingReport.object(item);
+        double images = number(r.get("images")), aligned = number(r.get("aligned"));
+        if (images > 0 && aligned < images * .9)
+          flags.add(String.format(Locale.ROOT, "Camera %s: only %d of %d images registered.", r.get("camera"), (int) aligned, (int) images));
+      }
+    if (survey.get("calibrations") instanceof List<?> cameras)
+      for (Object item : cameras) {
+        var c = ProcessingReport.object(item);
+        if ("exif_prior_small_camera".equals(c.get("initialization")))
+          flags.add("Camera " + c.get("camera") + " has only " + count(c.get("images"))
+              + " images: its calibration started from the EXIF focal length, not from image geometry.");
+      }
+    if (survey.get("camera_lens_refinement") instanceof List<?> lenses)
+      for (Object item : lenses) {
+        var l = ProcessingReport.object(item);
+        if (String.valueOf(l.get("reason")).startsWith("Camera kept"))
+          flags.add("Camera " + l.get("camera") + ": lens not refined in alignment ("
+              + String.valueOf(l.get("reason")).replaceFirst("^Camera kept at its calibration: ", "") + ").");
+      }
     // Skipped pairs, from 05_stereo/skipped_pairs.json (not from the stage text).
     var skipped = ProcessingReport.object(dense.get("skipped_pairs"));
     if (ReportDense.count(skipped.get("skipped")) > 0)

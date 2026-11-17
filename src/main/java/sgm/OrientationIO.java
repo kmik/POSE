@@ -9,19 +9,71 @@ final class OrientationIO {
   static final String FORMATS =
       "native,csv,csv-opk,bundler,colmap,openmvg,opensfm,metashape,micmac,opencv,inpho";
 
-  record View(String image, Calibration calibration, Camera pose) {}
+  /** camera: the camera (group) ID the format gives the image, or null when it names none. */
+  record View(String image, Calibration calibration, Camera pose, String camera) {
+    View(String image, Calibration calibration, Camera pose) {
+      this(image, calibration, pose, null);
+    }
+  }
 
   static final class Model {
     final LinkedHashMap<String, View> views = new LinkedHashMap<>();
     final List<String> notes = new ArrayList<>();
+    // Physical pixel pitch (mm) per camera ID, where the format states it (INPHO).
+    final Map<String, Double> pixelSizes = new LinkedHashMap<>();
     String crs = null, units = "project_units";
 
     void add(View v) {
       String name = name(v.image);
-      if (views.putIfAbsent(name, new View(name, v.calibration, v.pose)) != null)
+      if (views.putIfAbsent(name, new View(name, v.calibration, v.pose, v.camera)) != null)
         throw new IllegalArgumentException("Duplicate orientation image: " + name);
       if (v.pose != null) validate(v.pose);
     }
+
+    /** True when views name two or more cameras: exports then write one camera per group. */
+    boolean grouped() {
+      Set<String> cameras = new HashSet<>();
+      for (View v : views.values()) if (v.camera != null) cameras.add(v.camera);
+      return cameras.size() > 1;
+    }
+  }
+
+  /**
+   * The cameras of a grouped model in first-appearance order: camera ID to the views of that camera.
+   * Views of one camera whose intrinsics differ (per-image fixed calibrations) get separate entries
+   * named ID#2, ID#3 ...; importers read "ID#n" back as camera ID.
+   */
+  static LinkedHashMap<String, List<View>> cameras(Model m) {
+    LinkedHashMap<String, List<View>> out = new LinkedHashMap<>();
+    Map<String, List<Calibration>> variants = new HashMap<>();
+    for (View v : m.views.values()) {
+      String camera = v.camera == null ? v.image : v.camera;
+      List<Calibration> known = variants.computeIfAbsent(camera, k -> new ArrayList<>());
+      int at = -1;
+      for (int i = 0; i < known.size(); i++)
+        if (v.calibration != null && SharedCalibration.same(known.get(i), v.calibration)) at = i;
+      if (at < 0) {
+        known.add(v.calibration);
+        at = known.size() - 1;
+      }
+      out.computeIfAbsent(at == 0 ? camera : camera + "#" + (at + 1), k -> new ArrayList<>()).add(v);
+    }
+    return out;
+  }
+
+  /**
+   * camera_groups.csv (image,camera) beside an orientation file: written with every grouped export
+   * so formats with numeric camera keys (COLMAP, openMVG) or none (Bundler) keep camera names.
+   */
+  static Map<String, String> sidecar(Path dir) throws IOException {
+    Path file = dir == null ? null : dir.resolve("camera_groups.csv");
+    return file != null && Files.isRegularFile(file) ? CameraGroups.readCsv(file) : Map.of();
+  }
+
+  /** Camera ID read back from an exported camera name ("ID#n" variants belong to camera ID). */
+  static String cameraId(String exported) {
+    int hash = exported.lastIndexOf('#');
+    return hash > 0 && exported.substring(hash + 1).matches("\\d+") ? exported.substring(0, hash) : exported;
   }
 
   static String name(String s) {
@@ -167,6 +219,9 @@ final class OrientationIO {
                 && Files.isRegularFile(o.poses)
                 && Files.readString(o.poses).startsWith(PoseIO.HEADER));
     boolean custom = o.orientationInput != null || customCalibration || customPoses;
+    o.importedCameraIds = Map.of();
+    o.importedPixelSizes = Map.of();
+    o.importedCalibrations = Map.of();
     if (!custom) return;
     Map<String, int[]> sizes = new LinkedHashMap<>();
     for (Path p : images) sizes.put(p.getFileName().toString(), ResolutionPlan.originalSize(p));
@@ -177,6 +232,7 @@ final class OrientationIO {
     if (customPoses) merge(combined, read(o.poses, o.posesFormat, sizes, o));
     Map<String, Calibration> calibration = new LinkedHashMap<>();
     Map<String, Camera> poses = new LinkedHashMap<>();
+    Map<String, String> cameraIds = new LinkedHashMap<>();
     View shared = combined.views.get("*");
     if (shared != null && shared.pose != null)
       throw new IllegalArgumentException(
@@ -190,7 +246,11 @@ final class OrientationIO {
               : shared == null ? null : shared.calibration;
       if (c != null) calibration.put(name, c);
       if (view != null && view.pose != null) poses.put(name, view.pose);
+      if (view != null && view.camera != null) cameraIds.put(name, view.camera);
     }
+    o.importedCameraIds = Collections.unmodifiableMap(cameraIds);
+    o.importedPixelSizes = Collections.unmodifiableMap(new LinkedHashMap<>(combined.pixelSizes));
+    o.importedCalibrations = Collections.unmodifiableMap(calibration);
     if (poses.isEmpty() && combined.views.values().stream().anyMatch(v -> v.pose != null))
       throw new IllegalArgumentException(
           "No exterior-orientation filenames match the input photographs");
@@ -205,10 +265,8 @@ final class OrientationIO {
       if (calibration.size() != images.size())
         throw new IllegalArgumentException("Orientation input lacks intrinsics for some images");
       Calibration first = calibration.values().iterator().next();
-      if (!o.intrinsicsMode.equals("fixed")
-          && calibration.values().stream().anyMatch(c -> !same(first, c)))
-        throw new IllegalArgumentException(
-            "Distinct imported camera calibrations currently require --intrinsics-mode fixed");
+      // Distinct calibrations are checked per camera group once the groups are known
+      // (Pipeline.checkImportedCalibrations): within one camera they need a fixed policy.
       o.orientationCalibrations =
           calibration.values().stream().allMatch(c -> same(first, c))
               ? Map.of()
@@ -284,8 +342,10 @@ final class OrientationIO {
               : new View(
                   v.image,
                   v.calibration == null ? old.calibration : v.calibration,
-                  v.pose == null ? old.pose : v.pose));
+                  v.pose == null ? old.pose : v.pose,
+                  v.camera == null ? old.camera : v.camera));
     }
+    into.pixelSizes.putAll(other.pixelSizes);
     into.notes.addAll(other.notes);
     if (other.crs != null) into.crs = other.crs;
     into.units = other.units;
@@ -320,7 +380,12 @@ final class OrientationIO {
                 f.sourceWidth,
                 f.sourceHeight);
       }
-      model.add(new View(f.path.getFileName().toString(), c, f.camera.copy()));
+      CameraGroups groups = f.options.cameraGroups;
+      // One camera: no camera IDs, so single-camera exports keep their one-entry-per-photo layout.
+      String camera = groups != null && groups.multiple() ? groups.get(f.group).id : null;
+      model.add(new View(f.path.getFileName().toString(), c, f.camera.copy(), camera));
+      if (camera != null && Double.isFinite(groups.get(f.group).pixelSizeMm))
+        model.pixelSizes.put(camera, groups.get(f.group).pixelSizeMm);
     }
     model.notes.add(
         "Pixels: " + pixels + "; OpenCV camera x right, y down, z forward; X_camera=R*X_world+t");
@@ -332,7 +397,7 @@ final class OrientationIO {
     for (View v : model.views.values()) {
       Calibration c = v.calibration;
       Camera p = v.pose;
-      views.add(
+      Map<String, Object> entry =
           Json.object(
               "image",
               v.image,
@@ -357,9 +422,12 @@ final class OrientationIO {
               "R",
               p == null ? null : p.rotation,
               "t",
-              p == null ? null : p.translation));
+              p == null ? null : p.translation);
+      // Only grouped models carry camera IDs; single-camera files stay as they were.
+      if (v.camera != null) entry.put("camera", v.camera);
+      views.add(entry);
     }
-    return Json.object(
+    Map<String, Object> out = Json.object(
         "schema",
         "sgm-orientations-1",
         "pixel_origin",
@@ -374,6 +442,8 @@ final class OrientationIO {
         model.notes,
         "views",
         views);
+    if (!model.pixelSizes.isEmpty()) out.put("camera_pixel_sizes_mm", model.pixelSizes);
+    return out;
   }
 
   static Model fromJson(Object object) {
@@ -400,8 +470,16 @@ final class OrientationIO {
                 (int) num(i, "height"));
       }
       if (v.get("R") != null) p = pose(JsonRead.numbers(v.get("R")), JsonRead.numbers(v.get("t")));
-      m.add(new View(v.get("image").toString(), c, p));
+      m.add(
+          new View(
+              v.get("image").toString(),
+              c,
+              p,
+              v.get("camera") == null ? null : v.get("camera").toString()));
     }
+    if (root.get("camera_pixel_sizes_mm") != null)
+      for (var e : JsonRead.object(root.get("camera_pixel_sizes_mm")).entrySet())
+        m.pixelSizes.put(e.getKey(), JsonRead.number(e.getValue()));
     return m;
   }
 
@@ -535,6 +613,13 @@ final class OrientationIO {
           case "metashape", "micmac", "opencv" -> OrientationXml.write(model, target, format, o);
           default -> throw new IllegalArgumentException("Unsupported export format: " + format);
         }
+        if (model.grouped())
+          try (BufferedWriter w = Files.newBufferedWriter(target.resolve("camera_groups.csv"))) {
+            w.write("image,camera\n");
+            for (View v : model.views.values())
+              if (v.camera() != null)
+                w.write(PoseIO.quote(v.image()) + "," + PoseIO.quote(v.camera()) + "\n");
+          }
         Json.write(
             target.resolve("conventions.json"),
             Json.object(

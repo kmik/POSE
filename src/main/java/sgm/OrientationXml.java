@@ -172,6 +172,9 @@ final class OrientationXml {
       throw new IllegalArgumentException("Metashape chunk index out of range");
     Element chunk = (Element) chunks.item(o.orientationComponent);
     Map<String, Calibration> sensors = new HashMap<>();
+    Map<String, String> sensorNames = new HashMap<>();
+    Set<String> labels = new HashSet<>();
+    boolean uniqueLabels = true;
     Element ss = child(chunk, "sensors");
     for (Element sensor : children(ss, "sensor")) {
       List<Element> calibrations = children(sensor, "calibration");
@@ -179,6 +182,9 @@ final class OrientationXml {
       for (Element c : calibrations)
         if (selected == null || attr(c, "class", "").equals("adjusted")) selected = c;
       sensors.put(sensor.getAttribute("id"), metashapeCalibration(selected, sensor, model, o));
+      String label = attr(sensor, "label", "");
+      if (label.isEmpty() || !labels.add(label)) uniqueLabels = false;
+      sensorNames.put(sensor.getAttribute("id"), label);
     }
     double[] Q = Math3.identity(), T = {0, 0, 0};
     double scale = 1;
@@ -210,7 +216,11 @@ final class OrientationXml {
                 image,
                 Objects.requireNonNull(
                     sensors.get(c.getAttribute("sensor_id")), "Unknown Metashape sensor"),
-                centered(r, center)));
+                centered(r, center),
+                cameraId(
+                    uniqueLabels && !sensorNames.getOrDefault(c.getAttribute("sensor_id"), "").isEmpty()
+                        ? sensorNames.get(c.getAttribute("sensor_id"))
+                        : "sensor_" + c.getAttribute("sensor_id"))));
       }
     }
     Element crs = child(chunk, "reference");
@@ -400,7 +410,78 @@ final class OrientationXml {
     writeMicmac(model, directory, o);
   }
 
+  /** Several cameras: one sensor per camera group, labelled with the camera ID. */
+  private static void writeMetashapeGrouped(Model model, Path dir) throws IOException {
+    StringBuilder s =
+        new StringBuilder(
+            "<?xml version=\"1.0\"?>\n<document version=\"1.4.0\"><chunk label=\"POSE\"><sensors>");
+    var cameras = cameras(model);
+    Map<String, Integer> sensorOf = new HashMap<>();
+    int id = 0;
+    for (var e : cameras.entrySet()) {
+      Calibration c = Objects.requireNonNull(e.getValue().getFirst().calibration());
+      for (View v : e.getValue()) sensorOf.put(v.image(), id);
+      s.append("<sensor id=\"")
+          .append(id++)
+          .append("\" label=\"")
+          .append(xml(e.getKey()))
+          .append("\" type=\"frame\"><resolution width=\"")
+          .append(c.width)
+          .append("\" height=\"")
+          .append(c.height)
+          .append("\"/><calibration type=\"frame\" class=\"adjusted\"><resolution width=\"")
+          .append(c.width)
+          .append("\" height=\"")
+          .append(c.height)
+          .append("\"/>");
+      s.append("<width>")
+          .append(c.width)
+          .append("</width><height>")
+          .append(c.height)
+          .append("</height><f>")
+          .append(c.fy)
+          .append("</f><b1>")
+          .append(c.fx - c.fy)
+          .append("</b1><cx>")
+          .append(c.cx + .5 - c.width * .5)
+          .append("</cx><cy>")
+          .append(c.cy + .5 - c.height * .5)
+          .append("</cy>");
+      String[] keys = {"k1", "k2", "p2", "p1", "k3"};
+      for (int i = 0; i < 5; i++)
+        s.append('<')
+            .append(keys[i])
+            .append('>')
+            .append(c.distortion[i])
+            .append("</")
+            .append(keys[i])
+            .append('>');
+      s.append("</calibration></sensor>");
+    }
+    s.append("</sensors><cameras>");
+    id = 0;
+    for (View v : model.views.values()) {
+      if (v.pose() != null)
+        s.append("<camera id=\"")
+            .append(id)
+            .append("\" sensor_id=\"")
+            .append(sensorOf.get(v.image()))
+            .append("\" label=\"")
+            .append(xml(v.image()))
+            .append("\"><transform>")
+            .append(matrix4(v.pose()))
+            .append("</transform></camera>");
+      id++;
+    }
+    s.append("</cameras></chunk></document>\n");
+    Files.writeString(dir.resolve("cameras.xml"), s);
+  }
+
   private static void writeMetashape(Model model, Path dir) throws IOException {
+    if (model.grouped()) {
+      writeMetashapeGrouped(model, dir);
+      return;
+    }
     StringBuilder s =
         new StringBuilder(
             "<?xml version=\"1.0\"?>\n<document version=\"1.4.0\"><chunk label=\"POSE\"><sensors>");

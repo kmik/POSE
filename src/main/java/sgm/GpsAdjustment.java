@@ -30,30 +30,66 @@ final class GpsAdjustment {
 
   static final double TIME_SIGMA = 1, LEVER_SIGMA = .5;
 
-  /** GPS antenna model: time offset (s) and lever arm (camera frame, m). */
+  /**
+   * GPS antenna model per camera group: time offset (s) and lever arm (camera frame, m). Each
+   * camera of a multi-camera block has its own; with one camera, index 0 is the model.
+   */
   static final class Model {
-    double dt;
-    double[] lever = new double[3];
-    boolean timeFree, leverFree;
+    final double[] dt;
+    final double[][] lever;
+    final boolean[] timeFree, leverFree;
+
+    Model() {
+      this(1);
+    }
+
+    Model(int groups) {
+      dt = new double[groups];
+      lever = new double[groups][3];
+      timeFree = new boolean[groups];
+      leverFree = new boolean[groups];
+    }
+
+    int groups() {
+      return dt.length;
+    }
 
     double priorCost() {
-      double cost = timeFree ? .5 * Math.pow(dt / TIME_SIGMA, 2) : 0;
-      if (leverFree) for (double l : lever) cost += .5 * Math.pow(l / LEVER_SIGMA, 2);
+      double cost = 0;
+      for (int g = 0; g < dt.length; g++) {
+        cost += timeFree[g] ? .5 * Math.pow(dt[g] / TIME_SIGMA, 2) : 0;
+        if (leverFree[g]) for (double l : lever[g]) cost += .5 * Math.pow(l / LEVER_SIGMA, 2);
+      }
       return cost;
     }
 
-    /** Where the GPS antenna sits for camera c: C + V dt + R^T L. */
-    double[] antenna(Camera c) {
-      double[] p = Math3.add(c.center(), Math3.mv(Math3.transpose(c.rotation), lever));
-      if (c.velocity != null) p = Math3.add(p, Math3.times(c.velocity, dt));
+    /** Where the GPS antenna sits for camera c of group g: C + V dt + R^T L. */
+    double[] antenna(Camera c, int g) {
+      double[] p = Math3.add(c.center(), Math3.mv(Math3.transpose(c.rotation), lever[g]));
+      if (c.velocity != null) p = Math3.add(p, Math3.times(c.velocity, dt[g]));
       return p;
+    }
+
+    double[] antenna(ImageFrame f) {
+      return antenna(f.camera, Math.min(f.group, dt.length - 1));
+    }
+
+    boolean anyFree() {
+      for (int g = 0; g < dt.length; g++) if (timeFree[g] || leverFree[g]) return true;
+      return false;
+    }
+
+    boolean anyNonzero() {
+      for (int g = 0; g < dt.length; g++) if (dt[g] != 0 || Math3.norm(lever[g]) != 0) return true;
+      return false;
     }
   }
 
   record Outcome(double rms, String summary) {}
 
+  // Calibrations per frame id: restoring must never give one camera's calibration to another.
   private record State(
-      Camera[] cameras, double[][] points, Calibration calibration, double[] lens, Model model) {}
+      Camera[] cameras, double[][] points, Calibration[] calibrations, double[] lens, Model model) {}
 
   // Set by the GCP step: the GCPs fix the datum, so the block is never moved onto GPS; GPS gets an
   // offset instead (accumulated in gpsOffset). Single-threaded use only.
@@ -110,19 +146,30 @@ final class GpsAdjustment {
     report.put("height_sigma_metres", o.gpsHeightSigmaValue);
     report.put("height_sigma_source", heightSource);
 
-    // Shared parameters: lens (G3) and rolling shutter (G5) in one shared block.
+    // Shared parameters: lens (G3) and rolling shutter (G5) in one shared block per camera group.
+    int groups = SharedCalibration.groupCount(o);
     Set<Integer> lensParameters = new TreeSet<>();
     if (!o.gpsIntrinsics.equals("none"))
       for (String name : o.gpsIntrinsics.split(","))
         lensParameters.add(Arrays.asList(SharedCalibration.NAMES).indexOf(name.trim()));
     String lensReason = null;
     if (o.rectified) lensReason = "rectified input";
-    else if (o.calibration != null && o.intrinsicsMode.equals("fixed"))
+    else if (groups == 1 && !SharedCalibration.refinable(o, 0))
       lensReason = "supplied calibration is fixed (--intrinsics-mode fixed)";
-    else
-      for (ImageFrame f : frames)
-        if (!SharedCalibration.same(frames.get(0).calibration, f.calibration))
-          lensReason = "images do not share one calibration";
+    else if (!SharedCalibration.homogeneous(frames))
+      lensReason =
+          groups == 1
+              ? "images do not share one calibration"
+              : "a camera keeps different per-image calibrations";
+    // With several cameras, a camera whose supplied calibration is fixed keeps its lens, shutter
+    // and antenna model at their values, as the one camera does with --intrinsics-mode fixed.
+    boolean[] groupFree = new boolean[groups];
+    for (int g = 0; g < groups; g++) groupFree[g] = groups == 1 || SharedCalibration.refinable(o, g);
+    if (groups > 1 && lensReason == null)
+      for (int g = 0; g < groups; g++)
+        if (!groupFree[g])
+          notes.add("camera " + o.cameraGroups.get(g).id + ": supplied calibration is fixed; its lens,"
+              + " rolling shutter and GPS antenna model are not fitted");
     if (lensReason != null && !lensParameters.isEmpty()) {
       notes.add("lens refit skipped: " + lensReason);
       lensParameters.clear();
@@ -141,39 +188,52 @@ final class GpsAdjustment {
     }
     if (!hasMotion) shutterFixed = 0;
 
-    Model model = new Model();
-    model.timeFree = o.gpsTimeOffset.equals("estimate") && hasMotion;
-    if (!o.gpsTimeOffset.equals("estimate") && !o.gpsTimeOffset.equals("off"))
-      model.dt = hasMotion ? Double.parseDouble(o.gpsTimeOffset) : 0;
+    Model model = new Model(groups);
+    for (int g = 0; g < groups; g++) {
+      if (!groupFree[g]) continue;
+      model.timeFree[g] = o.gpsTimeOffset.equals("estimate") && hasMotion;
+      if (!o.gpsTimeOffset.equals("estimate") && !o.gpsTimeOffset.equals("off"))
+        model.dt[g] = hasMotion ? Double.parseDouble(o.gpsTimeOffset) : 0;
+      model.leverFree[g] = o.gpsLeverArm.equals("estimate");
+      if (!o.gpsLeverArm.equals("estimate") && !o.gpsLeverArm.equals("off")) {
+        String[] parts = o.gpsLeverArm.split(",");
+        for (int k = 0; k < 3; k++) model.lever[g][k] = Double.parseDouble(parts[k].trim());
+      }
+    }
     if (!hasMotion && !o.gpsTimeOffset.equals("off"))
       notes.add("GPS time offset not modelled: no camera velocities");
-    model.leverFree = o.gpsLeverArm.equals("estimate");
-    if (!o.gpsLeverArm.equals("estimate") && !o.gpsLeverArm.equals("off")) {
-      String[] parts = o.gpsLeverArm.split(",");
-      for (int k = 0; k < 3; k++) model.lever[k] = Double.parseDouble(parts[k].trim());
-    }
-    if (lensReason != null && (model.timeFree || model.leverFree || model.dt != 0)) {
+    if (lensReason != null && (model.anyFree() || Arrays.stream(model.dt).anyMatch(v -> v != 0))) {
       // The antenna model lives in the shared block, which needs one shared calibration.
       notes.add("GPS time offset and lever arm not modelled: " + lensReason);
-      model = new Model();
+      model = new Model(groups);
     }
     boolean shared =
         !lensParameters.isEmpty()
             || shutterFree
             || shutterFixed != 0
-            || model.timeFree
-            || model.leverFree
-            || model.dt != 0
-            || Math3.norm(model.lever) != 0;
+            || model.anyFree()
+            || model.anyNonzero();
 
     double focalPrior = Double.NaN;
     String focalSource = "none";
-    if (lensParameters.contains(0) && o.calibration == null) {
-      double[] prior = focalPrior(frames, o);
-      focalPrior = prior[0];
-      focalSource = prior[0] > 0 ? (prior[1] == 1 ? "xmp_calibrated_focal" : prior[1] == 2 ? "exif_35mm_equivalent" : "user") : "none";
-      if (!(focalPrior > 0)) focalPrior = Double.NaN;
-    }
+    // Per camera group: focal prior in source pixels (NaN = none) and its source.
+    double[] focalPriors = new double[groups];
+    String[] focalSources = new String[groups];
+    Arrays.fill(focalPriors, Double.NaN);
+    Arrays.fill(focalSources, "none");
+    if (lensParameters.contains(0))
+      for (int g = 0; g < groups; g++) {
+        boolean supplied = groups == 1 ? o.calibration != null : o.cameraGroups.get(g).supplied;
+        if (supplied || !groupFree[g]) continue;
+        final int group = g;
+        double[] prior =
+            focalPrior(groups == 1 ? frames : frames.stream().filter(f -> f.group == group).toList(), o);
+        focalPriors[g] = prior[0];
+        focalSources[g] = prior[0] > 0 ? (prior[1] == 1 ? "xmp_calibrated_focal" : prior[1] == 2 ? "exif_35mm_equivalent" : "user") : "none";
+        if (!(focalPriors[g] > 0)) focalPriors[g] = Double.NaN;
+      }
+    focalPrior = focalPriors[0];
+    focalSource = focalSources[0];
 
     int anchor = -1, scale = -1;
     for (ImageFrame f : frames)
@@ -208,16 +268,21 @@ final class GpsAdjustment {
       SharedCalibration lens = null;
       if (shared) {
         lens = new SharedCalibration(frames);
-        for (int k : lensParameters) lens.active[k] = true;
-        lens.active[SharedCalibration.READOUT] = shutterFree;
-        lens.values[SharedCalibration.READOUT] = shutterFixed;
-        lens.active[SharedCalibration.TIME] = m.timeFree;
-        for (int k = 0; k < 3; k++) lens.active[SharedCalibration.LEVER + k] = m.leverFree;
-        toLens(m, lens);
-        if (Double.isFinite(focalPrior)) {
-          lens.focalPrior = Math.log(focalPrior);
-          lens.focalPriorSigma = o.gpsFocalSigma;
+        for (int g = 0; g < groups; g++) {
+          if (!groupFree[g]) continue;
+          int b = g * SharedCalibration.SIZE;
+          for (int k : lensParameters) lens.active[b + k] = true;
+          lens.active[b + SharedCalibration.READOUT] = shutterFree;
+          lens.values[b + SharedCalibration.READOUT] = shutterFixed;
+          lens.active[b + SharedCalibration.TIME] = m.timeFree[g];
+          for (int k = 0; k < 3; k++) lens.active[b + SharedCalibration.LEVER + k] = m.leverFree[g];
         }
+        toLens(m, lens);
+        for (int g = 0; g < groups; g++)
+          if (Double.isFinite(focalPriors[g])) {
+            lens.focalPriors[g] = Math.log(focalPriors[g]);
+            lens.focalPriorSigma = o.gpsFocalSigma;
+          }
       }
       double objective;
       try (WorkProgress work =
@@ -228,22 +293,36 @@ final class GpsAdjustment {
         objective = rounds(frames, tracks, o, controls, lens, m, anchor, scale, work);
       }
       boolean physical = lens == null || lens.physical();
-      trials.add(
+      Map<String, Object> trialReport =
           Json.object(
               "start_focal_pixels", currentFocal * factor,
               "objective", objective,
               "physical", physical,
               "focal_pixels", lens == null ? currentFocal : Math.exp(lens.values[0]),
-              "time_offset_seconds", m.dt,
-              "lever_arm_camera_metres", m.lever,
-              "rolling_shutter_readout_seconds", lens == null ? 0 : lens.values[8]));
+              "time_offset_seconds", groups == 1 ? m.dt[0] : m.dt,
+              "lever_arm_camera_metres", groups == 1 ? m.lever[0] : m.lever,
+              "rolling_shutter_readout_seconds", lens == null ? 0 : lens.values[8]);
+      if (groups > 1 && lens != null) {
+        double[] focals = new double[groups];
+        for (int g = 0; g < groups; g++) focals[g] = Math.exp(lens.values[g * SharedCalibration.SIZE]);
+        trialReport.put("camera_focal_pixels", focals);
+      }
+      trials.add(trialReport);
       if (physical && objective < bestObjective) {
         bestObjective = objective;
         best = save(frames, tracks, lens, m);
         bestLens = lens;
       }
-      // --quick-calibration: keep the first (current-lens) start only.
-      if (trial == 0
+      // --quick-calibration: keep the first (current-lens) start only. Several cameras: one start
+      // (a block-wide focal rescale has no meaning when the cameras differ).
+      if (groups > 1) {
+        if (trial == 0
+            && lens != null
+            && lens.active[0]
+            && Double.isFinite(focalPrior)
+            && Math.abs(lens.values[0] - Math.log(focalPrior)) > 2 * o.gpsFocalSigma)
+          notes.add("several cameras: second focal start (at the EXIF/XMP prior) not tried");
+      } else if (trial == 0
           && !o.quickCalibration
           && lens != null
           && lens.active[0]
@@ -281,7 +360,7 @@ final class GpsAdjustment {
               similarityRms,
               gpsAfter));
       restore(frames, tracks, start, null);
-      model = new Model();
+      model = new Model(groups);
       bestLens = null;
       try (WorkProgress work = WorkProgress.start("GPS-weighted adjustment (poses only)", 1, "rounds")) {
         rounds(frames, tracks, o, controls, null, model, anchor, scale, work);
@@ -290,10 +369,15 @@ final class GpsAdjustment {
       gpsAfter = gpsRms(frames, controls, model);
     }
     Calibration before = frames.get(0).calibration, result = before;
-    double focalBefore = start.calibration().fx;
+    double focalBefore = start.calibrations()[frames.get(0).id].fx;
+    double[] focalsBefore = new double[groups];
+    for (ImageFrame f : frames) focalsBefore[Math.min(f.group, groups - 1)] = start.calibrations()[f.id].fx;
     if (bestLens != null) {
       result = bestLens.calibration();
-      for (ImageFrame f : frames) f.applyCalibration(result);
+      if (groups == 1) for (ImageFrame f : frames) f.applyCalibration(result);
+      else
+        for (ImageFrame f : frames)
+          if (groupFree[f.group]) f.applyCalibration(bestLens.calibration(f.group));
     }
     double readout = bestLens == null ? 0 : bestLens.values[8];
     o.rollingShutterReadout = readout;
@@ -304,7 +388,7 @@ final class GpsAdjustment {
     for (var e : controls.entrySet()) {
       Camera c = frames.get(e.getKey()).camera;
       double[] raw = Math3.sub(c.center(), e.getValue()),
-          modelled = Math3.sub(model.antenna(c), e.getValue());
+          modelled = Math3.sub(model.antenna(frames.get(e.getKey())), e.getValue());
       double[] along = trackFrame(c, raw), alongModel = trackFrame(c, modelled);
       if (along != null) {
         for (int k = 0; k < 3; k++) {
@@ -332,10 +416,10 @@ final class GpsAdjustment {
     report.put("controls", controls.size());
     report.put("similarity_rms_metres", similarityRms);
     report.put("bundle_rms_metres", gpsAfter);
-    report.put("camera_centre_rms_metres", gpsRms(frames, controls, new Model()));
+    report.put("camera_centre_rms_metres", gpsRms(frames, controls, new Model(groups)));
     double[] axes = new double[3];
     for (var e : controls.entrySet()) {
-      double[] r = Math3.sub(model.antenna(frames.get(e.getKey()).camera), e.getValue());
+      double[] r = Math3.sub(model.antenna(frames.get(e.getKey())), e.getValue());
       for (int k = 0; k < 3; k++) axes[k] += r[k] * r[k] / Math.max(1, controls.size());
     }
     report.put("bundle_horizontal_rms_metres", Math.sqrt(axes[0] + axes[1]));
@@ -351,7 +435,7 @@ final class GpsAdjustment {
             bestLens == null
                 ? List.of()
                 : bestLens.parameters().stream()
-                    .filter(p -> Arrays.asList(SharedCalibration.NAMES).indexOf(p) < SharedCalibration.LENS)
+                    .filter(p -> Arrays.asList(SharedCalibration.NAMES).indexOf(p.substring(p.lastIndexOf(':') + 1)) < SharedCalibration.LENS)
                     .toList(),
             "shared_block_parameters",
             bestLens == null ? List.of() : bestLens.parameters(),
@@ -368,9 +452,9 @@ final class GpsAdjustment {
     report.put(
         "gps_model",
         Json.object(
-            "time_offset_seconds", model.dt,
+            "time_offset_seconds", model.dt[0],
             "time_offset_mode", o.gpsTimeOffset,
-            "lever_arm_camera_metres", model.lever,
+            "lever_arm_camera_metres", model.lever[0],
             "lever_arm_mode", o.gpsLeverArm,
             "time_sigma_seconds", TIME_SIGMA,
             "lever_sigma_metres", LEVER_SIGMA,
@@ -390,6 +474,28 @@ final class GpsAdjustment {
     report.put("trials", trials);
     report.put("notes", notes);
     report.put("cameras", cameras);
+    if (groups > 1) {
+      List<Object> perCamera = new ArrayList<>();
+      for (int g = 0; g < groups; g++) {
+        Calibration after = null;
+        for (ImageFrame f : frames) if (f.group == g) { after = f.calibration; break; }
+        perCamera.add(
+            Json.object(
+                "camera", o.cameraGroups.get(g).id,
+                "fitted", groupFree[g],
+                "refitted", bestLens == null || !groupFree[g] ? List.of() : bestLens.parameters(g).stream()
+                    .filter(p -> Arrays.asList(SharedCalibration.NAMES).indexOf(p) < SharedCalibration.LENS).toList(),
+                "focal_before_pixels", focalsBefore[g],
+                "focal_after_pixels", after == null ? null : after.fx,
+                "focal_prior_pixels", Double.isFinite(focalPriors[g]) ? focalPriors[g] : null,
+                "focal_prior_source", focalSources[g],
+                "distortion_after", after == null ? null : after.distortion,
+                "time_offset_seconds", model.dt[g],
+                "lever_arm_camera_metres", model.lever[g],
+                "rolling_shutter_readout_seconds", bestLens == null ? 0 : bestLens.values[g * SharedCalibration.SIZE + SharedCalibration.READOUT]));
+      }
+      report.put("camera_groups", perCamera);
+    }
     Json.write(dir.resolve("gps_bundle.json"), report);
     String summary =
         String.format(
@@ -404,10 +510,10 @@ final class GpsAdjustment {
             focalBefore,
             result.fx,
             Double.isFinite(focalPrior) ? String.format(Locale.ROOT, "%.1f", focalPrior) : "none",
-            model.dt,
-            model.lever[0],
-            model.lever[1],
-            model.lever[2],
+            model.dt[0],
+            model.lever[0][0],
+            model.lever[0][1],
+            model.lever[0][2],
             readout,
             notes.isEmpty() ? "" : "; " + String.join("; ", notes));
     System.out.println(summary);
@@ -426,14 +532,16 @@ final class GpsAdjustment {
       int scale,
       WorkProgress work)
       throws IOException {
-    int rounds = lens == null && !model.timeFree && !model.leverFree ? 1 : o.gpsAdjustmentRounds;
+    int rounds = lens == null && !model.anyFree() ? 1 : o.gpsAdjustmentRounds;
     try {
       for (int round = 0; round < rounds; round++) {
-        double dt = model.dt;
+        double[] dt = model.dt.clone();
         if (!datumFixed) alignBlock(frames, tracks, controls, model);
         // With the cameras held, the linear antenna fit is exact; it starts (or, without a shared
         // block, replaces) the joint estimate in the bundle.
-        double[] lever = model.lever.clone(), shift = fitModel(frames, tracks, controls, model, o);
+        double[][] lever = new double[model.groups()][];
+        for (int g = 0; g < lever.length; g++) lever[g] = model.lever[g].clone();
+        double[] shift = fitModel(frames, tracks, controls, model, o);
         if (lens != null) toLens(model, lens);
         references(frames, controls, model, lens, o);
         BundleAdjuster.optimizeImpl(
@@ -447,10 +555,7 @@ final class GpsAdjustment {
             lens);
         if (lens != null) fromLens(lens, model);
         if (work != null) work.update(round + 1);
-        if (round > 0
-            && Math.abs(model.dt - dt) < 1e-3
-            && Math3.norm(Math3.sub(model.lever, lever)) < 1e-3
-            && Math3.norm(shift) < 1e-3) break;
+        if (round > 0 && converged(model, dt, lever) && Math3.norm(shift) < 1e-3) break;
       }
       if (!datumFixed) alignBlock(frames, tracks, controls, model);
       if (lens == null) {
@@ -482,42 +587,51 @@ final class GpsAdjustment {
       Map<Integer, double[]> controls,
       Model model,
       Options o) {
-    double[][] a = new double[7][7];
-    double[] b = new double[7], sigma = {o.gpsSigma, o.gpsSigma, o.gpsHeightSigmaValue};
+    // Unknowns: tau (3), then per camera group dt and lever arm (4 each).
+    int groups = model.groups(), n = 3 + 4 * groups;
+    double[][] a = new double[n][n];
+    double[] b = new double[n], sigma = {o.gpsSigma, o.gpsSigma, o.gpsHeightSigmaValue};
     for (var e : controls.entrySet()) {
       Camera c = frames.get(e.getKey()).camera;
+      int g = Math.min(frames.get(e.getKey()).group, groups - 1);
       if (!c.registered) continue;
       double[] residual = Math3.sub(e.getValue(), c.center());
       double[] rt = Math3.transpose(c.rotation);
       for (int axis = 0; axis < 3; axis++) {
-        double[] row = new double[7];
+        double[] row = new double[n];
         row[axis] = 1;
-        row[3] = c.velocity == null ? 0 : c.velocity[axis];
-        for (int k = 0; k < 3; k++) row[4 + k] = rt[axis * 3 + k];
-        for (int i = 0; i < 7; i++) {
+        row[3 + 4 * g] = c.velocity == null ? 0 : c.velocity[axis];
+        for (int k = 0; k < 3; k++) row[4 + 4 * g + k] = rt[axis * 3 + k];
+        for (int i = 0; i < n; i++) {
           b[i] += row[i] * residual[axis] / (sigma[axis] * sigma[axis]);
-          for (int j = 0; j < 7; j++) a[i][j] += row[i] * row[j] / (sigma[axis] * sigma[axis]);
+          for (int j = 0; j < n; j++) a[i][j] += row[i] * row[j] / (sigma[axis] * sigma[axis]);
         }
       }
     }
     double big = 1e12;
-    if (model.timeFree) a[3][3] += 1 / (TIME_SIGMA * TIME_SIGMA);
-    else {
-      a[3][3] += big;
-      b[3] += big * model.dt;
-    }
-    for (int k = 0; k < 3; k++)
-      if (model.leverFree) a[4 + k][4 + k] += 1 / (LEVER_SIGMA * LEVER_SIGMA);
+    for (int g = 0; g < groups; g++) {
+      int t = 3 + 4 * g;
+      if (model.timeFree[g]) a[t][t] += 1 / (TIME_SIGMA * TIME_SIGMA);
       else {
-        a[4 + k][4 + k] += big;
-        b[4 + k] += big * model.lever[k];
+        a[t][t] += big;
+        b[t] += big * model.dt[g];
       }
+      for (int k = 0; k < 3; k++)
+        if (model.leverFree[g]) a[t + 1 + k][t + 1 + k] += 1 / (LEVER_SIGMA * LEVER_SIGMA);
+        else {
+          a[t + 1 + k][t + 1 + k] += big;
+          b[t + 1 + k] += big * model.lever[g][k];
+        }
+    }
     double[] x = Math3.solve(a, b);
     if (x == null) return new double[3];
     // Bounded: a runaway estimate means the motion data cannot support the model.
-    if (model.timeFree) model.dt = Math.max(-2, Math.min(2, x[3]));
-    if (model.leverFree)
-      for (int k = 0; k < 3; k++) model.lever[k] = Math.max(-2, Math.min(2, x[4 + k]));
+    for (int g = 0; g < groups; g++) {
+      int t = 3 + 4 * g;
+      if (model.timeFree[g]) model.dt[g] = Math.max(-2, Math.min(2, x[t]));
+      if (model.leverFree[g])
+        for (int k = 0; k < 3; k++) model.lever[g][k] = Math.max(-2, Math.min(2, x[t + 1 + k]));
+    }
     double[] shift = {x[0], x[1], x[2]};
     if (datumFixed) {
       // GCP datum: the GPS fixes take the offset, the block stays.
@@ -549,7 +663,7 @@ final class GpsAdjustment {
       Camera c = frames.get(e.getKey()).camera;
       if (!c.registered) continue;
       source.add(c.center());
-      target.add(Math3.sub(e.getValue(), Math3.sub(model.antenna(c), c.center())));
+      target.add(Math3.sub(e.getValue(), Math3.sub(model.antenna(frames.get(e.getKey())), c.center())));
     }
     if (source.size() < 3) return;
     Georeference.Similarity s;
@@ -573,13 +687,19 @@ final class GpsAdjustment {
   }
 
   static void toLens(Model m, SharedCalibration lens) {
-    lens.values[SharedCalibration.TIME] = m.dt;
-    for (int k = 0; k < 3; k++) lens.values[SharedCalibration.LEVER + k] = m.lever[k];
+    for (int g = 0; g < m.groups(); g++) {
+      int o = g * SharedCalibration.SIZE;
+      lens.values[o + SharedCalibration.TIME] = m.dt[g];
+      for (int k = 0; k < 3; k++) lens.values[o + SharedCalibration.LEVER + k] = m.lever[g][k];
+    }
   }
 
   static void fromLens(SharedCalibration lens, Model m) {
-    m.dt = lens.values[SharedCalibration.TIME];
-    for (int k = 0; k < 3; k++) m.lever[k] = lens.values[SharedCalibration.LEVER + k];
+    for (int g = 0; g < m.groups(); g++) {
+      int o = g * SharedCalibration.SIZE;
+      m.dt[g] = lens.values[o + SharedCalibration.TIME];
+      for (int k = 0; k < 3; k++) m.lever[g][k] = lens.values[o + SharedCalibration.LEVER + k];
+    }
   }
 
   /**
@@ -600,7 +720,7 @@ final class GpsAdjustment {
       double[] centre =
           antenna
               ? e.getValue()
-              : Math3.sub(e.getValue(), Math3.sub(model.antenna(c), c.center()));
+              : Math3.sub(e.getValue(), Math3.sub(model.antenna(frames.get(e.getKey())), c.center()));
       Camera reference = c.copy();
       reference.reference = null;
       reference.translation = Math3.times(Math3.mv(reference.rotation, centre), -1);
@@ -616,7 +736,7 @@ final class GpsAdjustment {
     for (var e : controls.entrySet())
       square +=
           Math.pow(
-              Math3.norm(Math3.sub(model.antenna(frames.get(e.getKey()).camera), e.getValue())), 2);
+              Math3.norm(Math3.sub(model.antenna(frames.get(e.getKey())), e.getValue())), 2);
     return Math.sqrt(square / Math.max(1, controls.size()));
   }
 
@@ -819,31 +939,45 @@ final class GpsAdjustment {
   }
 
   private static Model copy(Model m) {
-    Model out = new Model();
-    out.dt = m.dt;
-    out.lever = m.lever.clone();
-    out.timeFree = m.timeFree;
-    out.leverFree = m.leverFree;
+    Model out = new Model(m.groups());
+    for (int g = 0; g < m.groups(); g++) {
+      out.dt[g] = m.dt[g];
+      out.lever[g] = m.lever[g].clone();
+      out.timeFree[g] = m.timeFree[g];
+      out.leverFree[g] = m.leverFree[g];
+    }
     return out;
+  }
+
+  /** No camera's time offset moved by 1 ms or lever arm by 1 mm in the last round. */
+  private static boolean converged(Model m, double[] dt, double[][] lever) {
+    for (int g = 0; g < m.groups(); g++)
+      if (!(Math.abs(m.dt[g] - dt[g]) < 1e-3) || !(Math3.norm(Math3.sub(m.lever[g], lever[g])) < 1e-3))
+        return false;
+    return true;
   }
 
   private static State save(
       List<ImageFrame> frames, List<FeatureTracks.Track> tracks, SharedCalibration lens, Model m) {
     Camera[] cameras = new Camera[frames.size()];
-    for (ImageFrame f : frames) cameras[f.id] = f.camera.copy();
+    Calibration[] calibrations = new Calibration[frames.size()];
+    for (ImageFrame f : frames) {
+      cameras[f.id] = f.camera.copy();
+      calibrations[f.id] = f.calibration;
+    }
     double[][] points = new double[tracks.size()][];
     for (int i = 0; i < points.length; i++) points[i] = tracks.get(i).point;
     return new State(
         cameras,
         points,
-        frames.get(0).calibration,
+        calibrations,
         lens == null ? null : lens.values.clone(),
         copy(m));
   }
 
   private static void restore(
       List<ImageFrame> frames, List<FeatureTracks.Track> tracks, State s, SharedCalibration lens) {
-    for (ImageFrame f : frames) f.applyCalibration(s.calibration());
+    for (ImageFrame f : frames) f.applyCalibration(s.calibrations()[f.id]);
     for (ImageFrame f : frames) {
       Camera c = s.cameras()[f.id];
       f.camera.rotation = c.rotation.clone();

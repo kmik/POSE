@@ -48,6 +48,21 @@ final class DepthMapFile {
   static void writeRegion(
       Path path, int width, int x0, int y0, int cols, int rows, float[] src, int sw, int sx0, int sy0)
       throws IOException {
+    if (rows <= 0 || cols <= 0) return;
+    if (!Boolean.getBoolean("sgm.depthMapFile.channelWrites")) {
+      // The rows' span of the file mapped once: a memory copy per row instead of a write system
+      // call per row (one per 8 KB on 2048-pixel tiles). Same bytes (raw little-endian floats).
+      long offset = HEADER + 4L * ((long) y0 * width + x0), span = 4L * ((long) (rows - 1) * width + cols);
+      try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined();
+          FileChannel ch = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+        if (ch.size() < offset + span)
+          throw new IOException("Depth map " + path + " holds " + ch.size() + " bytes, expected " + (offset + span));
+        java.lang.foreign.MemorySegment map = ch.map(FileChannel.MapMode.READ_WRITE, offset, span, arena);
+        for (int r = 0; r < rows; r++)
+          MappedFiles.copy(src, (sy0 + r) * sw + sx0, map, 4L * r * width, cols);
+      }
+      return;
+    }
     ByteBuffer b = ByteBuffer.allocate(4 * cols).order(ByteOrder.LITTLE_ENDIAN);
     try (FileChannel ch = FileChannel.open(path, StandardOpenOption.WRITE)) {
       for (int r = 0; r < rows; r++) {

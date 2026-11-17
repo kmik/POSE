@@ -8,7 +8,7 @@ final class CalibrationObservability {
   record Assessment(double[][] covariance, double minimumRelativeInformation, String reason) {
     double[] sigma() {
       if (covariance == null) return null;
-      double[] s = new double[SharedCalibration.SIZE];
+      double[] s = new double[covariance.length];
       for (int k = 0; k < s.length; k++) s[k] = Math.sqrt(covariance[k][k]);
       return s;
     }
@@ -19,9 +19,9 @@ final class CalibrationObservability {
     var data = BundleAdjuster.calibrationDataInformation(frames, tracks, huber, lens);
     if (data == null) return new Assessment(null, 0, "Singular structure or observability workspace limit");
     double[] h = data.matrix();
-    int n = (int) Math.round(Math.sqrt(h.length)), cameras = n - SharedCalibration.SIZE;
-    int[] keys = java.util.stream.IntStream.range(0, SharedCalibration.LENS)
-        .filter(k -> lens.active[k]).toArray();
+    int n = (int) Math.round(Math.sqrt(h.length)), cameras = n - lens.size();
+    int[] keys = java.util.stream.IntStream.range(0, lens.size())
+        .filter(k -> k % SharedCalibration.SIZE < SharedCalibration.LENS && lens.active[k]).toArray();
     int m = keys.length;
     if (m == 0) return new Assessment(null, 0, "No active lens parameters");
     double[] marginal = new double[m * m], scale = new double[m];
@@ -65,7 +65,7 @@ final class CalibrationObservability {
     // almost entirely absorbed by poses/points must not appear well conditioned after rescaling.
     if (e == null || minimum <= 1e-9)
       return new Assessment(null, minimum, "Lens change is absorbed by poses, structure or other active parameters");
-    double[][] covariance = new double[SharedCalibration.SIZE][SharedCalibration.SIZE];
+    double[][] covariance = new double[lens.size()][lens.size()];
     for (int i = 0; i < m; i++)
       for (int j = 0; j < m; j++) {
         double v = 0;

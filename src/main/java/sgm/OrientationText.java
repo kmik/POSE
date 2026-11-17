@@ -123,7 +123,8 @@ final class OrientationText {
                   get(values, "z", get(values, "center_z", Double.NaN))
                 });
       }
-      model.add(new View(image, c, pose));
+      String camera = values.getOrDefault("camera", "").strip();
+      model.add(new View(image, c, pose, camera.isEmpty() ? null : cameraId(camera)));
     }
     return model;
   }
@@ -244,6 +245,7 @@ final class OrientationText {
       if (count != names.size())
         throw new IllegalArgumentException("Bundler image-list count differs from camera count");
       Model m = new Model();
+      Map<String, String> groups = sidecar(file.toAbsolutePath().getParent());
       for (String image : names) {
         double f = scan.nextDouble(), k1 = scan.nextDouble(), k2 = scan.nextDouble();
         double[] r = new double[9], t = new double[3];
@@ -268,7 +270,8 @@ final class OrientationText {
                 key,
                 calibration(
                     f, f, size[0] * .5, size[1] * .5, new double[] {k1, k2}, size[0], size[1]),
-                pose(flipRows(r), flip(t))));
+                pose(flipRows(r), flip(t)),
+                groups.get(key)));
       }
       return m;
     }
@@ -299,6 +302,7 @@ final class OrientationText {
   private static Model colmap(Path input, Options o) throws IOException {
     Path dir = Files.isDirectory(input) ? input : input.toAbsolutePath().getParent();
     Map<Integer, Calibration> cameras = new LinkedHashMap<>();
+    Map<String, String> groups = sidecar(dir);
     Model m = new Model();
     if (Files.exists(dir.resolve("cameras.txt"))) {
       for (String line : Files.readAllLines(dir.resolve("cameras.txt"))) {
@@ -332,7 +336,8 @@ final class OrientationText {
                 t[9],
                 Objects.requireNonNull(
                     cameras.get(Integer.parseInt(t[8])), "Unknown COLMAP camera ID"),
-                pose(quaternion(q), v)));
+                pose(quaternion(q), v),
+                groups.getOrDefault(name(t[9]), "colmap_camera_" + t[8])));
         i++;
       }
     } else {
@@ -385,7 +390,9 @@ final class OrientationText {
               new View(
                   name.toString(StandardCharsets.UTF_8),
                   Objects.requireNonNull(cameras.get(camera)),
-                  pose(quaternion(q), t)));
+                  pose(quaternion(q), t),
+                  groups.getOrDefault(
+                      name(name.toString(StandardCharsets.UTF_8)), "colmap_camera_" + camera)));
         }
       }
     }
@@ -468,7 +475,16 @@ final class OrientationText {
       Map<String, String> tag = tags(block);
       String image = name(tag.getOrDefault("PHOTO_FILE", tag.getOrDefault("PHOTO_NUM", "")));
       int[] size = sizes.get(image);
-      String definition = definitions.get(tag.get("CAMERA_ID"));
+      String cameraId = tag.get("CAMERA_ID"), definition = cameraId == null ? null : definitions.get(cameraId);
+      if (!definitions.isEmpty() && definition == null)
+        throw new IllegalArgumentException(
+            "INPHO photo "
+                + image
+                + (cameraId == null
+                    ? " has no $CAMERA_ID"
+                    : " refers to camera '" + cameraId + "', which has no $CAMERA_DEFINITION")
+                + "; the project defines cameras "
+                + new TreeSet<>(definitions.keySet()));
       Map<String, String> cameraTags = definition == null ? Map.of() : tags(definition);
       checkInphoDistortion((definition == null ? "" : definition) + "\n" + block, m, o);
       if (size == null && cameraTags.containsKey("CCD_COLUMNS"))
@@ -493,10 +509,13 @@ final class OrientationText {
       if (o.orientationRotation.equals("camera-to-world")) rotation = Math3.transpose(rotation);
       if (!o.orientationAxes.equals("opencv")) rotation = flipRows(rotation);
       Camera pose = centered(rotation, Arrays.copyOfRange(values, 1, 4));
+      Double cameraPixel = cameraId == null ? null : o.orientationPixelSizes.get(cameraId(cameraId));
       double pixel =
-          Double.isFinite(o.orientationPixelSize)
-              ? o.orientationPixelSize
-              : Double.parseDouble(tag.getOrDefault("PIXEL_SIZE", "NaN"));
+          cameraPixel != null
+              ? cameraPixel
+              : Double.isFinite(o.orientationPixelSize)
+                  ? o.orientationPixelSize
+                  : Double.parseDouble(tag.getOrDefault("PIXEL_SIZE", "NaN"));
       Calibration calibration = null;
       Matcher affine =
           Pattern.compile("(?m)^\\s*\\$CCD_INTERIOR_ORIENTATION[^\\r\\n]*\\R\\s*([^$]+)")
@@ -536,7 +555,8 @@ final class OrientationText {
                 size[0],
                 size[1]);
       }
-      m.add(new View(image, calibration, pose));
+      if (cameraId != null && pixel > 0) m.pixelSizes.putIfAbsent(cameraId(cameraId), pixel);
+      m.add(new View(image, calibration, pose, cameraId == null ? null : cameraId(cameraId)));
     }
     m.notes.add(
         "INPHO digital pinhole EXT_ORI; default world-to-camera photogrammetric axes; pixel size in"
@@ -560,7 +580,8 @@ final class OrientationText {
     try (BufferedWriter io = Files.newBufferedWriter(dir.resolve("interiors.csv"));
         BufferedWriter eo = Files.newBufferedWriter(dir.resolve("exteriors.csv"));
         BufferedWriter both = Files.newBufferedWriter(dir.resolve("orientations.csv"))) {
-      String ih = "image,width,height,fx,fy,cx,cy,k1,k2,p1,p2,k3",
+      boolean grouped = m.grouped();
+      String ih = "image,width,height,fx,fy,cx,cy,k1,k2,p1,p2,k3" + (grouped ? ",camera" : ""),
           eh = format.equals("csv-opk") ? "image,x,y,z,omega,phi,kappa" : PoseIO.HEADER;
       io.write(ih + "\n");
       eo.write(eh + "\n");
@@ -576,6 +597,7 @@ final class OrientationText {
             image + "," + c.width + "," + c.height + "," + c.fx + "," + c.fy + "," + c.cx + ","
                 + c.cy;
         for (double d : c.distortion) interior += "," + d;
+        if (grouped) interior += "," + PoseIO.quote(v.camera() == null ? "" : v.camera());
         io.write(interior + "\n");
         if (v.pose() != null) {
           String pose = "";
@@ -595,7 +617,46 @@ final class OrientationText {
     }
   }
 
+  private static void colmapCamera(BufferedWriter cameras, int id, Calibration c) throws IOException {
+    String model = c.distortion[4] == 0 ? "OPENCV" : "FULL_OPENCV";
+    cameras.write(
+        id + " " + model + " " + c.width + " " + c.height + " " + c.fx + " " + c.fy + " "
+            + (c.cx + .5) + " " + (c.cy + .5));
+    for (int j = 0; j < 4; j++) cameras.write(" " + c.distortion[j]);
+    if (model.equals("FULL_OPENCV")) cameras.write(" " + c.distortion[4] + " 0 0 0");
+    cameras.newLine();
+  }
+
+  /** Several cameras: one COLMAP camera per camera group (names in camera_groups.csv). */
+  private static void writeColmapGrouped(Model m, Path dir) throws IOException {
+    try (BufferedWriter cameras = Files.newBufferedWriter(dir.resolve("cameras.txt"));
+        BufferedWriter images = Files.newBufferedWriter(dir.resolve("images.txt"))) {
+      int cameraId = 0, imageId = 0;
+      for (var e : cameras(m).entrySet()) {
+        cameraId++;
+        Calibration c = e.getValue().getFirst().calibration();
+        if (c == null) throw new IllegalArgumentException("COLMAP export requires intrinsics");
+        cameras.write("# camera " + cameraId + ": " + e.getKey() + "\n");
+        colmapCamera(cameras, cameraId, c);
+        for (View v : e.getValue()) {
+          imageId++;
+          if (v.pose() == null) continue;
+          images.write(Integer.toString(imageId));
+          for (double q : quaternion(v.pose())) images.write(" " + q);
+          for (double t : v.pose().translation) images.write(" " + t);
+          images.write(" " + cameraId + " " + v.image() + "\n\n");
+        }
+      }
+    }
+    Files.writeString(
+        dir.resolve("points3D.txt"), "# Orientations only; no sparse observations exported\n");
+  }
+
   private static void writeColmap(Model m, Path dir) throws IOException {
+    if (m.grouped()) {
+      writeColmapGrouped(m, dir);
+      return;
+    }
     try (BufferedWriter cameras = Files.newBufferedWriter(dir.resolve("cameras.txt"));
         BufferedWriter images = Files.newBufferedWriter(dir.resolve("images.txt"))) {
       int id = 0;
@@ -671,7 +732,110 @@ final class OrientationText {
     Files.copy(dir.resolve("interiors.csv"), dir.resolve("images.csv"));
   }
 
+  /** Pixel pitch of an exported camera: --orientation-pixel-size CAMERA=MM, the run's, or the plain option. */
+  private static double pixelSize(Model m, String camera, Options o) {
+    Double own = o.orientationPixelSizes.get(camera);
+    if (own != null) return own;
+    Double known = m.pixelSizes.get(camera);
+    if (known != null) return known;
+    if (o.orientationPixelSize > 0) return o.orientationPixelSize;
+    throw new IllegalArgumentException(
+        "INPHO export needs the pixel size of camera "
+            + camera
+            + ": --orientation-pixel-size "
+            + camera
+            + "=MM (or a plain --orientation-pixel-size MM for every camera)");
+  }
+
+  /** Several cameras: one $CAMERA_DEFINITION per camera group, each with its own pixel size. */
+  private static void writeInphoGrouped(Model m, Path dir, Options o) throws IOException {
+    if (m.crs == null && !Set.of("m", "ft", "mm", "metres").contains(m.units))
+      throw new IllegalArgumentException(
+          "INPHO export requires declared --orientation-world-units m|ft|mm for an unreferenced"
+              + " model");
+    var cameras = cameras(m);
+    try (BufferedWriter out = Files.newBufferedWriter(dir.resolve("orientations.prj"))) {
+      out.write(
+          "$PROJECT 5.0.0\n  $LINEAR_UNITS_OF_OBJECT : "
+              + (m.crs == null ? m.units : "m")
+              + "\n  $LINEAR_UNITS_OF_IMAGE : mm\n  $ANGULAR_UNITS : deg\n$END\n");
+      Map<String, Double> pixels = new HashMap<>();
+      for (var e : cameras.entrySet()) {
+        Calibration c = e.getValue().getFirst().calibration();
+        if (c == null) throw new IllegalArgumentException("INPHO export requires interiors and exteriors");
+        if (c.fx != c.fy || Arrays.stream(c.distortion).anyMatch(d -> d != 0))
+          loss(
+              m,
+              o,
+              "INPHO pinhole export supports square pixels and distortion-free imagery; choose"
+                  + " processed pixels for lossless distortion-free export");
+        double pixel = pixelSize(m, cameraId(e.getKey()), o);
+        pixels.put(e.getKey(), pixel);
+        if (e.getKey().matches(".*\\s.*"))
+          throw new IllegalArgumentException("INPHO camera IDs cannot contain whitespace: " + e.getKey());
+        out.write(
+            "$CAMERA_DEFINITION\n  $ID : "
+                + e.getKey()
+                + "\n  $KIND : CCDFrame\n  $CCD_COLUMNS : "
+                + c.width
+                + "\n  $CCD_ROWS : "
+                + c.height
+                + "\n"
+                + "  $PIXEL_REFERENCE : CenterTopLeft\n"
+                + "  $ACTIVE_CALIBRATION : 1\n"
+                + "  $CALIBRATION_SET :\n"
+                + "    $ID : 1\n"
+                + "    $MODE : manual\n"
+                + "    $FOCAL_LENGTH : "
+                + c.fx * pixel
+                + "\n    $PRINCIPAL_POINT_PPA : 0 0\n    $CCD_INTERIOR_ORIENTATION :\n      "
+                + 1 / pixel
+                + " 0 "
+                + c.cx
+                + "\n      0 "
+                + (-1 / pixel)
+                + " "
+                + c.cy
+                + "\n  $END\n$END\n");
+      }
+      int id = 0;
+      for (var e : cameras.entrySet())
+        for (View v : e.getValue()) {
+          id++;
+          Camera p = v.pose();
+          if (p == null) throw new IllegalArgumentException("INPHO export requires interiors and exteriors");
+          double pixel = pixels.get(e.getKey()), f = v.calibration().fx * pixel;
+          double[] center = p.center(), r = flipRows(p.rotation);
+          out.write(
+              "$PHOTO\n  $PHOTO_NUM : "
+                  + id
+                  + "\n  $PHOTO_FILE : "
+                  + v.image()
+                  + "\n  $CAMERA_ID : "
+                  + e.getKey()
+                  + "\n  $PIXEL_SIZE : "
+                  + pixel
+                  + "\n  $SCAN_POS : 0\n  $IO_PARS : 2 2\n  $EXT_ORI : 00:00:00 01/01/2000\n    "
+                  + f
+                  + " "
+                  + center[0]
+                  + " "
+                  + center[1]
+                  + " "
+                  + center[2]
+                  + "\n");
+          for (int row = 0; row < 3; row++)
+            out.write("    " + r[row * 3] + " " + r[row * 3 + 1] + " " + r[row * 3 + 2] + "\n");
+          out.write("$END\n");
+        }
+    }
+  }
+
   private static void writeInpho(Model m, Path dir, Options o) throws IOException {
+    if (m.grouped()) {
+      writeInphoGrouped(m, dir, o);
+      return;
+    }
     if (!(o.orientationPixelSize > 0))
       throw new IllegalArgumentException(
           "INPHO export needs --orientation-pixel-size MM; physical sensor pitch cannot be"
