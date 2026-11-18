@@ -26,6 +26,15 @@ final class FusionOutput implements AutoCloseable {
   }
 
   private boolean finished;
+  private FusionHostMemory hostMemory;
+  void hostMemory(FusionHostMemory memory) { hostMemory = memory; }
+
+  private void retainOutput(long voxels) throws IOException {
+    if (hostMemory == null) return;
+    // One new tile and one overflow spool can appear in the upcoming point write.
+    long extra = options.tiledLasOutput > 0 ? 4096 + (1L << 20) : 0;
+    hostMemory.retainOutput(Math.addExact(Math.multiplyExact(voxels, 128L), cloud.retainedMetadataBytes() + extra));
+  }
 
   private record Voxel(long x, long y, long z) {}
 
@@ -193,6 +202,8 @@ final class FusionOutput implements AutoCloseable {
             }
           });
     if (records != null) records.flush();
+    if (hostMemory != null)
+      Json.write(options.output.resolve("06_fusion/host_output_memory.json"), hostMemory.report());
     Json.write(
         options.output.resolve("06_fusion/confidence.json"),
         Json.object(
@@ -261,12 +272,14 @@ final class FusionOutput implements AutoCloseable {
               (long) Math.floor(p.point[0] / size),
               (long) Math.floor(p.point[1] / size),
               (long) Math.floor(p.point[2] / size));
+      if (hostMemory != null && !occupied.contains(v)) retainOutput((long) occupied.size() + 1);
       if (!occupied.add(v)) {
         voxelRejected++;
         if (surfaceDecisions != null) surfaceDecisions.write(p.id + ",-1,voxel_duplicate,0\n");
         return;
       }
     }
+    if (hostMemory != null && occupied == null && options.tiledLasOutput > 0) retainOutput(0);
     if (surfaceDecisions != null)
       surfaceDecisions.write(
           p.id + "," + p.id + ",representative," + (p.surfaceShift * options.scale) + "\n");

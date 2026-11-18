@@ -137,35 +137,43 @@ final class ImageFusion {
   static final class Raster {
     final float[] a;
     final java.lang.foreign.MemorySegment s;
+    final HostMapCache.File file;
 
     Raster(float[] a) {
       this.a = a;
       s = null;
+      file = null;
     }
 
     Raster(java.lang.foreign.MemorySegment s) {
       a = null;
       this.s = s;
+      file = null;
     }
 
+    Raster(HostMapCache.File file) { a = null; s = null; this.file = file; }
+
     float get(long i) {
-      return a != null ? a[(int) i] : s.get(MappedFiles.FLOAT, 4L * i);
+      return a != null ? a[(int) i] : file != null ? file.get(i) : s.get(MappedFiles.FLOAT, 4L * i);
     }
 
     void set(long i, float v) {
       if (a != null) a[(int) i] = v;
+      else if (file != null) file.set(i, v);
       else s.set(MappedFiles.FLOAT, 4L * i, v);
     }
 
     /** Copies count values from offset into dst[at..]. */
     void read(long offset, float[] dst, int at, int count) {
       if (a != null) System.arraycopy(a, (int) offset, dst, at, count);
+      else if (file != null) file.read(offset, dst, at, count);
       else MappedFiles.copy(s, 4 * offset, dst, at, count);
     }
 
     /** Copies src[at..at + count) to offset. */
     void write(long offset, float[] src, int at, int count) {
       if (a != null) System.arraycopy(src, at, a, (int) offset, count);
+      else if (file != null) file.write(offset, src, at, count);
       else MappedFiles.copy(src, at, s, 4 * offset, count);
     }
   }
@@ -174,24 +182,30 @@ final class ImageFusion {
   static final class Bits {
     final long[] a;
     final java.lang.foreign.MemorySegment s;
+    final HostMapCache.File file;
 
     Bits(long[] a) {
       this.a = a;
       s = null;
+      file = null;
     }
 
     Bits(java.lang.foreign.MemorySegment s) {
       a = null;
       this.s = s;
+      file = null;
     }
 
+    Bits(HostMapCache.File file) { a = null; s = null; this.file = file; }
+
     boolean get(int q) {
-      long word = a != null ? a[q >>> 6] : s.get(MappedFiles.LONG, 8L * (q >>> 6));
+      long word = a != null ? a[q >>> 6] : file != null ? file.getLong(q >>> 6) : s.get(MappedFiles.LONG, 8L * (q >>> 6));
       return (word & 1L << (q & 63)) != 0;
     }
 
     void set(int q) {
       if (a != null) a[q >>> 6] |= 1L << (q & 63);
+      else if (file != null) file.setLong(q >>> 6, file.getLong(q >>> 6) | 1L << (q & 63));
       else s.set(MappedFiles.LONG, 8L * (q >>> 6), s.get(MappedFiles.LONG, 8L * (q >>> 6)) | 1L << (q & 63));
     }
   }
@@ -222,6 +236,21 @@ final class ImageFusion {
   private final boolean tiled;
   private final int stripRows;
   private final Map<Integer, MappedFiles> tileFiles = new HashMap<>();
+  private final Map<Integer, List<HostMapCache.File>> hostFiles = new HashMap<>();
+  private final FusionHostMemory hostMemory;
+  private static final class SourceRows {
+    final int width;
+    final float[][] values;
+    final int[] colours;
+    SourceRows(int width) { this.width = width; values = new float[5][width]; colours = new int[width]; }
+  }
+  // One reusable row buffer per worker. Per-call ThreadLocals can leave stale values until GC.
+  private final ThreadLocal<SourceRows> sourceRows = new ThreadLocal<>();
+  private SourceRows sourceRows(int width) {
+    SourceRows rows = sourceRows.get();
+    if (rows == null || rows.width != width) { rows = new SourceRows(width); sourceRows.set(rows); }
+    return rows;
+  }
   private long tileMappedBytes;
   // Halo rows: pass 1 spike filter (5x5 window: 2), pass 2 normals (7x7 at stride 4: 12); +1 for
   // the merge's 3x3 search, which makes a region's outermost row inexact.
@@ -240,6 +269,8 @@ final class ImageFusion {
   private boolean gpuNormals;
   private final long workingBytes;
   static final long EMISSION_BYTES = 640;
+  private final long emissionBytes;
+  private final int minimumBandPixels;
   private final boolean[] hasMap, spilledMaps;
   private final long mapBudget;
   private final boolean normalCache;
@@ -256,6 +287,7 @@ final class ImageFusion {
   private int liveCameras, peakLiveCameras;
   private int preparedCameras, passTwoCameras;
   private List<NavigableSet<Integer>> remainingReaders;
+  private BitSet[] boundedReaders;
 
   /** One pair's candidates, read from the stream; sinef = f * sin(triangulation angle). */
   private static final class PairData {
@@ -339,6 +371,7 @@ final class ImageFusion {
     this.start = start;
     this.maps = maps;
     window = maps == null ? null : maps.window;
+    hostMemory = maps == null ? null : maps.hostMemory;
     sigmaTolerance = o.fusionTolerance.equals("sigma");
     precisionCheck = o.fusionPrecisionCheck;
     sigmaK = o.fusionSigmaK;
@@ -350,6 +383,11 @@ final class ImageFusion {
     cameras = fusion.cameraCount();
     mapWindowCameras = window == null ? cameras : window.graph.peakCameras;
     words = (cameras + 63) / 64;
+    int widestBand = 1;
+    for (int c = 0; c < cameras; c++) widestBand = Math.max(widestBand, fusion.width(c));
+    minimumBandPixels = hostMemory == null ? MIN_BAND_PIXELS : widestBand;
+    // Agreements/depths and support bitsets grow with the dependency window, including on strips.
+    emissionBytes = hostMemory == null ? EMISSION_BYTES : EMISSION_BYTES + 24L * words + 16L * cameras;
     fields = Double.isFinite(fusion.twoViewConfidenceThreshold()) ? 6 : 5;
     record = 24 + 3 + 8 + 4 * fields;
     for (int c = 0; c < cameras; c++) pairsOf.add(new ArrayList<>());
@@ -366,6 +404,8 @@ final class ImageFusion {
     // 06_fusion and only the camera being fused and its overlapping cameras are resident; the
     // operating system's file cache then uses whatever RAM is free. Neither changes any result.
     gridCells = SurfacePatchGrid.cacheCells(o, Math.max(1, mapWindowCameras));
+    if (hostMemory != null)
+      gridCells = (int) Math.max(16, Math.min(gridCells, hostMemory.workBytes / 32 / Math.max(1, cameras) / SurfacePatchGrid.CELL_BYTES));
     gpuNormals = GpuNormals.requested(o) && (o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal"));
     long[] plannedMaps = new long[cameras];
     long worstCamera = 0, worstPixels = 0, speckleWork = 0, speckleLimit = Long.MAX_VALUE;
@@ -394,7 +434,8 @@ final class ImageFusion {
       requestedCache = Math.min(requestedCache, (long) o.imageFusionCacheMb * 1048576);
     if (window != null) requestedCache = 0;
     long avail = budget - budget / 8, base = worstCamera + normalBytes;
-    long minEmit = 3L * MIN_BAND_PIXELS * EMISSION_BYTES;
+    if (hostMemory != null) avail = hostMemory.workBytes;
+    long minEmit = 3L * minimumBandPixels * emissionBytes;
     long needed = allMapBytes + base + minEmit;
     // Strips: forced by a test property or --streamed-processing on; with auto only when even the
     // spilled plan cannot hold one camera's work.
@@ -409,7 +450,7 @@ final class ImageFusion {
         compulsoryMaps = Math.max(compulsoryMaps, bytes);
       }
     boolean windowSetFits = window == null || compulsoryMaps + base + minEmit <= avail;
-    tiled = wantTiles || (!(forced < 0 && needed <= avail) && !spillFits || !windowSetFits)
+    tiled = hostMemory != null || wantTiles || (!(forced < 0 && needed <= avail) && !spillFits || !windowSetFits)
         && !o.streamedProcessing.equals("off");
     if (tiled) {
       // One camera at a time, strip by strip; maps are memory-mapped files, so the heap holds
@@ -430,18 +471,19 @@ final class ImageFusion {
         pairData = Math.max(pairData, bytes);
       }
       long perPixel = 27 + 8L * words + 16L * pairsMax + 1 + (maps != null ? 36 + 4L * fields : 0) + (normalCache ? 24 : 0);
-      long fixed = (DepthOutlierFilter.enabled(o) ? (long) SurfacePatchGrid.CELL_BYTES * gridCells * mapWindowCameras : 0) + (maps == null ? pairData : 0);
+      long fixed = (DepthOutlierFilter.enabled(o) ? (long) SurfacePatchGrid.CELL_BYTES * gridCells * (hostMemory == null ? mapWindowCameras : cameras) : 0) + (maps == null ? pairData : 0);
+      if (hostMemory != null) fixed += (long) threads * (16L * cameras + 24L * words + 48L * widest + HostMapCache.PAGE);
       long left = avail - fixed;
-      bandPixels = bandFor(left / 4);
-      left -= 3L * bandPixels * EMISSION_BYTES;
+      bandPixels = hostBandFor(left / 4);
+      left -= 3L * bandPixels * emissionBytes;
       long rows = left / 2 / (perPixel * widest) - 2L * PASS_TWO_HALO;
-      if (forcedRows <= 0 && rows < MIN_STRIP_ROWS)
+      if ((forcedRows <= 0 || hostMemory != null) && rows < MIN_STRIP_ROWS)
         throw new IllegalArgumentException(
             "Image-space fusion needs at least about "
                 + (fixed + minEmit + 2 * perPixel * widest * (MIN_STRIP_ROWS + 2L * PASS_TWO_HALO)) * 8 / 7 * 4 / 3 / 1048576
                 + " MiB heap even in strips (" + perPixel + " bytes per pixel of a strip, " + fixed / 1048576
                 + " MiB fixed); raise PHOTOGRAMMETRY_HEAP/-Xmx or lower --quality");
-      stripRows = (int) Math.max(1, Math.min(tallest, forcedRows > 0 ? forcedRows : rows));
+      stripRows = (int) Math.max(1, Math.min(tallest, forcedRows > 0 ? (hostMemory == null ? forcedRows : Math.min(forcedRows, rows)) : rows));
       // The speckle filter runs over a camera's mapped map when no strip is in work: it gets the
       // strips' share of the heap, on as many threads as fit (at least one).
       speckleLimit = Math.max(1, left / 2);
@@ -452,7 +494,13 @@ final class ImageFusion {
         speckleThreads = Math.min(speckleThreads, t);
         speckleWork = Math.max(speckleWork, SpeckleFilter.workingBytes(sw, sh, SpeckleFilter.rows(sh, t), t));
       }
-      workingBytes = perPixel * widest * (stripRows + 2L * PASS_TWO_HALO) + 3L * bandPixels * EMISSION_BYTES + fixed;
+      if (hostMemory != null && o.speckleSize > 0 && speckleWork > speckleLimit)
+        throw new IllegalArgumentException("Bounded host fusion cannot fit even one speckle worker: needs "
+            + Math.ceilDiv(speckleWork, MemorySafety.MIB) + " MiB, filter allowance "
+            + (speckleLimit >> 20) + " MiB; increase --fusion-host-memory-mb/job RAM or lower --quality");
+      long stripWork = perPixel * widest * (stripRows + 2L * PASS_TWO_HALO);
+      if (hostMemory != null && o.speckleSize > 0) stripWork = Math.max(stripWork, speckleWork);
+      workingBytes = stripWork + 3L * bandPixels * emissionBytes + fixed;
       spillDirectory = o.output.resolve("06_fusion/map-spill");
     } else if (forced < 0 && needed <= avail) {
       stripRows = 0;
@@ -510,7 +558,7 @@ final class ImageFusion {
             + " largest camera's work %,d MiB; %d camera(s) at once in pass 1; candidate cache %,d MiB;"
             + " normal cache %s; row bands of %,d pixels; speckle filter %,d MiB on up to %d thread(s)",
         budget >> 20, allMapBytes >> 20, cameras,
-        tiled ? "memory-mapped files; fusion in strips of " + stripRows + " rows"
+        tiled ? (hostMemory == null ? "memory-mapped files" : "bounded file-page cache") + "; fusion in strips of " + stripRows + " rows"
             : mapBudget == Long.MAX_VALUE ? "all resident" : "spilled to disk, " + (mapBudget >> 20) + " MiB resident",
         workingBytes >> 20, passOneCameras, cacheLimit >> 20, normalCache ? "on" : "off", bandPixels,
         speckleWork + 1048575 >> 20, speckleThreads);
@@ -554,8 +602,10 @@ final class ImageFusion {
       MvsgmMaps maps)
       throws IOException {
     ImageFusion f = new ImageFusion(o, fusion, candidates, pairStarts, maps);
+    if (f.hostMemory != null) output.hostMemory(f.hostMemory);
     try {
       Counters c = f.fuse(output, diagnostics);
+      if (f.hostMemory != null) f.hostMemory.workspaceFinished();
       c.memory = Json.object(
           "plan", f.plan, "map_loads", f.mapLoads, "map_evictions", f.mapEvictions,
           "spill_bytes_written", f.spillWritten, "spill_bytes_read", f.spillRead,
@@ -566,7 +616,14 @@ final class ImageFusion {
           "last_map_use", f.lastUse, "planned_peak_map_bytes", f.plannedMapPeakBytes,
           "peak_live_map_bytes", f.peakLiveMapBytes, "peak_live_cameras", f.peakLiveCameras,
           "peak_resident_bytes", f.peakResidentBytes, "window", f.window == null ? null : f.window.report());
-      if (f.tiled)
+      if (f.hostMemory != null) ((Map<String, Object>) c.memory).put("host_memory", f.hostMemory.report());
+      if (maps != null) ((Map<String, Object>) c.memory).put("source_maps", maps.sourceReport());
+      if (maps != null && maps.scoped && f.hostMemory == null)
+        System.out.println("Scoped MVSGM source maps: " + maps.sourceReport());
+      if (f.hostMemory != null)
+        System.out.printf(Locale.ROOT, "Bounded host fusion: strips of %,d rows; shared file-page cache %s%n",
+            f.stripRows, f.hostMemory.cache.report());
+      else if (f.tiled)
         System.out.printf(Locale.ROOT, "Image fusion in strips of %,d rows: %,d MiB of memory-mapped maps%n",
             f.stripRows, f.tileMappedBytes >> 20);
       else if (f.spillDirectory != null)
@@ -574,11 +631,16 @@ final class ImageFusion {
             f.mapLoads, f.mapEvictions, f.spillWritten >> 20, f.spillRead >> 20);
       return c;
     } finally {
+      boolean interrupted = f.hostMemory != null && Thread.interrupted();
+      try {
       f.pairCache.clear();
       f.readBuffer = null;
       stopWorkers(f.pool);
+      f.sourceRows.remove();
+      if (f.hostMemory != null) interrupted |= Thread.interrupted();
       GpuSpikeFilter.close();
       f.deleteSpill();
+      } finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
   }
 
@@ -589,6 +651,11 @@ final class ImageFusion {
   static int bandFor(long bytes) {
     long pixels = bytes / (3 * EMISSION_BYTES);
     return (int) Math.max(MIN_BAND_PIXELS, Math.min(BAND_PIXELS, pixels));
+  }
+
+  private int hostBandFor(long bytes) {
+    return hostMemory == null ? bandFor(bytes)
+        : (int) Math.max(minimumBandPixels, Math.min(BAND_PIXELS, bytes / (3 * emissionBytes)));
   }
 
   /** Heap bytes of camera c's resident maps (depth, weights, local sigma, marks, patch cache). */
@@ -605,6 +672,11 @@ final class ImageFusion {
 
   /** Pass 1: camera c's maps are complete; record them, spilling others if over the plan. */
   private synchronized void admit(int c, Raster z, Raster weight, Raster best) throws IOException {
+    if (hostMemory != null) {
+      z.file.freeze();
+      if (weight != null) weight.file.freeze();
+      if (best != null) best.file.freeze();
+    }
     compact[c] = z;
     compactWeight[c] = weight;
     localBest[c] = best;
@@ -613,6 +685,7 @@ final class ImageFusion {
     liveCameras++;
     peakLiveMapBytes = Math.max(peakLiveMapBytes, liveMapBytes);
     peakLiveCameras = Math.max(peakLiveCameras, liveCameras);
+    if (hostMemory != null) hostMemory.cameras(liveCameras, retiredCameras);
     if (window != null) allMapBytes += mapBytes(c);
     // Strips: every map is a memory-mapped file; nothing is resident on the heap.
     if (tiled) return;
@@ -628,7 +701,7 @@ final class ImageFusion {
     final float[] array = compact[c].a;
     final java.lang.foreign.MemorySegment mapped = compact[c].s;
     surfaceContext[c] = new SurfacePatchGrid(fusion.width(c), fusion.height(c),
-        array != null ? p -> array[p] : p -> mapped.get(MappedFiles.FLOAT, 4L * p), o.fusionRelative, gridCells);
+        array != null ? p -> array[p] : p -> compact[c].get(p), o.fusionRelative, gridCells);
   }
 
   /** Pass 2: camera c and the cameras it cross-checks become resident; others may be spilled. */
@@ -661,6 +734,7 @@ final class ImageFusion {
   /** No later cross-check or mark update can access c. Pending output owns values, not maps. */
   private void releaseCamera(int c) throws IOException {
     if (!hasMap[c]) return;
+    retireHostFiles(c);
     MappedFiles owner = tileFiles.remove(c);
     if (owner != null) owner.close();
     compact[c] = compactWeight[c] = localBest[c] = null;
@@ -677,6 +751,7 @@ final class ImageFusion {
     liveMapBytes -= mapBytes(c);
     liveCameras--;
     retiredCameras++;
+    if (hostMemory != null) hostMemory.cameras(liveCameras, retiredCameras);
   }
 
   /** Spilled mode needs one camera plus all of its overlapping cameras resident at once. */
@@ -847,6 +922,24 @@ final class ImageFusion {
   }
 
   /** A new zero map file of camera c, memory-mapped read-write. */
+  private HostMapCache.File hostFile(int c, String kind, long bytes) throws IOException {
+    OutputDiskSpace.require(o, bytes, "bounded fusion " + kind + " map for camera " + c);
+    HostMapCache.File file = hostMemory.cache.create(tileFile(c, kind), bytes);
+    hostFiles.computeIfAbsent(c, k -> new ArrayList<>()).add(file);
+    return file;
+  }
+
+  private Raster tileRaster(int c, String kind, long bytes) throws IOException {
+    return hostMemory == null ? new Raster(tileMap(c, kind, bytes)) : new Raster(hostFile(c, kind, bytes));
+  }
+
+  private void retireHostFiles(int c) throws IOException {
+    List<HostMapCache.File> files = hostFiles.get(c);
+    if (files == null) return;
+    for (var file : files) hostMemory.cache.retire(file);
+    hostFiles.remove(c);
+  }
+
   private java.lang.foreign.MemorySegment tileMap(int c, String kind, long bytes) throws IOException {
     OutputDiskSpace.require(o, bytes, "fusion " + kind + " map for camera " + c);
     var segment = tileFiles.computeIfAbsent(c, k -> new MappedFiles()).create(tileFile(c, kind), bytes);
@@ -857,6 +950,7 @@ final class ImageFusion {
   /** used/emitted marks of camera j, created on first use (memory-mapped in strips). */
   private Bits newBits(int j, String kind) throws IOException {
     long words = ((long) fusion.width(j) * fusion.height(j) + 63) / 64;
+    if (hostMemory != null) return new Bits(hostFile(j, kind, 8 * words));
     return tiled ? new Bits(tileMap(j, kind, 8 * words)) : new Bits(new long[(int) words]);
   }
 
@@ -875,6 +969,8 @@ final class ImageFusion {
   }
 
   private void deleteSpill() {
+    for (int c : new ArrayList<>(hostFiles.keySet())) try { retireHostFiles(c); }
+    catch (IOException e) { System.err.println("Could not flush host fusion maps: " + e); }
     for (MappedFiles owner : tileFiles.values()) owner.close();
     tileFiles.clear();
     if (spillDirectory == null || !Files.isDirectory(spillDirectory)) return;
@@ -905,6 +1001,10 @@ final class ImageFusion {
   }
 
   private void parallel(int n, java.util.function.IntConsumer action) {
+    if (hostMemory != null) {
+      FusionHostMemory.parallel(pool, n, action, hostMemory.pressured());
+      return;
+    }
     try {
       pool.submit(() -> IntStream.range(0, n).parallel().forEach(action)).get();
     } catch (InterruptedException e) {
@@ -1000,6 +1100,10 @@ final class ImageFusion {
     });
   }
 
+  private java.lang.foreign.MemorySegment sourceSegment(MvsgmMaps.Reader source, int camera, int kind) throws IOException {
+    return source == null ? maps.segment(camera, kind) : source.segment(kind);
+  }
+
   /**
    * --dense-method mvsgm: the candidates of rows [r0, r1) of pair k's camera, read from its maps
    * (MvsgmMaps) with the arithmetic the former candidate file used (world point from the map
@@ -1015,24 +1119,37 @@ final class ImageFusion {
     long first = rowStart[r0];
     PairData data = new PairData(k, Math.toIntExact(rowStart[r1] - first), fields, full);
     data.first = first;
-    var z = maps.segment(c, MvsgmMaps.DEPTH);
-    var lr = maps.segment(c, MvsgmMaps.LR);
-    var margin = full ? maps.segment(c, MvsgmMaps.MARGIN) : null;
-    var sharp = full ? maps.segment(c, MvsgmMaps.SHARP) : null;
-    var photo = full ? maps.segment(c, MvsgmMaps.PHOTO) : null;
-    var rgb = full ? maps.segment(c, MvsgmMaps.RGB) : null;
+    boolean scoped = maps.scopedReaders();
+    try (var source = scoped ? maps.reader(c) : null) {
+    var z = hostMemory == null ? sourceSegment(source, c, MvsgmMaps.DEPTH) : null;
+    var lr = hostMemory == null ? sourceSegment(source, c, MvsgmMaps.LR) : null;
+    var margin = full && hostMemory == null ? sourceSegment(source, c, MvsgmMaps.MARGIN) : null;
+    var sharp = full && hostMemory == null ? sourceSegment(source, c, MvsgmMaps.SHARP) : null;
+    var photo = full && hostMemory == null ? sourceSegment(source, c, MvsgmMaps.PHOTO) : null;
+    var rgb = full && hostMemory == null ? sourceSegment(source, c, MvsgmMaps.RGB) : null;
     Camera cam = fusion.camera(c);
     double[] rt = Math3.transpose(cam.rotation);
     // Rows are copied out of the mapped files in bulk (one copy per map and row).
-    ThreadLocal<float[][]> rows = ThreadLocal.withInitial(() -> new float[5][w]);
-    ThreadLocal<int[]> colours = ThreadLocal.withInitial(() -> new int[w]);
-    parallel(r1 - r0, row -> {
+    ThreadLocal<float[][]> rows = hostMemory == null ? ThreadLocal.withInitial(() -> new float[5][w]) : null;
+    ThreadLocal<int[]> colours = hostMemory == null ? ThreadLocal.withInitial(() -> new int[w]) : null;
+    java.util.function.IntConsumer copyRow = row -> {
       int y = r0 + row, i = (int) (rowStart[y] - first);
       if (rowStart[y + 1] == rowStart[y]) return;
       long at = (long) y * w;
-      float[][] v = rows.get();
+      SourceRows scratch = hostMemory == null ? null : sourceRows(w);
+      float[][] v = scratch == null ? rows.get() : scratch.values;
       float[] zr = v[0], lrr = v[1], mr = v[2], sr = v[3], pr = v[4];
-      int[] cr = colours.get();
+      int[] cr = scratch == null ? colours.get() : scratch.colours;
+      if (hostMemory != null) {
+        source.read(MvsgmMaps.DEPTH, at, zr);
+        source.read(MvsgmMaps.LR, at, lrr);
+        if (full) {
+          source.read(MvsgmMaps.MARGIN, at, mr);
+          source.read(MvsgmMaps.SHARP, at, sr);
+          source.read(MvsgmMaps.PHOTO, at, pr);
+          source.readInts(MvsgmMaps.RGB, at, cr);
+        }
+      } else {
       MappedFiles.copy(z, 4 * at, zr, 0, w);
       MappedFiles.copy(lr, 4 * at, lrr, 0, w);
       if (full) {
@@ -1040,6 +1157,7 @@ final class ImageFusion {
         MappedFiles.copy(sharp, 4 * at, sr, 0, w);
         MappedFiles.copy(photo, 4 * at, pr, 0, w);
         MappedFiles.copy(rgb, 4 * at, cr, 0, w);
+      }
       }
       for (int x = 0; x < w; x++) {
         float zp = zr[x];
@@ -1064,7 +1182,12 @@ final class ImageFusion {
         }
         i++;
       }
-    });
+    };
+    // On failure a parallel stream can finish its root before sibling leaves. A scoped
+    // source must join every submitted copying task before its mappings can be closed.
+    if (scoped && hostMemory == null) FusionHostMemory.parallel(pool, r1 - r0, copyRow, false);
+    else parallel(r1 - r0, copyRow);
+    } // Row tasks have joined; PairData contains only owned arrays.
     counters.pairReads++;
     counters.bytesRead += (long) (r1 - r0) * w * (full ? 24 : 8);
     sines(data);
@@ -1127,8 +1250,13 @@ final class ImageFusion {
     // edges the reference overlap test rejected, so a known-finished camera is not kept longer.
     for (int j : window.graph.possible[c])
       if (Arrays.binarySearch(neighbours[c], j) < 0) {
-        remainingReaders.get(j).remove(c);
-        lastUse[j] = remainingReaders.get(j).last();
+        if (boundedReaders != null) {
+          boundedReaders[j].clear(c);
+          lastUse[j] = boundedReaders[j].length() - 1;
+        } else {
+          remainingReaders.get(j).remove(c);
+          lastUse[j] = remainingReaders.get(j).last();
+        }
       }
     samples[c] = null;
   }
@@ -1221,10 +1349,16 @@ final class ImageFusion {
       for (int c = 0; c < cameras; c++) finishedAfter.add(new ArrayList<>());
       lastUse = window == null ? lastMapUse(neighbours) : window.graph.last.clone();
       if (window != null) {
+        if (hostMemory != null) {
+          boundedReaders = new BitSet[cameras];
+          for (int j = 0; j < cameras; j++) { boundedReaders[j] = new BitSet(cameras); boundedReaders[j].set(j); }
+          for (int c = 0; c < cameras; c++) for (int j : window.graph.possible[c]) boundedReaders[j].set(c);
+        } else {
         remainingReaders = new ArrayList<>();
         for (int j = 0; j < cameras; j++) remainingReaders.add(new TreeSet<>(Set.of(j)));
         for (int c = 0; c < cameras; c++)
           for (int j : window.graph.possible[c]) remainingReaders.get(j).add(c);
+        }
       }
       for (int c = 0; c < cameras; c++) finishedAfter.get(lastUse[c]).add(c);
       // Skipped cameras never materialised their planned maps.
@@ -1256,6 +1390,11 @@ final class ImageFusion {
       for (int c = 0; c < cameras; c++) {
         progress.update(window == null ? cameras + c : preparedCameras + passTwoCameras);
         if (window != null && window.eligible[c]) {
+          // Stereo's reservation must not overlap the previous camera's queued output bands.
+          // Output owns values, so joining here also makes those old arrays collectible before
+          // preparation allocates the next stereo/merge workspace.
+          if (hostMemory != null)
+            while (!pending.isEmpty()) outputNanos += awaitOutput(pending.poll());
           ensurePassOne(channel, c, perCamera, times, samples, counters);
           for (int j : neighbours[c]) ensurePassOne(channel, j, perCamera, times, samples, counters);
           window.beforePassTwo(c, start);
@@ -1269,6 +1408,7 @@ final class ImageFusion {
           continue;
         }
         residentFor(c);
+        if (hostMemory != null) hostMemory.require(workingBytes, "fusion cross-check camera " + c);
         // The whole image at once, or (fusion in strips) strip by strip with a halo covering the
         // normal fits (+-12 rows) and the merge's 3x3 search. Bands and strips never change results.
         int h = fusion.height(c), strip = tiled ? stripRows : h, halo = tiled ? PASS_TWO_HALO : 0;
@@ -1658,11 +1798,12 @@ final class ImageFusion {
    */
   private void passOneTiled(FileChannel channel, int c, Counters own, long[] times, double[][] samples, Counters counters)
       throws IOException {
+    if (hostMemory != null) hostMemory.require(workingBytes, "fusion pass one camera " + c);
     int w = fusion.width(c), h = fusion.height(c);
     long n = (long) w * h;
     Camera cam = fusion.camera(c);
-    Raster z = new Raster(tileMap(c, "z", 4 * n));
-    Raster weight = storeWeights || localSigma > 0 ? new Raster(tileMap(c, "w", 4 * n)) : null;
+    Raster z = tileRaster(c, "z", 4 * n);
+    Raster weight = storeWeights || localSigma > 0 ? tileRaster(c, "w", 4 * n) : null;
     for (int y0 = 0; y0 < h; y0 += stripRows) {
       int y1 = Math.min(h, y0 + stripRows), r0 = Math.max(0, y0 - PASS_ONE_HALO), r1 = Math.min(h, y1 + PASS_ONE_HALO);
       long clock = System.nanoTime();
@@ -1759,7 +1900,7 @@ final class ImageFusion {
   /** localMinimumSigma in strips (halo SIGMA_HALO rows), written to camera c's "best" map file. */
   private Raster localBestTiled(int c, Raster z, Raster weight) throws IOException {
     int w = fusion.width(c), h = fusion.height(c);
-    Raster best = new Raster(tileMap(c, "best", 4L * w * h));
+    Raster best = tileRaster(c, "best", 4L * w * h);
     for (int y0 = 0; y0 < h; y0 += stripRows) {
       int y1 = Math.min(h, y0 + stripRows), r0 = Math.max(0, y0 - SIGMA_HALO), r1 = Math.min(h, y1 + SIGMA_HALO);
       int cells = (r1 - r0) * w;
@@ -2041,8 +2182,7 @@ final class ImageFusion {
         boolean narrowSeed = seedMinSine > 0 && m.narrow[q];
         for (int j : near) {
           // Neighbour maps in locals: an array (resident) or a mapped file (strips); see at().
-          float[] oa = compact[j].a, wa = compactWeight[j] == null ? null : compactWeight[j].a;
-          java.lang.foreign.MemorySegment os = compact[j].s, ws = compactWeight[j] == null ? null : compactWeight[j].s;
+          Raster oa = compact[j], wa = compactWeight[j];
           boolean hasWeights = compactWeight[j] != null;
           Camera oc = fusion.camera(j);
           int ow = fusion.width(j), oh = fusion.height(j);
@@ -2051,7 +2191,7 @@ final class ImageFusion {
           double uj = oc.fx * vj[0] / vj[2] + oc.cx, wj = oc.fy * vj[1] / vj[2] + oc.cy;
           int xj = (int) Math.round(uj), yj = (int) Math.round(wj);
           if (xj < 1 || yj < 1 || xj >= ow - 1 || yj >= oh - 1) continue;
-          double zj = at(oa, os, yj * ow + xj);
+          double zj = at(oa, yj * ow + xj);
           boolean preciseAgreement=false;
           if(DepthOutlierFilter.enabled(o)) {
             // The merged map is one vote per camera. Source-pair cameras cannot independently
@@ -2061,12 +2201,12 @@ final class ImageFusion {
             {
               double low=Double.POSITIVE_INFINITY,high=0;int count=0;
               for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
-                double z=at(oa, os, (yj+dy)*ow+xj+dx);
+                double z=at(oa, (yj+dy)*ow+xj+dx);
                 if(z>0){low=Math.min(low,z);high=Math.max(high,z);count++;}
               }
               double footprint=vj[2]/Math.min(oc.fx,oc.fy);
               double sourceSigma=vj[2]/Math.sqrt(Math.max(1e-30,m.wsum[q]))/mz;
-              double weight=hasWeights?at(wa,ws,yj*ow+xj):0;
+              double weight=hasWeights?at(wa,yj*ow+xj):0;
               double otherSigma=weight>0?1/Math.sqrt(weight):footprint;
               int vote=DepthOutlierFilter.cameraVote(vj[2],zj,low,high,count,
                   sourceSigma,otherSigma,footprint,o.fusionRelative);
@@ -2093,20 +2233,20 @@ final class ImageFusion {
 
           double focalJ = Math.min(oc.fx, oc.fy);
           double seedJ = seedWeight * ((double) mz / vj[2]) * ((double) mz / vj[2]);
-          boolean agrees = zj > 0 && agree(zj, vj[2], hasWeights ? at(wa, ws, yj * ow + xj) : 0, seedJ, focalJ);
+          boolean agrees = zj > 0 && agree(zj, vj[2], hasWeights ? at(wa, yj * ow + xj) : 0, seedJ, focalJ);
           int ax = xj, ay = yj;
           for (int dy = -agreementRadius; !agrees && dy <= agreementRadius; dy++)
             for (int dx = -agreementRadius; !agrees && dx <= agreementRadius; dx++) {
               int xx = xj + dx, yy = yj + dy;
               if ((dx | dy) == 0 || xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
-              double zn = at(oa, os, yy * ow + xx);
-              agrees = zn > 0 && agree(zn, vj[2], hasWeights ? at(wa, ws, yy * ow + xx) : 0, seedJ, focalJ);
+              double zn = at(oa, yy * ow + xx);
+              agrees = zn > 0 && agree(zn, vj[2], hasWeights ? at(wa, yy * ow + xx) : 0, seedJ, focalJ);
               if (agrees) {
                 ax = xx;
                 ay = yy;
               }
             }
-          if (precisionCheck && zj > 0 && hasWeights && at(wa, ws, yj * ow + xj) > 4 * seedJ) {
+          if (precisionCheck && zj > 0 && hasWeights && at(wa, yj * ow + xj) > 4 * seedJ) {
             // Camera j is at least 2x more precise here. Confirmation at its precision, or a near
             // miss: the same surface within the relative band but outside K sigma (occluders and
             // other layers lie beyond the band and stay neutral).
@@ -2115,11 +2255,11 @@ final class ImageFusion {
               for (int dx = -agreementRadius; !tight && dx <= agreementRadius; dx++) {
                 int xx = xj + dx, yy = yj + dy;
                 if (xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
-                double zn = at(oa, os, yy * ow + xx), wn = at(wa, ws, yy * ow + xx);
+                double zn = at(oa, yy * ow + xx), wn = at(wa, yy * ow + xx);
                 tight = zn > 0 && wn > 0 && agreeSigma(zn, vj[2], wn, seedJ, focalJ);
               }
             if (tight) preciseConfirm++;
-            else if (Math.abs(zj - vj[2]) <= tol * Math.min(zj, vj[2]) && reliable(oa, os, ow, xj, yj)) preciseDisagree++;
+            else if (Math.abs(zj - vj[2]) <= tol * Math.min(zj, vj[2]) && reliable(oa, ow, xj, yj)) preciseDisagree++;
           }
           if (agrees && (m.partners.length == 0 || (m.partners[q * words + (j >>> 6)] & 1L << (j & 63)) == 0))
             outsideConfirm++;
@@ -2139,7 +2279,7 @@ final class ImageFusion {
             // The member's depth along j's ray at (ax, ay), moved to this pixel's ray: depth in j
             // changes by slope per unit of this camera's depth. Grazing members are not averaged.
             double slope = oc.rotation[6] * ray[0] + oc.rotation[7] * ray[1] + oc.rotation[8] * ray[2];
-            double zm = at(oa, os, ay * ow + ax), wm = at(wa, ws, ay * ow + ax);
+            double zm = at(oa, ay * ow + ax), wm = at(wa, ay * ow + ax);
             if (slope > .2 && wm > 0) {
               sumW += wm;
               sumWZ += wm * (mz + (zm - vj[2]) / slope);
@@ -2160,11 +2300,11 @@ final class ImageFusion {
               for (int dx = -agreementRadius; !close && dx <= agreementRadius; dx++) {
                 int xx = xj + dx, yy = yj + dy;
                 if (xx < 0 || yy < 0 || xx >= ow || yy >= oh) continue;
-                double zn = at(oa, os, yy * ow + xx);
+                double zn = at(oa, yy * ow + xx);
                 close = zn > 0 && Math.abs(zn - vj[2]) <= margin;
               }
             if (close) closeViews++;
-            else if (zj > 0 && vj[2] < zj - margin && !(vj[2] < zj * (1 - 3 * tol)) && reliable(oa, os, ow, xj, yj)) seeThrough++;
+            else if (zj > 0 && vj[2] < zj - margin && !(vj[2] < zj * (1 - 3 * tol)) && reliable(oa, ow, xj, yj)) seeThrough++;
           }
           if (!agrees && zj <= 0) continue;
           if (agrees) {
@@ -2172,7 +2312,7 @@ final class ImageFusion {
             views[j >>> 6] |= 1L << (j & 63);
             confirmed[j >>> 6] |= 1L << (j & 63);
             independent++;
-          } else if (vj[2] < zj * (1 - 3 * tol) && reliable(oa, os, ow, xj, yj)) contradictions++;
+          } else if (vj[2] < zj * (1 - 3 * tol) && reliable(oa, ow, xj, yj)) contradictions++;
         }
         int viewCount = 0;
         for (long word : views) viewCount += Long.bitCount(word);
@@ -2385,16 +2525,16 @@ final class ImageFusion {
    * A map value in the cross-check's hot loop: the array (resident maps) or the mapped file
    * (strips), with both held in locals by the caller so the resident path reads the array directly.
    */
-  private static float at(float[] a, java.lang.foreign.MemorySegment s, int i) {
-    return a != null ? a[i] : s.get(MappedFiles.FLOAT, 4L * i);
+  private static float at(Raster raster, int i) {
+    return raster.get(i);
   }
 
-  private boolean reliable(float[] a, java.lang.foreign.MemorySegment s, int w, int x, int y) {
+  private boolean reliable(Raster raster, int w, int x, int y) {
     int valid = 0;
     double lo = Double.POSITIVE_INFINITY, hi = 0;
     for (int dy = -1; dy <= 1; dy++)
       for (int dx = -1; dx <= 1; dx++) {
-        double value = at(a, s, (y + dy) * w + x + dx);
+        double value = at(raster, (y + dy) * w + x + dx);
         if (value <= 0) continue;
         valid++;
         lo = Math.min(lo, value);

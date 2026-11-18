@@ -147,6 +147,9 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | `--cores` | half the CPUs | CPU threads. |
 | `--memory-mb` | `2048` | Processing buffer budget in MiB, not a total RAM limit: the Java heap is set to about this / 0.65 (56000 gives an 84 GB heap), and native memory (OpenCV, SIFT, GPU buffers) comes on top. |
 | `--ram-limit-mb` | `0` | Total RAM to plan for (0 = detect the host or job limit). Caps the heap at 65% of it, and parallel feature extraction and pair matching wait instead of going over it. For about 52 GB in total: `--memory-mb 22000 --ram-limit-mb 52000`. |
+| `--fusion-source-maps` | `retained` | Opt-in `scoped` releases MVSGM source mappings after copying; keeps required files and existing fusion planning. |
+| `--fusion-host-memory-mb` | `0` | Opt-in shared host-memory accounting and bounded source/fusion page cache. Zero disables this path; this is not a hard RSS limit. |
+| `--fusion-host-cache-mb` | `512` | Shared page-cache payload cap in MiB when the host-memory option is enabled. |
 
 `--estimate-memory` shows the memory plan without processing.
 
@@ -172,6 +175,8 @@ into that root, and build the module. The Java entry point is `photogrammetry`.
 - [Ground classification](docs/GROUND_CLASSIFICATION.md)
 - [Orthomosaic and automatic check points](docs/ORTHOMOSAIC.md)
 - [Multi-view SGM](docs/MULTIVIEW_SGM.md)
+- [Scoped MVSGM source maps and measurements](docs/FUSION_SOURCE_MAPS.md)
+- [Bounded host fusion memory](docs/FUSION_HOST_MEMORY.md) and [validation](docs/FUSION_HOST_MEMORY_VALIDATION.md)
 - [Thin surfaces](docs/THIN_SURFACES_FUSION.md)
 - [Quick calibration](docs/QUICK_CALIBRATION.md)
 - [Portable releases](PORTABLE_INSTALL.md)

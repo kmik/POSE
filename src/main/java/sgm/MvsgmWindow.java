@@ -13,6 +13,7 @@ final class MvsgmWindow implements AutoCloseable {
   final long[] planningStarts;
   final long estimatedPeakBytes;
   final MvsgmDiskPlan diskPlan;
+  final FusionHostMemory hostMemory;
   final int[] pairOf;
   private final MultiViewSgm mvs;
   private final Options o;
@@ -62,7 +63,7 @@ final class MvsgmWindow implements AutoCloseable {
     Camera[] cameras = new Camera[n];
     int[] widths = new int[n], heights = new int[n];
     mvs.handoff = new MvsgmMaps(o.output.resolve("05_stereo/mvsgm"),
-        o.diagnostics || Boolean.getBoolean("sgm.mvsgm.keepMaps"));
+        o.diagnostics || Boolean.getBoolean("sgm.mvsgm.keepMaps"), o.fusionSourceMaps.equals("scoped"));
     if (tracks.stream().filter(t -> t.point != null).count() < 12)
       throw new IllegalArgumentException("mvsgm needs at least 12 triangulated sparse points; rerun the match step");
     long pixels = 0;
@@ -117,6 +118,14 @@ final class MvsgmWindow implements AutoCloseable {
       rawReaders[c]++;
       for (int j : ci.neighbours()) if (eligible[j]) rawReaders[j]++;
     }
+    long futureMetadata = 0;
+    if (o.fusionHostMemoryMb > 0) futureMetadata += 8L * n * Math.ceilDiv(n, 64);
+    if (o.fusionHostMemoryMb > 0) for (ImageFrame f : frames)
+      futureMetadata += 8L * (f.height + 1) + (64L << 10)
+          + 16L * Math.ceilDiv(40L * f.width * f.height, HostMapCache.PAGE);
+    hostMemory = o.fusionHostMemoryMb > 0 ? new FusionHostMemory(o, futureMetadata) : null;
+    mvs.hostMemory = hostMemory;
+    mvs.handoff.hostMemory = hostMemory;
     gpu = o.compute.equals("cpu") ? null : GpuMemoryPool.install(mvs.gpuBudget());
     preparer = Executors.newSingleThreadExecutor(r -> {
       Thread t = new Thread(r, "mvsgm-window-prepare");
@@ -225,22 +234,30 @@ final class MvsgmWindow implements AutoCloseable {
       int camera = missing[i];
       long clock = System.nanoTime();
       stereoWork.detail("depth camera " + camera);
-      schedule(camera);
       MultiViewSgm.Plan plan;
-      try {
-        if (nextCamera != camera) throw new IllegalStateException("Stereo preparation order changed");
-        plan = next.get();
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        throw new IOException("mvsgm window interrupted", e);
-      } catch (ExecutionException e) {
-        if (e.getCause() instanceof IOException io) throw io;
-        if (e.getCause() instanceof RuntimeException r) throw r;
-        if (e.getCause() instanceof Error error) throw error;
-        throw new IOException(e.getCause());
+      if (hostMemory != null) {
+        // No prepared replacement/prefetch alongside the previous camera's working set.
+        hostMemory.require(mvs.hostWorkspace(frames, headers[camera]), "stereo camera " + camera);
+        try (var rows = StereoRows.open(Math.max(1, o.cores / 2))) {
+          plan = mvs.preparePlan(frames, headers[camera]);
+        }
+      } else {
+        schedule(camera);
+        try {
+          if (nextCamera != camera) throw new IllegalStateException("Stereo preparation order changed");
+          plan = next.get();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IOException("mvsgm window interrupted", e);
+        } catch (ExecutionException e) {
+          if (e.getCause() instanceof IOException io) throw io;
+          if (e.getCause() instanceof RuntimeException r) throw r;
+          if (e.getCause() instanceof Error error) throw error;
+          throw new IOException(e.getCause());
+        }
+        next = null;
+        if (i + 1 < missing.length) schedule(missing[i + 1]);
       }
-      next = null;
-      if (i + 1 < missing.length) schedule(missing[i + 1]);
       OutputDiskSpace.require(o, 16L * frames.get(camera).width * frames.get(camera).height
           + 4L * DepthMapFile.HEADER, "raw MVSGM maps for camera " + camera);
       try (var rows = StereoRows.open(Math.max(1, o.cores / 2))) {
@@ -349,6 +366,7 @@ final class MvsgmWindow implements AutoCloseable {
         "stereo_depth_seconds", depthNanos / 1e9, "stereo_consistency_seconds", consistencyNanos / 1e9,
         "precision_or_retention_requires_all_maps", retainFusion, "stage_times_overlap", true));
     if (pool != null) out.put("cameras_in_flight", pool.report());
+    if (hostMemory != null) out.put("host_memory", hostMemory.report());
     return out;
   }
 

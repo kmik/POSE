@@ -199,6 +199,11 @@ public final class Options {
   double mvsgmConsistencyLabels = 1;
   /** --mvsgm-cameras-in-flight: cameras whose depth maps are computed at once (0 = auto; 1 = serial). */
   int mvsgmCamerasInFlight = 1;
+  /** Opt-in shared accounting allowance for overlap-window host work; zero preserves legacy. */
+  public long fusionHostMemoryMb;
+  public int fusionHostCacheMb = 512;
+  /** Independent source-map lifetime opt-in; does not change fusion memory planning. */
+  public String fusionSourceMaps = "retained";
   public double censusWeight = .5;
   public int adTruncation = 30, gradientTruncation = 60, gpuStripRows = 64;
   public int gpuBankMb = 1024;
@@ -899,6 +904,15 @@ public final class Options {
           break;
         case "--mvsgm-cameras-in-flight":
           o.mvsgmCamerasInFlight = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
+          break;
+        case "--fusion-host-memory-mb":
+          o.fusionHostMemoryMb = Long.parseLong(v);
+          break;
+        case "--fusion-host-cache-mb":
+          o.fusionHostCacheMb = Integer.parseInt(v);
+          break;
+        case "--fusion-source-maps":
+          o.fusionSourceMaps = v.toLowerCase(Locale.ROOT);
           break;
         case "--block-overlap":
           o.blockOverlap = number(v);
@@ -1688,6 +1702,16 @@ public final class Options {
     if (o.fusionAssociation.equals("camera") && !o.fusionMode.equals("incremental"))
       throw new IllegalArgumentException(
           "--fusion-association camera requires --fusion-mode incremental");
+    choice(o.fusionSourceMaps, "--fusion-source-maps", "retained", "scoped");
+    if (o.fusionSourceMaps.equals("scoped")
+        && !(o.denseMethod.equals("mvsgm") && o.fusionMode.equals("image")))
+      throw new IllegalArgumentException("--fusion-source-maps scoped requires --dense-method mvsgm --fusion-mode image");
+    if (o.fusionHostMemoryMb < 0 || o.fusionHostMemoryMb > Long.MAX_VALUE / MemorySafety.MIB
+        || o.fusionHostCacheMb < 1)
+      throw new IllegalArgumentException("--fusion-host-memory-mb must be nonnegative; --fusion-host-cache-mb must be positive");
+    if (o.fusionHostMemoryMb > 0 && !MvsgmWindow.enabled(o))
+      throw new IllegalArgumentException("--fusion-host-memory-mb requires overlap-window MVSGM image fusion"
+          + " and --streamed-processing auto|on");
     if (o.fusionWindowMb < 0)
       throw new IllegalArgumentException("--fusion-window-mb must be nonnegative");
     if (o.windowedMode.equals("on") && o.denseMethod.equals("patchmatch"))
@@ -2794,6 +2818,25 @@ Point filtering and multi-view fusion:
       until the per-camera heap estimate fits; 1 with --compute cpu. Up to N raw depth
       maps exist ahead of fusion (extra temporary disk: 16 bytes per pixel each). If
       a camera runs out of heap, the remaining cameras are computed one at a time.
+  --fusion-source-maps retained|scoped
+      MVSGM image-fusion source-map lifetime (default: retained, legacy behavior).
+      scoped unmaps each camera's source maps after its last active copying reader
+      finishes; required files remain available for later reopening. Uses ordinary
+      memory-mapped reads, without a new memory budget, forced strips or stereo
+      concurrency changes. Does not bound other fusion maps, heap or OS file cache.
+      With --fusion-host-memory-mb enabled, its bounded page cache takes precedence.
+      Saved in run settings and available in the GUI. See FUSION_SOURCE_MAPS.md.
+  --fusion-host-memory-mb N
+      Opt-in host working allowance for overlap-window MVSGM image fusion (default: 0,
+      legacy path). Includes retained project data, native/image reserve, stereo workspace,
+      fusion strips, output bands and the shared source/fusion file-page cache. Requires
+      --streamed-processing auto|on. Keeps every dependency on disk, serializes stereo
+      preparation and fusion, and refuses work that cannot fit. Application accounting
+      is not a strict total-RAM guarantee; use a job/cgroup limit for enforcement.
+      Independent of --fusion-window-mb (GPU evidence). See FUSION_HOST_MEMORY.md.
+  --fusion-host-cache-mb N
+      Shared source/fusion file-page cache size (default: 512 MiB), capped at 1/8 of
+      --fusion-host-memory-mb and the safe heap allowance. Only used with that opt-in.
   --dense-pipeline standard|aerial-tiled
       Default standard is unchanged. Opt-in aerial-tiled requires a compatible OpenCL GPU.
       It rectifies source regions on demand, predicts tile search intervals from a coarse
@@ -3409,6 +3452,7 @@ Additional workflow controls:
       Outlier rule in fusion (default: reference). robust removes a 3+ view point only
       when independent cameras contradict it (free space or a nearer surface).
   --fusion-window-mb N
+      Independent of the opt-in --fusion-host-memory-mb host working allowance.
       Cap in MiB for regional GPU fusion evidence (default: 0 = at most half the GPU
       budget). Used by --fusion-gpu-evidence windowed/auto.
   --export-confidence RUN_DIRECTORY

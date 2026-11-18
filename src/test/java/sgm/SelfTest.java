@@ -71,6 +71,8 @@ public final class SelfTest {
       checks += GpuMvsgmCensusRegression.run();
     checks += LargeFormatRegression.run();
     checks += CameraWindowRegression.run(root.resolve("camera-window"));
+    checks += FusionHostMemoryRegression.run(root.resolve("host-memory"));
+    checks += ScopedSourceMapsRegression.run(root.resolve("scoped-source-maps"));
     checks += MvsgmCameraPoolRegression.run(root.resolve("camera-pool"));
     checks += DiskAdmissionRegression.run(root.resolve("disk-admission"));
     checks += CloudOutputRegression.run(root.resolve("cloud-output"));

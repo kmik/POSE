@@ -10,6 +10,9 @@ final class RasterCache {
   private static long used, peak;
 
   static long limit(Options o) {
+    if (o.fusionHostMemoryMb > 0)
+      return Math.min((o.imageMemoryMb > 0 ? o.imageMemoryMb : Math.max(1, Math.min(2048, o.memoryMb / 4))) * 1048576L,
+          Math.max(1, o.fusionHostMemoryMb / 8) * 1048576L);
     return (long)
             (o.imageMemoryMb > 0 ? o.imageMemoryMb : Math.max(1, Math.min(2048, o.memoryMb / 4)))
         * 1048576;

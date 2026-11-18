@@ -45,6 +45,8 @@ final class MappedFiles implements AutoCloseable {
 
   private final Arena arena = Arena.ofShared();
   private long mappedBytes;
+  private static final java.util.concurrent.atomic.AtomicLong LIVE = new java.util.concurrent.atomic.AtomicLong();
+  static long liveBytes() { return LIVE.get(); }
 
   /** bytes of an existing file from offset, read-only or read-write. */
   MemorySegment map(Path path, long offset, long bytes, boolean write) throws IOException {
@@ -53,8 +55,10 @@ final class MappedFiles implements AutoCloseable {
         : FileChannel.open(path, StandardOpenOption.READ)) {
       if (ch.size() < offset + bytes)
         throw new IOException("Map file " + path + " holds " + ch.size() + " bytes, expected " + (offset + bytes));
+      MemorySegment result = ch.map(write ? FileChannel.MapMode.READ_WRITE : FileChannel.MapMode.READ_ONLY, offset, bytes, arena);
       mappedBytes += bytes;
-      return ch.map(write ? FileChannel.MapMode.READ_WRITE : FileChannel.MapMode.READ_ONLY, offset, bytes, arena);
+      LIVE.addAndGet(bytes);
+      return result;
     }
   }
 
@@ -75,5 +79,6 @@ final class MappedFiles implements AutoCloseable {
   @Override
   public void close() {
     arena.close();
+    LIVE.addAndGet(-mappedBytes);
   }
 }

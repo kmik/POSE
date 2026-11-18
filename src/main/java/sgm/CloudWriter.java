@@ -53,6 +53,7 @@ public final class CloudWriter implements AutoCloseable {
   private final ByteBuffer lasRecord, plyRecord;
   private final byte[] noExtra = new byte[0];
   private long count;
+  private long spoolBufferBytes;
   private boolean closed, opened;
   private boolean ply = true;
   private OutputDiskSpace diskSpace;
@@ -204,6 +205,9 @@ public final class CloudWriter implements AutoCloseable {
   public long count() {
     return count;
   }
+
+  /** Conservative retained tile objects plus any overflow-spool buffers. */
+  long retainedMetadataBytes() { return 4096L * tiles.size() + spoolBufferBytes; }
 
   public void abort() throws IOException {
     if (closed) return;
@@ -378,6 +382,7 @@ public final class CloudWriter implements AutoCloseable {
         }
         spool = Files.createTempFile(part.getParent(), "cloud-", ".bin");
         spoolOut = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(spool), 1 << 20));
+        spoolBufferBytes += 1L << 20;
       }
       spoolOut.writeDouble(x);
       spoolOut.writeDouble(y);
