@@ -51,14 +51,23 @@ final class PairMatching {
   static <T> void ordered(List<int[]> edges, int threads, long unitBytes, Options o, Task<T> task, Sink<T> sink)
       throws IOException {
     if (threads <= 1 || edges.size() < 2) {
-      for (int[] edge : edges) sink.accept(edge, task.run(edge));
+      try {
+        for (int[] edge : edges) {
+          try (var memory = MemoryGovernor.admit("pair matching", unitBytes, o)) {
+            sink.accept(edge, task.run(edge));
+          }
+          NativeMemory.trimMatching();
+        }
+      } finally { closeWorker(); }
       return;
     }
     ExecutorService pool =
         Executors.newFixedThreadPool(
             Math.min(threads, edges.size()),
             r -> {
-              Thread t = new Thread(r, "pair-matching");
+              Thread t = new Thread(() -> {
+                try { r.run(); } finally { closeWorker(); }
+              }, "pair-matching");
               t.setDaemon(true);
               return t;
             });
@@ -76,6 +85,7 @@ final class PairMatching {
           }));
         }
         sink.accept(edges.get(done), join(queue.poll()));
+        NativeMemory.trimMatching();
       }
     } finally {
       pool.shutdownNow();
@@ -86,6 +96,11 @@ final class PairMatching {
         Thread.currentThread().interrupt();
       }
     }
+  }
+
+  private static void closeWorker() {
+    try { FeatureAlgorithms.closeWorkspace(); }
+    finally { FeatureTracks.closeWorkspace(); }
   }
 
   private static <T> T join(Future<T> task) throws IOException {
@@ -127,6 +142,15 @@ final class PairMatching {
       Consumer<String> progress,
       boolean remember,
       boolean[] reused) {
+    KnnMatches flat = new KnnMatches();
+    int searched = reciprocal(o, a, b, flat, reverse, progress, remember, reused);
+    flat.toLegacy(forward);
+    return searched;
+  }
+
+  static int reciprocal(
+      Options o, ImageFrame a, ImageFrame b, KnnMatches forward, Map<Integer, Integer> reverse,
+      Consumer<String> progress, boolean remember, boolean[] reused) {
     if (!parallel(o))
       return FeatureAlgorithms.reciprocal(
           o, a.descriptors, b.descriptors, forward, reverse, progress);
@@ -184,30 +208,13 @@ final class PairMatching {
 
   /** Compact copy of one search; {@link #restore} rebuilds equal forward rows and decisions. */
   private static final class Reciprocal {
-    final int[] counts, query, train, image, reverseKeys, reverseValues;
-    final float[] distance;
+    final KnnMatches forward = new KnnMatches();
+    final int[] reverseKeys, reverseValues;
     final int searched;
 
-    Reciprocal(List<MatOfDMatch> forward, Map<Integer, Integer> reverse, int searched) {
+    Reciprocal(KnnMatches forward, Map<Integer, Integer> reverse, int searched) {
       this.searched = searched;
-      counts = new int[forward.size()];
-      List<DMatch> all = new ArrayList<>();
-      for (int i = 0; i < forward.size(); i++) {
-        DMatch[] row = forward.get(i).toArray();
-        counts[i] = row.length;
-        all.addAll(Arrays.asList(row));
-      }
-      query = new int[all.size()];
-      train = new int[all.size()];
-      image = new int[all.size()];
-      distance = new float[all.size()];
-      for (int i = 0; i < all.size(); i++) {
-        DMatch m = all.get(i);
-        query[i] = m.queryIdx;
-        train[i] = m.trainIdx;
-        image[i] = m.imgIdx;
-        distance[i] = m.distance;
-      }
+      this.forward.copyFrom(forward);
       reverseKeys = new int[reverse.size()];
       reverseValues = new int[reverse.size()];
       int i = 0;
@@ -218,17 +225,11 @@ final class PairMatching {
     }
 
     long bytes() {
-      return 4L * (counts.length + 4L * query.length + 2L * reverseKeys.length) + 128;
+      return forward.bytes() + 8L * reverseKeys.length + 128;
     }
 
-    int restore(List<MatOfDMatch> forward, Map<Integer, Integer> reverse) {
-      int at = 0;
-      for (int count : counts) {
-        DMatch[] row = new DMatch[count];
-        for (int k = 0; k < count; k++, at++)
-          row[k] = new DMatch(query[at], train[at], image[at], distance[at]);
-        forward.add(new MatOfDMatch(row));
-      }
+    int restore(KnnMatches forward, Map<Integer, Integer> reverse) {
+      forward.copyFrom(this.forward);
       for (int i = 0; i < reverseKeys.length; i++) reverse.put(reverseKeys[i], reverseValues[i]);
       return searched;
     }

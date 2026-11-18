@@ -26,6 +26,23 @@ final class NativeMemory {
   private static MethodHandle mallocTrim;
   private static boolean trimUnavailable = !LINUX || Boolean.getBoolean("sgm.noMallocTrim");
   static long trims, trimmedBytes;
+  private static final long MATCH_TRIM_INTERVAL = 15_000_000_000L;
+  private static volatile long nextMatchTrim = System.nanoTime() + MATCH_TRIM_INTERVAL;
+
+  /** Coordinator only: cheap deadline check per pair; at most one native trim per 15 seconds. */
+  static void trimMatching() {
+    if (!LINUX || trimUnavailable) return;
+    long now = System.nanoTime();
+    if (now - nextMatchTrim < 0) return;
+    synchronized (NativeMemory.class) {
+      if (now - nextMatchTrim < 0) return;
+      long started = System.nanoTime();
+      trim("during pair matching");
+      long elapsed = System.nanoTime() - started;
+      // Back off on expensive trims: direct trim time stays below roughly 1% of this interval.
+      nextMatchTrim = System.nanoTime() + Math.max(MATCH_TRIM_INTERVAL, elapsed * 100);
+    }
+  }
 
   /**
    * Bytes of this process that need RAM or swap: Linux RssAnon + RssShmem (not file pages the

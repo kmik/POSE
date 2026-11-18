@@ -437,7 +437,7 @@ final class ProjectArtifacts implements AutoCloseable {
       ImageFrame a,
       ImageFrame b,
       FeatureTracks.Pair pair,
-      List<MatOfDMatch> forward,
+      KnnMatches forward,
       Map<Integer, Integer> reverse,
       Set<Integer> ransac,
       Set<Integer> cheirality)
@@ -456,8 +456,8 @@ final class ProjectArtifacts implements AutoCloseable {
     try (BufferedWriter w = gzip(dir.resolve("matches.csv.gz"))) {
       w.write(
           "query_keypoint_id,best_train_keypoint_id,best_l2_distance,second_train_keypoint_id,second_l2_distance,ratio,ratio_pass,reciprocal_pass,essential_ransac_inlier,cheirality_inlier,used_for_tracks,rejection_stage\n");
-      for (MatOfDMatch row : forward) {
-        DMatch[] matches = row.toArray();
+      for (int row = 0; row < forward.size(); row++) {
+        DMatch[] matches = forward.rowArray(row);
         if (matches.length == 0) continue;
         DMatch m = matches[0];
         boolean ratio = matches.length > 1 && m.distance < options.ratio * matches[1].distance,

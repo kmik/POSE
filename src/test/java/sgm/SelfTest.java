@@ -55,6 +55,7 @@ public final class SelfTest {
     checks += TiePointCleanupRegression.run(root.resolve("tie points"));
     checks += LidarRegression.run(root.resolve("lidar"));
     checks += MatchMemoryRegression.run();
+    checks += MatchingBuffersRegression.run();
     checks += RegistrationDriftRegression.run(root.resolve("registration-drift"));
     checks += FeatureGridRegression.run(root.resolve("feature-grid"));
     checks += RegistrationRecoveryRegression.run(root.resolve("registration-recovery"));

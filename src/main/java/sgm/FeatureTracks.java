@@ -6,6 +6,27 @@ import org.opencv.calib3d.Calib3d;
 import org.opencv.core.*;
 
 final class FeatureTracks {
+  private static final ThreadLocal<VerificationWorkspace> VERIFY = new ThreadLocal<>();
+
+  private static final class VerificationWorkspace implements AutoCloseable {
+    final MatOfPoint2f p1 = new MatOfPoint2f(), p2 = new MatOfPoint2f();
+    final Mat mask = new Mat(), r = new Mat(), t = new Mat();
+    @Override public void close() {
+      p1.release(); p2.release(); mask.release(); r.release(); t.release();
+    }
+  }
+
+  static void closeWorkspace() {
+    VerificationWorkspace workspace = VERIFY.get();
+    VERIFY.remove();
+    if (workspace != null) workspace.close();
+  }
+
+  private static VerificationWorkspace verificationWorkspace() {
+    VerificationWorkspace workspace = VERIFY.get();
+    if (workspace == null) { workspace = new VerificationWorkspace(); VERIFY.set(workspace); }
+    return workspace;
+  }
   static final class Match {
     final int a, b;
 
@@ -253,7 +274,7 @@ final class FeatureTracks {
           Pair pair = result.pair;
           matching.update(++consumed[0]);
           matching.detail("pair " + a + "-" + b);
-          try {
+          {
             // Exports and track joins stay on this thread, in the original pair order.
             if (project != null && result.restored != null)
               project.data.compactMatches(frames.get(a), frames.get(b), pair, result.restored.queries(),
@@ -267,8 +288,6 @@ final class FeatureTracks {
                   result.reverse,
                   result.ransacFlags,
                   result.cheiralityFlags);
-          } finally {
-            for (Mat m : result.forward) m.release();
           }
           if (checkpoint != null && result.restored == null)
             checkpoint.put(frames.get(a), frames.get(b), pair, result.forward.size(),
@@ -438,7 +457,7 @@ final class FeatureTracks {
   /** One verified pair plus the nearest-neighbor decisions its export needs. */
   private static final class Result {
     final Pair pair;
-    final List<MatOfDMatch> forward = new ArrayList<>();
+    final KnnMatches forward = new KnnMatches();
     final Map<Integer, Integer> reverse = new HashMap<>();
     final Set<Integer> ransacFlags = new HashSet<>(), cheiralityFlags = new HashSet<>();
     final boolean[] reusedSearch = new boolean[1];
@@ -459,9 +478,6 @@ final class FeatureTracks {
       verify(a, b, o, work, result);
       result.reused = result.reusedSearch[0];
       return result;
-    } catch (RuntimeException | Error e) {
-      for (Mat m : result.forward) m.release();
-      throw e;
     } finally {
       DescriptorCache.release(a, b);
     }
@@ -473,42 +489,34 @@ final class FeatureTracks {
       out.reason = "missing_descriptors";
       return;
     }
-    List<MatOfDMatch> forward = res.forward;
+    KnnMatches forward = res.forward;
     Map<Integer, Integer> reverse = res.reverse;
     Set<Integer> ransacFlags = res.ransacFlags, cheiralityFlags = res.cheiralityFlags;
-    Mat p1 = new Mat(),
-        p2 = new Mat(),
-        mask = new Mat(),
-        e = new Mat(),
-        r = new Mat(),
-        t = new Mat();
+    VerificationWorkspace workspace = verificationWorkspace();
+    MatOfPoint2f p1 = workspace.p1, p2 = workspace.p2;
+    Mat mask = workspace.mask, r = workspace.r, t = workspace.t;
+    Mat e = null;
     try {
       PairMatching.reciprocal(
           o, a, b, forward, reverse, work::detail, false, res.reusedSearch);
       work.detail("essential RANSAC and cheirality");
       List<Match> accepted = new ArrayList<>();
       List<Point> x = new ArrayList<>(), y = new ArrayList<>();
-      for (MatOfDMatch row : forward) {
-        DMatch[] m = row.toArray();
-        if (m.length < 2 || m[0].distance >= o.ratio * m[1].distance) continue;
-        DMatch best = m[0];
-        if (!Objects.equals(reverse.get(best.trainIdx), best.queryIdx)) continue;
-        accepted.add(new Match(best.queryIdx, best.trainIdx));
-        x.add(normalize(a.camera, a.keypoints[best.queryIdx].pt));
-        y.add(normalize(b.camera, b.keypoints[best.trainIdx].pt));
+      for (int row = 0; row < forward.size(); row++) {
+        if (forward.count(row) < 2 || forward.distance(row) >= o.ratio * forward.secondDistance(row)) continue;
+        int query = forward.query(row), train = forward.train(row);
+        if (!Objects.equals(reverse.get(train), query)) continue;
+        accepted.add(new Match(query, train));
+        x.add(normalize(a.camera, a.keypoints[query].pt));
+        y.add(normalize(b.camera, b.keypoints[train].pt));
       }
       if (accepted.size() < o.minMatches) {
         out.reason = "insufficient_reciprocal_ratio_matches";
         return;
       }
-      p1.release();
-      p2.release();
-      p1 = new MatOfPoint2f();
-      p2 = new MatOfPoint2f();
-      ((MatOfPoint2f) p1).fromList(x);
-      ((MatOfPoint2f) p2).fromList(y);
+      p1.fromList(x);
+      p2.fromList(y);
       double threshold = o.reprojection / Math.max(a.camera.fx, b.camera.fx);
-      e.release();
       e =
           Calib3d.findEssentialMat(
               p1, p2, 1.0, new Point(0, 0), Calib3d.RANSAC, .999, threshold, 2000, mask);
@@ -534,12 +542,7 @@ final class FeatureTracks {
       out.reason =
           out.matches.size() >= o.minMatches ? "accepted" : "insufficient_geometric_inliers";
     } finally {
-      p1.release();
-      p2.release();
-      mask.release();
-      e.release();
-      r.release();
-      t.release();
+      if (e != null) e.release();
     }
   }
 

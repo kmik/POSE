@@ -292,7 +292,7 @@ final class AutomaticCalibration {
       out.reason = "missing_descriptors";
       return out;
     }
-    List<MatOfDMatch> fw = new ArrayList<>();
+    KnnMatches fw = new KnnMatches();
     MatOfPoint2f x = new MatOfPoint2f(), y = new MatOfPoint2f();
     Mat f = new Mat(), mask = new Mat(), h = new Mat(), hMask = new Mat();
     try {
@@ -303,13 +303,12 @@ final class AutomaticCalibration {
       out.fullReverseQueries = b.descriptors.rows();
       work.detail("fundamental/homography RANSAC and focal constraint");
       List<Point> p = new ArrayList<>(), q = new ArrayList<>();
-      for (MatOfDMatch row : fw) {
-        DMatch[] v = row.toArray();
-        if (v.length < 2
-            || v[0].distance >= o.ratio * v[1].distance
-            || !Objects.equals(reverse.get(v[0].trainIdx), v[0].queryIdx)) continue;
-        p.add(centered(a, a.keypoints[v[0].queryIdx].pt));
-        q.add(centered(b, b.keypoints[v[0].trainIdx].pt));
+      for (int row = 0; row < fw.size(); row++) {
+        if (fw.count(row) < 2
+            || fw.distance(row) >= o.ratio * fw.secondDistance(row)
+            || !Objects.equals(reverse.get(fw.train(row)), fw.query(row))) continue;
+        p.add(centered(a, a.keypoints[fw.query(row)].pt));
+        q.add(centered(b, b.keypoints[fw.train(row)].pt));
       }
       out.matches = p.size();
       if (p.size() < Math.max(24, o.minMatches)) {
@@ -401,7 +400,6 @@ final class AutomaticCalibration {
       return out;
     } finally {
       out.seconds = (System.nanoTime() - started) / 1e9;
-      for (Mat m : fw) m.release();
       x.release();
       y.release();
       f.release();

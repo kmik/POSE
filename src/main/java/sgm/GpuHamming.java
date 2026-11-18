@@ -164,6 +164,14 @@ final class GpuHamming {
   /** Both reciprocal directions reuse the same uploaded descriptors and result allocation. */
   static Integer reciprocal(Options o, Mat a, Mat b, List<MatOfDMatch> forward,
       Map<Integer, Integer> reverse, java.util.function.Consumer<String> progress) {
+    KnnMatches flat = new KnnMatches();
+    Integer searched = reciprocal(o, a, b, flat, reverse, progress);
+    if (searched != null) flat.toLegacy(forward);
+    return searched;
+  }
+
+  static Integer reciprocal(Options o, Mat a, Mat b, KnnMatches forward,
+      Map<Integer, Integer> reverse, java.util.function.Consumer<String> progress) {
     if (!eligible(o, a, b) || a.rows() < 2) return null;
     // Keep initialization, first-use audit and teardown ordered with the legacy entry point.
     synchronized (GpuHamming.class) {
@@ -180,7 +188,7 @@ final class GpuHamming {
     }
   }
 
-  private synchronized int reciprocalImpl(Options o, Mat a, Mat b, List<MatOfDMatch> forward,
+  private synchronized int reciprocalImpl(Options o, Mat a, Mat b, KnnMatches forward,
       Map<Integer, Integer> reverse, java.util.function.Consumer<String> progress) {
     long started = System.nanoTime();
     try (Arena arena = Arena.ofConfined()) {
@@ -234,14 +242,12 @@ final class GpuHamming {
           }
         }
         // Publish only after both searches and audits succeed; fallback sees untouched outputs.
-        List<MatOfDMatch> rows = new ArrayList<>();
+        forward.reset(na);
         for (int i = 0; i < na; i++)
-          rows.add(new MatOfDMatch(new DMatch(i, first[4 * i], 0, first[4 * i + 1]),
-              new DMatch(i, first[4 * i + 2], 0, first[4 * i + 3])));
+          forward.setGpu(i, first[4 * i], first[4 * i + 1], first[4 * i + 2], first[4 * i + 3]);
         for (int i = 0; i < searched; i++)
           if (second[4 * i + 1] < o.ratio * second[4 * i + 3])
             reverse.put(full ? i : ids[i], second[4 * i]);
-        forward.addAll(rows);
         verified = true;
         searches += searched > 0 ? 2 : 1;
         queries += na + searched;

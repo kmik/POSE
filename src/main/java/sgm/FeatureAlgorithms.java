@@ -7,6 +7,51 @@ import org.opencv.features2d.*;
 
 /** Descriptor metric is selected by actual descriptor storage, including calibration previews. */
 final class FeatureAlgorithms {
+  private static final ThreadLocal<Workspace> WORK = new ThreadLocal<>();
+
+  private static final class Workspace implements AutoCloseable {
+    final OpenCvKnn nativeSearch = new OpenCvKnn();
+    final KnnMatches backward = new KnnMatches();
+    final Mat queries = new Mat();
+    final BitSet needed = new BitSet();
+    final Map<String, DescriptorMatcher> matchers = new HashMap<>();
+    float[] floatRow = new float[0];
+    byte[] byteRow = new byte[0];
+
+    DescriptorMatcher matcher(Options o, Mat descriptors) {
+      String key = descriptors.depth() == CvType.CV_8U ? "hamming" : o.descriptorMatcher;
+      return matchers.computeIfAbsent(key, k -> FeatureAlgorithms.matcher(o, descriptors));
+    }
+
+    void gather(Mat source, int[] ids) {
+      queries.create(ids.length, source.cols(), source.type());
+      if (source.depth() == CvType.CV_8U) {
+        if (byteRow.length != source.cols()) byteRow = new byte[source.cols()];
+        for (int i = 0; i < ids.length; i++) { source.get(ids[i], 0, byteRow); queries.put(i, 0, byteRow); }
+      } else {
+        if (floatRow.length != source.cols()) floatRow = new float[source.cols()];
+        for (int i = 0; i < ids.length; i++) { source.get(ids[i], 0, floatRow); queries.put(i, 0, floatRow); }
+      }
+    }
+
+    @Override public void close() {
+      queries.release(); nativeSearch.close();
+      for (DescriptorMatcher matcher : matchers.values()) matcher.clear();
+      matchers.clear();
+    }
+  }
+
+  static void closeWorkspace() {
+    Workspace workspace = WORK.get();
+    WORK.remove();
+    if (workspace != null) workspace.close();
+  }
+
+  private static Workspace workspace() {
+    Workspace workspace = WORK.get();
+    if (workspace == null) { workspace = new Workspace(); WORK.set(workspace); }
+    return workspace;
+  }
   static Feature2D detector(Options o, int maximum) {
     return switch (o.matchingAlgorithm) {
       case "orb" -> {
@@ -49,19 +94,28 @@ final class FeatureAlgorithms {
       List<MatOfDMatch> forward,
       Map<Integer, Integer> reverse,
       Consumer<String> progress) {
+    KnnMatches flat = new KnnMatches();
+    int searched = reciprocal(o, a, b, flat, reverse, progress);
+    flat.toLegacy(forward);
+    return searched;
+  }
+
+  static int reciprocal(
+      Options o, Mat a, Mat b, KnnMatches forward, Map<Integer, Integer> reverse,
+      Consumer<String> progress) {
     Integer resident = GpuHamming.reciprocal(o, a, b, forward, reverse, progress);
     if (resident != null) return resident;
-    DescriptorMatcher matcher = matcher(o, a);
-    List<MatOfDMatch> backward = new ArrayList<>();
-    Mat queries = new Mat();
+    Workspace work = workspace();
+    DescriptorMatcher matcher = work.matcher(o, a);
+    KnnMatches backward = work.backward;
     try {
       progress.accept("forward nearest neighbors; " + a.rows() + " queries");
-      if (!GpuHamming.knn2(o, a, b, forward)) matcher.knnMatch(a, b, forward, 2);
-      BitSet needed = new BitSet(b.rows());
-      for (MatOfDMatch row : forward) {
-        DMatch[] m = row.toArray();
-        if (m.length >= 2 && m[0].distance < o.ratio * m[1].distance) needed.set(m[0].trainIdx);
-      }
+      work.nativeSearch.search(matcher, a, b, forward);
+      BitSet needed = work.needed;
+      needed.clear();
+      for (int row = 0; row < forward.size(); row++)
+        if (forward.count(row) >= 2 && forward.distance(row) < o.ratio * forward.secondDistance(row))
+          needed.set(forward.train(row));
       int count = needed.cardinality();
       boolean flann = o.descriptorMatcher.equals("flann") && a.depth() != CvType.CV_8U;
       // Dense selections do not justify gathering rows. Preserve FLANN index construction even
@@ -69,32 +123,18 @@ final class FeatureAlgorithms {
       boolean full = count * 5L >= b.rows() * 4L || count == 0 && flann;
       int[] ids = full ? null : needed.stream().toArray();
       if (!full && count == 0) return 0;
-      if (!full) {
-        queries.create(count, b.cols(), b.type());
-        for (int i = 0; i < count; i++) {
-          Mat from = b.row(ids[i]), to = queries.row(i);
-          try {
-            from.copyTo(to);
-          } finally {
-            from.release();
-            to.release();
-          }
-        }
-      }
+      if (!full) work.gather(b, ids);
       int searched = full ? b.rows() : count;
       progress.accept("reverse nearest neighbors; " + searched + "/" + b.rows() + " queries");
-      if (!GpuHamming.knn2(o, full ? b : queries, a, backward)) matcher.knnMatch(full ? b : queries, a, backward, 2);
-      for (MatOfDMatch row : backward) {
-        DMatch[] m = row.toArray();
-        if (m.length >= 2 && m[0].distance < o.ratio * m[1].distance) {
-          int id = full ? m[0].queryIdx : ids[m[0].queryIdx];
-          reverse.put(id, m[0].trainIdx);
+      work.nativeSearch.search(matcher, full ? b : work.queries, a, backward);
+      for (int row = 0; row < backward.size(); row++) {
+        if (backward.count(row) >= 2 && backward.distance(row) < o.ratio * backward.secondDistance(row)) {
+          int id = full ? backward.query(row) : ids[backward.query(row)];
+          reverse.put(id, backward.train(row));
         }
       }
       return searched;
     } finally {
-      for (Mat m : backward) m.release();
-      queries.release();
       matcher.clear();
     }
   }
