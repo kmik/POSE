@@ -144,7 +144,7 @@ final class CalibrationDiagnostics {
           if (!f.camera.registered) continue;
           double[] uv = lens.project(f, t.point);
           if (uv == null) continue;
-          Point p = lens.observed[f.id][ob.feature];
+          Point p = new Point(lens.observed[f.id][2 * ob.feature], lens.observed[f.id][2 * ob.feature + 1]);
           double x = (p.x + .5) * lens.initialOf(f).width / f.width - .5;
           double y = (p.y + .5) * lens.initialOf(f).height / f.height - .5;
           double dx = (uv[0] - p.x) * lens.initialOf(f).width / f.width;

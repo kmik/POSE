@@ -25,7 +25,11 @@ final class SharedCalibration {
   final Calibration[] initials;
   final int groups;
   final Options options;
-  final Point[][] observed;
+  /**
+   * Measured (distorted) image points: observed[frame id] holds x, y of keypoint i at 2 i and
+   * 2 i + 1, the exact doubles of {@link #distorted}. Null after {@link #releaseObservations}.
+   */
+  double[][] observed;
   final boolean fixedPoses;
   /** Parameter k of group g is index g * SIZE + k in active, values and prior. */
   final boolean[] active;
@@ -73,13 +77,24 @@ final class SharedCalibration {
     Arrays.fill(focalPriors, Double.NaN);
     long measuredPoints = 0;
     for (ImageFrame f : frames) measuredPoints += f.keypoints.length;
-    MemorySafety.requireHeap(measuredPoints * 48 + frames.size() * 32L, options, "Shared-calibration measured image points");
-    observed = new Point[frames.size()][];
+    // Two doubles per point plus one array header and reference per frame.
+    MemorySafety.requireHeap(measuredPoints * 16 + frames.size() * 32L, options, "Shared-calibration measured image points");
+    observed = new double[frames.size()][];
     for (ImageFrame f : frames) {
-      observed[f.id] = new Point[f.keypoints.length];
-      for (int i = 0; i < f.keypoints.length; i++)
-        observed[f.id][i] = distorted(f.camera, f.calibration.distortion, f.keypoints[i].pt);
+      double[] measured = observed[f.id] = new double[2 * f.keypoints.length];
+      for (int i = 0; i < f.keypoints.length; i++) {
+        Point pixel = f.keypoints[i].pt;
+        distorted(f.camera, f.calibration.distortion, pixel.x, pixel.y, measured, 2 * i);
+      }
     }
+  }
+
+  /**
+   * Drops the measured points once no fit or validation of this model follows (reports may
+   * still use the parameters). Any later use fails instead of reading stale points.
+   */
+  void releaseObservations() {
+    observed = null;
   }
 
   /** Width of the lens part of the bundle system: 13 per camera group. */
@@ -102,11 +117,17 @@ final class SharedCalibration {
   }
 
   static Point distorted(Camera c, double[] d, Point pixel) {
-    double x = (pixel.x - c.cx) / c.fx, y = (pixel.y - c.cy) / c.fy, r = x * x + y * y;
+    double[] xy = new double[2];
+    distorted(c, d, pixel.x, pixel.y, xy, 0);
+    return new Point(xy[0], xy[1]);
+  }
+
+  /** {@link #distorted(Camera, double[], Point)} of (px, py) into out[at], out[at + 1]. */
+  static void distorted(Camera c, double[] d, double px, double py, double[] out, int at) {
+    double x = (px - c.cx) / c.fx, y = (py - c.cy) / c.fy, r = x * x + y * y;
     double radial = 1 + d[0] * r + d[1] * r * r + d[4] * r * r * r;
-    return new Point(
-        c.fx * (x * radial + 2 * d[2] * x * y + d[3] * (r + 2 * x * x)) + c.cx,
-        c.fy * (y * radial + d[2] * (r + 2 * y * y) + 2 * d[3] * x * y) + c.cy);
+    out[at] = c.fx * (x * radial + 2 * d[2] * x * y + d[3] * (r + 2 * x * x)) + c.cx;
+    out[at + 1] = c.fy * (y * radial + d[2] * (r + 2 * y * y) + 2 * d[3] * x * y) + c.cy;
   }
 
   /** Group 0's calibration (one camera: the shared calibration). */
@@ -158,13 +179,28 @@ final class SharedCalibration {
    * Translation only; the gimbal keeps rotation rates small between turns.
    */
   double[] view(ImageFrame frame, double[] point, double row) {
-    double[] q = frame.camera.view(point);
+    double[] q = new double[3];
+    viewInto(frame, point, row, q);
+    return q;
+  }
+
+  /**
+   * {@link #view} into q (3 values), allocation-free: Camera.viewInto has Camera.view's
+   * arithmetic, and R V is formed as Math3.mv forms it.
+   */
+  void viewInto(ImageFrame frame, double[] point, double row, double[] q) {
+    Camera c = frame.camera;
+    c.viewInto(point[0], point[1], point[2], q);
     double s = values[base(frame) + 8] * rowFraction(frame, row);
     if (s != 0) {
-      double[] rv = Math3.mv(frame.camera.rotation, frame.camera.velocity);
-      for (int k = 0; k < 3; k++) q[k] -= s * rv[k];
+      double[] r = c.rotation, v = c.velocity;
+      double rv0 = r[0] * v[0] + r[1] * v[1] + r[2] * v[2];
+      double rv1 = r[3] * v[0] + r[4] * v[1] + r[5] * v[2];
+      double rv2 = r[6] * v[0] + r[7] * v[1] + r[8] * v[2];
+      q[0] -= s * rv0;
+      q[1] -= s * rv1;
+      q[2] -= s * rv2;
     }
-    return q;
   }
 
   double[] project(ImageFrame frame, double[] point) {
@@ -176,21 +212,37 @@ final class SharedCalibration {
     return q[2] > 1e-8 ? projectView(frame, q) : null;
   }
 
+  /**
+   * {@link #project} with caller-owned scratch q (3) and uv (2): false where project returns null
+   * (point not in front of the camera); uv is then unspecified.
+   */
+  boolean projectInto(ImageFrame frame, double[] point, double row, double[] q, double[] uv) {
+    viewInto(frame, point, row, q);
+    if (!(q[2] > 1e-8)) return false;
+    projectViewInto(frame, q, uv);
+    return true;
+  }
+
   private double[] projectView(ImageFrame frame, double[] q) {
+    double[] uv = new double[2];
+    projectViewInto(frame, q, uv);
+    return uv;
+  }
+
+  /** Distorted pixel of the camera-frame point q into uv (2 values). */
+  void projectViewInto(ImageFrame frame, double[] q, double[] uv) {
     int o = base(frame);
     Calibration initial = initialOf(frame);
     double fx = Math.exp(values[o]) * frame.width / initial.width;
     double fy = Math.exp(values[o]) * initial.fy / initial.fx * frame.height / initial.height;
     double x = q[0] / q[2], y = q[1] / q[2], r = x * x + y * y;
     double radial = 1 + values[o + 1] * r + values[o + 2] * r * r + values[o + 7] * r * r * r;
-    return new double[] {
-      fx * (x * radial + 2 * values[o + 5] * x * y + values[o + 6] * (r + 2 * x * x))
-          + (values[o + 3] * initial.width + .5) * frame.width / initial.width
-          - .5,
-      fy * (y * radial + values[o + 5] * (r + 2 * y * y) + 2 * values[o + 6] * x * y)
-          + (values[o + 4] * initial.height + .5) * frame.height / initial.height
-          - .5
-    };
+    uv[0] = fx * (x * radial + 2 * values[o + 5] * x * y + values[o + 6] * (r + 2 * x * x))
+        + (values[o + 3] * initial.width + .5) * frame.width / initial.width
+        - .5;
+    uv[1] = fy * (y * radial + values[o + 5] * (r + 2 * y * y) + 2 * values[o + 6] * x * y)
+        + (values[o + 4] * initial.height + .5) * frame.height / initial.height
+        - .5;
   }
 
   double[][] lensJacobian(ImageFrame frame, double[] point) {
@@ -198,52 +250,68 @@ final class SharedCalibration {
   }
 
   double[][] lensJacobian(ImageFrame frame, double[] point, double row) {
-    int o = base(frame);
+    double[] q = view(frame, point, row), uv = projectView(frame, q), jq = new double[6];
+    spatialViewInto(frame, q, jq);
+    int n = size();
+    double[] flat = new double[2 * n];
+    lensJacobianInto(frame, q, uv, row, jq, flat, 0);
+    double[][] j = new double[2][];
+    j[0] = Arrays.copyOfRange(flat, 0, n);
+    j[1] = Arrays.copyOfRange(flat, n, 2 * n);
+    return j;
+  }
+
+  /**
+   * {@link #lensJacobian} of the camera-frame point q (from {@link #viewInto} with the same row),
+   * given its projection uv ({@link #projectViewInto}) and spatial Jacobian jq
+   * ({@link #spatialViewInto}), into out[at, at + size()) (row 0) and out[at + size(), at + 2
+   * size()) (row 1). Every element of both rows is written.
+   */
+  void lensJacobianInto(ImageFrame frame, double[] q, double[] uv, double row, double[] jq, double[] out, int at) {
+    int o = base(frame), n = size();
     Calibration initial = initialOf(frame);
-    double[] q = view(frame, point, row), uv = projectView(frame, q);
     double x = q[0] / q[2], y = q[1] / q[2], r = x * x + y * y;
     double fx = Math.exp(values[o]) * frame.width / initial.width;
     double fy = Math.exp(values[o]) * initial.fy / initial.fx * frame.height / initial.height;
     double cx = (values[o + 3] * initial.width + .5) * frame.width / initial.width - .5;
     double cy = (values[o + 4] * initial.height + .5) * frame.height / initial.height - .5;
-    double[][] j = new double[2][size()];
-    double[][] lens = {
-      {
-        uv[0] - cx,
-        fx * x * r,
-        fx * x * r * r,
-        frame.width,
-        0,
-        2 * fx * x * y,
-        fx * (r + 2 * x * x),
-        fx * x * r * r * r
-      },
-      {
-        uv[1] - cy,
-        fy * y * r,
-        fy * y * r * r,
-        0,
-        frame.height,
-        fy * (r + 2 * y * y),
-        2 * fy * x * y,
-        fy * y * r * r * r
-      }
-    };
-    for (int i = 0; i < 2; i++) System.arraycopy(lens[i], 0, j[i], o, LENS);
+    Arrays.fill(out, at, at + 2 * n, 0);
+    int a = at + o, b = at + n + o;
+    out[a] = uv[0] - cx;
+    out[a + 1] = fx * x * r;
+    out[a + 2] = fx * x * r * r;
+    out[a + 3] = frame.width;
+    out[a + 4] = 0;
+    out[a + 5] = 2 * fx * x * y;
+    out[a + 6] = fx * (r + 2 * x * x);
+    out[a + 7] = fx * x * r * r * r;
+    out[b] = uv[1] - cy;
+    out[b + 1] = fy * y * r;
+    out[b + 2] = fy * y * r * r;
+    out[b + 3] = 0;
+    out[b + 4] = frame.height;
+    out[b + 5] = fy * (r + 2 * y * y);
+    out[b + 6] = 2 * fy * x * y;
+    out[b + 7] = fy * y * r * r * r;
     double fraction = rowFraction(frame, row);
     if (active[o + 8] && fraction != 0) {
       // d q / d readout = -fraction * R V.
-      double[] rv = Math3.mv(frame.camera.rotation, frame.camera.velocity);
-      double[][] jq = spatialView(frame, q);
-      for (int i = 0; i < 2; i++)
-        for (int k = 0; k < 3; k++) j[i][o + 8] -= jq[i][k] * fraction * rv[k];
-    }
-    for (int k = 0; k < size(); k++)
-      if (!active[k]) {
-        j[0][k] = 0;
-        j[1][k] = 0;
+      double[] rot = frame.camera.rotation, v = frame.camera.velocity;
+      double rv0 = rot[0] * v[0] + rot[1] * v[1] + rot[2] * v[2];
+      double rv1 = rot[3] * v[0] + rot[4] * v[1] + rot[5] * v[2];
+      double rv2 = rot[6] * v[0] + rot[7] * v[1] + rot[8] * v[2];
+      for (int i = 0; i < 2; i++) {
+        int e = at + i * n + o + 8;
+        out[e] -= jq[i * 3] * fraction * rv0;
+        out[e] -= jq[i * 3 + 1] * fraction * rv1;
+        out[e] -= jq[i * 3 + 2] * fraction * rv2;
       }
-    return j;
+    }
+    for (int k = 0; k < n; k++)
+      if (!active[k]) {
+        out[at + k] = 0;
+        out[at + n + k] = 0;
+      }
   }
 
   double[][] spatialJacobian(ImageFrame frame, double[] point) {
@@ -256,6 +324,13 @@ final class SharedCalibration {
   }
 
   private double[][] spatialView(ImageFrame frame, double[] q) {
+    double[] jq = new double[6];
+    spatialViewInto(frame, q, jq);
+    return new double[][] {{jq[0], jq[1], jq[2]}, {jq[3], jq[4], jq[5]}};
+  }
+
+  /** {@link #spatialJacobian} of the camera-frame point q into jq: row 0 at 0-2, row 1 at 3-5. */
+  void spatialViewInto(ImageFrame frame, double[] q, double[] jq) {
     int o = base(frame);
     Calibration initial = initialOf(frame);
     double x = q[0] / q[2], y = q[1] / q[2], r = x * x + y * y;
@@ -267,10 +342,12 @@ final class SharedCalibration {
     double uy = fx * (2 * x * y * slope + 2 * values[o + 5] * x + 2 * values[o + 6] * y);
     double vx = fy * (2 * x * y * slope + 2 * values[o + 5] * x + 2 * values[o + 6] * y);
     double vy = fy * (a + 2 * y * y * slope + 6 * values[o + 5] * y + 2 * values[o + 6] * x);
-    return new double[][] {
-      {ux / q[2], uy / q[2], -(ux * x + uy * y) / q[2]},
-      {vx / q[2], vy / q[2], -(vx * x + vy * y) / q[2]}
-    };
+    jq[0] = ux / q[2];
+    jq[1] = uy / q[2];
+    jq[2] = -(ux * x + uy * y) / q[2];
+    jq[3] = vx / q[2];
+    jq[4] = vy / q[2];
+    jq[5] = -(vx * x + vy * y) / q[2];
   }
 
   void move(double[] delta, int offset) {
@@ -589,11 +666,11 @@ final class SharedCalibration {
         for (var ob : t.observations) {
           ImageFrame f = frames.get(ob.image);
           if (!f.camera.registered || multiple && f.group != g) continue;
-          Point p = lens.observed[f.id][ob.feature];
+          double[] p = lens.observed[f.id];
           radii.add(
               Math.hypot(
-                      (p.x - f.camera.cx) * base.width / f.width,
-                      (p.y - f.camera.cy) * base.height / f.height)
+                      (p[2 * ob.feature] - f.camera.cx) * base.width / f.width,
+                      (p[2 * ob.feature + 1] - f.camera.cy) * base.height / f.height)
                   / corner);
         }
       Collections.sort(radii);
@@ -903,11 +980,17 @@ final class SharedCalibration {
         }
       }
     }
+    // The pre-trial block is only needed by the subset refit above.
+    startCameras = null;
+    startPoints = null;
     System.arraycopy(retained, 0, lens.active, 0, lens.size());
     if (acceptedAny) {
       // Fit all structure conditionally, including points omitted by the sampling cap. This is
       // needed for fixed poses too, where no subsequent pose/point bundle is performed.
       lens.validationRms(frames, tracks, true);
+      // Last use of the measured points: the report below needs only the parameters, and the
+      // final pose/point bundle uses the frames' keypoints.
+      lens.releaseObservations();
       Calibration result = lens.calibration();
       if (!multiple) for (ImageFrame frame : frames) frame.applyCalibration(result);
       else
@@ -1373,6 +1456,9 @@ final class SharedCalibration {
   private double[] validationTrack(
       List<ImageFrame> frames, FeatureTracks.Track t, boolean commit, int scope) {
       if (t.point == null) return null;
+      // This track's projection scratch (one task owns a track): camera-frame point, pixel,
+      // spatial Jacobian and point Jacobian, overwritten per observation.
+      double[] q = new double[3], uv = new double[2], jq = new double[6], jp = new double[6];
       double[] p = t.point.clone();
       for (int iter = 0; iter < 25; iter++) {
         double[][] h = new double[3][3];
@@ -1380,30 +1466,36 @@ final class SharedCalibration {
         for (var ob : t.observations) {
           ImageFrame frame = frames.get(ob.image);
           if (!frame.camera.registered) continue;
-          Point measured = observed[frame.id][ob.feature];
-          double[] uv = project(frame, p, measured.y);
-          if (uv == null) return new double[] {Double.POSITIVE_INFINITY};
-          double[] r = {uv[0] - measured.x, uv[1] - measured.y};
-          double weight = Math.min(1, 2 / Math.max(1e-12, Math.hypot(r[0], r[1])));
-          double[][] jq = spatialJacobian(frame, p, measured.y), jp = new double[2][3];
+          double[] measured = observed[frame.id];
+          double mx = measured[2 * ob.feature], my = measured[2 * ob.feature + 1];
+          if (!projectInto(frame, p, my, q, uv)) return new double[] {Double.POSITIVE_INFINITY};
+          double r0 = uv[0] - mx, r1 = uv[1] - my;
+          double weight = Math.min(1, 2 / Math.max(1e-12, Math.hypot(r0, r1)));
+          // spatialJacobian(frame, p, my) is the spatial Jacobian of this same q.
+          spatialViewInto(frame, q, jq);
           for (int row = 0; row < 2; row++)
-            for (int j = 0; j < 3; j++)
+            for (int j = 0; j < 3; j++) {
+              jp[row * 3 + j] = 0;
               for (int k = 0; k < 3; k++)
-                jp[row][j] += jq[row][k] * frame.camera.rotation[k * 3 + j];
+                jp[row * 3 + j] += jq[row * 3 + k] * frame.camera.rotation[k * 3 + j];
+            }
           for (int j = 0; j < 3; j++) {
-            for (int row = 0; row < 2; row++) b[j] -= weight * jp[row][j] * r[row];
-            for (int k = 0; k < 3; k++)
-              for (int row = 0; row < 2; row++) h[j][k] += weight * jp[row][j] * jp[row][k];
+            b[j] -= weight * jp[j] * r0;
+            b[j] -= weight * jp[3 + j] * r1;
+            for (int k = 0; k < 3; k++) {
+              h[j][k] += weight * jp[j] * jp[k];
+              h[j][k] += weight * jp[3 + j] * jp[3 + k];
+            }
           }
         }
         for (int j = 0; j < 3; j++) h[j][j] += 1e-6 * Math.max(1, h[j][j]);
         double[] delta = Math3.solve(h, b);
         if (delta == null) break;
-        double previous = pointCost(frames, t, p), factor = 1;
+        double previous = pointCost(frames, t, p, q, uv), factor = 1;
         boolean moved = false;
         while (factor >= 1. / 128) {
           double[] trial = Math3.add(p, Math3.times(delta, factor));
-          if (pointCost(frames, t, trial) < previous) {
+          if (pointCost(frames, t, trial, q, uv) < previous) {
             p = trial;
             moved = true;
             break;
@@ -1418,24 +1510,25 @@ final class SharedCalibration {
       for (var ob : t.observations) {
         ImageFrame frame = frames.get(ob.image);
         if (!frame.camera.registered) continue;
-        Point measured = observed[frame.id][ob.feature];
-        double[] uv = project(frame, p, measured.y);
-        if (uv == null) return new double[] {Double.POSITIVE_INFINITY};
+        double[] measured = observed[frame.id];
+        double mx = measured[2 * ob.feature], my = measured[2 * ob.feature + 1];
+        if (!projectInto(frame, p, my, q, uv)) return new double[] {Double.POSITIVE_INFINITY};
         if (scope >= 0 && frame.group != scope) continue;
-        errors[n++] = Math.pow(uv[0] - measured.x, 2) + Math.pow(uv[1] - measured.y, 2);
+        errors[n++] = Math.pow(uv[0] - mx, 2) + Math.pow(uv[1] - my, 2);
       }
       return n == errors.length ? errors : Arrays.copyOf(errors, n);
   }
 
-  private double pointCost(List<ImageFrame> frames, FeatureTracks.Track t, double[] p) {
+  /** Robust cost of the track's observations at p; q and uv are the caller's projection scratch. */
+  private double pointCost(List<ImageFrame> frames, FeatureTracks.Track t, double[] p, double[] q, double[] uv) {
     double cost = 0;
     for (var ob : t.observations) {
       ImageFrame f = frames.get(ob.image);
       if (!f.camera.registered) continue;
-      Point o = observed[f.id][ob.feature];
-      double[] uv = project(f, p, o.y);
-      if (uv == null) return Double.POSITIVE_INFINITY;
-      double e = Math.hypot(uv[0] - o.x, uv[1] - o.y);
+      double[] measured = observed[f.id];
+      double ox = measured[2 * ob.feature], oy = measured[2 * ob.feature + 1];
+      if (!projectInto(f, p, oy, q, uv)) return Double.POSITIVE_INFINITY;
+      double e = Math.hypot(uv[0] - ox, uv[1] - oy);
       cost += e <= 2 ? .5 * e * e : 2 * (e - 1);
     }
     return cost;

@@ -226,11 +226,13 @@ final class Terminal {
     if (stageIndex > 0) s.append('[').append(stageIndex).append('/').append(STAGES.length).append("] ");
     s.append(stageName);
     if (measured != null) {
-      long done = Math.min(measured.count(), measured.total()), total = measured.total();
+      // A task may revise its total while running: read it once (at least 1, never a 0 divisor).
+      long total = Math.max(1, measured.total()), done = Math.min(measured.count(), total);
       double fraction = done / (double) total, elapsed = (now - measured.startedNanos()) / 1e9;
       if (!sameTopic(measured.label(), stageName)) s.append(": ").append(ascii(measured.label()));
       s.append("  ").append(bar(fraction, 20));
-      s.append(String.format(Locale.ROOT, " %3.0f%%  %,d/%,d %s", 100 * fraction, done, total, measured.units()));
+      s.append(String.format(Locale.ROOT, " %3.0f%%  %,d/%s%,d %s", 100 * fraction, done,
+          measured.estimated() ? "~" : "", total, measured.units()));
       s.append("  ").append(clock((now - stageStarted) / 1e9));
       if (done > 0 && done < total) s.append("  ~").append(clock(elapsed * (total - done) / done)).append(" left");
       String detail = measured.detailText();

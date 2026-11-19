@@ -146,8 +146,8 @@ final class BundleSchurRegression {
       for (var t : f.tracks)
         for (var ob : t.observations) {
           double[] uv = lens.project(f.frames.get(ob.image), t.point);
-          Point p = lens.observed[ob.image][ob.feature];
-          after += Math.pow(uv[0] - p.x, 2) + Math.pow(uv[1] - p.y, 2);
+          double[] p = lens.observed[ob.image];
+          after += Math.pow(uv[0] - p[2 * ob.feature], 2) + Math.pow(uv[1] - p[2 * ob.feature + 1], 2);
         }
       Json.write(
           output.resolve("benchmark.json"),

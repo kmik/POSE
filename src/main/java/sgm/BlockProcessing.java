@@ -169,8 +169,13 @@ final class BlockProcessing {
   static long estimateAlignment(Options o, int n) {
     long keypoints = (long) n * o.features, observations = keypoints / 2, tracks = observations / 3;
     long pairs = PairSelection.maximumPairs(n, o), matches = pairs * o.features / 4;
-    return AlignmentMemory.graphBytes(keypoints, tracks, observations, pairs, matches)
-        + AlignmentMemory.bundleBytes(tracks, observations, n, true);
+    // Block planning keeps its previous bundle figure (1152 bytes per point, 256 per observation,
+    // 4096 per camera) so that automatic block partitions, and with them the results of existing
+    // block-processing runs, do not change with the smaller bundle representation
+    // (AlignmentMemory.bundleBytes is the admission estimate of that representation).
+    long bundle = Math.addExact(Math.multiplyExact(tracks, 1152),
+        Math.addExact(Math.multiplyExact(observations, 256), Math.multiplyExact((long) n, 4096)));
+    return AlignmentMemory.graphBytes(keypoints, tracks, observations, pairs, matches) + bundle;
   }
 
   /** Largest block (images) whose alignment and fusion fit 70% of the heap a process gets here. */

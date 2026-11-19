@@ -614,9 +614,9 @@ final class GuiRegression {
     double[][] fr = CloudRenderer.frustum(all.cameras.get(0), 5);
     check(Math.abs(fr[0][2] - 90) < 1e-9 && fr[1][2] < fr[0][2] - 4.9, "frustum points down from the camera");
     check(CloudRenderer.ramp(0) != CloudRenderer.ramp(1) && CloudRenderer.classColour(2) != CloudRenderer.classColour(5), "colour ramps");
-    // Orbit keeps the pitch within limits; pan and zoom move as expected.
+    // Orbit crosses the poles without clamping; pan and zoom move as expected.
     CloudRenderer.View v = home.orbit(370, 100);
-    check(v.pitch() == 90 && v.yaw() >= 0 && v.yaw() < 360, "orbit limits");
+    check(v.pitch() == CloudRenderer.View.wrap(home.pitch()+100) && v.yaw() >= 0 && v.yaw() < 360, "unrestricted orbit");
     check(home.zoom(.5).distance() == home.distance() * .5, "zoom");
   }
 

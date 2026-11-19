@@ -63,6 +63,7 @@ public final class SelfTest {
     checks += ExactSpeedupRegression.run(root.resolve("exact-speedup"));
     checks += MemoryGovernorRegression.run(root.resolve("memory-governor"));
     checks += GuiRegression.run(root.resolve("gui"));
+    checks += CloudViewerRegression.run(root.resolve("viewer"));
     checks += GpuStereoFiltersRegression.run();
     checks += GpuDepthOutlierRegression.run();
     checks += GpuRangeGuardRegression.run();

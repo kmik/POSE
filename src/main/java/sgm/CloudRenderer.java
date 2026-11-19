@@ -18,7 +18,7 @@ final class CloudRenderer {
   private static final VarHandle LONGS = MethodHandles.arrayElementVarHandle(long[].class);
   static final long EMPTY = Long.MAX_VALUE;
   /** Point ids: dense index, SPARSE | sparse index, or LIDAR | lidar reference index. */
-  static final int SPARSE = 1 << 30, LIDAR = 1 << 29;
+  static final int SPARSE = 1 << 30, LIDAR = 1 << 29, OVERVIEW = 1 << 28;
   /** Colour of the lidar reference points. */
   static final int LIDAR_COLOUR = 0xff9800;
 
@@ -29,7 +29,12 @@ final class CloudRenderer {
    * below the horizon, 90 = straight down), distance, vertical field of view; orthographic for
    * a map-like top view.
    */
-  record View(double[] target, double yaw, double pitch, double distance, double fov, boolean ortho) {
+  record View(double[] target, double yaw, double pitch, double distance, double fov, boolean ortho, double roll) {
+    View(double[] target, double yaw, double pitch, double distance, double fov, boolean ortho) {
+      this(target,yaw,pitch,distance,fov,ortho,0);
+    }
+    View { target=target.clone(); }
+    @Override public double[] target() { return target.clone(); }
     double[] forward() {
       double y = Math.toRadians(yaw), p = Math.toRadians(pitch);
       return new double[] {Math.cos(p) * Math.sin(y), Math.cos(p) * Math.cos(y), -Math.sin(p)};
@@ -37,7 +42,10 @@ final class CloudRenderer {
 
     double[] right() {
       double y = Math.toRadians(yaw);
-      return new double[] {Math.cos(y), -Math.sin(y), 0};
+      double p = Math.toRadians(pitch), a = Math.toRadians(roll);
+      double[] r = {Math.cos(y), -Math.sin(y), 0};
+      double[] u = {Math.sin(p)*Math.sin(y),Math.sin(p)*Math.cos(y),Math.cos(p)};
+      return new double[] {r[0]*Math.cos(a)+u[0]*Math.sin(a),r[1]*Math.cos(a)+u[1]*Math.sin(a),u[2]*Math.sin(a)};
     }
 
     double[] up() {
@@ -51,11 +59,11 @@ final class CloudRenderer {
     }
 
     View orbit(double dYaw, double dPitch) {
-      return new View(target, ((yaw + dYaw) % 360 + 360) % 360, Math.max(-89, Math.min(90, pitch + dPitch)), distance, fov, ortho);
+      return new View(target, ((yaw + dYaw) % 360 + 360) % 360, wrap(pitch + dPitch), distance, fov, ortho, roll);
     }
 
     View zoom(double factor) {
-      return new View(target, yaw, pitch, Math.max(1e-3, distance * factor), fov, ortho);
+      return new View(target, yaw, pitch, Math.max(1e-3, distance * factor), fov, ortho, roll);
     }
 
     /** Moves the target by screen pixels (dx right, dy down) at the target's depth. */
@@ -63,19 +71,23 @@ final class CloudRenderer {
       double perPixel = 2 * distance * Math.tan(Math.toRadians(fov) / 2) / Math.max(1, height);
       double[] r = right(), u = up(), t = target.clone();
       for (int k = 0; k < 3; k++) t[k] += (-dx * r[k] + dy * u[k]) * perPixel;
-      return new View(t, yaw, pitch, distance, fov, ortho);
+      return new View(t, yaw, pitch, distance, fov, ortho, roll);
     }
 
     View at(double[] t) {
-      return new View(t.clone(), yaw, pitch, distance, fov, ortho);
+      return new View(t.clone(), yaw, pitch, distance, fov, ortho, roll);
     }
 
     View withOrtho(boolean o) {
-      return new View(target, yaw, pitch, distance, fov, o);
+      return new View(target, yaw, pitch, distance, fov, o, roll);
     }
 
+    static double wrap(double a) { return ((a % 360) + 360) % 360; }
+    View withRoll(double r) { return new View(target,yaw,pitch,distance,fov,ortho,wrap(r)); }
+    View shifted(double x,double y,double z) { return at(new double[] {target[0]+x,target[1]+y,target[2]+z}); }
+
     View withAngles(double y, double p) {
-      return new View(target, y, p, distance, fov, ortho);
+      return new View(target, wrap(y), wrap(p), distance, fov, ortho, 0);
     }
   }
 
@@ -98,6 +110,28 @@ final class CloudRenderer {
       ortho = v.ortho();
     }
 
+    boolean visible(CloudDisplay.Box b) {
+      double[] c=b.centre();
+      double radius=Math.sqrt(Math.pow(b.x1()-b.x0(),2)+Math.pow(b.y1()-b.y0(),2)+Math.pow(b.z1()-b.z0(),2))/2;
+      double dx=c[0]-ex,dy=c[1]-ey,dz=c[2]-ez,depth=dx*fx+dy*fy+dz*fz;
+      if(depth+radius<=1e-6) return false;
+      double a=dx*rx+dy*ry+dz*rz,u=dx*ux+dy*uy+dz*uz;
+      if(ortho) return Math.abs(a)<=cx/scale+radius && Math.abs(u)<=cy/scale+radius;
+      double tx=cx/focal,ty=cy/focal;
+      return Math.abs(a)<=depth*tx+radius*Math.sqrt(1+tx*tx)
+          && Math.abs(u)<=depth*ty+radius*Math.sqrt(1+ty*ty);
+    }
+    double pixelSpan(CloudDisplay.Box b) {
+      double[] c=b.centre();
+      double radius=Math.sqrt(Math.pow(b.x1()-b.x0(),2)+Math.pow(b.y1()-b.y0(),2)+Math.pow(b.z1()-b.z0(),2))/2;
+      double depth=(c[0]-ex)*fx+(c[1]-ey)*fy+(c[2]-ez)*fz;
+      return 2*radius*(ortho?scale:focal/Math.max(1e-6,depth-radius));
+    }
+    double[] unproject(double x,double y,double depth) {
+      double a=(x-cx)/(ortho?scale:focal/depth),b=(cy-y)/(ortho?scale:focal/depth);
+      return new double[] {ex+fx*depth+rx*a+ux*b,ey+fy*depth+ry*a+uy*b,ez+fz*depth+rz*a+uz*b};
+    }
+
     /** Fills out {sx, sy, depth}; false when the point is behind the eye. */
     boolean project(double x, double y, double z, double[] out) {
       double dx = x - ex, dy = y - ey, dz = z - ez;
@@ -118,58 +152,78 @@ final class CloudRenderer {
 
   /** What to draw. step > 1 draws every step-th dense point (the fast preview while moving). */
   record Request(CloudData data, View view, int width, int height, Colour colour, int attribute, int pointSize, boolean edl,
-                 boolean dense, boolean sparse, int step, float lowValue, float highValue) {}
+                 boolean dense, boolean sparse, int step, float lowValue, float highValue, CloudDisplay display,
+                 java.util.function.BooleanSupplier cancelled, int pointBudget, CloudData overview) {
+    Request(CloudData d,View v,int w,int h,Colour c,int a,int size,boolean edl,boolean dense,boolean sparse,int step,float lo,float hi,CloudDisplay display,java.util.function.BooleanSupplier cancelled,int budget) {
+      this(d,v,w,h,c,a,size,edl,dense,sparse,step,lo,hi,display,cancelled,budget,null);
+    }
+    Request(CloudData d,View v,int w,int h,Colour c,int a,int size,boolean edl,boolean dense,boolean sparse,int step,float lo,float hi) {
+      this(d,v,w,h,c,a,size,edl,dense,sparse,step,lo,hi,CloudDisplay.DEFAULT,()->false,Integer.MAX_VALUE);
+    }
+  }
 
   /** The picture and its per-pixel nearest-point buffer (for picking). */
   record Frame(int width, int height, int[] argb, long[] buffer, Request request) {
     /** Nearest point id within radius pixels of (px, py), or -1. */
     int pick(int px, int py, int radius) {
-      long best = EMPTY;
+      long best = EMPTY; int distance=Integer.MAX_VALUE;
       for (int y = Math.max(0, py - radius); y <= Math.min(height - 1, py + radius); y++)
-        for (int x = Math.max(0, px - radius); x <= Math.min(width - 1, px + radius); x++) best = Math.min(best, buffer[y * width + x]);
+        for (int x = Math.max(0, px - radius); x <= Math.min(width - 1, px + radius); x++) {
+          long v=buffer[y*width+x];int ds=(x-px)*(x-px)+(y-py)*(y-py);
+          if(v!=EMPTY && ds<=radius*radius && (ds<distance || ds==distance && v<best)) {best=v;distance=ds;}
+        }
       return best == EMPTY ? -1 : (int) (best & 0xffffffffL);
     }
   }
 
-  static Frame render(Request q) {
+  static Frame render(Request q) { return render(q,null,null); }
+  static Frame render(Request q,long[] reuse,int[] pixels) {return render(q,reuse,pixels,null);}
+  static Frame render(Request q,long[] reuse,int[] pixels,float[] shadeReuse) {
+    if(q.cancelled().getAsBoolean()) throw new java.util.concurrent.CancellationException();
     int w = q.width(), h = q.height();
-    long[] buffer = new long[w * h];
+    long[] buffer = reuse!=null && reuse.length==w*h?reuse:new long[w*h];
     Arrays.fill(buffer, EMPTY);
     CloudData d = q.data();
     Projector pr = new Projector(q.view(), w, h);
     int size = Math.max(1, q.pointSize());
-    if (q.dense() && d.n > 0) {
-      int step = Math.max(1, q.step()), chunks = Math.max(1, Math.min(256, d.n / step / 50_000 + 1));
-      IntStream.range(0, chunks).parallel().forEach(c -> {
-        double[] s = new double[3];
-        long count = (d.n + (long) step - 1) / step;
-        for (long k = count * c / chunks; k < count * (c + 1) / chunks; k++) {
-          int i = (int) (k * step);
-          if (pr.project(d.x[i], d.y[i], d.z[i], s)) splat(buffer, w, h, s, size, i);
-        }
-      });
-    }
+    int contextBudget=q.overview()==null?0:d.n==0?q.pointBudget():Math.max(1,q.pointBudget()/2);
+    if(q.dense() && q.overview()!=null)
+      projectDense(q,q.overview(),pr,buffer,size,OVERVIEW,contextBudget);
+    if(q.dense() && d.n>0)
+      projectDense(q,d,pr,buffer,size,0,q.pointBudget()==Integer.MAX_VALUE?Integer.MAX_VALUE:Math.max(1,q.pointBudget()-contextBudget));
     if (d.showLidar && d.lx.length > 0) {
-      int step = Math.max(1, q.step());
+      int step = Math.max(Math.max(1,q.step()),(int)Math.max(1,Math.ceil(d.lx.length/(double)Math.max(1,q.pointBudget()))));
       double[] s = new double[3];
-      for (int i = 0; i < d.lx.length; i += step) if (pr.project(d.lx[i], d.ly[i], d.lz[i], s)) splat(buffer, w, h, s, size, LIDAR | i);
+      for (int i = 0; i < d.lx.length; i += step) if (q.display().position(d.lx[i],d.ly[i],d.lz[i]) && pr.project(d.lx[i], d.ly[i], d.lz[i], s)) splat(buffer, w, h, s, size, LIDAR | i);
     }
     if (q.sparse() && d.sx.length > 0) {
       double[] s = new double[3];
       int sparseSize = Math.max(2, size + 1);
       boolean[] hidden = d.shidden, big = d.sbig;
       for (int i = 0; i < d.sx.length; i++) {
+        if((i&4095)==0 && q.cancelled().getAsBoolean())throw new java.util.concurrent.CancellationException();
         if (hidden != null && hidden[i]) continue;
-        if (pr.project(d.sx[i], d.sy[i], d.sz[i], s)) splat(buffer, w, h, s, big != null && big[i] ? sparseSize + 1 : sparseSize, SPARSE | i);
+        if (q.display().position(d.sx[i],d.sy[i],d.sz[i]) && pr.project(d.sx[i], d.sy[i], d.sz[i], s)) splat(buffer, w, h, s, big != null && big[i] ? sparseSize + 1 : sparseSize, SPARSE | i);
       }
     }
-    int[] argb = new int[w * h];
+    if(q.cancelled().getAsBoolean()) throw new java.util.concurrent.CancellationException();
+    int[] argb = pixels!=null && pixels.length==w*h?pixels:new int[w*h];
     float[] attr = q.colour() == Colour.ATTRIBUTE && q.attribute() >= 0 && q.attribute() < d.attributes.size() ? d.attributes.get(q.attribute()).values() : null;
     float lo = q.lowValue(), hi = q.highValue(), range = hi > lo ? hi - lo : 1;
     int sparseMax = 2;
     for (int o : d.sobs) sparseMax = Math.max(sparseMax, Math.min(20, o));
     final int sm = sparseMax;
+    CloudData.Attribute contextAttribute=q.overview()!=null && q.colour()==Colour.ATTRIBUTE
+        && q.attribute()>=0 && q.attribute()<d.attributes.size()
+        ?q.overview().attribute(d.attributes.get(q.attribute()).name()):null;
+    final float[] contextValues=contextAttribute==null?null:contextAttribute.values();
+    float[] logDepth=q.edl()?(shadeReuse!=null && shadeReuse.length==w*h?shadeReuse:new float[w*h]):null;
+    if(logDepth!=null)IntStream.range(0,h).parallel().forEach(y->{
+      if(q.cancelled().getAsBoolean())return;
+      for(int x=0;x<w;x++){int i=y*w+x;logDepth[i]=buffer[i]==EMPTY?Float.NaN:(float)(Math.log(depth(buffer[i]))/Math.log(2));}
+    });
     IntStream.range(0, h).parallel().forEach(y -> {
+      if(q.cancelled().getAsBoolean()) return;
       for (int x = 0; x < w; x++) {
         int p = y * w + x;
         long v = buffer[p];
@@ -186,19 +240,43 @@ final class CloudRenderer {
           c = own != null ? own[i] & 0xffffff : ramp(.3f + .7f * Math.min(1f, (Math.min(20, d.sobs[i]) - 2f) / Math.max(1, sm - 2)));
           argb[p] = 0xff000000 | c;
           continue;
-        } else if ((id & LIDAR) != 0) c = LIDAR_COLOUR;
-        else
-          c = switch (q.colour()) {
-            case RGB -> d.rgb[id];
-            case HEIGHT -> ramp((d.z[id] - lo) / range);
-            case CLASS -> classColour(d.cls[id]);
-            case ATTRIBUTE -> attr == null || Float.isNaN(attr[id]) ? 0x808080 : ramp((attr[id] - lo) / range);
+        } else if ((id & OVERVIEW) != 0) {
+          int i=id&~OVERVIEW;CloudData coarse=q.overview();float value=contextValues==null?Float.NaN:contextValues[i];
+          c=q.display().denseColour()!=null?q.display().denseColour():switch(q.colour()){
+            case RGB->coarse.rgb[i];case HEIGHT->ramp(normalize(coarse.z[i],lo,hi));case CLASS->classColour(coarse.cls[i]);case ATTRIBUTE->Float.isNaN(value)?0x808080:ramp(normalize(value,lo,hi));
           };
-        if (q.edl()) c = shade(c, edl(buffer, w, h, x, y, v));
+        } else if ((id & LIDAR) != 0) c = q.display().lidarColour();
+        else
+          c = q.display().denseColour()!=null?q.display().denseColour():switch (q.colour()) {
+            case RGB -> d.rgb[id];
+            case HEIGHT -> ramp(normalize(d.z[id],lo,hi));
+            case CLASS -> classColour(d.cls[id]);
+            case ATTRIBUTE -> attr == null || Float.isNaN(attr[id]) ? 0x808080 : ramp(normalize(attr[id],lo,hi));
+          };
+        if (q.edl()) c = shade(c, edl(logDepth, w, h, x, y), q.display().shading());
         argb[p] = 0xff000000 | c;
       }
     });
+    if(q.cancelled().getAsBoolean()) throw new java.util.concurrent.CancellationException();
     return new Frame(w, h, argb, buffer, q);
+  }
+
+  /** Both the resident overview and local detail use spatial culling and bounded parallel work. */
+  private static void projectDense(Request q,CloudData d,Projector pr,long[] buffer,int size,int marker,int budget) {
+    int[] selected=d.spatial==null?null:d.spatial.select(pr,q.display().box(),
+        Math.min(budget,Math.max(1,d.n/Math.max(1,q.step()))),q.cancelled());
+    int step=Math.max(Math.max(1,q.step()),(int)Math.max(1,Math.ceil(d.n/(double)Math.max(1,budget))));
+    int count=selected==null?(d.n+step-1)/step:selected.length;
+    int chunks=Math.max(1,Math.min(256,count/50_000+1));
+    IntStream.range(0,chunks).parallel().forEach(chunk->{
+      double[] screen=new double[3];
+      for(int k=(int)((long)count*chunk/chunks);k<(long)count*(chunk+1)/chunks;k++) {
+        if((k&4095)==0 && q.cancelled().getAsBoolean())return;
+        int i=selected==null?k*step:selected[k];
+        if(q.display().dense(d,i) && pr.project(d.x[i],d.y[i],d.z[i],screen))
+          splat(buffer,q.width(),q.height(),screen,size,marker|i);
+      }
+    });
   }
 
   private static void splat(long[] buffer, int w, int h, double[] s, int size, int id) {
@@ -217,12 +295,18 @@ final class CloudRenderer {
     return Float.intBitsToFloat((int) (v >>> 32));
   }
 
+  static final int[] EDL_X={-2,2,0,0,-1,1,-1,1},EDL_Y={0,0,-2,2,-1,-1,1,1};
+  static float edl(float[] log,int w,int h,int x,int y) {
+    float centre=log[y*w+x],sum=0;
+    for(int i=0;i<8;i++){int nx=x+EDL_X[i],ny=y+EDL_Y[i];if(nx<0||ny<0||nx>=w||ny>=h)continue;float d=centre-log[ny*w+nx];if(d>0)sum+=d;}
+    return sum;
+  }
+
   /** Eye-dome lighting: how much nearer the neighbouring points are (log depth), 0 = none. */
   static float edl(long[] buffer, int w, int h, int x, int y, long v) {
     double centre = Math.log(depth(v)) / Math.log(2), sum = 0;
-    int[][] around = {{-2, 0}, {2, 0}, {0, -2}, {0, 2}, {-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
-    for (int[] o : around) {
-      int nx = x + o[0], ny = y + o[1];
+    for (int i=0;i<8;i++) {
+      int nx = x + EDL_X[i], ny = y + EDL_Y[i];
       if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
       long n = buffer[ny * w + nx];
       if (n == EMPTY) continue;
@@ -233,7 +317,10 @@ final class CloudRenderer {
   }
 
   static int shade(int rgb, float response) {
-    double k = Math.exp(-12 * response);
+    return shade(rgb,response,12);
+  }
+  static int shade(int rgb,float response,double strength) {
+    double k = Math.exp(-strength * response);
     int r = (int) ((rgb >> 16 & 255) * k), g = (int) ((rgb >> 8 & 255) * k), b = (int) ((rgb & 255) * k);
     return r << 16 | g << 8 | b;
   }
@@ -242,6 +329,8 @@ final class CloudRenderer {
     int top = 0x2a, bottom = 0x14, v = top + (bottom - top) * y / Math.max(1, h - 1);
     return 0xff000000 | v << 16 | v << 8 | (v + 6);
   }
+
+  static float normalize(float value,float lo,float hi) {return hi>lo?(value-lo)/(hi-lo):.5f;}
 
   /** Turbo-like colour ramp over 0..1. */
   static int ramp(float t) {
@@ -295,7 +384,11 @@ final class CloudRenderer {
     boolean any = false;
     float[][] axes = d.n > 0 ? new float[][] {d.x, d.y, d.z} : new float[][] {d.sx, d.sy, d.sz};
     int count = d.n > 0 ? d.n : d.sx.length;
-    if (count > 0) {
+    if(d.detailRegion!=null && d.sourceIndex!=null && d.sourceIndex.root!=null) {
+      var b=d.sourceIndex.root.bounds;
+      lo=new double[]{b.x0()-d.origin[0],b.y0()-d.origin[1],b.z0()-d.origin[2]};
+      hi=new double[]{b.x1()-d.origin[0],b.y1()-d.origin[1],b.z1()-d.origin[2]};any=true;
+    } else if (count > 0) {
       any = true;
       for (int k = 0; k < 3; k++) {
         lo[k] = CloudData.quantile(axes[k], count, .01);

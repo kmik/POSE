@@ -38,6 +38,13 @@ final class ImageWindow {
     OPEN.put(run.dir(), new ImageWindow(run, images, parent));
   }
 
+  /** Select a photograph from the 3D viewer using the same image window. */
+  static void openImage(Component parent,ProjectFiles.Run run,String name) {
+    open(parent,run);
+    ImageWindow w=OPEN.get(run.dir());
+    if(w!=null) for(RunImages.Image im:w.images.images) if(im.name().equals(name)) {w.select(im,true);break;}
+  }
+
   static final int PREVIEW = 1024, THUMB = 180;
 
   final RunImages images;

@@ -3,13 +3,22 @@ package sgm;
 /** One Cholesky factorization, multiple right-hand sides, and a residual certificate. */
 final class SmallMatrices {
   static double[] inverse(double[] a, int n) {
-    double[] l = new double[n * n], inverse = new double[n * n], work = new double[n];
+    double[] inverse = new double[n * n];
+    return inverseInto(a, 0, n, inverse, 0, new double[n * n], new double[n]) ? inverse : null;
+  }
+
+  /**
+   * {@link #inverse} of the n x n matrix at a[ao..] into out[oo..], with caller-owned scratch l
+   * (n * n) and work (n). Every element of l, work and the output is written before it is read,
+   * so reused scratch gives the same result bit for bit. On false the output is unspecified.
+   */
+  static boolean inverseInto(double[] a, int ao, int n, double[] out, int oo, double[] l, double[] work) {
     for (int i = 0; i < n; i++)
       for (int j = 0; j <= i; j++) {
-        double sum = a[i * n + j];
+        double sum = a[ao + i * n + j];
         for (int k = 0; k < j; k++) sum -= l[i * n + k] * l[j * n + k];
         if (i == j) {
-          if (!(sum > 0) || !Double.isFinite(sum)) return null;
+          if (!(sum > 0) || !Double.isFinite(sum)) return false;
           l[i * n + j] = Math.sqrt(sum);
         } else l[i * n + j] = sum / l[j * n + j];
       }
@@ -21,17 +30,17 @@ final class SmallMatrices {
       }
       for (int i = n - 1; i >= 0; i--) {
         double v = work[i];
-        for (int k = i + 1; k < n; k++) v -= l[k * n + i] * inverse[k * n + column];
-        inverse[i * n + column] = v / l[i * n + i];
+        for (int k = i + 1; k < n; k++) v -= l[k * n + i] * out[oo + k * n + column];
+        out[oo + i * n + column] = v / l[i * n + i];
       }
     }
     double worst = 0;
     for (int i = 0; i < n; i++)
       for (int j = 0; j < n; j++) {
         double sum = 0;
-        for (int k = 0; k < n; k++) sum += a[i * n + k] * inverse[k * n + j];
+        for (int k = 0; k < n; k++) sum += a[ao + i * n + k] * out[oo + k * n + j];
         worst = Math.max(worst, Math.abs(sum - (i == j ? 1 : 0)));
       }
-    return Double.isFinite(worst) && worst < 1e-8 ? inverse : null;
+    return Double.isFinite(worst) && worst < 1e-8;
   }
 }

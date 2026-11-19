@@ -750,11 +750,18 @@ final class GpsAdjustment {
         for (FeatureTracks.Observation ob : t.observations) {
           ImageFrame f = frames.get(ob.image);
           if (!f.camera.registered) continue;
-          org.opencv.core.Point p =
-              lens == null ? f.keypoints[ob.feature].pt : lens.observed[f.id][ob.feature];
-          double[] uv = lens == null ? f.camera.project(t.point) : lens.project(f, t.point, p.y);
+          double px, py;
+          if (lens == null) {
+            org.opencv.core.Point p = f.keypoints[ob.feature].pt;
+            px = p.x;
+            py = p.y;
+          } else {
+            px = lens.observed[f.id][2 * ob.feature];
+            py = lens.observed[f.id][2 * ob.feature + 1];
+          }
+          double[] uv = lens == null ? f.camera.project(t.point) : lens.project(f, t.point, py);
           if (uv == null) continue;
-          sum += Math.pow(uv[0] - p.x, 2) + Math.pow(uv[1] - p.y, 2);
+          sum += Math.pow(uv[0] - px, 2) + Math.pow(uv[1] - py, 2);
           n++;
         }
     return Math.sqrt(sum / Math.max(1, n));

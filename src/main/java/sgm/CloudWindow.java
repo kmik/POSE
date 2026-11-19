@@ -27,7 +27,12 @@ final class CloudWindow {
   final JCheckBox edl = new JCheckBox("Shading", true), showDense = new JCheckBox("Dense", true), showSparse = new JCheckBox("Tie points", false),
       showCameras = new JCheckBox("Cameras", true), ortho = new JCheckBox("Orthographic", false), showLidar = new JCheckBox("Lidar", false);
   final JComboBox<String> budget = new JComboBox<>(new String[] {"1 M points", "3 M points", "6 M points", "12 M points"});
-  final ExecutorService loader = Executors.newSingleThreadExecutor(GcpEditorWindow.daemon("pose-cloud-load"));
+  final ThreadPoolExecutor loader = new ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new LinkedBlockingQueue<>(),GcpEditorWindow.daemon("pose-cloud-load"));
+  final java.util.concurrent.atomic.AtomicLong loadGeneration=new java.util.concurrent.atomic.AtomicLong();
+  Future<?> loading,confidenceTask,lidarTask;
+  CloudDisplay.Box loadingRegion;
+  boolean closed,updatingColour,confidenceLoading;
+  CloudViewerControls controls;
   volatile CloudData data;
   volatile float lo, hi;
 
@@ -54,6 +59,8 @@ final class CloudWindow {
     frame.addWindowListener(new WindowAdapter() {
       @Override
       public void windowClosed(WindowEvent e) {
+        closed=true;loadGeneration.incrementAndGet();
+        if(controls!=null)controls.dispose();
         canvas.dispose();
         loader.shutdownNow();
         data = null;
@@ -87,13 +94,13 @@ final class CloudWindow {
     bar.add(budget);
     edl.setToolTipText("Eye-dome lighting: darkens points behind nearer ones, so edges and relief stand out");
     showSparse.setToolTipText("Tie points of the alignment, coloured by the number of images that see them (cyan few, red many)");
-    showLidar.setToolTipText("The lidar reference points (orange) of a run made with --lidar-reference, within the cloud's extent");
+    showLidar.setToolTipText("The lidar reference points of a run made with --lidar-reference, within the cloud's extent");
     showLidar.setEnabled(!CloudData.lidarFiles(run.dir()).isEmpty());
     showLidar.addActionListener(e -> lidarToggled());
     showCameras.setToolTipText("Camera positions and viewing directions; red: flagged by camera screening. Hover for the name.");
-    budget.setToolTipText("At most this many dense points are read (every k-th point of the cloud); more needs more memory");
+    budget.setToolTipText("Maximum displayed dense samples; also capped by the viewer memory allowance. Local detail loads replace the overview.");
 
-    home.addActionListener(e -> canvas.home());
+    home.addActionListener(e -> {ortho.setSelected(false);canvas.home();});
     top.addActionListener(e -> {
       ortho.setSelected(true);
       if (canvas.view != null) canvas.setView(canvas.view.withAngles(0, 90).withOrtho(true), false);
@@ -108,18 +115,21 @@ final class CloudWindow {
     colour.addActionListener(e -> colourChanged());
     pointSize.addChangeListener(e -> canvas.redraw());
     for (JCheckBox b : List.of(edl, showDense, showSparse, showCameras)) b.addActionListener(e -> canvas.redraw());
-    budget.addActionListener(e -> load());
+    budget.addActionListener(e -> {load();if(controls!=null && controls.compareRun!=null)controls.loadComparison();});
 
     canvas.setPreferredSize(new Dimension(1100, 720));
     status.setBorder(new EmptyBorder(3, 6, 3, 6));
     JPanel content = new JPanel(new BorderLayout());
     content.add(bar, BorderLayout.NORTH);
-    content.add(canvas, BorderLayout.CENTER);
+    controls=new CloudViewerControls(this);
+    content.add(controls.component, BorderLayout.CENTER);
     content.add(status, BorderLayout.SOUTH);
     frame.setContentPane(content);
     frame.pack();
+    frame.setSize(1450,900);
     frame.setLocationRelativeTo(parent);
     frame.setVisible(true);
+    controls.adjustLayout();
     load();
   }
 
@@ -128,20 +138,52 @@ final class CloudWindow {
         showSparse.isSelected(), showCameras.isSelected(), lo, hi, String.valueOf(colour.getSelectedItem()));
   }
 
-  void load() {
-    status.setText("Loading...");
-    long max = BUDGETS[Math.max(0, budget.getSelectedIndex())];
-    loader.submit(() -> {
+  void load() {load(null);}
+  void load(CloudDisplay.Box region) {
+    if(closed)return;
+    if(region==null && controls!=null)controls.prepareOverviewLoad();
+    long token=loadGeneration.incrementAndGet();
+    if(loading!=null)loading.cancel(true);
+    if(confidenceTask!=null)confidenceTask.cancel(true);
+    if(lidarTask!=null)lidarTask.cancel(true);
+    confidenceLoading=false;loader.purge();
+    loadingRegion=region;
+    status.setText(region==null?"Loading overview...":"Loading local detail...");
+    long max=controls==null?BUDGETS[Math.max(0,budget.getSelectedIndex())]:controls.pointBudget();
+    if(region!=null)max=CloudDetailCache.detailBudget(max);
+    final long sampleBudget=max;
+    CloudSourceIndex index=data==null?null:data.sourceIndex;
+    loading=loader.submit(()->{
       try {
-        CloudData d = CloudData.load(run.dir(), max, s -> SwingUtilities.invokeLater(() -> status.setText(s)));
-        SwingUtilities.invokeLater(() -> loaded(d));
-      } catch (Exception | OutOfMemoryError e) {
-        SwingUtilities.invokeLater(() -> {
-          status.setText("Could not read the run: " + e);
-          GuiSupport.error(frame, "3D view", e);
+        CloudData d=CloudData.load(run.dir(),sampleBudget,msg->SwingUtilities.invokeLater(()->{
+          if(!closed && token==loadGeneration.get())status.setText(msg);
+        }),region,index);
+        SwingUtilities.invokeLater(()->{if(!closed && token==loadGeneration.get()){loadingRegion=null;loaded(d);}});
+      }catch(Exception|OutOfMemoryError e) {
+        if(Thread.currentThread().isInterrupted())return;
+        SwingUtilities.invokeLater(()->{
+          if(!closed && token==loadGeneration.get() && !(e instanceof java.io.InterruptedIOException) && !(e instanceof CancellationException)){
+            status.setText("Could not read the run: "+e.getMessage());GuiSupport.error(frame,"3D view",e);
+          }
         });
       }
     });
+  }
+
+  void cancelDetailLoad() {
+    if(loadingRegion==null)return;
+    loadGeneration.incrementAndGet();loadingRegion=null;
+    if(loading!=null)loading.cancel(true);
+    loading=null;loader.purge();
+  }
+
+  void showCached(CloudData cached) {
+    cancelDetailLoad();
+    if(cached!=null && cached!=data){
+      if(confidenceTask!=null)confidenceTask.cancel(true);
+      if(lidarTask!=null)lidarTask.cancel(true);
+      loader.purge();loaded(cached);
+    }
   }
 
   /** First time on: read the lidar points within the cloud (same budget as the dense cloud), then draw them. */
@@ -150,21 +192,28 @@ final class CloudWindow {
     if (d == null) return;
     if (!showLidar.isSelected() || d.lx.length > 0) {
       d.showLidar = showLidar.isSelected();
+      controls.syncDisplay();
       canvas.redraw();
       return;
     }
-    long max = BUDGETS[Math.max(0, budget.getSelectedIndex())];
+    long max = controls.pointBudget();
     status.setText("Reading the lidar reference...");
-    loader.submit(() -> {
+    if(lidarTask!=null && !lidarTask.isDone())return;
+    lidarTask=loader.submit(() -> {
       try {
-        d.readLidar(CloudData.lidarFiles(run.dir()), max, s -> SwingUtilities.invokeLater(() -> status.setText(s)));
+        CloudData temp=new CloudData();temp.n=d.n;temp.x=d.x;temp.y=d.y;temp.sx=d.sx;temp.sy=d.sy;System.arraycopy(d.origin,0,temp.origin,0,3);
+        temp.readLidar(CloudData.lidarFiles(run.dir()), max, s -> SwingUtilities.invokeLater(() -> {if(!closed && data==d)status.setText(s);}));
         SwingUtilities.invokeLater(() -> {
+          if(closed || data!=d)return;
+          d.lx=temp.lx;d.ly=temp.ly;d.lz=temp.lz;d.lidarInExtent=temp.lidarInExtent;
           d.showLidar = showLidar.isSelected();
           canvas.redraw();
           describe();
         });
       } catch (Exception | OutOfMemoryError e) {
+        if(Thread.currentThread().isInterrupted())return;
         SwingUtilities.invokeLater(() -> {
+          if(closed || data!=d)return;
           showLidar.setSelected(false);
           status.setText("Could not read the lidar reference: " + e);
         });
@@ -175,9 +224,11 @@ final class CloudWindow {
   void loaded(CloudData d) {
     boolean first = data == null;
     data = d;
+    confidenceLoading=false;
+    updatingColour=true;
     String selected = (String) colour.getSelectedItem();
     colour.removeAllItems();
-    if (d.n > 0) {
+    if (d.total > 0) {
       colour.addItem("RGB");
       colour.addItem("Height");
       colour.addItem("Classification");
@@ -187,14 +238,19 @@ final class CloudWindow {
         colour.addItem(CloudData.label("confidence"));
       }
     } else colour.addItem("Height");
-    if (selected != null) colour.setSelectedItem(selected);
-    if (d.n == 0) {
+    if (selected != null) {for(int i=0;i<colour.getItemCount();i++)if(selected.equals(colour.getItemAt(i)))colour.setSelectedIndex(i); }
+    updatingColour=false;
+    if (d.n == 0 && d.total==0) {
       showDense.setSelected(false);
       showDense.setEnabled(false);
       showSparse.setSelected(true);
     }
+    showDense.setEnabled(d.total>0);
     computeRange();
     canvas.setData(d, first);
+    controls.dataChanged();
+    colourChanged();
+    controls.loadActiveConfidence();
     describe();
     if (showLidar.isSelected()) lidarToggled();
   }
@@ -205,36 +261,46 @@ final class CloudWindow {
     String s = d.n > 0
         ? String.format(Locale.ROOT, "%,d of %,d dense points (every %d.)", d.n, d.total, d.stride)
         : "No dense cloud yet";
+    if(d.detailRegion!=null)s=String.format(Locale.ROOT,"Local detail: %,d of %,d points in area (%,d total)",d.n,d.regionTotal,d.total);
     s += String.format(Locale.ROOT, "; %,d tie points; %d cameras", d.sx.length, d.cameras.size());
     long flagged = d.cameras.stream().filter(c -> c.flag() != null).count();
     if (flagged > 0) s += " (" + flagged + " flagged, red)";
-    if (d.lx.length > 0) s += String.format(Locale.ROOT, "; %,d of %,d lidar points (orange)", d.lx.length, d.lidarInExtent);
+    if (d.lx.length > 0) s += String.format(Locale.ROOT, "; %,d of %,d lidar points", d.lx.length, d.lidarInExtent);
     if (d.crs != null) s += "; " + d.crs;
-    status.setText(s + ".   Left drag: orbit, right drag: pan, wheel: zoom, double-click: centre.");
+    status.setText(s + ".   Drag: orbit; Ctrl+drag / Q,E: roll; right drag: pan; wheel: zoom.");
   }
 
   /** The colour range of the chosen mode (2% and 98% quantiles), loading confidence on request. */
   void colourChanged() {
+    if(updatingColour || closed)return;
     CloudData d = data;
     String c = (String) colour.getSelectedItem();
     if (d == null || c == null) return;
     String views = CloudData.label("views"), confidence = CloudData.label("confidence");
     if ((c.equals(views) || c.equals(confidence)) && d.attributes.stream().noneMatch(a -> a.name().equals("views"))) {
+      if(confidenceLoading)return;
+      confidenceLoading=true;
       status.setText("Reading point confidence...");
-      loader.submit(() -> {
+      confidenceTask=loader.submit(() -> {
         try {
-          d.loadConfidence(run.dir(), s -> SwingUtilities.invokeLater(() -> status.setText(s)));
+          CloudData temp=new CloudData();temp.n=d.n;temp.originalIds=d.originalIds;temp.lasFiles.addAll(d.lasFiles);
+          temp.loadConfidence(run.dir(), s -> SwingUtilities.invokeLater(() -> {if(!closed && data==d)status.setText(s);}));
           SwingUtilities.invokeLater(() -> {
+            if(closed || data!=d)return;
+            for(var a:temp.attributes)if(d.attribute(a.name())==null)d.attributes.add(a);
+            confidenceLoading=false;
             describe();
             colourChanged();
           });
         } catch (Exception e) {
-          SwingUtilities.invokeLater(() -> GuiSupport.error(frame, "3D view", e));
+          if(Thread.currentThread().isInterrupted())return;
+          SwingUtilities.invokeLater(() -> {if(!closed && data==d){confidenceLoading=false;GuiSupport.error(frame, "3D view", e);}});
         }
       });
       return;
     }
     computeRange();
+    if(controls!=null)controls.colourChanged();
     canvas.redraw();
   }
 

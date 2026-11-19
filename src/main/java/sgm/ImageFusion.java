@@ -59,6 +59,29 @@ final class ImageFusion {
           + precisionRejected + narrowRejected + localSigmaRejected;
     }
 
+    /** Adds the tallies one crossCheck call writes (integer sums: any order gives the same totals). */
+    void addCrossCheck(Counters t) {
+      visibility += t.visibility;
+      ambiguous += t.ambiguous;
+      unsupported += t.unsupported;
+      uncertainty += t.uncertainty;
+      notOwner += t.notOwner;
+      twoView += t.twoView;
+      consumed += t.consumed;
+      freeSpace += t.freeSpace;
+      edgeSupported += t.edgeSupported;
+      edgeFreeSpace += t.edgeFreeSpace;
+      edgeUnknown += t.edgeUnknown;
+      patchSuspects += t.patchSuspects;
+      patchUnsupported += t.patchUnsupported;
+      patchFreeSpace += t.patchFreeSpace;
+      uncertainAverageSkipped += t.uncertainAverageSkipped;
+      averageReverted += t.averageReverted;
+      precisionRejected += t.precisionRejected;
+      narrowRejected += t.narrowRejected;
+      localSigmaRejected += t.localSigmaRejected;
+    }
+
     Object json() {
       return json(false);
     }
@@ -1385,6 +1408,19 @@ final class ImageFusion {
                 return t;
               });
       ArrayDeque<Future<Long>> pending = new ArrayDeque<>();
+      // Two bands' cross-checks in flight on the fusion pool (null: one band at a time). Not with
+      // the bounded host-memory mode (its own worker accounting) or GPU normals (device batches
+      // stay serial); -Dsgm.fusion.serialBands=true keeps the serial path for comparisons.
+      ExecutorService bandChecker =
+          hostMemory == null && !gpuNormals && !Boolean.getBoolean("sgm.fusion.serialBands")
+              ? Executors.newFixedThreadPool(
+                  2,
+                  r -> {
+                    Thread t = new Thread(r, "fusion-band");
+                    t.setDaemon(true);
+                    return t;
+                  })
+              : null;
       try {
       for (int tier = 0; tier < tierCount; tier++)
       for (int c = 0; c < cameras; c++) {
@@ -1425,9 +1461,26 @@ final class ImageFusion {
         // GPU normals back-project on the device; the CPU fallback computes the same values directly.
         double[] points = gpuNormals ? null : pointCache(c, m);
         int w = m.w, bandRows = Math.max(1, bandPixels / Math.max(1, w));
-        for (int y0 = s0; y0 < s1; y0 += bandRows) {
+        List<int[]> bands = new ArrayList<>();
+        for (int y0 = s0; y0 < s1; y0 += bandRows) bands.add(new int[] {y0, Math.min(s1, y0 + bandRows)});
+        // Band overlap: the next band's cross-check runs while this one finishes (workers otherwise
+        // idle at a band's end) and while its marks are applied. The cross-check reads no mark this
+        // camera writes (see above), so the result does not depend on when its band runs; marks,
+        // counters and the output stay on this thread in band order.
+        ArrayDeque<Future<BandCheck>> checks = new ArrayDeque<>();
+        int launched = 0;
+        try {
+        for (int[] band : bands) {
           clock = System.nanoTime();
-          Emission[][] rows = crossCheck(c, m, splats, counters, tier, points, y0, Math.min(s1, y0 + bandRows));
+          Emission[][] rows;
+          if (bandChecker == null) rows = crossCheck(c, m, splats, counters, tier, points, band[0], band[1]);
+          else {
+            while (checks.size() < 2 && launched < bands.size())
+              checks.add(checkBand(bandChecker, c, m, splats, tier, points, bands.get(launched++)));
+            BandCheck done = awaitCheck(checks.poll());
+            counters.addCrossCheck(done.tallies());
+            rows = done.rows();
+          }
           if (gpuNormals) {
             long normalStarted = System.nanoTime();
             fillNormals(c, m, rows, points);
@@ -1452,9 +1505,11 @@ final class ImageFusion {
                   emitted[c].set(e.cameraPixel());
                 }
               }
-          // Time this thread is blocked because two bands already wait for the writer.
+          // Time this thread is blocked because two bands already wait for the writer. With band
+          // overlap one band may wait (two are in flight), so at most three bands' emissions are
+          // held at once, as the memory plan assumes.
           long blocked = System.nanoTime();
-          while (pending.size() >= 2) outputNanos += awaitOutput(pending.poll());
+          while (pending.size() >= (bandChecker == null ? 2 : 1)) outputNanos += awaitOutput(pending.poll());
           outputWaitNanos += System.nanoTime() - blocked;
           pending.add(
               writer.submit(
@@ -1471,6 +1526,17 @@ final class ImageFusion {
                     return System.nanoTime() - started;
                   }));
         }
+        } finally {
+          // After a failure no band may still run against this camera's maps: wait for them.
+          for (Future<BandCheck> f : checks)
+            try {
+              f.get();
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+            } catch (ExecutionException ignored) {
+              // The original failure propagates.
+            }
+        }
         }
         if (earlyDelete && tier == tierCount - 1)
           if (window == null) { for (int j : finishedAfter.get(c)) releaseCamera(j); }
@@ -1480,6 +1546,7 @@ final class ImageFusion {
       while (!pending.isEmpty()) outputNanos += awaitOutput(pending.poll());
       } finally {
         stopWorkers(writer);
+        if (bandChecker != null) stopWorkers(bandChecker);
       }
       for (int c = 0; c < cameras; c++) {
         if (perCamera[c] == null) continue;
@@ -2113,6 +2180,30 @@ final class ImageFusion {
   }
 
   /** Cross-check, ownership and emission for rows [y0, y1) of camera c, row-parallel and row-ordered. */
+  /** One band's cross-check result and its own tallies (added in band order by the caller). */
+  private record BandCheck(Emission[][] rows, Counters tallies) {}
+
+  private Future<BandCheck> checkBand(ExecutorService checker, int c, Merged m, Splat[] splats, int tier,
+      double[] points, int[] band) {
+    return checker.submit(() -> {
+      Counters tallies = new Counters();
+      return new BandCheck(crossCheck(c, m, splats, tallies, tier, points, band[0], band[1]), tallies);
+    });
+  }
+
+  private static BandCheck awaitCheck(Future<BandCheck> check) {
+    try {
+      return check.get();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Image fusion interrupted", e);
+    } catch (ExecutionException e) {
+      if (e.getCause() instanceof RuntimeException r) throw r;
+      if (e.getCause() instanceof Error error) throw error;
+      throw new IllegalStateException(e.getCause());
+    }
+  }
+
   private Emission[][] crossCheck(int c, Merged m, Splat[] splats, Counters counters, int tier, double[] points, int y0, int y1) {
     int w = m.w, h = m.h, required = fusion.requiredViews();
     // p: image pixel (marks, local sigma, emission); q: pixel in m (rows from m.row0).
@@ -2127,6 +2218,8 @@ final class ImageFusion {
     int agreementRadius = agreementRadius(o);
     boolean consume = o.fusionStrategy.equals("owner-consume"), freeSpace = !o.fusionFreeSpace.equals("off"), strictFreeSpace = o.fusionFreeSpace.equals("strict");
     boolean graph = o.fusionStrategy.equals("graph-average");
+    // Read once: the option is fixed for the run (a string comparison per neighbour and pixel otherwise).
+    boolean edgeAware = DepthOutlierFilter.enabled(o);
     // Inverse-variance averaging along the ray: graph-average, or --fusion-precision-check (snap a
     // confirmed point onto the precise depths that confirmed it).
     boolean average = graph || precisionCheck;
@@ -2193,22 +2286,27 @@ final class ImageFusion {
           if (xj < 1 || yj < 1 || xj >= ow - 1 || yj >= oh - 1) continue;
           double zj = at(oa, yj * ow + xj);
           boolean preciseAgreement=false;
-          if(DepthOutlierFilter.enabled(o)) {
+          if(edgeAware) {
             // The merged map is one vote per camera. Source-pair cameras cannot independently
             // confirm their own mismatch. Uncertainty comes from the generating pair and the
             // other camera's merged inverse-variance weight, where available.
             int pair=data.pair;
             {
-              double low=Double.POSITIVE_INFINITY,high=0;int count=0;
+              // A third invalid depth leaves fewer than the 7 valid ones cameraVote requires: its
+              // first test then returns 0 whatever the rest of the window holds (it has no side
+              // effects), so the remaining reads and the call are skipped. Same vote.
+              double low=Double.POSITIVE_INFINITY,high=0;int count=0,invalid=0;
+              window:
               for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++) {
                 double z=at(oa, (yj+dy)*ow+xj+dx);
                 if(z>0){low=Math.min(low,z);high=Math.max(high,z);count++;}
+                else if(++invalid==3)break window;
               }
               double footprint=vj[2]/Math.min(oc.fx,oc.fy);
               double sourceSigma=vj[2]/Math.sqrt(Math.max(1e-30,m.wsum[q]))/mz;
               double weight=hasWeights?at(wa,yj*ow+xj):0;
               double otherSigma=weight>0?1/Math.sqrt(weight):footprint;
-              int vote=DepthOutlierFilter.cameraVote(vj[2],zj,low,high,count,
+              int vote=invalid>=3?0:DepthOutlierFilter.cameraVote(vj[2],zj,low,high,count,
                   sourceSigma,otherSigma,footprint,o.fusionRelative);
               preciseAgreement=vote==1;
               if(j!=fusion.pairCamera(pair,false) && j!=fusion.pairCamera(pair,true)) {
@@ -2263,11 +2361,11 @@ final class ImageFusion {
           }
           if (agrees && (m.partners.length == 0 || (m.partners[q * words + (j >>> 6)] & 1L << (j & 63)) == 0))
             outsideConfirm++;
-          if(agrees && DepthOutlierFilter.enabled(o) && !preciseAgreement)t[14]++;
+          if(agrees && edgeAware && !preciseAgreement)t[14]++;
           // Sigma agreement is already precise; the coherent-patch vote is only needed for the
           // relative band.
-          boolean averageAgreement=agrees&&(!DepthOutlierFilter.enabled(o)||preciseAgreement||sigmaTolerance);
-          if(averageAgreement&&DepthOutlierFilter.enabled(o)&&preciseAgreement){ax=xj;ay=yj;}
+          boolean averageAgreement=agrees&&(!edgeAware||preciseAgreement||sigmaTolerance);
+          if(averageAgreement&&edgeAware&&preciseAgreement){ax=xj;ay=yj;}
           if (averageAgreement && consume) {
             agreeAt[agreed] = (long) j << 42 | (long) ay << 21 | ax;
             agreeDepth[agreed++] = (float) vj[2];
@@ -2318,13 +2416,13 @@ final class ImageFusion {
         for (long word : views) viewCount += Long.bitCount(word);
         int needed = robust ? Math.max(1, (viewCount + 1) / 2) : 1;
         String status = "accepted";
-        if(DepthOutlierFilter.enabled(o)) {
+        if(edgeAware) {
           if(patchSuspect)t[11]++;
           if(DepthOutlierFilter.cameraReject(edgeSupport,edgeThrough))t[9]++;
           else if(edgeSupport>0)t[8]++;else t[10]++;
         }
         double sigma = 1 / Math.sqrt(Math.max(1e-30, m.wsum[q])) / mz;
-        if (DepthOutlierFilter.enabled(o) && DepthOutlierFilter.cameraReject(edgeSupport,edgeThrough)) status="free_space_rejected";
+        if (edgeAware && DepthOutlierFilter.cameraReject(edgeSupport,edgeThrough)) status="free_space_rejected";
         else if (patchSuspect && edgeSupport==0) {status="independent_support_rejected";t[12]++;}
         else if (contradictions >= needed) status = "visibility_contradiction_rejected";
         // Free space: cameras whose surface lies clearly behind this point (more than three

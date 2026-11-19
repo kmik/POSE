@@ -401,10 +401,16 @@ final class RegistrationRecovery {
       if (gps && members.size() >= MIN_MODEL_IMAGES)
         modelToGps = toGps(frames, members, enu, tracks, member);
       main.restore(frames, tracks);
+      // Last use of the set-aside copy: it is not kept through the merge bundle or next round.
+      main = null;
       if (log != null) log.stage = previousStage;
       List<Integer> fresh = new ArrayList<>(), shared = new ArrayList<>();
       for (int i : members) (inMain[i] ? shared : fresh).add(i);
-      if (members.size() < MIN_MODEL_IMAGES || fresh.isEmpty()) continue;
+      if (members.size() < MIN_MODEL_IMAGES || fresh.isEmpty()) {
+        model = null;
+        modelPoints = null;
+        continue;
+      }
       // Merge: through shared images, else through GPS.
       Fit fit = null;
       String via = null;
@@ -461,6 +467,8 @@ final class RegistrationRecovery {
             fresh.size(),
             fit == null ? "no usable shared images or GPS fit"
                 : String.format(Locale.ROOT, "%s fit RMS %.3g above %.3g", via, fit.rms(), limit));
+        model = null;
+        modelPoints = null;
         continue;
       }
       modelId++;
@@ -484,6 +492,9 @@ final class RegistrationRecovery {
           tracks.get(k).point = sim.apply(modelPoints[k]);
           points++;
         }
+      // The trial model's poses and points are merged: not kept through the merge bundle.
+      model = null;
+      modelPoints = null;
       System.out.printf(
           Locale.ROOT,
           "Registration recovery: model %d merged via %s (%d new images, %d shared, fit RMS %.3g,"

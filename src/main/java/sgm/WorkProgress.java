@@ -13,7 +13,10 @@ final class WorkProgress implements AutoCloseable {
             return t;
           });
   private final String label, units;
-  private final long total, started = System.nanoTime();
+  private final long started = System.nanoTime();
+  // Total work; a task may revise it (see total(long, boolean)). 0 = unknown.
+  private volatile long total;
+  private volatile boolean estimated, revised;
   private final RunTelemetry owner = RunTelemetry.current();
   private final ScheduledFuture<?> heartbeat;
   private volatile long count;
@@ -60,6 +63,21 @@ final class WorkProgress implements AutoCloseable {
     return count;
   }
 
+  /** True when the total is an estimate (shown with "~"). */
+  boolean estimated() {
+    return estimated;
+  }
+
+  /**
+   * Sets or revises the total (0 = unknown, no bar). A revised total is exact or an upper bound
+   * when estimated is false. On done() a revised total becomes the count actually reached.
+   */
+  void total(long total, boolean estimated) {
+    this.estimated = estimated && total > 0;
+    this.total = Math.max(0, total);
+    revised = true;
+  }
+
   String detailText() {
     return detail;
   }
@@ -78,18 +96,25 @@ final class WorkProgress implements AutoCloseable {
 
   void done() {
     detail = "";
+    if (revised) {
+      // An early stop or an estimate: report the work actually done.
+      total = count;
+      estimated = false;
+    }
     complete = true;
   }
 
   private synchronized void print(String state) {
     if (closed && state.equals("working")) return;
     double seconds = (System.nanoTime() - started) / 1e9;
+    long total = this.total;
     String amount =
         total > 0
             ? String.format(
                 Locale.ROOT,
-                "%,d/%,d %s (%.1f%%)",
+                "%,d/%s%,d %s (%.1f%%)",
                 count,
+                estimated ? "~" : "",
                 total,
                 units,
                 Math.min(100, 100. * count / total))

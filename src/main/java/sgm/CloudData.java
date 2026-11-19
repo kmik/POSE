@@ -28,10 +28,24 @@ final class CloudData {
   int n;
   long total;
   int stride = 1;
+  long[] originalIds = new long[0];
+  CloudSpatialIndex spatial;
+  CloudSourceIndex sourceIndex;
+  CloudDisplay.Box detailRegion;
+  long regionTotal;
+  Attribute attribute(String name) { for(Attribute a:attributes) if(a.name().equals(name))return a;return null; }
+  static void cancelled() throws java.io.InterruptedIOException {
+    if(Thread.currentThread().isInterrupted()) throw new java.io.InterruptedIOException("Viewer load cancelled");
+  }
+  long pointId(int i) { return originalIds.length>=n?originalIds[i]:(long)i*stride; }
+  static long budget(long requested,long memoryBytes,int attributes) {
+    long bytes=2L*(40+4L*attributes);
+    return Math.max(1,Math.min(requested,Math.max(1,memoryBytes/bytes)));
+  }
   float[] x = new float[0], y = new float[0], z = new float[0];
   int[] rgb = new int[0];
   byte[] cls = new byte[0];
-  final List<Attribute> attributes = new ArrayList<>();
+  final List<Attribute> attributes = new java.util.concurrent.CopyOnWriteArrayList<>();
   final List<Path> lasFiles = new ArrayList<>();
   // Sparse tie points.
   float[] sx = new float[0], sy = new float[0], sz = new float[0];
@@ -42,6 +56,16 @@ final class CloudData {
   final List<Cam> cameras = new ArrayList<>();
   double multiplier = 1;
   String crs;
+
+  /** Small context layer retained during local detail replacement. */
+  CloudData coarse(int budget) {
+    CloudData d=new CloudData();int step=Math.max(1,(n+budget-1)/budget);d.n=(n+step-1)/step;d.total=total;d.multiplier=multiplier;d.crs=crs;
+    System.arraycopy(origin,0,d.origin,0,3);d.lasFiles.addAll(lasFiles);d.sourceIndex=sourceIndex;
+    d.x=new float[d.n];d.y=new float[d.n];d.z=new float[d.n];d.rgb=new int[d.n];d.cls=new byte[d.n];d.originalIds=new long[d.n];
+    for(int i=0;i<d.n;i++){int k=i*step;d.x[i]=x[k];d.y[i]=y[k];d.z[i]=z[k];d.rgb[i]=rgb[k];d.cls[i]=cls[k];d.originalIds[i]=pointId(k);}
+    for(var a:attributes){float[] values=new float[d.n];for(int i=0;i<d.n;i++)values[i]=a.values()[i*step];d.attributes.add(new Attribute(a.name(),a.label(),values));}
+    return d;
+  }
 
   /** Dense clouds of a run: dense.las, else LAS tiles (07_results/**​/tile_*.las). */
   static List<Path> lasFiles(Path run) {
@@ -63,7 +87,12 @@ final class CloudData {
 
   /** Loads a run: the dense cloud with at most {@code budget} points, sparse points and cameras. */
   static CloudData load(Path run, long budget, Consumer<String> progress) throws IOException {
+    return load(run,budget,progress,null,null);
+  }
+  static CloudData load(Path run,long budget,Consumer<String> progress,CloudDisplay.Box region,CloudSourceIndex source) throws IOException {
+    cancelled();
     CloudData d = new CloudData();
+    d.detailRegion=region; d.sourceIndex=source;
     Object m = ProjectFiles.map(run.resolve("07_results/coordinates.json")).get("coordinate_multiplier");
     if (!(m instanceof Number mm && mm.doubleValue() > 0)) m = ProjectFiles.map(run.resolve("coordinates.json")).get("coordinate_multiplier");
     d.multiplier = m instanceof Number mm && mm.doubleValue() > 0 ? mm.doubleValue() : 1;
@@ -97,6 +126,8 @@ final class CloudData {
     for (Cam c : cams)
       d.cameras.add(new Cam(c.name, new double[] {c.center[0] - d.origin[0], c.center[1] - d.origin[1], c.center[2] - d.origin[2]}, c.r, c.fx, c.width, c.height, c.flag, c.rms));
     if (!d.lasFiles.isEmpty()) d.readLas(budget, progress);
+    cancelled();
+    if(d.n>50_000) d.spatial=new CloudSpatialIndex(d);
     return d;
   }
 
@@ -146,83 +177,107 @@ final class CloudData {
 
   /** Every stride-th record of the dense LAS file(s), at most budget points in all. */
   void readLas(long budget, Consumer<String> progress) throws IOException {
-    long count = 0;
-    for (Path f : lasFiles)
-      try (FileChannel ch = FileChannel.open(f, StandardOpenOption.READ)) {
-        ByteBuffer h = ByteBuffer.allocate(CloudWriter.HEADER_14).order(ByteOrder.LITTLE_ENDIAN);
-        ch.read(h, 0);
-        count += CloudWriter.lasPointCount(h);
-      }
-    total = count;
-    stride = (int) Math.max(1, (count + budget - 1) / Math.max(1, budget));
-    int capacity = (int) Math.min(Integer.MAX_VALUE - 8, (count + stride - 1) / stride + lasFiles.size());
-    x = new float[capacity];
-    y = new float[capacity];
-    z = new float[capacity];
-    rgb = new int[capacity];
-    cls = new byte[capacity];
-    List<Extra> layout = null;
-    float[][] extraValues = null;
-    long seen = 0;
-    for (Path f : lasFiles)
-      try (FileChannel ch = FileChannel.open(f, StandardOpenOption.READ)) {
-        ByteBuffer h = ByteBuffer.allocate(CloudWriter.HEADER_14).order(ByteOrder.LITTLE_ENDIAN);
-        ch.read(h, 0);
-        long dataOffset = h.getInt(96) & 0xffffffffL;
-        int format = h.get(104) & 255, recordLength = h.getShort(105) & 0xffff;
-        long points = CloudWriter.lasPointCount(h);
-        double[] scale = {h.getDouble(131), h.getDouble(139), h.getDouble(147)}, offset = {h.getDouble(155), h.getDouble(163), h.getDouble(171)};
-        int colour = format == 2 ? 20 : format == 3 ? 28 : format == 7 ? 30 : format == 8 ? 30 : -1;
-        int classAt = format >= 6 ? 16 : 15, base = format <= 5 ? new int[] {20, 28, 26, 34, 57, 63}[format] : new int[] {30, 36, 38, 59, 67}[Math.min(4, format - 6)];
-        if (layout == null) {
-          layout = extras(ch, h);
-          extraValues = new float[layout.size()][];
-          for (int k = 0; k < layout.size(); k++) if (useful(layout.get(k))) extraValues[k] = new float[capacity];
-        }
-        // Records through the shared LAS/LAZ reader (LasFile): the same raw layout either way.
-        byte[] raw = new byte[recordLength * 65536];
-        ByteBuffer block = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN);
-        LasFile.Reader reader = LasFile.open(f);
-        try {
-        for (long start = 0; start < points; start += 65536) {
-          int records = reader.read(raw, (int) Math.min(65536, points - start));
-          if (records <= 0) throw new EOFException(f.toString());
-          for (int r = 0; r < records; r++) {
-            long index = seen + start + r;
-            if (index % stride != 0 || n >= capacity) continue;
-            int p = r * recordLength;
-            x[n] = (float) (block.getInt(p) * scale[0] + offset[0] - origin[0]);
-            y[n] = (float) (block.getInt(p + 4) * scale[1] + offset[1] - origin[1]);
-            z[n] = (float) (block.getInt(p + 8) * scale[2] + offset[2] - origin[2]);
-            cls[n] = (byte) (format >= 6 ? block.get(p + classAt) : block.get(p + classAt) & 31);
-            if (colour >= 0)
-              rgb[n] = (block.getShort(p + colour) & 0xffff) >> 8 << 16 | (block.getShort(p + colour + 2) & 0xffff) >> 8 << 8 | (block.getShort(p + colour + 4) & 0xffff) >> 8;
-            else rgb[n] = 0xb0b0b0;
-            for (int k = 0; k < layout.size(); k++)
-              if (extraValues[k] != null) {
-                Extra e = layout.get(k);
-                int at = p + base + e.offset();
-                if (at + 4 > p + recordLength && e.type() == 9) continue;
-                extraValues[k][n] = switch (e.type()) {
-                  case 1 -> block.get(at) & 255;
-                  case 3 -> block.getShort(at) & 0xffff;
-                  case 9 -> block.getFloat(at);
-                  default -> Float.NaN;
-                };
-              }
-            n++;
+    cancelled();
+    long count=0;
+    List<Extra> layout=null;
+    for(Path f:lasFiles) try(FileChannel ch=FileChannel.open(f)) {
+      ByteBuffer h=header(ch);
+      count=Math.addExact(count,CloudWriter.lasPointCount(h));
+      List<Extra> e=extras(ch,h);
+      if(layout==null)layout=e;
+      else if(!layout.equals(e)) throw new IOException("LAS tiles have different attribute layouts");
+    }
+    total=count;
+    budget=budget(Math.min(budget,Integer.MAX_VALUE-8L),Math.max(1,Runtime.getRuntime().maxMemory()/3),layout==null?0:layout.size());
+    stride=(int)Math.min(Integer.MAX_VALUE,Math.max(1,(count+budget-1)/budget));
+    int capacity=(int)Math.min(budget,detailRegion==null?(count+stride-1)/stride:budget);
+    x=new float[capacity];y=new float[capacity];z=new float[capacity];rgb=new int[capacity];cls=new byte[capacity];originalIds=new long[capacity];
+    if(layout==null)layout=List.of();
+    float[][] extraValues=new float[layout.size()][];
+    for(int k=0;k<layout.size();k++) if(useful(layout.get(k))) {
+      extraValues[k]=new float[capacity];Arrays.fill(extraValues[k],Float.NaN);
+    }
+    boolean build=sourceIndex==null || !sourceIndex.valid(lasFiles);
+    if(build)sourceIndex=new CloudSourceIndex(lasFiles);
+    Map<Path,List<CloudSourceIndex.Block>> selected=new HashMap<>();
+    if(!build && detailRegion!=null)
+      for(var b:sourceIndex.query(detailRegion.shift(origin[0],origin[1],origin[2])))
+        selected.computeIfAbsent(b.file(),key->new ArrayList<>()).add(b);
+    long seen=0,processed=0,eligible=0;Random random=new Random(0x504f5345);
+    for(Path f:lasFiles) try(FileChannel ch=FileChannel.open(f)) {
+      ByteBuffer h=header(ch);
+      long offset=h.getInt(96)&0xffffffffL,points=CloudWriter.lasPointCount(h);
+      int format=h.get(104)&63,len=h.getShort(105)&65535;
+      if(format>10 || (h.get(104)&192)!=0) throw new IOException("Unsupported or compressed LAS point format: "+f);
+      int colour=format==2?20:format==3||format==5?28:format==7||format==8||format==10?30:-1;
+      int base=format<=5?new int[]{20,28,26,34,57,63}[format]:new int[]{30,36,38,59,67}[format-6];
+      if(len<base)throw new IOException("Invalid LAS record length: "+f);
+      double[] scale={h.getDouble(131),h.getDouble(139),h.getDouble(147)},off={h.getDouble(155),h.getDouble(163),h.getDouble(171)};
+      List<CloudSourceIndex.Block> blocks=new ArrayList<>();
+      if(!build && detailRegion!=null) blocks=selected.getOrDefault(f,List.of());
+      else for(long at=0;at<points;at+=65536)blocks.add(new CloudSourceIndex.Block(f,at,(int)Math.min(65536,points-at),seen+at,null));
+      ByteBuffer b=ByteBuffer.allocate(len*65536).order(ByteOrder.LITTLE_ENDIAN);
+      for(var block:blocks) {
+        cancelled();int records=block.count();b.clear().limit(len*records);
+        long at=offset+block.start()*len;
+        while(b.hasRemaining()) {int got=ch.read(b,at+b.position());if(got<0)throw new EOFException(f.toString());}
+        double[] min={Double.POSITIVE_INFINITY,Double.POSITIVE_INFINITY,Double.POSITIVE_INFINITY},max={Double.NEGATIVE_INFINITY,Double.NEGATIVE_INFINITY,Double.NEGATIVE_INFINITY};
+        for(int r=0;r<records;r++) {
+          int pos=r*len;long id=seen+block.start()+r;
+          double wx=b.getInt(pos)*scale[0]+off[0],wy=b.getInt(pos+4)*scale[1]+off[1],wz=b.getInt(pos+8)*scale[2]+off[2];
+          if(!Double.isFinite(wx)||!Double.isFinite(wy)||!Double.isFinite(wz))continue;
+          min[0]=Math.min(min[0],wx);min[1]=Math.min(min[1],wy);min[2]=Math.min(min[2],wz);
+          max[0]=Math.max(max[0],wx);max[1]=Math.max(max[1],wy);max[2]=Math.max(max[2],wz);
+          int slot;
+          if(detailRegion==null) {if(id%stride!=0 || n>=capacity)continue;slot=n++;}
+          else {
+            if(!detailRegion.contains(wx-origin[0],wy-origin[1],wz-origin[2]))continue;
+            eligible++;
+            long pick=eligible<=capacity?n:random.nextLong(eligible);
+            if(pick>=capacity)continue;
+            slot=(int)pick;if(n<capacity)n++;
           }
-          if (progress != null && (start / 65536) % 64 == 0)
-            progress.accept(String.format(Locale.ROOT, "Reading %s: %.0f%%", f.getFileName(), 100.0 * (seen + start) / Math.max(1, total)));
+          x[slot]=(float)(wx-origin[0]);y[slot]=(float)(wy-origin[1]);z[slot]=(float)(wz-origin[2]);originalIds[slot]=id;
+          cls[slot]=(byte)(format>=6?b.get(pos+16):b.get(pos+15)&31);
+          rgb[slot]=colour<0?0xb0b0b0:(b.getShort(pos+colour)&65535)>>8<<16 | (b.getShort(pos+colour+2)&65535)>>8<<8 | (b.getShort(pos+colour+4)&65535)>>8;
+          for(int k=0;k<layout.size();k++) if(extraValues[k]!=null) {
+            Extra e=layout.get(k);int o=pos+base+e.offset();
+            int bytes=e.type()==1?1:e.type()==3?2:4;
+            if(o+bytes>pos+len)throw new IOException("LAS attribute exceeds record: "+e.name());
+            extraValues[k][slot]=switch(e.type()){case 1->b.get(o)&255;case 3->b.getShort(o)&65535;case 9->b.getFloat(o);default->Float.NaN;};
+          }
         }
-        } finally {
-          reader.close();
-        }
-        seen += points;
+        if(build && min[0]!=Double.POSITIVE_INFINITY)sourceIndex.blocks.add(new CloudSourceIndex.Block(f,block.start(),records,block.firstId(),new CloudDisplay.Box(min[0],min[1],min[2],max[0],max[1],max[2])));
+        processed+=records;
+        if(progress!=null && (processed&0xfffff)<65536)progress.accept(String.format(Locale.ROOT,"Reading %s: %,d source points; %,d displayed",f.getFileName(),processed,n));
       }
-    if (layout != null)
-      for (int k = 0; k < layout.size(); k++)
-        if (extraValues[k] != null) attributes.add(new Attribute(layout.get(k).name(), label(layout.get(k).name()), extraValues[k]));
+      seen+=points;
+    }
+    if(!sourceIndex.valid(lasFiles))throw new IOException("Cloud files changed while loading; reload the viewer");
+    if(build)sourceIndex.finish();
+    for(int k=0;k<layout.size();k++)if(extraValues[k]!=null)attributes.add(new Attribute(layout.get(k).name(),label(layout.get(k).name()),extraValues[k]));
+    regionTotal=detailRegion==null?total:eligible;
+    if(detailRegion!=null && n>1)sortSamples(0,n-1);
+  }
+  private static ByteBuffer header(FileChannel ch) throws IOException {
+    ByteBuffer b=ByteBuffer.allocate(CloudWriter.HEADER_14).order(ByteOrder.LITTLE_ENDIAN);
+    while(b.hasRemaining()) {int n=ch.read(b,b.position());if(n<0)break;}
+    if(b.position()<CloudWriter.HEADER_12 || b.get(0)!='L'||b.get(1)!='A'||b.get(2)!='S'||b.get(3)!='F')throw new IOException("Invalid LAS header");
+    return b;
+  }
+  private void sortSamples(int lo,int hi) {
+    int i=lo,j=hi;long pivot=originalIds[(lo+hi)>>>1];
+    while(i<=j) {
+      while(originalIds[i]<pivot)i++;while(originalIds[j]>pivot)j--;
+      if(i<=j) {swap(i,j);i++;j--;}
+    }
+    if(lo<j)sortSamples(lo,j);if(i<hi)sortSamples(i,hi);
+  }
+  private void swap(int a,int b) {
+    long id=originalIds[a];originalIds[a]=originalIds[b];originalIds[b]=id;
+    int c=rgb[a];rgb[a]=rgb[b];rgb[b]=c;byte cl=cls[a];cls[a]=cls[b];cls[b]=cl;
+    float v=x[a];x[a]=x[b];x[b]=v;v=y[a];y[a]=y[b];y[b]=v;v=z[a];z[a]=z[b];z[b]=v;
+    for(Attribute at:attributes){v=at.values()[a];at.values()[a]=at.values()[b];at.values()[b]=v;}
   }
 
   // Lidar reference of a lidar-referenced run (--lidar-reference), drawn as its own layer.
@@ -283,6 +338,7 @@ final class CloudData {
         byte[] b = new byte[rl * 65536];
         long done = 0;
         for (int k; (k = r.read(b, 65536)) > 0; ) {
+          cancelled();
           for (int j = 0; j < k; j++) {
             int o = j * rl;
             double px = h.x(LasFile.rawX(b, o)), py = h.y(LasFile.rawY(b, o));
@@ -332,21 +388,8 @@ final class CloudData {
   boolean loadConfidence(Path run, Consumer<String> progress) throws IOException {
     Path file = run.resolve("07_results/point-confidence.bin");
     if (!Files.isRegularFile(file) || lasFiles.size() != 1) return false;
-    float[] views = new float[n], confidence = new float[n];
-    Arrays.fill(views, Float.NaN);
-    Arrays.fill(confidence, Float.NaN);
-    try (PointRecords.Reader reader = new PointRecords.Reader(file)) {
-      long i = 0;
-      for (PointRecords.Row row; (row = reader.next()) != null; i++) {
-        long id = row.id();
-        if (id % stride != 0) continue;
-        long k = id / stride;
-        if (k >= n) continue;
-        views[(int) k] = row.sample().views;
-        confidence[(int) k] = (float) row.score();
-        if (progress != null && (i & 0xfffff) == 0) progress.accept(String.format(Locale.ROOT, "Reading point confidence: %.0f%%", 100.0 * i / Math.max(1, total)));
-      }
-    }
+    float[][] values=CloudPointMetadata.samples(file,originalIds,n);
+    float[] views=values[0],confidence=values[1];
     attributes.removeIf(a -> a.name().equals("views") || a.name().equals("confidence"));
     attributes.add(new Attribute("views", label("views"), views));
     attributes.add(new Attribute("confidence", label("confidence"), confidence));
@@ -359,6 +402,7 @@ final class CloudData {
     try (BufferedReader r = Files.newBufferedReader(file)) {
       String line = r.readLine();
       while ((line = r.readLine()) != null) {
+        cancelled();
         String[] c = line.split(",");
         if (c.length < 3) continue;
         try {
@@ -410,7 +454,7 @@ final class CloudData {
     int step = Math.max(1, n / 200_000);
     float[] s = new float[(n + step - 1) / step];
     int m = 0;
-    for (int i = 0; i < n; i += step) if (!Float.isNaN(v[i])) s[m++] = v[i];
+    for (int i = 0; i < n; i += step) if (Float.isFinite(v[i])) s[m++] = v[i];
     if (m == 0) return 0;
     Arrays.sort(s, 0, m);
     return s[(int) Math.min(m - 1, Math.max(0, Math.round(q * (m - 1))))];
