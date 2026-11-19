@@ -43,6 +43,35 @@ final class AdaptiveCalibrationRegression {
           && Collections.disjoint(split.train(), split.second())
           && Collections.disjoint(split.first(), split.second()), "Calibration folds do not leak tracks");
       SharedCalibration lens = new SharedCalibration(frames);
+      // Held-out scoring with gross mismatches (a large block before tie-point cleanup): the
+      // unweighted RMS is dominated by them, the capped score still sees the lens correction.
+      List<FeatureTracks.Track> scored = new ArrayList<>();
+      for (var t : split.first()) if (t.point != null) scored.add(t);
+      int clean = scored.size();
+      for (int i = 0; i < clean / 4; i++) {
+        FeatureTracks.Track bad = new FeatureTracks.Track();
+        bad.id = -1 - i;
+        var a = scored.get(i).observations.get(0);
+        var b = scored.get((i + clean / 2) % clean).observations.get(1);
+        bad.observations.add(a);
+        bad.observations.add(b);
+        bad.point = scored.get(i).point.clone();
+        scored.add(bad);
+      }
+      double[] start = lens.heldOutRms(frames, scored, -1);
+      check(start[1] == lens.validationRms(frames, scored),
+          "The unweighted held-out score is the existing validation RMS");
+      double[] startValues = lens.values.clone();
+      lens.values[1] = -.10;
+      double[] corrected = lens.heldOutRms(frames, scored, -1);
+      lens.values = startValues;
+      System.out.println("HELD-OUT SCORE: start " + Arrays.toString(start) + " corrected " + Arrays.toString(corrected));
+      check(corrected[2] == start[2], "The gate is fixed at the starting model");
+      check(corrected[0] < start[0] * .995 && start[0] - corrected[0] > .002,
+          "The true lens passes the capped held-out test despite 20% gross mismatches");
+      check((start[0] - corrected[0]) / start[0] > 2 * (start[1] - corrected[1]) / start[1],
+          "Capping makes the relative lens gain visible behind gross mismatches");
+      check(lens.heldOutRms(frames, scored, -1)[0] == start[0], "The capped score is repeatable");
       frames.get(0).camera.fixed = true;
       lens.active[0] = true;
       lens.adaptivePriors = true;
@@ -129,6 +158,16 @@ final class AdaptiveCalibrationRegression {
       check(!SharedCalibration.enabled(o), "Explicit no-self-calibration remains disabled");
       check(!SharedCalibration.validationEvidence(.01, .005, 100, .35),
           "Tiny noise-level improvements do not justify another parameter");
+      check(lens.options == o, "The lens reads the run options");
+      check(!lens.relaxed() && !lens.heldOutImproved(1, .996, 1, .9)
+          && lens.heldOutImproved(1, .99, 1, .99), "strict: both held-out groups improve by 0.5%");
+      o.calibrationAcceptance = "relaxed";
+      check(lens.relaxed() && lens.heldOutImproved(1, 1, 1, .999) && lens.heldOutImproved(1, .996, 1, .9),
+          "relaxed: neither held-out group may get worse");
+      check(!lens.heldOutImproved(1, 1.0001, 1, .5) && !lens.heldOutImproved(1, .5, 1, 1.0001)
+          && !lens.heldOutImproved(1, Double.POSITIVE_INFINITY, 1, .5)
+          && !lens.heldOutImproved(1, .5, 1, Double.NaN), "relaxed: a worse or invalid group rejects");
+      o.calibrationAcceptance = "strict";
     } finally {
       for (var f : frames) f.close();
     }

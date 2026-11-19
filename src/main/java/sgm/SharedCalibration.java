@@ -39,6 +39,14 @@ final class SharedCalibration {
   // GPS-weighted adjustment priors: log focal (NaN = none) per group with log sigma; readout sigma (s).
   final double[] focalPriors;
   double focalPriorSigma = .03, readoutSigma = .1;
+  /**
+   * Held-out residual gate (squared pixels) per held-out set and camera scope, fixed at the
+   * first score of that set (the starting model). Lens model selection scores capped squared
+   * residuals so mismatched tie points do not dominate the comparison.
+   */
+  private final Map<List<?>, Map<Integer, Double>> heldOutGates = new IdentityHashMap<>();
+  /** Gate: GATE_MEDIAN_FACTOR times the median squared residual, at least GATE_FLOOR_PIXELS. */
+  static final double GATE_MEDIAN_FACTOR = 10, GATE_FLOOR_PIXELS = 4;
 
   SharedCalibration(List<ImageFrame> frames) {
     options = frames.get(0).options;
@@ -679,7 +687,9 @@ final class SharedCalibration {
     Path diagnostics = report.getParent().resolve("calibration_diagnostics");
     if (lens.options.diagnostics)
       CalibrationDiagnostics.residuals(diagnostics, "initial", lens, frames, train, held, second);
-    double initialRms = lens.validationRms(frames, held);
+    double[] initialScore = lens.heldOutRms(frames, held, -1),
+        initialSecondScore = lens.heldOutRms(frames, second, -1);
+    double initialRms = initialScore[0];
     boolean[] retained = new boolean[lens.size()];
     int skippedUnchanged = 0;
     List<Object> cameraSections = new ArrayList<>();
@@ -728,9 +738,12 @@ final class SharedCalibration {
           continue;
         }
       }
-      double currentRms = multiple ? lens.validationRms(frames, held, false, scope) : initialRms,
-          currentSecondRms = lens.validationRms(frames, second, false, scope);
+      double[] currentScore = multiple ? lens.heldOutRms(frames, held, scope) : initialScore,
+          currentSecondScore = multiple ? lens.heldOutRms(frames, second, scope) : initialSecondScore;
+      double currentRms = currentScore[0], currentSecondRms = currentSecondScore[0];
       section.put("initial_validation_rms_pixels", currentRms);
+      section.put("initial_unweighted_validation_rms_pixels", currentScore[1]);
+      section.put("held_out_gate_pixels", new double[] {currentScore[2], currentSecondScore[2]});
       int modelVersion = 0;
       int[] triedVersion = new int[LENS];
       Arrays.fill(triedVersion, -1);
@@ -787,24 +800,28 @@ final class SharedCalibration {
           else
             BundleAdjuster.optimizeTrial(
                 frames, train, iterations, huber, trialAnchor, trialScale, lens);
-          double after = lens.validationRms(frames, held, false, scope);
-          double secondAfter = lens.validationRms(frames, second, false, scope);
+          double[] afterScore = lens.heldOutRms(frames, held, scope),
+              secondAfterScore = lens.heldOutRms(frames, second, scope);
+          double after = afterScore[0];
+          double secondAfter = secondAfterScore[0];
           double proposalAfter = after, proposalSecondAfter = secondAfter;
           double proposalNoise = Math.max(.35, Math.max(after, secondAfter));
           // Spend a full convergence solve only on a promising, bounded short proposal.
           // Acceptance is always reassessed after this solve, including both holdouts and
           // data-only observability. Held-out tracks still never fit poses or intrinsics.
           boolean polished = o.calibrationTrialIterations > 0 && lens.physical()
-              && after < before * .995 && before - after > .002
-              && secondAfter < secondBefore * .995 && secondBefore - secondAfter > .002
+              && lens.heldOutImproved(before, after, secondBefore, secondAfter)
               && lens.withinPriorBounds()
-              && validationEvidence(before, after, firstObservations, proposalNoise)
-              && validationEvidence(secondBefore, secondAfter, secondObservations, proposalNoise);
+              && (lens.relaxed()
+                  || validationEvidence(before, after, firstObservations, proposalNoise)
+                      && validationEvidence(secondBefore, secondAfter, secondObservations, proposalNoise));
           if (polished) {
             BundleAdjuster.optimizeImpl(frames, train, Math.max(12, iterations), huber,
                 null, trialAnchor, trialScale, lens);
-            after = lens.validationRms(frames, held, false, scope);
-            secondAfter = lens.validationRms(frames, second, false, scope);
+            afterScore = lens.heldOutRms(frames, held, scope);
+            secondAfterScore = lens.heldOutRms(frames, second, scope);
+            after = afterScore[0];
+            secondAfter = secondAfterScore[0];
           }
           if (lens.options.diagnostics)
             CalibrationDiagnostics.residuals(
@@ -812,15 +829,12 @@ final class SharedCalibration {
                 (multiple ? CameraGroups.safe(lens.id(g)) + "-" : "") + "sweep-" + sweep + "-" + NAMES[parameter],
                 lens, frames, train, held, second);
           boolean improvement =
-              lens.physical()
-                  && Double.isFinite(after)
-                  && after < before * .995
-                  && before - after > .002
-                  && secondAfter < secondBefore * .995
-                  && secondBefore - secondAfter > .002;
+              lens.physical() && lens.heldOutImproved(before, after, secondBefore, secondAfter);
           double noise = Math.max(.35, Math.max(after, secondAfter));
-          boolean evidenceGain = validationEvidence(before, after, firstObservations, noise)
-              && validationEvidence(secondBefore, secondAfter, secondObservations, noise);
+          // relaxed: no complexity penalty; the parameter's change must be significant instead.
+          boolean evidenceGain = lens.relaxed()
+              || validationEvidence(before, after, firstObservations, noise)
+                  && validationEvidence(secondBefore, secondAfter, secondObservations, noise);
           boolean bounded = lens.withinPriorBounds();
           CalibrationObservability.Assessment assessment =
               improvement && evidenceGain && bounded && Double.isFinite(noise)
@@ -830,7 +844,10 @@ final class SharedCalibration {
           double[][] covariance = assessment.covariance();
           double[] uncertainty = assessment.sigma();
           boolean constrained = lens.constrained(uncertainty, coverage);
-          boolean accept = improvement && evidenceGain && constrained && bounded;
+          Double changeSigma = uncertainty == null || !(uncertainty[k] > 0) ? null
+              : Math.abs(lens.values[k] - beforeLens[k]) / uncertainty[k];
+          boolean significant = !lens.relaxed() || changeSigma != null && changeSigma >= 3;
+          boolean accept = improvement && evidenceGain && constrained && bounded && significant;
           Integer trialBudget = null;
           if (o.calibrationTrialIterations > 0) trialBudget = o.calibrationTrialIterations;
           else if (o.bundleIterationsExplicit) trialBudget = Math.max(12, iterations);
@@ -863,6 +880,8 @@ final class SharedCalibration {
                   secondBefore,
                   "second_validation_rms_after_pixels",
                   secondAfter,
+                  "unweighted_validation_rms_after_pixels",
+                  new double[] {afterScore[1], secondAfterScore[1]},
                   "pixel_correction_uncertainty",
                   CalibrationDiagnostics.correctionUncertainty(lens, covariance, coverage[g], g),
                   "candidate",
@@ -882,7 +901,10 @@ final class SharedCalibration {
                       : !constrained ? assessment.covariance() == null ? assessment.reason()
                           : "Data uncertainty or parameter-specific image coverage is insufficient"
                       : improvement && !evidenceGain ? "Withheld-track improvement does not justify additional model complexity"
+                      : improvement && !significant ? "Parameter changed by less than three data-only standard deviations"
+                      : lens.relaxed() ? "Retained preceding calibration; a withheld-track group got worse"
                       : "Retained preceding calibration; insufficient withheld-track improvement");
+          if (lens.relaxed()) stage.put("change_in_standard_deviations", changeSigma);
           if (multiple) stage.put("camera", lens.id(g));
           stages.add(stage);
           if (accept) {
@@ -930,8 +952,8 @@ final class SharedCalibration {
         double[][] before = new double[groupCount][], after = new double[groupCount][];
         for (int g = 0; g < groupCount; g++) {
           int scope = multiple ? g : -1;
-          before[g] = new double[] {lens.validationRms(frames, full.first(), false, scope),
-              lens.validationRms(frames, full.second(), false, scope)};
+          before[g] = new double[] {lens.heldOutScore(frames, full.first(), scope),
+              lens.heldOutScore(frames, full.second(), scope)};
         }
         lens.values = chosen;
         System.arraycopy(retained, 0, lens.active, 0, lens.size());
@@ -939,9 +961,12 @@ final class SharedCalibration {
         boolean keep = lens.physical();
         for (int g = 0; g < groupCount; g++) {
           int scope = multiple ? g : -1;
-          after[g] = new double[] {lens.validationRms(frames, full.first(), false, scope),
-              lens.validationRms(frames, full.second(), false, scope)};
-          if (changedGroup[g] && !(after[g][0] < before[g][0] && after[g][1] < before[g][1])) keep = false;
+          after[g] = new double[] {lens.heldOutScore(frames, full.first(), scope),
+              lens.heldOutScore(frames, full.second(), scope)};
+          boolean better = lens.relaxed()
+              ? after[g][0] <= before[g][0] && after[g][1] <= before[g][1]
+              : after[g][0] < before[g][0] && after[g][1] < before[g][1];
+          if (changedGroup[g] && !better) keep = false;
         }
         wholeBlock = Json.object(
             "accepted", keep,
@@ -952,7 +977,7 @@ final class SharedCalibration {
             "second_validation_rms_before_pixels", before[0][1],
             "second_validation_rms_after_pixels", after[0][1],
             "elapsed_seconds", (System.nanoTime() - started) / 1e9,
-            "rule", "the subset's model, fitted once to the whole block, must lower both held-out"
+            "rule", "the subset's model, fitted once to the whole block, must " + (lens.relaxed() ? "not raise" : "lower") + " both held-out"
                 + " RMS values of the whole block (of every changed camera)");
         if (multiple) {
           List<Object> perCamera = new ArrayList<>();
@@ -1059,7 +1084,10 @@ final class SharedCalibration {
             split.coverage(),
             "validation_policy",
             "Two disjoint spatially stratified holdouts; neither fits poses or intrinsics. Both"
-                + " must improve by 0.5% and 0.002 processed pixels. Focal trials selected by"
+                + " must improve by 0.5% and 0.002 processed pixels. Scores are capped RMS: each"
+                + " squared residual is capped at a gate fixed from the starting model (10 times the"
+                + " median squared residual, at least 4 px), so gross mismatches count the same before"
+                + " and after; unweighted RMS is reported alongside. Focal trials selected by"
                 + " combined holdout RMS; these sets perform model selection and are not an"
                 + " independent accuracy test.",
             "second_held_out_tracks",
@@ -1074,6 +1102,10 @@ final class SharedCalibration {
             coverage[0],
             "initial_validation_rms_pixels",
             initialRms,
+            "initial_unweighted_validation_rms_pixels",
+            new double[] {initialScore[1], initialSecondScore[1]},
+            "held_out_gate_pixels",
+            new double[] {initialScore[2], initialSecondScore[2]},
             "calibration",
             lens.calibrationValues(0),
             "stages",
@@ -1091,6 +1123,11 @@ final class SharedCalibration {
               + " observations. Top-level calibration and coverage describe the first camera.");
       out.put("cameras", cameraSections);
     }
+    if (lens.relaxed())
+      out.put("acceptance", Json.object("mode", "relaxed",
+          "rule", "neither held-out group may get worse (capped RMS) and every fitted parameter must"
+              + " have moved by at least three data-only standard deviations; no complexity penalty;"
+              + " observability, coverage, prior bound and physical checks as in strict"));
     if (!method.equals("full")) {
       out.put("trial_method", method);
       out.put("block_registered_views", blockViews);
@@ -1200,8 +1237,10 @@ final class SharedCalibration {
       double[] beforeLens = lens.values.clone();
       lens.setActive(retained, base, set);
       BundleAdjuster.optimizeImpl(frames, train, Math.max(12, iterations), huber, null, anchor, scaleCamera, lens);
-      double after = lens.validationRms(frames, held, false, scope);
-      double secondAfter = lens.validationRms(frames, second, false, scope);
+      double[] afterScore = lens.heldOutRms(frames, held, scope),
+          secondAfterScore = lens.heldOutRms(frames, second, scope);
+      double after = afterScore[0];
+      double secondAfter = secondAfterScore[0];
       double fitNoise = Math.max(.35, Math.max(after, secondAfter));
       CalibrationObservability.Assessment assessment = lens.physical()
           ? assess(frames, assessTracks, huber, lens, fitNoise, subset)
@@ -1215,16 +1254,18 @@ final class SharedCalibration {
           zScores.add(Json.object("parameter", NAMES[p], "change_in_standard_deviations", z));
           if (z >= 3) significant.add(p);
         }
-      boolean improvement = lens.physical() && Double.isFinite(after)
-          && after < currentRms * .995 && currentRms - after > .002
-          && secondAfter < currentSecondRms * .995 && currentSecondRms - secondAfter > .002;
-      // Complexity penalty per fitted parameter (one trial adds one parameter).
-      boolean evidenceGain = validationEvidence(currentRms, after, firstObservations, fitNoise, set.size())
-          && validationEvidence(currentSecondRms, secondAfter, secondObservations, fitNoise, set.size());
+      boolean improvement = lens.physical()
+          && lens.heldOutImproved(currentRms, after, currentSecondRms, secondAfter);
+      // Complexity penalty per fitted parameter (one trial adds one parameter); relaxed relies on
+      // the three-sigma elimination instead.
+      boolean evidenceGain = lens.relaxed()
+          || validationEvidence(currentRms, after, firstObservations, fitNoise, set.size())
+              && validationEvidence(currentSecondRms, secondAfter, secondObservations, fitNoise, set.size());
       boolean bounded = lens.withinPriorBounds();
       boolean constrained = lens.constrained(sigma, coverage);
       boolean eliminate = !eliminated && sigma != null && significant.size() < set.size();
-      boolean accept = !eliminate && improvement && evidenceGain && bounded && constrained;
+      boolean allSignificant = !lens.relaxed() || sigma != null && significant.size() == set.size();
+      boolean accept = !eliminate && improvement && evidenceGain && bounded && constrained && allSignificant;
       List<String> names = new ArrayList<>();
       for (int p : set) names.add(NAMES[p]);
       Map<String, Object> stage = Json.object(
@@ -1239,15 +1280,17 @@ final class SharedCalibration {
           "validation_rms_after_pixels", after,
           "second_validation_rms_before_pixels", currentSecondRms,
           "second_validation_rms_after_pixels", secondAfter,
+          "unweighted_validation_rms_after_pixels", new double[] {afterScore[1], secondAfterScore[1]},
           "candidate", lens.calibrationValues(g),
           "data_only_standard_deviations", sigma,
           "validation_complexity_gain_passed", evidenceGain,
           "observability", assessment.reason(),
           "reason", accept ? "Withheld-track improvement and data-supported, significant bounded parameters"
               : eliminate ? "Parameters changed by less than three standard deviations are dropped; the rest refitted"
-              : !improvement ? "Insufficient withheld-track improvement"
+              : !improvement ? (lens.relaxed() ? "A withheld-track group got worse" : "Insufficient withheld-track improvement")
               : !evidenceGain ? "Withheld-track improvement does not justify the number of parameters"
               : !bounded ? "A parameter exceeds four prior standard deviations"
+              : !allSignificant ? "A parameter changed by less than three standard deviations after the refit"
               : "Data uncertainty or image coverage is insufficient after the fit");
       if (multiple) stage.put("camera", lens.id(g));
       stages.add(stage);
@@ -1357,7 +1400,7 @@ final class SharedCalibration {
         restore(frames, tracks, original, originalPoints);
         BundleAdjuster.optimizeTrial(
             frames, train, iterations, huber, anchor, scaleCamera, this);
-        double score = validationRms(frames, first, false, scope) + validationRms(frames, second, false, scope);
+        double score = heldOutScore(frames, first, scope) + heldOutScore(frames, second, scope);
         if (physical() && score < bestScore) {
           bestScore = score;
           bestLens = values.clone();
@@ -1451,6 +1494,73 @@ final class SharedCalibration {
       begin = end;
     }
     return Math.sqrt(sum / Math.max(1, n));
+  }
+
+  /**
+   * Lens model-selection score of a held-out set: {capped RMS, plain RMS, gate in pixels}.
+   * Squared residuals are capped at a gate fixed at this set's first score (the starting model),
+   * so a gross mismatch counts the same before and after a trial and the comparison measures the
+   * inliers, like the robust training cost. Plain RMS is validationRms (same order, same sum).
+   */
+  double[] heldOutRms(List<ImageFrame> frames, List<FeatureTracks.Track> held, int scope) {
+    double[] errors = new double[1024];
+    int n = 0;
+    for (int begin = 0; begin < held.size(); ) {
+      int end = BundleAdjuster.linearizationBatchEnd(held, begin, BundleAdjuster.linearizationObservationLimit(options, true));
+      final int first = begin, size = end - begin;
+      double[][] residuals = new double[size][];
+      int chunks = Math.min(Math.max(1, options.cores), Math.max(1, size));
+      BundleAdjuster.parallel(chunks, chunk -> {
+        int from = (int) ((long) size * chunk / chunks);
+        int to = (int) ((long) size * (chunk + 1) / chunks);
+        for (int i = from; i < to; i++) residuals[i] = validationTrack(frames, held.get(first + i), false, scope);
+      });
+      for (double[] row : residuals) if (row != null)
+        for (double error : row) {
+          if (n == errors.length) errors = Arrays.copyOf(errors, n * 2);
+          errors[n++] = error;
+        }
+      begin = end;
+    }
+    Map<Integer, Double> byScope = heldOutGates.computeIfAbsent(held, k -> new HashMap<>());
+    Double gate = byScope.get(scope);
+    if (gate == null) {
+      double[] sorted = Arrays.copyOf(errors, n);
+      Arrays.sort(sorted);
+      double median = n == 0 ? 0 : n % 2 == 1 ? sorted[n / 2] : .5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+      gate = Double.isFinite(median)
+          ? Math.max(GATE_MEDIAN_FACTOR * median, GATE_FLOOR_PIXELS * GATE_FLOOR_PIXELS)
+          : Double.POSITIVE_INFINITY;
+      byScope.put(scope, gate);
+    }
+    double capped = 0, plain = 0;
+    for (int i = 0; i < n; i++) {
+      plain += errors[i];
+      capped += Math.min(errors[i], gate);
+    }
+    int count = Math.max(1, n);
+    return new double[] {Math.sqrt(capped / count), Math.sqrt(plain / count), Math.sqrt(gate)};
+  }
+
+  /** --calibration-acceptance relaxed (alignment lens only). */
+  boolean relaxed() {
+    return "relaxed".equals(options.calibrationAcceptance);
+  }
+
+  /**
+   * Held-out test of a lens fit. strict: both groups improve by 0.5% and 0.002 px; relaxed:
+   * neither group gets worse (the parameters must then be significant, checked by the caller).
+   */
+  boolean heldOutImproved(double before, double after, double secondBefore, double secondAfter) {
+    if (!Double.isFinite(after)) return false;
+    if (relaxed()) return Double.isFinite(secondAfter) && after <= before && secondAfter <= secondBefore;
+    return after < before * .995 && before - after > .002
+        && secondAfter < secondBefore * .995 && secondBefore - secondAfter > .002;
+  }
+
+  /** The capped held-out RMS of heldOutRms. */
+  double heldOutScore(List<ImageFrame> frames, List<FeatureTracks.Track> held, int scope) {
+    return heldOutRms(frames, held, scope)[0];
   }
 
   private double[] validationTrack(

@@ -161,6 +161,9 @@ public final class Options {
   // --calibration-trial-method full|subset|joint and --calibration-trial-cameras N (0 = auto):
   // see SharedCalibration.refine and CalibrationSubset.
   public String calibrationTrialMethod = "full";
+  // --calibration-acceptance strict|relaxed (alignment lens only): relaxed accepts a fit that
+  // leaves both held-out groups no worse and moves each fitted parameter by >= 3 sigma.
+  public String calibrationAcceptance = "strict";
   public int calibrationTrialCameras;
   public double fusionSigmaK = 3, fusionSeedMinAngle = 0, fusionLocalSigma = 0;
   public int step = 2, cores = Math.max(1, Runtime.getRuntime().availableProcessors() / 2);
@@ -764,6 +767,10 @@ public final class Options {
         case "--calibration-trial-method":
           o.calibrationTrialMethod = v.toLowerCase(Locale.ROOT);
           choice(o.calibrationTrialMethod, "--calibration-trial-method", "full", "subset", "joint");
+          break;
+        case "--calibration-acceptance":
+          o.calibrationAcceptance = v.toLowerCase(Locale.ROOT);
+          choice(o.calibrationAcceptance, "--calibration-acceptance", "strict", "relaxed");
           break;
         case "--calibration-trial-cameras":
           o.calibrationTrialCameras = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
@@ -2577,6 +2584,14 @@ Feature matching and final bundle adjustment:
   --calibration-trial-cameras auto|N
       Cameras in the subset of --calibration-trial-method subset|joint (default auto:
       100), at most what the support check accepts (about 120 for one camera model).
+  --calibration-acceptance strict|relaxed
+      How a lens fit after alignment is accepted (not the GPS-weighted adjustment).
+      strict (default): both held-out track groups must improve by 0.5% and 0.002 px,
+      by more than a complexity penalty per parameter. relaxed: neither held-out group
+      may get worse, and every fitted parameter must have moved by at least three
+      data-only standard deviations. Both keep the observability, image coverage, prior
+      bound and physical lens checks. Held-out scores cap each squared residual at a
+      gate fixed from the starting lens, so gross mismatches do not decide.
 
 Dense stereo / SGM:
   --disparities N

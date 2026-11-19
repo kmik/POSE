@@ -99,6 +99,7 @@ final class GuiOptions {
           new Field("--min-views", "Minimum views per point", PROCESSING, Kind.TEXT, List.of()),
           new Field("--quick-calibration", "Quick calibration", PROCESSING, Kind.FLAG, List.of()),
           new Field("--calibration-trial-method", "Calibration trials", PROCESSING, Kind.CHOICE, List.of("", "full", "subset", "joint")),
+          new Field("--calibration-acceptance", "Calibration acceptance", PROCESSING, Kind.CHOICE, List.of("", "strict", "relaxed")),
           new Field("--tie-point-cleanup", "Tie-point cleanup", PROCESSING, Kind.CHOICE, List.of("", "off", "auto", "custom", "pause")),
           new Field("--tie-point-max-error", "   Largest error (px)", PROCESSING, Kind.SUGGEST, List.of("", "auto")),
           new Field("--tie-point-min-views", "   Fewest images", PROCESSING, Kind.TEXT, List.of()),

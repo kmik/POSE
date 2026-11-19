@@ -889,6 +889,7 @@ final class ReuseCache {
     // Only a non-default trial method enters the key, so existing cache entries stay valid.
     if (!o.calibrationTrialMethod.equals("full"))
       b.append("trialMethod=").append(o.calibrationTrialMethod).append(",cameras=").append(o.calibrationTrialCameras);
+    if (!o.calibrationAcceptance.equals("strict")) b.append("acceptance=").append(o.calibrationAcceptance);
     if (o.poses != null) b.append(hash(o.poses));
     for (var e : o.calibrationPoses.entrySet())
       b.append(e.getKey())
@@ -949,6 +950,7 @@ final class ReuseCache {
     // Only a non-default trial method enters the key, so existing cache entries stay valid.
     if (!o.calibrationTrialMethod.equals("full"))
       b.append("trialMethod=").append(o.calibrationTrialMethod).append(",cameras=").append(o.calibrationTrialCameras);
+    if (!o.calibrationAcceptance.equals("strict")) b.append("acceptance=").append(o.calibrationAcceptance);
     if (o.poses != null) b.append(hash(o.poses));
     String key = key(b.toString());
     Path artifacts = o.output.resolve("01_calibration");

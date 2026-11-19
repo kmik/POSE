@@ -107,6 +107,10 @@ final class MultiCameraRegression {
     check(Options.parse(new String[] {"-i", in, "-o", out, "--calibration-trial-cameras", "auto"}).calibrationTrialCameras == 0, "Subset size auto");
     rejects(() -> Options.parse(new String[] {"-i", in, "-o", out, "--calibration-trial-method", "fast"}), "Unknown trial method rejected");
     rejects(() -> Options.parse(new String[] {"-i", in, "-o", out, "--calibration-trial-cameras", "2"}), "Too small subset rejected");
+    check(d.calibrationAcceptance.equals("strict")
+        && Options.parse(new String[] {"-i", in, "-o", out, "--calibration-acceptance", "Relaxed"})
+            .calibrationAcceptance.equals("relaxed"), "Calibration acceptance: strict default, relaxed parsed");
+    rejects(() -> Options.parse(new String[] {"-i", in, "-o", out, "--calibration-acceptance", "loose"}), "Unknown acceptance rejected");
     check(CalibrationSubset.limit(1) == 125 && CalibrationSubset.size(0, 1) == 100 && CalibrationSubset.size(500, 1) == 125
             && CalibrationSubset.size(500, 3) == (768 - 39) / 6,
         "Subset size: default 100, bounded by the observability limit per camera count");
