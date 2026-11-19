@@ -16,8 +16,10 @@ final class CalibrationObservability {
 
   static Assessment assess(List<ImageFrame> frames, List<FeatureTracks.Track> tracks,
       double huber, SharedCalibration lens, double noise) {
-    var data = BundleAdjuster.calibrationDataInformation(frames, tracks, huber, lens);
-    if (data == null) return new Assessment(null, 0, "Singular structure or observability workspace limit");
+    var data = BundleAdjuster.calibrationDataAssessment(frames, tracks, huber, lens);
+    if (data.failure() != null) return new Assessment(null, 0, data.failure());
+    String excluded = data.excludedTracks() == 0 ? ""
+        : "; " + data.excludedTracks() + " degenerate tracks (rays not intersecting) left out";
     double[] h = data.matrix();
     int n = (int) Math.round(Math.sqrt(h.length)), cameras = n - lens.size();
     int[] keys = java.util.stream.IntStream.range(0, lens.size())
@@ -72,7 +74,7 @@ final class CalibrationObservability {
         for (int k = 0; k < m; k++) v += e.vectors[k * m + i] * e.vectors[k * m + j] / e.values[k];
         covariance[keys[i]][keys[j]] = noise * noise * v / (scale[i] * scale[j]);
       }
-    return new Assessment(covariance, minimum, "Data-only local information; conditional on retained fixed parameters");
+    return new Assessment(covariance, minimum, "Data-only local information; conditional on retained fixed parameters" + excluded);
   }
 
   private record Eigen(double[] values, double[] vectors) {}

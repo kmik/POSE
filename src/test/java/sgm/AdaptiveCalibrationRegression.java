@@ -57,6 +57,25 @@ final class AdaptiveCalibrationRegression {
       System.out.println("RADIAL INFORMATION: " + radial);
       check(radial.covariance() != null,
           "The same two cameras have data information for radial distortion");
+      // A tie point behind both cameras (before the post-bundle cleanup, possible on a large
+      // block) has no usable observation: its undamped point block is singular. It is left out
+      // instead of failing the whole assessment.
+      FeatureTracks.Track behind = new FeatureTracks.Track();
+      behind.id = tracks.size();
+      for (var t : tracks)
+        if (t.point != null && t.observations.size() >= 2) {
+          behind.observations.addAll(t.observations);
+          break;
+        }
+      behind.point = new double[] {0, 0, -50};
+      tracks.add(behind);
+      var robust = CalibrationObservability.assess(frames, tracks, 2, lens, .35);
+      check(robust.covariance() != null && robust.reason().contains("1 degenerate tracks"),
+          "A singular tie point is left out of the assessment: " + robust.reason());
+      for (int k = 0; k < radial.sigma().length; k++)
+        check(Math.abs(robust.sigma()[k] - radial.sigma()[k]) <= 1e-9 * Math.max(1, Math.abs(radial.sigma()[k])),
+            "Leaving out the degenerate track keeps the information of the others");
+      tracks.remove(behind);
       Geometry.triangulateTracks(frames, tracks, 8);
       double baseline = Math3.norm(frames.get(1).camera.center());
       BundleAdjuster.optimize(frames, tracks, 25, 2, null, 0, 1);

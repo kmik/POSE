@@ -38,6 +38,8 @@ final class GpsAdjustment {
     final double[] dt;
     final double[][] lever;
     final boolean[] timeFree, leverFree;
+    /** Free terms whose estimate ran beyond its bound and were fixed at zero (see fitModel). */
+    final List<String> dropped = new ArrayList<>();
 
     Model() {
       this(1);
@@ -285,12 +287,13 @@ final class GpsAdjustment {
           }
       }
       double objective;
+      List<Object> fits = new ArrayList<>();
       try (WorkProgress work =
           WorkProgress.start(
               String.format(Locale.ROOT, "GPS-weighted adjustment (focal start %.0f px)", currentFocal * factor),
               o.gpsAdjustmentRounds,
               "rounds")) {
-        objective = rounds(frames, tracks, o, controls, lens, m, anchor, scale, work);
+        objective = rounds(frames, tracks, o, controls, lens, m, anchor, scale, work, fits);
       }
       boolean physical = lens == null || lens.physical();
       Map<String, Object> trialReport =
@@ -301,7 +304,11 @@ final class GpsAdjustment {
               "focal_pixels", lens == null ? currentFocal : Math.exp(lens.values[0]),
               "time_offset_seconds", groups == 1 ? m.dt[0] : m.dt,
               "lever_arm_camera_metres", groups == 1 ? m.lever[0] : m.lever,
-              "rolling_shutter_readout_seconds", lens == null ? 0 : lens.values[8]);
+              "rolling_shutter_readout_seconds", lens == null ? 0 : lens.values[8],
+              "reprojection_rms_pixels", reprojectionRms(frames, tracks, lens),
+              "gps_rms_metres", gpsRms(frames, controls, m),
+              "bundle_rounds", fits);
+      if (!m.dropped.isEmpty()) trialReport.put("dropped_terms", new ArrayList<>(m.dropped));
       if (groups > 1 && lens != null) {
         double[] focals = new double[groups];
         for (int g = 0; g < groups; g++) focals[g] = Math.exp(lens.values[g * SharedCalibration.SIZE]);
@@ -348,26 +355,69 @@ final class GpsAdjustment {
       // may legitimately grow a little while the block converges; blow-ups are rejected.
       accepted = rmsAfter <= rmsBefore * 1.15 + .05 && gpsAfter <= similarityRms * 1.5 + .5;
     }
+    String rejected = null;
+    if (!accepted)
+      rejected = String.format(Locale.ROOT,
+          "extended adjustment rejected (reprojection RMS %.3f -> %.3f px, GPS RMS %.3f -> %.3f m)",
+          rmsBefore, rmsAfter, similarityRms, gpsAfter);
+    // The antenna (time offset, lever arm) and rolling-shutter terms can fail on their own (for
+    // example a time offset fitted to inconsistent velocities); the lens alone is then still
+    // worth refitting before falling back to poses only.
+    boolean beyondLens = start.model().anyFree() || start.model().anyNonzero() || shutterFree || shutterFixed != 0;
+    if (!accepted && !lensParameters.isEmpty() && beyondLens) {
+      restore(frames, tracks, start, null);
+      Model m = new Model(groups);
+      SharedCalibration lens = new SharedCalibration(frames);
+      for (int g = 0; g < groups; g++) {
+        if (!groupFree[g]) continue;
+        for (int k : lensParameters) lens.active[g * SharedCalibration.SIZE + k] = true;
+        if (Double.isFinite(focalPriors[g])) {
+          lens.focalPriors[g] = Math.log(focalPriors[g]);
+          lens.focalPriorSigma = o.gpsFocalSigma;
+        }
+      }
+      List<Object> fits = new ArrayList<>();
+      double objective;
+      try (WorkProgress work = WorkProgress.start("GPS-weighted adjustment (lens only)", o.gpsAdjustmentRounds, "rounds")) {
+        objective = rounds(frames, tracks, o, controls, lens, m, anchor, scale, work, fits);
+      }
+      boolean physical = lens.physical();
+      double rms = reprojectionRms(frames, tracks, lens), gps = gpsRms(frames, controls, m);
+      boolean ok = physical && rms <= rmsBefore * 1.15 + .05 && gps <= similarityRms * 1.5 + .5;
+      trials.add(Json.object(
+          "model", "lens only (no time offset, lever arm or rolling shutter)",
+          "objective", objective,
+          "physical", physical,
+          "focal_pixels", Math.exp(lens.values[0]),
+          "reprojection_rms_pixels", rms,
+          "gps_rms_metres", gps,
+          "accepted", ok,
+          "bundle_rounds", fits));
+      if (ok) {
+        accepted = true;
+        model = m;
+        bestLens = lens;
+        rmsAfter = rms;
+        gpsAfter = gps;
+        notes.add(rejected + "; lens-only GPS adjustment applied (no time offset or lever arm)");
+      } else
+        rejected += String.format(Locale.ROOT,
+            "; lens-only adjustment rejected too (physical %s, reprojection RMS %.3f px, GPS RMS %.3f m)",
+            physical, rms, gps);
+    }
     if (!accepted) {
       // Fall back to the plain G1 adjustment: poses only, no antenna model.
-      notes.add(
-          String.format(
-              Locale.ROOT,
-              "extended adjustment rejected (reprojection RMS %.3f -> %.3f px, GPS RMS %.3f -> %.3f"
-                  + " m); poses-only GPS adjustment applied",
-              rmsBefore,
-              rmsAfter,
-              similarityRms,
-              gpsAfter));
+      notes.add(rejected + "; poses-only GPS adjustment applied");
       restore(frames, tracks, start, null);
       model = new Model(groups);
       bestLens = null;
       try (WorkProgress work = WorkProgress.start("GPS-weighted adjustment (poses only)", 1, "rounds")) {
-        rounds(frames, tracks, o, controls, null, model, anchor, scale, work);
+        rounds(frames, tracks, o, controls, null, model, anchor, scale, work, null);
       }
       rmsAfter = reprojectionRms(frames, tracks, null);
       gpsAfter = gpsRms(frames, controls, model);
     }
+    notes.addAll(model.dropped);
     Calibration before = frames.get(0).calibration, result = before;
     double focalBefore = start.calibrations()[frames.get(0).id].fx;
     double[] focalsBefore = new double[groups];
@@ -530,7 +580,8 @@ final class GpsAdjustment {
       Model model,
       int anchor,
       int scale,
-      WorkProgress work)
+      WorkProgress work,
+      List<Object> fits)
       throws IOException {
     int rounds = lens == null && !model.anyFree() ? 1 : o.gpsAdjustmentRounds;
     try {
@@ -542,7 +593,16 @@ final class GpsAdjustment {
         double[][] lever = new double[model.groups()][];
         for (int g = 0; g < lever.length; g++) lever[g] = model.lever[g].clone();
         double[] shift = fitModel(frames, tracks, controls, model, o);
-        if (lens != null) toLens(model, lens);
+        if (lens != null) {
+          // A term fitModel dropped leaves the shared block too.
+          for (int g = 0; g < model.groups(); g++) {
+            int b = g * SharedCalibration.SIZE;
+            if (!model.timeFree[g]) lens.active[b + SharedCalibration.TIME] = false;
+            if (!model.leverFree[g])
+              for (int k = 0; k < 3; k++) lens.active[b + SharedCalibration.LEVER + k] = false;
+          }
+          toLens(model, lens);
+        }
         references(frames, controls, model, lens, o);
         BundleAdjuster.optimizeImpl(
             frames,
@@ -553,6 +613,12 @@ final class GpsAdjustment {
             anchor,
             scale,
             lens);
+        if (fits != null && BundleAdjuster.LAST_FIT.get() != null) {
+          Map<String, Object> fit = BundleAdjuster.LAST_FIT.get().json();
+          fit.put("round", round + 1);
+          fit.put("time_offset_seconds_linear_fit", model.groups() == 1 ? model.dt[0] : model.dt);
+          fits.add(fit);
+        }
         if (lens != null) fromLens(lens, model);
         if (work != null) work.update(round + 1);
         if (round > 0 && converged(model, dt, lever) && Math3.norm(shift) < 1e-3) break;
@@ -625,7 +691,32 @@ final class GpsAdjustment {
     }
     double[] x = Math3.solve(a, b);
     if (x == null) return new double[3];
-    // Bounded: a runaway estimate means the motion data cannot support the model.
+    // A runaway estimate (beyond 2 s or 2 m) means the motion data cannot support that term. It
+    // is fixed at zero and the fit repeated. Clamping it at the bound instead froze the whole
+    // GPS bundle: every step moving the term further was unphysical (SharedCalibration.physical),
+    // so no step, lens included, was ever accepted.
+    boolean drop = false;
+    for (int g = 0; g < groups; g++) {
+      int t = 3 + 4 * g;
+      String camera = groups == 1 ? "" : " (camera group " + g + ")";
+      if (model.timeFree[g] && !(Math.abs(x[t]) <= 2)) {
+        model.timeFree[g] = false;
+        model.dt[g] = 0;
+        model.dropped.add(String.format(Locale.ROOT,
+            "GPS time offset%s not modelled: estimate %.2f s beyond the 2 s bound", camera, x[t]));
+        drop = true;
+      }
+      if (model.leverFree[g]
+          && !(Math.abs(x[t + 1]) <= 2 && Math.abs(x[t + 2]) <= 2 && Math.abs(x[t + 3]) <= 2)) {
+        model.leverFree[g] = false;
+        model.lever[g] = new double[3];
+        model.dropped.add(String.format(Locale.ROOT,
+            "GPS lever arm%s not modelled: estimate (%.2f, %.2f, %.2f) m beyond the 2 m bound",
+            camera, x[t + 1], x[t + 2], x[t + 3]));
+        drop = true;
+      }
+    }
+    if (drop) return fitModel(frames, tracks, controls, model, o);
     for (int g = 0; g < groups; g++) {
       int t = 3 + 4 * g;
       if (model.timeFree[g]) model.dt[g] = Math.max(-2, Math.min(2, x[t]));
@@ -953,6 +1044,7 @@ final class GpsAdjustment {
       out.timeFree[g] = m.timeFree[g];
       out.leverFree[g] = m.leverFree[g];
     }
+    out.dropped.addAll(m.dropped);
     return out;
   }
 

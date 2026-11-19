@@ -191,6 +191,10 @@ final class BundleAdjuster {
     // This fit's reusable systems and scratch: one undamped system refilled each iteration, one
     // damped trial system refilled each trial. Dropped when the fit returns or throws.
     Workspace workspace = new Workspace();
+    FitStats stats = new FitStats();
+    stats.cameras = count;
+    stats.objectiveBefore = before;
+    LAST_FIT.set(stats);
     // Progress display only: a fixed budget is an exact upper bound; a converging fit gets an
     // estimate from its recent gains (newest first), refreshed every iteration.
     if (!converge) work.total(limit, false);
@@ -216,6 +220,12 @@ final class BundleAdjuster {
                 + system.points()
                 + " point blocks");
         Result result = system.solve();
+        stats.trials++;
+        if (result == null) stats.failedSolves++;
+        else {
+          stats.lastMethod = result.method;
+          stats.lastRelative = result.relative;
+        }
         work.detail(
             "iteration "
                 + (iteration + 1)
@@ -292,9 +302,13 @@ final class BundleAdjuster {
         lambda = Math.min(1e12, lambda * 10);
       }
       if (!accepted) {
+        stats.stop = "no improving step (" + stats.failedSolves + " of " + stats.trials
+            + " linear solves failed)";
         System.out.println("Bundle: no improving joint step; stopping.");
         break;
       }
+      stats.acceptedIterations++;
+      stats.objectiveAfter = after;
       if (project != null) project.data.bundle(iteration + 1, before, after, frames, tracks);
       System.out.printf(
           Locale.ROOT,
@@ -575,6 +589,28 @@ final class BundleAdjuster {
 
   /** Result of one linear solve. x is always a new array owned by the caller (never scratch). */
   private record Result(double[] x, int iterations, double relative, String method) {}
+
+  /** What the last fit of this thread did (diagnostics only; never read by the solve). */
+  static final class FitStats {
+    int cameras, trials, failedSolves, acceptedIterations;
+    double objectiveBefore = Double.NaN, objectiveAfter = Double.NaN, lastRelative = Double.NaN;
+    String lastMethod = "none", stop = "iteration limit or converged";
+
+    Map<String, Object> json() {
+      return Json.object(
+          "variable_cameras", cameras,
+          "accepted_iterations", acceptedIterations,
+          "linear_solve_trials", trials,
+          "failed_linear_solves", failedSolves,
+          "last_linear_method", lastMethod,
+          "last_relative_linear_residual", Double.isFinite(lastRelative) ? lastRelative : null,
+          "objective_before", Double.isFinite(objectiveBefore) ? objectiveBefore : null,
+          "objective_after", Double.isFinite(objectiveAfter) ? objectiveAfter : null,
+          "stop", stop);
+    }
+  }
+
+  static final ThreadLocal<FitStats> LAST_FIT = new ThreadLocal<>();
 
   /** log2 of the points (or edges) per storage page: 8192 by default; tests may lower it. */
   private static int pageShift() {
@@ -1117,9 +1153,35 @@ final class BundleAdjuster {
 
   /** Undamped observation information, with lens priors excluded. Points are eliminated exactly;
    * the caller must marginalize the remaining camera freedoms, including the scale nullspace. */
-  record CalibrationInformation(double[] matrix, double[] observationDiagonal) {}
+  /**
+   * matrix/observationDiagonal are null when the assessment failed; failure then says why.
+   * excludedTracks: degenerate tracks left out after a singular point block (0 normally).
+   */
+  record CalibrationInformation(double[] matrix, double[] observationDiagonal, int excludedTracks, String failure) {
+    CalibrationInformation(double[] matrix, double[] observationDiagonal) {
+      this(matrix, observationDiagonal, 0, null);
+    }
+  }
 
+  /** Smallest ray angle (radians) a track keeps in the degenerate-track retry below. */
+  static final double ASSESSMENT_MIN_RAY_ANGLE = 1e-3;
+
+  /** The information, or null when it cannot be formed (see {@link #calibrationDataAssessment}). */
   static CalibrationInformation calibrationDataInformation(
+      List<ImageFrame> frames, List<FeatureTracks.Track> tracks, double huber,
+      SharedCalibration lens) {
+    var info = calibrationDataAssessment(frames, tracks, huber, lens);
+    return info.failure() == null ? info : null;
+  }
+
+  /**
+   * Undamped lens/camera information. Without damping, one tie point whose rays do not intersect
+   * (fewer than two observations in front of registered cameras, or parallel rays: possible
+   * before the post-bundle cleanup on a large block) has a singular 3 x 3 block, which made the
+   * whole assessment fail. Such a failure is retried once without the degenerate tracks; a
+   * successful first attempt is unchanged.
+   */
+  static CalibrationInformation calibrationDataAssessment(
       List<ImageFrame> frames, List<FeatureTracks.Track> tracks, double huber,
       SharedCalibration lens) {
     int[] index = new int[frames.size()];
@@ -1129,23 +1191,75 @@ final class BundleAdjuster {
     int n = count * 6 + lens.size();
     // Keep the same bounded workspace as the bundle solver. Unsupported oversized assessments
     // retain the previous calibration instead of substituting a damped/prior-driven certificate.
-    if (n > CalibrationSubset.OBSERVABILITY_UNKNOWNS || 8L * n * n > frames.get(0).options.memoryMb * 1048576L / 16) return null;
+    if (n > CalibrationSubset.OBSERVABILITY_UNKNOWNS)
+      return new CalibrationInformation(null, null, 0, "Observability workspace limit: " + count
+          + " free cameras (" + n + " unknowns > " + CalibrationSubset.OBSERVABILITY_UNKNOWNS + ")");
+    if (8L * n * n > frames.get(0).options.memoryMb * 1048576L / 16)
+      return new CalibrationInformation(null, null, 0, "Observability workspace exceeds the memory budget");
     boolean before = lens.dataOnly;
     lens.dataOnly = true;
     try {
-      // A stand-alone system: the returned reduced matrix is never refilled after this.
-      Damped system = linearize(frames, tracks, index, count, huber, 0, lens);
-      double[] diagonal = new double[n];
-      for (int c = 0; c < count; c++)
-        for (int k = 0; k < 6; k++) diagonal[c * 6 + k] = system.cameraNormal[c][k * 6 + k];
-      for (int k = 0; k < lens.size(); k++)
-        diagonal[count * 6 + k] = system.lensNormal[k * lens.size() + k];
-      return new CalibrationInformation(system.reducedMatrix(n), diagonal);
-    } catch (IllegalStateException singularPoint) {
-      return null;
+      try {
+        return information(frames, tracks, index, count, n, huber, lens, 0);
+      } catch (IllegalStateException singularPoint) {
+        List<FeatureTracks.Track> usable = new ArrayList<>(tracks.size());
+        double[] q = new double[3];
+        for (FeatureTracks.Track t : tracks)
+          if (t.point != null && intersecting(frames, t, lens, q)) usable.add(t);
+        int excluded = (int) tracks.stream().filter(t -> t.point != null).count() - usable.size();
+        if (excluded == 0)
+          return new CalibrationInformation(null, null, 0, "Singular structure (no degenerate track found)");
+        try {
+          return information(frames, usable, index, count, n, huber, lens, excluded);
+        } catch (IllegalStateException again) {
+          return new CalibrationInformation(null, null, excluded,
+              "Singular structure after leaving out " + excluded + " degenerate tracks");
+        }
+      }
     } finally {
       lens.dataOnly = before;
     }
+  }
+
+  private static CalibrationInformation information(List<ImageFrame> frames,
+      List<FeatureTracks.Track> tracks, int[] index, int count, int n, double huber,
+      SharedCalibration lens, int excluded) {
+    // A stand-alone system: the returned reduced matrix is never refilled after this.
+    Damped system = linearize(frames, tracks, index, count, huber, 0, lens);
+    double[] diagonal = new double[n];
+    for (int c = 0; c < count; c++)
+      for (int k = 0; k < 6; k++) diagonal[c * 6 + k] = system.cameraNormal[c][k * 6 + k];
+    for (int k = 0; k < lens.size(); k++)
+      diagonal[count * 6 + k] = system.lensNormal[k * lens.size() + k];
+    return new CalibrationInformation(system.reducedMatrix(n), diagonal, excluded, null);
+  }
+
+  /**
+   * At least two observations in front of registered cameras (the depth test of the
+   * linearization) whose rays span at least {@link #ASSESSMENT_MIN_RAY_ANGLE}.
+   */
+  private static boolean intersecting(List<ImageFrame> frames, FeatureTracks.Track t,
+      SharedCalibration lens, double[] q) {
+    double[] first = null;
+    double minSin = Math.sin(ASSESSMENT_MIN_RAY_ANGLE);
+    for (FeatureTracks.Observation o : t.observations) {
+      ImageFrame f = frames.get(o.image);
+      if (!f.camera.registered) continue;
+      lens.viewInto(f, t.point, lens.observed[f.id][2 * o.feature + 1], q);
+      if (!(q[2] > 1e-8)) continue;
+      double[] ray = Math3.sub(t.point, f.camera.center());
+      double length = Math3.norm(ray);
+      if (!(length > 0)) continue;
+      ray = Math3.times(ray, 1 / length);
+      if (first == null) {
+        first = ray;
+        continue;
+      }
+      double[] cross = {first[1] * ray[2] - first[2] * ray[1], first[2] * ray[0] - first[0] * ray[2],
+          first[0] * ray[1] - first[1] * ray[0]};
+      if (Math3.norm(cross) >= minSin) return true;
+    }
+    return false;
   }
 
   /**
