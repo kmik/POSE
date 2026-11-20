@@ -1089,6 +1089,7 @@ final class MultiViewSgm {
 
   /** Rows [y0, y0 + h) x columns [x0, x0 + w) of a frame's gray image and valid mask. */
   static byte[][] region(ImageFrame f, int x0, int y0, int w, int h) throws IOException {
+    RasterCache.prefetch(f);
     synchronized (RasterCache.class) {
       RasterCache.pair(f, f);
       org.opencv.core.Mat g = f.gray.submat(y0, y0 + h, x0, x0 + w).clone(),
@@ -1573,6 +1574,7 @@ final class MultiViewSgm {
       }
       // Packed colour r << 16 | g << 8 | b (as fusion stores it), copied in bands of rows.
       int band = Math.max(1, (1 << 22) / Math.max(1, w));
+      RasterCache.prefetch(rf);
       for (int y0 = 0; y0 < h; y0 += band) {
         int y1 = Math.min(h, y0 + band);
         byte[] colors;
@@ -1661,6 +1663,7 @@ final class MultiViewSgm {
 
   /** Gray and valid mask of a frame (undistorted, processed size). */
   static byte[][] rasters(ImageFrame f) throws IOException {
+    RasterCache.prefetch(f);
     synchronized (RasterCache.class) {
       RasterCache.pair(f, f);
       byte[] mask;

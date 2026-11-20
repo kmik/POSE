@@ -8,6 +8,11 @@ final class RasterCache {
   private static final LinkedHashMap<ImageFrame, Long> resident =
       new LinkedHashMap<>(16, .75f, true);
   private static long used, peak;
+  // Frames being decoded outside the lock (prefetch, preload) and their bytes, not yet in `used`.
+  // Nobody else touches such a frame's rasters until it leaves this set (pair() waits for it).
+  private static final Set<ImageFrame> loading = new HashSet<>();
+  private static long reserved;
+  private static long prefetched;
 
   static long limit(Options o) {
     if (o.fusionHostMemoryMb > 0)
@@ -19,6 +24,7 @@ final class RasterCache {
   }
 
   static synchronized void pair(ImageFrame a, ImageFrame b) throws IOException {
+    awaitLoading(a, b);
     long wanted = a.rasterBytes() + (a == b ? 0 : b.rasterBytes()),
         limit = Math.min(limit(a.options), limit(b.options));
     if (wanted > limit)
@@ -29,16 +35,69 @@ final class RasterCache {
     long extra =
         (a.gray.empty() ? a.rasterBytes() : 0)
             + (a == b ? 0 : b.gray.empty() ? b.rasterBytes() : 0);
+    evict(extra, limit, a, b);
+    load(a);
+    if (a != b) load(b);
+  }
+
+  /** Releases least recently used frames (never a or b) until extra bytes fit the limit. Lock held. */
+  private static void evict(long extra, long limit, ImageFrame a, ImageFrame b) {
     var it = resident.entrySet().iterator();
-    while (used + extra > limit && it.hasNext()) {
+    while (used + reserved + extra > limit && it.hasNext()) {
       var e = it.next();
       if (e.getKey() == a || e.getKey() == b) continue;
       e.getKey().releaseRasters();
       used -= e.getValue();
       it.remove();
     }
-    load(a);
-    if (a != b) load(b);
+  }
+
+  /** Waits (releasing the lock) while another thread decodes a or b. Lock held. */
+  private static void awaitLoading(ImageFrame a, ImageFrame b) throws IOException {
+    while (loading.contains(a) || loading.contains(b)) {
+      try {
+        RasterCache.class.wait();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new InterruptedIOException("interrupted while waiting for an image decode");
+      }
+    }
+  }
+
+  /**
+   * Makes f's rasters resident, decoding them outside the cache lock, so other threads keep
+   * reading other resident frames meanwhile (several mvsgm cameras in flight read source regions
+   * through the lock). Decoding is deterministic, so the rasters equal those pair() loads; a frame
+   * evicted again before the caller's pair() is simply reloaded there.
+   */
+  static void prefetch(ImageFrame f) throws IOException {
+    if (!f.managedRasters) return;
+    long bytes = f.rasterBytes();
+    synchronized (RasterCache.class) {
+      awaitLoading(f, f);
+      if (!f.gray.empty() || bytes > limit(f.options)) return;
+      long limit = limit(f.options);
+      evict(bytes, limit, f, f);
+      // Other decodes in progress fill the budget: the caller's pair() loads under the lock.
+      if (used + reserved + bytes > limit) return;
+      loading.add(f);
+      reserved += bytes;
+    }
+    boolean ok = false;
+    try {
+      f.loadRasters();
+      ok = true;
+    } finally {
+      synchronized (RasterCache.class) {
+        loading.remove(f);
+        reserved -= bytes;
+        if (ok) {
+          load(f);
+          prefetched++;
+        }
+        RasterCache.class.notifyAll();
+      }
+    }
   }
 
   /**
@@ -48,16 +107,19 @@ final class RasterCache {
    */
   static int preload(List<ImageFrame> frames, int threads) throws IOException {
     List<ImageFrame> wanted = new ArrayList<>();
+    long budget = 0;
     synchronized (RasterCache.class) {
-      long budget = 0;
       for (ImageFrame f : frames) {
-        if (wanted.contains(f) || !f.gray.empty()) continue;
-        if (budget + used + f.rasterBytes() > limit(f.options)) break;
+        if (wanted.contains(f) || loading.contains(f) || !f.gray.empty()) continue;
+        if (budget + used + reserved + f.rasterBytes() > limit(f.options)) break;
         budget += f.rasterBytes();
         wanted.add(f);
       }
+      if (wanted.size() < 2 || threads < 2) return 0;
+      loading.addAll(wanted);
+      reserved += budget;
     }
-    if (wanted.size() < 2 || threads < 2) return 0;
+    boolean ok = false;
     var pool = java.util.concurrent.Executors.newFixedThreadPool(Math.min(threads, wanted.size()));
     try {
       List<java.util.concurrent.Future<?>> tasks = new ArrayList<>();
@@ -75,11 +137,26 @@ final class RasterCache {
           throw new IOException(e.getCause());
         }
       }
+      ok = true;
     } finally {
       pool.shutdown();
-    }
-    synchronized (RasterCache.class) {
-      for (ImageFrame f : wanted) load(f);
+      if (!ok) {
+        // Let running decodes end before their frames are released.
+        try {
+          pool.awaitTermination(1, java.util.concurrent.TimeUnit.HOURS);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
+      synchronized (RasterCache.class) {
+        loading.removeAll(wanted);
+        reserved -= budget;
+        for (ImageFrame f : wanted) {
+          if (ok) load(f);
+          else f.releaseRasters();
+        }
+        RasterCache.class.notifyAll();
+      }
     }
     return wanted.size();
   }
@@ -102,6 +179,11 @@ final class RasterCache {
 
   static synchronized long bytes() {
     return used;
+  }
+
+  /** Frames decoded by prefetch() (outside the lock) so far. */
+  static synchronized long prefetched() {
+    return prefetched;
   }
 
   static synchronized void clear() {

@@ -142,7 +142,69 @@ final class ImageResourceRegression {
           files.noneMatch(p -> p.getFileName().toString().startsWith("feature-descriptors-")),
           "Descriptor spools cleaned");
     }
+    concurrentRegions(root.resolve("concurrent"), c, w, h);
     return checks;
+  }
+
+  /**
+   * Several threads reading source regions of more frames than the cache holds (mvsgm cameras in
+   * flight): frames decode outside the cache lock (RasterCache.prefetch) while other frames are
+   * evicted and read; every region must equal the single-threaded result.
+   */
+  private static void concurrentRegions(Path root, Calibration c, int w, int h) throws Exception {
+    Files.createDirectories(root);
+    Options o = TestSupport.options();
+    o.output = root;
+    o.rectified = true;
+    o.imageMemoryMb = 2; // 4 B/px rectified: four frames of 431x277 fit, eight are used
+    o.memoryMb = 16;
+    int count = 8;
+    List<ImageFrame> frames = new ArrayList<>();
+    try {
+      for (int i = 0; i < count; i++) {
+        BufferedImage image = new BufferedImage(w, h, BufferedImage.TYPE_3BYTE_BGR);
+        for (int y = 0; y < h; y++)
+          for (int x = 0; x < w; x++)
+            image.setRGB(x, y, ((x * 31 + y * 7 + i * 37) & 255) << 16 | ((x * 11 + y * 19 + i * 5) & 255) << 8
+                | ((x * 17 + y * 43 + i * 101) & 255));
+        Path file = root.resolve("frame-" + i + ".tif");
+        check(ImageIO.write(image, "TIFF", file.toFile()), "TIFF fixture writer");
+        frames.add(new ImageFrame(i, file, c, o, true));
+      }
+      int[][] boxes = {{0, 0, w, h}, {13, 29, 101, 77}, {200, 150, 231, 127}, {5, 200, 64, 64}};
+      byte[][][][] expected = new byte[count][boxes.length][][];
+      for (int i = 0; i < count; i++)
+        for (int b = 0; b < boxes.length; b++)
+          expected[i][b] = MultiViewSgm.region(frames.get(i), boxes[b][0], boxes[b][1], boxes[b][2], boxes[b][3]);
+      check(!Arrays.equals(expected[0][0][0], expected[1][0][0]), "Frames differ (mix-ups are visible)");
+      long before = RasterCache.prefetched();
+      var pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+      try {
+        List<java.util.concurrent.Future<Boolean>> tasks = new ArrayList<>();
+        for (int t = 0; t < 8; t++) {
+          int seed = t;
+          tasks.add(pool.submit(() -> {
+            Random random = new Random(seed);
+            for (int k = 0; k < 150; k++) {
+              int i = random.nextInt(count), b = random.nextInt(boxes.length);
+              byte[][] got = MultiViewSgm.region(frames.get(i), boxes[b][0], boxes[b][1], boxes[b][2], boxes[b][3]);
+              if (!Arrays.equals(got[0], expected[i][b][0]) || !Arrays.equals(got[1], expected[i][b][1])) return false;
+              if (RasterCache.bytes() > 2 * 1048576) return false;
+            }
+            return true;
+          }));
+        }
+        boolean all = true;
+        for (var task : tasks) all &= task.get();
+        check(all, "Concurrent region reads equal single-threaded reads within the cache budget");
+      } finally {
+        pool.shutdown();
+      }
+      check(RasterCache.prefetched() > before, "Evicted frames were decoded outside the cache lock");
+    } finally {
+      for (ImageFrame f : frames) f.close();
+    }
+    check(RasterCache.bytes() == 0, "Concurrent run resources released");
   }
 
   public static void main(String[] args) throws Exception {

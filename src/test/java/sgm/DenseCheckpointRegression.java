@@ -87,7 +87,8 @@ final class DenseCheckpointRegression {
     a.output = b.output = run;
     check(a.denseCheckpoint.equals("auto"), "Checkpoints default to auto");
     check(DenseCheckpoint.fingerprint(a).equals(DenseCheckpoint.fingerprint(b)), "Fingerprint is repeatable");
-    Options resources = Options.parse(concat(base, "--cores", "3", "--memory-mb", "5000", "--mvsgm-cameras-in-flight", "2"));
+    Options resources = Options.parse(concat(base, "--cores", "3", "--memory-mb", "5000", "--mvsgm-cameras-in-flight", "2",
+        "--image-memory-mb", "20000"));
     resources.output = run;
     check(DenseCheckpoint.fingerprint(resources).equals(DenseCheckpoint.fingerprint(a)), "Resources may change on resume");
     Options setting = Options.parse(concat(base, "--mvsgm-neighbors", "5"));

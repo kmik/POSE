@@ -739,6 +739,8 @@ final class DenseReconstruction {
                             0,
                             "pixels")) {
                       PairPixels pixels;
+                      RasterCache.prefetch(a);
+                      RasterCache.prefetch(b);
                       synchronized (RasterCache.class) {
                         pixels =
                             new PairPixels(rectifyLocked(a, b, false, -1, false, false), options);

@@ -49,7 +49,7 @@ final class DenseCheckpoint {
   static final Set<String> RESOURCE_OPTIONS = Set.of(
       "output", "cores", "memoryMb", "denseCheckpoint", "imageFusionCacheMb", "streamedProcessing",
       "fusionSourceMaps", "surfaceMemoryMb", "estimateMemory", "processedImageCache", "cache",
-      "verbose", "mvsgmCamerasInFlight", "fusionHostCacheMb", "gpuMemoryMb");
+      "verbose", "mvsgmCamerasInFlight", "fusionHostCacheMb", "gpuMemoryMb", "imageMemoryMb");
 
   final Options o;
   final Path dir;
