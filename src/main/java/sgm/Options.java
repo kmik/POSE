@@ -202,6 +202,10 @@ public final class Options {
   double mvsgmConsistencyLabels = 1;
   /** --mvsgm-cameras-in-flight: cameras whose depth maps are computed at once (0 = auto; 1 = serial). */
   int mvsgmCamerasInFlight = 1;
+  /** --dense-checkpoint off|auto|MINUTES: resumable mvsgm overlap-window dense step (DenseCheckpoint). */
+  public String denseCheckpoint = "auto";
+  /** The open checkpoint of the running dense step (not an option). */
+  transient DenseCheckpoint checkpoint;
   /** Opt-in shared accounting allowance for overlap-window host work; zero preserves legacy. */
   public long fusionHostMemoryMb;
   public int fusionHostCacheMb = 512;
@@ -911,6 +915,11 @@ public final class Options {
           break;
         case "--mvsgm-cameras-in-flight":
           o.mvsgmCamerasInFlight = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
+          break;
+        case "--dense-checkpoint":
+          if (!v.equalsIgnoreCase("off") && !v.equalsIgnoreCase("auto") && !v.matches("[1-9][0-9]{0,5}"))
+            throw new IllegalArgumentException("--dense-checkpoint must be off, auto or minutes (1..999999)");
+          o.denseCheckpoint = v.toLowerCase(Locale.ROOT);
           break;
         case "--fusion-host-memory-mb":
           o.fusionHostMemoryMb = Long.parseLong(v);
@@ -2823,6 +2832,19 @@ Point filtering and multi-view fusion:
   --mvsgm-consistency-labels T
       mvsgm: agreement tolerance in the neighbour's inverse-depth label steps
       (about one pixel of image motion each; default 1).
+  --dense-checkpoint off|auto|MINUTES
+      mvsgm with overlap-window fusion: save a checkpoint every MINUTES (auto = 30)
+      between two fused cameras. If the dense step is interrupted (killed, server
+      restart, out of memory), run the same dense command on the same run again
+      (dense -o PROJECT --run ID): it continues after the last checkpoint with the
+      same result as an uninterrupted run. Live cameras' fused maps are kept under
+      06_fusion/checkpoint (hard links where possible) and depth maps retired after
+      a checkpoint are deleted at the next one, so temporary disk grows by up to one
+      interval's maps. A checkpoint is used only with the same options (resources
+      such as --cores and --memory-mb may change) and the same earlier steps;
+      otherwise dense starts over. Not with --fusion-seed-order precision,
+      --fusion-host-memory-mb, --voxel without surface consolidation, --fusion-emission camera
+      or --diagnostics. off deletes an earlier checkpoint.
   --mvsgm-cameras-in-flight N|auto
       mvsgm: compute the depth maps of N cameras at once (default 1 = one at a time;
       1..16). Each camera in flight prepares its neighbour images on the CPU and solves

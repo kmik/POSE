@@ -96,6 +96,7 @@ final class GuiOptions {
           new Field("--max-dimension", "Max image dimension (px)", PROCESSING, Kind.TEXT, List.of()),
           new Field("--dense-method", "Dense method", PROCESSING, Kind.CHOICE, List.of("", "sgm", "mvsgm", "patchmatch")),
           new Field("--filtering", "Filtering", PROCESSING, Kind.CHOICE, List.of("", "mild", "moderate", "aggressive")),
+          new Field("--dense-checkpoint", "Dense checkpoint (minutes)", PROCESSING, Kind.SUGGEST, List.of("", "auto", "off")),
           new Field("--min-views", "Minimum views per point", PROCESSING, Kind.TEXT, List.of()),
           new Field("--quick-calibration", "Quick calibration", PROCESSING, Kind.FLAG, List.of()),
           new Field("--calibration-trial-method", "Calibration trials", PROCESSING, Kind.CHOICE, List.of("", "full", "subset", "joint")),

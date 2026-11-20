@@ -145,6 +145,9 @@ final class DenseReconstruction {
           MultiViewSgm mvs = new MultiViewSgm(options);
           try {
             if (MvsgmWindow.enabled(options)) {
+              options.checkpoint = DenseCheckpoint.open(options);
+              if (options.checkpoint != null && options.checkpoint.resume() != null)
+                options.checkpoint.deleteStaleTemporaries(candidates);
               mvsgmWindow = new MvsgmWindow(mvs, frames, tracks, fusion, project);
               for (int k = 0; k < mvsgmWindow.planningStarts.length - 1; k++)
                 pairStarts.add(mvsgmWindow.planningStarts[k]);
@@ -336,6 +339,8 @@ final class DenseReconstruction {
             starts[k] = k < pairStarts.size() ? pairStarts.get(k) : count;
           ImageFusion.Counters c =
               ImageFusion.run(options, fusion, candidates, starts, output, twoViewDiagnostics, mvsgmMaps);
+          // Every camera is fused: an interruption from here on reruns dense from the start.
+          if (options.checkpoint != null) options.checkpoint.complete();
           if (mvsgmWindow != null) {
             count = mvsgmWindow.count();
             rawCandidates = count;

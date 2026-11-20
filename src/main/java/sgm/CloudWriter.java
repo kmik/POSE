@@ -114,14 +114,137 @@ public final class CloudWriter implements AutoCloseable {
     return lasRecordBytes + (ply ? plyRecordBytes : 0);
   }
 
-  private void open() throws IOException {
-    opened = true;
+  private void prepareVlrs() {
     byte[] projection = crs == null ? new byte[0] : projectionVlr(crs.epsg);
     byte[] extras = attributes ? extraVlr() : new byte[0];
     vlrs = new byte[projection.length + extras.length];
     System.arraycopy(projection, 0, vlrs, 0, projection.length);
     System.arraycopy(extras, 0, vlrs, projection.length, extras.length);
     vlrCount = (crs == null ? 0 : 1) + (attributes ? 1 : 0);
+  }
+
+  // ---- --dense-checkpoint: the cloud written so far, and continuing it after an interruption
+
+  /**
+   * Flushes every open file and returns their lengths and statistics: points written after this
+   * are cut off again by {@link #restore}. Tile streams are closed (reopened for appending).
+   */
+  Map<String, Object> checkpoint() throws IOException {
+    if (closed) throw new IOException("Cloud writer is closed");
+    List<Object> files = new ArrayList<>();
+    List<Las> all = new ArrayList<>(tiles.values());
+    all.sort(Comparator.comparingInt((Las t) -> t.col).thenComparingInt(t -> t.row));
+    if (single != null) all.add(single);
+    for (Las las : all) {
+      if (las.out != null) {
+        las.out.close();
+        las.out = null;
+        openTiles.remove(las);
+      }
+      if (las.spoolOut != null) las.spoolOut.flush();
+      DenseCheckpoint.force(las.part);
+      if (las.spool != null) DenseCheckpoint.force(las.spool);
+      files.add(Json.object("tile", las.tile, "col", las.col, "row", las.row, "count", las.count,
+          "direct", las.direct, "offset", las.offset.clone(), "min", las.min.clone(), "max", las.max.clone(),
+          "part_bytes", Files.size(las.part),
+          "spool", las.spool == null ? null : las.spool.getFileName().toString(),
+          "spool_bytes", las.spool == null ? 0L : Files.size(las.spool)));
+    }
+    long plyBytes = 0;
+    if (plyOut != null) {
+      plyOut.flush();
+      DenseCheckpoint.force(plyPart);
+      plyBytes = Files.size(plyPart);
+    }
+    return Json.object("opened", opened, "count", count, "min", min.clone(), "max", max.clone(),
+        "files", files, "ply_bytes", plyBytes);
+  }
+
+  /** Continues a checkpointed cloud (after tiles/writePly/diskSpace were set as before). */
+  @SuppressWarnings("unchecked")
+  void restore(Map<String, Object> s) throws IOException {
+    if (!(boolean) s.get("opened")) return;
+    opened = true;
+    prepareVlrs();
+    count = (long) s.get("count");
+    System.arraycopy((double[]) s.get("min"), 0, min, 0, 3);
+    System.arraycopy((double[]) s.get("max"), 0, max, 0, 3);
+    Set<Path> kept = new HashSet<>();
+    for (Object entry : (List<Object>) s.get("files")) {
+      Map<String, Object> f = (Map<String, Object>) entry;
+      Las las;
+      if ((boolean) f.get("tile")) {
+        int col = (int) f.get("col"), row = (int) f.get("row");
+        String name = "tile_" + number(col * tileSize) + "_" + number(row * tileSize) + ".las";
+        las = new Las(tileDirectory.resolve(name + ".part"), tileDirectory.resolve(name), true, col, row);
+        tiles.put(((long) col << 32) | (row & 0xffffffffL), las);
+      } else {
+        las = new Las(directory.resolve("dense.las.part"), directory.resolve("dense.las"), false, 0, 0);
+        single = las;
+      }
+      las.count = (long) f.get("count");
+      las.direct = (long) f.get("direct");
+      System.arraycopy((double[]) f.get("offset"), 0, las.offset, 0, 3);
+      System.arraycopy((double[]) f.get("min"), 0, las.min, 0, 3);
+      System.arraycopy((double[]) f.get("max"), 0, las.max, 0, 3);
+      DenseCheckpoint.truncate(las.part, (long) f.get("part_bytes"));
+      kept.add(las.part);
+      if (f.get("spool") != null) {
+        las.spool = las.part.resolveSibling((String) f.get("spool"));
+        DenseCheckpoint.truncate(las.spool, (long) f.get("spool_bytes"));
+        las.spoolOut = new DataOutputStream(new BufferedOutputStream(
+            Files.newOutputStream(las.spool, StandardOpenOption.APPEND), 1 << 20));
+        spoolBufferBytes += 1L << 20;
+        kept.add(las.spool);
+      }
+    }
+    // Tiles begun after the checkpoint.
+    if (tileDirectory != null && Files.isDirectory(tileDirectory))
+      try (var files = Files.list(tileDirectory)) {
+        for (Path p : files.toList()) {
+          String name = p.getFileName().toString();
+          if (kept.contains(p)) continue;
+          if (name.startsWith("tile_") && name.endsWith(".las.part") || name.startsWith("cloud-") && name.endsWith(".bin"))
+            Files.deleteIfExists(p);
+        }
+      }
+    if (ply) {
+      plyPart = directory.resolve("dense.ply.part");
+      DenseCheckpoint.truncate(plyPart, (long) s.get("ply_bytes"));
+      plyOut = new BufferedOutputStream(Files.newOutputStream(plyPart, StandardOpenOption.APPEND), 1 << 20);
+    }
+  }
+
+  /** An interrupted run that a checkpoint can continue: close the files, keep them. */
+  void release() throws IOException {
+    if (closed) return;
+    closed = true;
+    IOException failure = null;
+    List<Las> all = new ArrayList<>(tiles.values());
+    if (single != null) all.add(single);
+    List<Closeable> streams = new ArrayList<>();
+    for (Las las : all) {
+      streams.add(las.out);
+      streams.add(las.spoolOut);
+      las.out = null;
+      las.spoolOut = null;
+    }
+    streams.add(plyOut);
+    plyOut = null;
+    for (Closeable c : streams)
+      if (c != null)
+        try {
+          c.close();
+        } catch (IOException e) {
+          if (failure == null) failure = e; else failure.addSuppressed(e);
+        }
+    if (diskSpace != null) diskSpace.exports(0, 0);
+    if (failure != null) throw failure;
+  }
+
+  private void open() throws IOException {
+    opened = true;
+    prepareVlrs();
     if (tileDirectory != null) {
       Files.createDirectories(tileDirectory);
       try (var files = Files.list(tileDirectory)) {

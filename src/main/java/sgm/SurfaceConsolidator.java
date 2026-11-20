@@ -200,16 +200,36 @@ final class SurfaceConsolidator implements AutoCloseable {
     maxRecordBytes = RECORD_BYTES + (fusion.cameraCount() + 7) / 8;
     int pairCount = fusion.pairCount();
     weightScratch = ThreadLocal.withInitial(() -> new WeightScratch(pairCount));
-    directory = Files.createTempDirectory(options.output, "surface-work-");
+    Map<String, Object> resumed =
+        options.checkpoint == null ? null : options.checkpoint.resume("output");
+    resumed = resumed == null ? null : DenseCheckpoint.map(resumed, "surface");
+    directory = resumed != null
+        ? options.output.resolve((String) resumed.get("directory"))
+        : Files.createTempDirectory(options.output, "surface-work-");
     root = new Tile(directory.resolve("accepted.bin.gz"));
-    spool = output(root.path);
     partitionStrategy = options.surfacePartition;
-    if (partitionStrategy.equals("routed")) {
-      coordinateFile = directory.resolve("coordinates.bin");
+    if (partitionStrategy.equals("routed")) coordinateFile = directory.resolve("coordinates.bin");
+    if (resumed != null) {
+      // --dense-checkpoint: cut the spool back to the checkpoint and append a new gzip member.
+      DenseCheckpoint.truncate(root.path, (long) resumed.get("spool_bytes"));
+      if (coordinateFile != null) DenseCheckpoint.truncate(coordinateFile, (long) resumed.get("coordinate_bytes"));
+      root.count = (long) resumed.get("count");
+      root.uncompressedBytes = (long) resumed.get("uncompressed_bytes");
+      root.queryFootprint = (double) resumed.get("query_footprint");
+      System.arraycopy((double[]) resumed.get("min"), 0, root.min, 0, 3);
+      System.arraycopy((double[]) resumed.get("max"), 0, root.max, 0, 3);
+      largestFootprint = (double) resumed.get("largest_footprint");
+      footprintCount = (int) resumed.get("footprint_count");
+      double[] saved = (double[]) resumed.get("footprints");
+      System.arraycopy(saved, 0, footprints, 0, saved.length);
+    }
+    spool = output(root.path, resumed != null);
+    if (coordinateFile != null)
       coordinates =
           new DataOutputStream(
-              new BufferedOutputStream(Files.newOutputStream(coordinateFile), 1048576));
-    }
+              new BufferedOutputStream(resumed != null
+                  ? Files.newOutputStream(coordinateFile, StandardOpenOption.APPEND)
+                  : Files.newOutputStream(coordinateFile), 1048576));
     // Includes Java object/hash-grid overhead, halo records and sort/query scratch.
     long budget = Math.min(options.surfaceMemoryMb, Math.max(8, options.memoryMb / 4)) * 1048576L;
     // Decoded-partition cache only (no effect on partitioning or results): neighbouring
@@ -1586,8 +1606,36 @@ final class SurfaceConsolidator implements AutoCloseable {
   }
 
   private static DataOutputStream output(Path p) throws IOException {
+    return output(p, false);
+  }
+
+  private static DataOutputStream output(Path p, boolean append) throws IOException {
     return new DataOutputStream(
-        new BufferedOutputStream(Compression.gzip(Files.newOutputStream(p), 1), 65536));
+        new BufferedOutputStream(Compression.gzip(append
+            ? Files.newOutputStream(p, StandardOpenOption.CREATE, StandardOpenOption.APPEND)
+            : Files.newOutputStream(p), 1), 65536));
+  }
+
+  /**
+   * --dense-checkpoint: ends the spool's gzip member (all records so far on disk) and starts a new
+   * member; returns what a resumed run needs to continue the spool exactly here.
+   */
+  Map<String, Object> checkpoint() throws IOException {
+    if (finished) throw new IOException("Surface input is closed");
+    spool.close();
+    DenseCheckpoint.force(root.path);
+    long spoolBytes = Files.size(root.path), coordinateLength = 0;
+    spool = output(root.path, true);
+    if (coordinates != null) {
+      coordinates.flush();
+      DenseCheckpoint.force(coordinateFile);
+      coordinateLength = Files.size(coordinateFile);
+    }
+    return Json.object("directory", options.output.relativize(directory).toString(),
+        "spool_bytes", spoolBytes, "coordinate_bytes", coordinateLength, "count", root.count,
+        "uncompressed_bytes", root.uncompressedBytes, "query_footprint", root.queryFootprint,
+        "min", root.min.clone(), "max", root.max.clone(), "largest_footprint", largestFootprint,
+        "footprint_count", footprintCount, "footprints", Arrays.copyOf(footprints, footprintCount));
   }
 
   public void close() throws IOException {
@@ -1605,6 +1653,8 @@ final class SurfaceConsolidator implements AutoCloseable {
     }
     decoded.clear();
     decodedBytes = 0;
+    // An interrupted dense step keeps the spool for --dense-checkpoint to resume.
+    if (!finished && options.checkpoint != null && options.checkpoint.keepsWork()) return;
     // Only files created in this private temporary directory are removed; no recursive traversal.
     try (var files = Files.list(directory)) {
       for (Path p : files.toList()) Files.deleteIfExists(p);

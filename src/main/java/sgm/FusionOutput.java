@@ -52,13 +52,18 @@ final class FusionOutput implements AutoCloseable {
     if (options.tiledLasOutput > 0)
       cloud.tiles(options.tiledLasOutput, options.output.resolve("07_results/dense_tiles"));
     cloud.diskSpace(options.outputDiskSpace);
+    Map<String, Object> resumed = options.checkpoint == null ? null : options.checkpoint.resume("output");
+    if (resumed != null && resumed.get("cloud") != null) cloud.restore(DenseCheckpoint.map(resumed, "cloud"));
     BufferedWriter openedDecisions = null;
     PointRecords.Writer openedRecords = null;
     SurfaceConsolidator openedSurface = null;
     CameraEmission openedCamera = null;
     try {
       if (options.writePointConfidence)
-        openedRecords = new PointRecords.Writer(file.resolveSibling("point-confidence.bin"));
+        openedRecords = resumed != null && resumed.get("records_length") != null
+            ? new PointRecords.Writer(file.resolveSibling("point-confidence.bin"),
+                (long) resumed.get("records_length"), (long) resumed.get("records_bytes"))
+            : new PointRecords.Writer(file.resolveSibling("point-confidence.bin"));
       if (options.fusionEmission.equals("camera"))
         openedCamera = new CameraEmission(options, fusion);
       openedSurface =
@@ -94,6 +99,31 @@ final class FusionOutput implements AutoCloseable {
     surface = openedSurface;
     surfaceDecisions = openedDecisions;
     occupied = options.voxel > 0 ? new HashSet<>() : null;
+    if (resumed != null) {
+      staged = (long) resumed.get("staged");
+      confidenceRejected = (long) resumed.get("confidence_rejected");
+      unavailableConfidence = (long) resumed.get("unavailable_confidence");
+      voxelRejected = (long) resumed.get("voxel_rejected");
+    }
+  }
+
+  /** --dense-checkpoint: the staged output so far (surface consolidation spool). */
+  Map<String, Object> checkpoint() throws IOException {
+    if (cameraEmission != null || surface == null && occupied != null || finished)
+      throw new IOException("Dense checkpoints need pair emissions without --voxel");
+    Map<String, Object> out = new LinkedHashMap<>(Json.object("staged", staged,
+        "confidence_rejected", confidenceRejected, "unavailable_confidence", unavailableConfidence,
+        "voxel_rejected", voxelRejected));
+    if (surface != null) out.put("surface", surface.checkpoint());
+    else {
+      // Without consolidation the points are already in the cloud files and records.
+      out.put("cloud", cloud.checkpoint());
+      if (records != null) {
+        out.put("records_length", records.checkpoint());
+        out.put("records_bytes", records.bytes);
+      }
+    }
+    return out;
   }
 
   void add(
@@ -313,6 +343,7 @@ final class FusionOutput implements AutoCloseable {
         }
     try {
       if (finished && failure == null) cloud.close();
+      else if (options.checkpoint != null && options.checkpoint.keepsWork()) cloud.release();
       else cloud.abort();
     } catch (IOException e) {
       if (failure == null) failure = e;

@@ -65,8 +65,10 @@ final class MappedFiles implements AutoCloseable {
   /** A new file of bytes zeros (sparse where the file system allows), mapped read-write. */
   MemorySegment create(Path path, long bytes) throws IOException {
     Files.createDirectories(path.toAbsolutePath().getParent());
+    // A new file, not a truncated old one: an old path may be a hard link that a dense checkpoint
+    // keeps (its data must not change).
+    Files.deleteIfExists(path);
     try (RandomAccessFile f = new RandomAccessFile(path.toFile(), "rw")) {
-      f.setLength(0);
       f.setLength(bytes);
     }
     return map(path, 0, bytes, true);

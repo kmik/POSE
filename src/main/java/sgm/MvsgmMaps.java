@@ -32,6 +32,8 @@ final class MvsgmMaps implements AutoCloseable {
   private long sourceMappedBytes, peakSourceMappedBytes, mappingOpens, mappingCloses;
   private int mappedFiles, peakMappedFiles;
   MvsgmWindow window;
+  /** --dense-checkpoint: retired map files wait for the next checkpoint before deletion. */
+  DenseCheckpoint checkpoint;
   FusionHostMemory hostMemory;
   private final Map<Integer, HostMapCache.File[]> cachedFiles = new HashMap<>();
   private final Map<Integer, Integer> readers = new HashMap<>();
@@ -113,6 +115,11 @@ final class MvsgmMaps implements AutoCloseable {
     cameras.put(camera.camera(), camera);
   }
 
+  /** A camera retired before a resumed checkpoint: no maps, no files to delete. */
+  synchronized void forget(int c) {
+    cameras.remove(c);
+  }
+
   boolean keepsFiles() {
     return keep;
   }
@@ -176,7 +183,8 @@ final class MvsgmMaps implements AutoCloseable {
       IOException failure = null;
       for (int k = 0; k < KINDS.length; k++)
         try {
-          Files.deleteIfExists(file(c, k));
+          if (checkpoint != null && checkpoint.keepsWork()) checkpoint.defer(file(c, k));
+          else Files.deleteIfExists(file(c, k));
         } catch (IOException e) {
           if (failure == null) failure = e;
           else failure.addSuppressed(e);

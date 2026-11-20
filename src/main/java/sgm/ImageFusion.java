@@ -231,6 +231,20 @@ final class ImageFusion {
       else if (file != null) file.setLong(q >>> 6, file.getLong(q >>> 6) | 1L << (q & 63));
       else s.set(MappedFiles.LONG, 8L * (q >>> 6), s.get(MappedFiles.LONG, 8L * (q >>> 6)) | 1L << (q & 63));
     }
+
+    /** Words [word, word + n) into dst[0..n) (dense checkpoints). */
+    void read(long word, long[] dst, int n) {
+      if (a != null) System.arraycopy(a, (int) word, dst, 0, n);
+      else if (file != null) for (int i = 0; i < n; i++) dst[i] = file.getLong(word + i);
+      else java.lang.foreign.MemorySegment.copy(s, MappedFiles.LONG, 8L * word, dst, 0, n);
+    }
+
+    /** src[0..n) to words [word, word + n). */
+    void write(long word, long[] src, int n) {
+      if (a != null) System.arraycopy(src, 0, a, (int) word, n);
+      else if (file != null) for (int i = 0; i < n; i++) file.setLong(word + i, src[i]);
+      else java.lang.foreign.MemorySegment.copy(src, 0, s, MappedFiles.LONG, 8L * word, n);
+    }
   }
 
   private final ForkJoinPool pool;
@@ -590,6 +604,16 @@ final class ImageFusion {
     if (window != null)
       System.out.printf(Locale.ROOT, "Image fusion overlap window: %d/%d cameras; peak planned maps %,d MiB%n",
           mapWindowCameras, cameras, allMapBytes >> 20);
+    if (window != null && o.checkpoint != null) {
+      long perPixel = 4L + (storeWeights ? 4 : 0) + (localSigma > 0 ? 4 : 0);
+      long largest = 0;
+      for (int c = 0; c < cameras; c++) largest = Math.max(largest, (long) fusion.width(c) * fusion.height(c));
+      System.out.printf(Locale.ROOT,
+          "Dense checkpoint every %s: up to about %,d MiB more temporary disk for the overlap window's"
+              + " fused maps (%s), plus depth maps retired between two checkpoints%n",
+          o.checkpoint.intervalNanos / 60_000_000_000L + " min", mapWindowCameras * largest * (perPixel + 1) >> 20,
+          tiled ? "hard links of the strip files where the file system allows" : "written once per camera");
+    }
     plannedMapPeakBytes = allMapBytes;
     if (window != null) allMapBytes = 0;
     compact = new Raster[cameras];
@@ -641,6 +665,7 @@ final class ImageFusion {
           "peak_resident_bytes", f.peakResidentBytes, "window", f.window == null ? null : f.window.report());
       if (f.hostMemory != null) ((Map<String, Object>) c.memory).put("host_memory", f.hostMemory.report());
       if (maps != null) ((Map<String, Object>) c.memory).put("source_maps", maps.sourceReport());
+      if (o.checkpoint != null && f.window != null) ((Map<String, Object>) c.memory).put("dense_checkpoint", o.checkpoint.report());
       if (maps != null && maps.scoped && f.hostMemory == null)
         System.out.println("Scoped MVSGM source maps: " + maps.sourceReport());
       if (f.hostMemory != null)
@@ -877,6 +902,175 @@ final class ImageFusion {
     residentBytes += mapBytes(j);
     peakResidentBytes = Math.max(peakResidentBytes, residentBytes);
     mapLoads++;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // --dense-checkpoint (DenseCheckpoint): fusion state between two cameras of pass 2
+
+  /**
+   * Saves everything pass 2 needs to continue at camera next: live cameras' maps and marks, the
+   * pass-1 results, overlap graph, counters, the stereo window and the output spool.
+   */
+  private void writeCheckpoint(DenseCheckpoint cp, int next, Counters counters, Counters[] perCamera,
+      long[][] times, FusionOutput output, TwoViewConfidence.Diagnostics diagnostics) throws IOException {
+    long started = System.nanoTime();
+    Path gen = cp.begin();
+    List<Object> live = new ArrayList<>();
+    Set<Integer> liveSet = new TreeSet<>();
+    for (int j = 0; j < cameras; j++) {
+      if (!hasMap[j]) continue;
+      long n = (long) fusion.width(j) * fusion.height(j), words = (n + 63) / 64;
+      boolean resident = compact[j] != null;
+      if (o.outputDiskSpace != null)
+        OutputDiskSpace.require(o, words * 16 + (cp.stored(j) ? 0 : 12 * n), "dense checkpoint of camera " + j);
+      if (!cp.stored(j)) {
+        // Depth, weights and local sigma do not change after pass 1: saved once per camera.
+        if (resident && compact[j].s != null) {
+          compact[j].s.force();
+          DenseCheckpoint.linkOrCopy(tileFile(j, "z"), cp.storeFile(j, "z"));
+          if (storeWeights) {
+            compactWeight[j].s.force();
+            DenseCheckpoint.linkOrCopy(tileFile(j, "w"), cp.storeFile(j, "w"));
+          }
+          if (localSigma > 0) {
+            localBest[j].s.force();
+            DenseCheckpoint.linkOrCopy(tileFile(j, "best"), cp.storeFile(j, "best"));
+          }
+        } else if (resident) {
+          DenseCheckpoint.writeFloats(cp.storeFile(j, "z"), compact[j], n);
+          if (storeWeights) DenseCheckpoint.writeFloats(cp.storeFile(j, "w"), compactWeight[j], n);
+          if (localSigma > 0) DenseCheckpoint.writeFloats(cp.storeFile(j, "best"), localBest[j], n);
+        } else {
+          long at = 0;
+          DenseCheckpoint.copyRange(mapFile(j), at, 4 * n, cp.storeFile(j, "z"));
+          at += 4 * n;
+          if (storeWeights) {
+            DenseCheckpoint.copyRange(mapFile(j), at, 4 * n, cp.storeFile(j, "w"));
+            at += 4 * n;
+          }
+          if (localSigma > 0) DenseCheckpoint.copyRange(mapFile(j), at, 4 * n, cp.storeFile(j, "best"));
+        }
+        cp.markStored(j);
+      }
+      // Ownership marks change with every later camera: copied at each checkpoint.
+      boolean hasUsed, hasEmitted;
+      if (resident) {
+        hasUsed = used[j] != null;
+        hasEmitted = emitted[j] != null;
+        if (hasUsed) DenseCheckpoint.writeLongs(gen.resolve("camera_" + j + ".used"), used[j], words);
+        if (hasEmitted) DenseCheckpoint.writeLongs(gen.resolve("camera_" + j + ".emitted"), emitted[j], words);
+      } else if (Files.isRegularFile(bitsFile(j))) {
+        byte[] head = new byte[2];
+        try (InputStream in = Files.newInputStream(bitsFile(j))) {
+          if (in.readNBytes(head, 0, 2) != 2) throw new EOFException("Fusion spill truncated");
+        }
+        hasUsed = head[0] != 0;
+        hasEmitted = head[1] != 0;
+        long at = 2;
+        if (hasUsed) {
+          DenseCheckpoint.copyRange(bitsFile(j), at, 8 * words, gen.resolve("camera_" + j + ".used"));
+          at += 8 * words;
+        }
+        if (hasEmitted) DenseCheckpoint.copyRange(bitsFile(j), at, 8 * words, gen.resolve("camera_" + j + ".emitted"));
+      } else hasUsed = hasEmitted = false;
+      live.add(Json.object("camera", j, "used", hasUsed, "emitted", hasEmitted));
+      liveSet.add(j);
+    }
+    List<Object> pass1 = new ArrayList<>(), neighbourLists = new ArrayList<>(), timeLists = new ArrayList<>();
+    for (int j = 0; j < cameras; j++) {
+      pass1.add(perCamera[j] == null ? null : DenseCheckpoint.fields(perCamera[j]));
+      neighbourLists.add(neighbours[j]);
+      timeLists.add(times[j]);
+    }
+    Map<String, Object> fusionState = Json.object(
+        "next_camera", next, "live", live, "counters", DenseCheckpoint.fields(counters),
+        "per_camera", pass1, "neighbours", neighbourLists, "times", timeLists, "last_use", lastUse.clone(),
+        "start", start.clone(), "prepared_cameras", preparedCameras, "pass_two_cameras", passTwoCameras,
+        "retired_cameras", retiredCameras, "retired_map_bytes", retiredMapBytes,
+        "peak_live_map_bytes", peakLiveMapBytes, "peak_live_cameras", peakLiveCameras,
+        "peak_resident_bytes", peakResidentBytes);
+    Map<String, Object> state = new LinkedHashMap<>(Json.object(
+        "next_camera", next, "cameras_fused", passTwoCameras, "fusion", fusionState,
+        "window", window.checkpointState(), "diagnostics", DenseCheckpoint.fields(diagnostics)));
+    state.put("output", output.checkpoint());
+    cp.commit(state, liveSet, started);
+  }
+
+  /** Restores a checkpoint's fusion state; returns the first camera of pass 2 still to fuse. */
+  @SuppressWarnings("unchecked")
+  private int restoreCheckpoint(Map<String, Object> s, Counters counters, Counters[] perCamera, long[][] times,
+      TwoViewConfidence.Diagnostics diagnostics) throws IOException {
+    DenseCheckpoint cp = o.checkpoint;
+    // Map files of the interrupted process (some are hard links of the checkpoint's maps).
+    Path staleSpill = o.output.resolve("06_fusion/map-spill");
+    if (Files.isDirectory(staleSpill))
+      try (var files = Files.list(staleSpill)) {
+        for (Path p : files.toList()) Files.deleteIfExists(p);
+      }
+    DenseCheckpoint.restore(counters, DenseCheckpoint.map(s, "counters"));
+    DenseCheckpoint.restore(diagnostics, DenseCheckpoint.map(cp.resume(), "diagnostics"));
+    List<Object> pass1 = (List<Object>) s.get("per_camera"), neighbourLists = (List<Object>) s.get("neighbours"),
+        timeLists = (List<Object>) s.get("times");
+    for (int j = 0; j < cameras; j++) {
+      if (pass1.get(j) != null) {
+        perCamera[j] = new Counters();
+        DenseCheckpoint.restore(perCamera[j], (Map<String, Object>) pass1.get(j));
+      }
+      neighbours[j] = (int[]) neighbourLists.get(j);
+      System.arraycopy((long[]) timeLists.get(j), 0, times[j], 0, times[j].length);
+    }
+    long[] savedStart = (long[]) s.get("start");
+    System.arraycopy(savedStart, 0, start, 0, start.length);
+    // Readers: the conservative window graph, less the edges that pass 1's overlap test removed.
+    for (int c = 0; c < cameras; c++) {
+      if (perCamera[c] == null || !window.eligible[c] || neighbours[c] == null) continue;
+      for (int j : window.graph.possible[c])
+        if (Arrays.binarySearch(neighbours[c], j) < 0) {
+          if (boundedReaders != null) boundedReaders[j].clear(c);
+          else remainingReaders.get(j).remove(c);
+        }
+    }
+    System.arraycopy((int[]) s.get("last_use"), 0, lastUse, 0, cameras);
+    Path gen = cp.currentGeneration();
+    for (Object entry : (List<Object>) s.get("live")) {
+      Map<String, Object> m = (Map<String, Object>) entry;
+      int j = (int) m.get("camera");
+      long n = (long) fusion.width(j) * fusion.height(j);
+      Raster z = tiled ? tileRaster(j, "z", 4 * n) : new Raster(new float[Math.toIntExact(n)]);
+      DenseCheckpoint.readFloats(cp.storeFile(j, "z"), z, n);
+      Raster weight = null, best = null;
+      if (storeWeights) {
+        weight = tiled ? tileRaster(j, "w", 4 * n) : new Raster(new float[(int) n]);
+        DenseCheckpoint.readFloats(cp.storeFile(j, "w"), weight, n);
+      }
+      if (localSigma > 0) {
+        best = tiled ? tileRaster(j, "best", 4 * n) : new Raster(new float[(int) n]);
+        DenseCheckpoint.readFloats(cp.storeFile(j, "best"), best, n);
+      }
+      long words = (n + 63) / 64;
+      if ((boolean) m.get("used")) {
+        used[j] = newBits(j, "used");
+        DenseCheckpoint.readLongs(gen.resolve("camera_" + j + ".used"), used[j], words);
+      }
+      if ((boolean) m.get("emitted")) {
+        emitted[j] = newBits(j, "emitted");
+        DenseCheckpoint.readLongs(gen.resolve("camera_" + j + ".emitted"), emitted[j], words);
+      }
+      admit(j, z, weight, best);
+      grid(j);
+    }
+    preparedCameras = (int) s.get("prepared_cameras");
+    passTwoCameras = (int) s.get("pass_two_cameras");
+    retiredCameras = (int) s.get("retired_cameras");
+    retiredMapBytes = (long) s.get("retired_map_bytes");
+    peakLiveMapBytes = Math.max(peakLiveMapBytes, (long) s.get("peak_live_map_bytes"));
+    peakLiveCameras = Math.max(peakLiveCameras, (int) s.get("peak_live_cameras"));
+    peakResidentBytes = Math.max(peakResidentBytes, (long) s.get("peak_resident_bytes"));
+    window.fusionStarting();
+    int next = (int) s.get("next_camera");
+    System.out.printf(Locale.ROOT, "Dense checkpoint restored: %d live cameras; fusion continues at camera %d of %d%n",
+        ((List<Object>) s.get("live")).size(), next, cameras);
+    return next;
   }
 
   private void writeFloats(FileChannel ch, float[] a) throws IOException {
@@ -1384,6 +1578,12 @@ final class ImageFusion {
         }
       }
       for (int c = 0; c < cameras; c++) finishedAfter.get(lastUse[c]).add(c);
+      // --dense-checkpoint: a resumed dense step continues after the checkpoint's last fused camera.
+      DenseCheckpoint checkpoint = window == null ? null : o.checkpoint;
+      int firstCamera = 0;
+      if (checkpoint != null && checkpoint.resume("fusion") != null)
+        firstCamera = restoreCheckpoint(checkpoint.resume("fusion"), counters, perCamera, times, diagnostics);
+      int haltAfter = Integer.getInteger("sgm.dense.haltAfterCamera", -1);
       // Skipped cameras never materialised their planned maps.
       if (window == null) {
         for (int c = 0; c < cameras; c++) if (!hasMap[c]) allMapBytes -= mapBytes(c);
@@ -1423,7 +1623,7 @@ final class ImageFusion {
               : null;
       try {
       for (int tier = 0; tier < tierCount; tier++)
-      for (int c = 0; c < cameras; c++) {
+      for (int c = tier == 0 ? firstCamera : 0; c < cameras; c++) {
         progress.update(window == null ? cameras + c : preparedCameras + passTwoCameras);
         if (window != null && window.eligible[c]) {
           // Stereo's reservation must not overlap the previous camera's queued output bands.
@@ -1542,6 +1742,18 @@ final class ImageFusion {
           if (window == null) { for (int j : finishedAfter.get(c)) releaseCamera(j); }
           else retireWindowThrough(c);
         if (window != null) progress.update(preparedCameras + ++passTwoCameras);
+        if (checkpoint != null && c + 1 < cameras && checkpoint.due()) {
+          // Every finished camera's points are in the output before the spool is closed.
+          while (!pending.isEmpty()) outputNanos += awaitOutput(pending.poll());
+          writeCheckpoint(checkpoint, c + 1, counters, perCamera, times, output, diagnostics);
+        }
+        if (c == Integer.getInteger("sgm.dense.failAfterCamera", -1))
+          throw new IOException("Test hook: simulated failure after camera " + c + " (-Dsgm.dense.failAfterCamera)");
+        if (c == haltAfter) {
+          System.out.println("Test hook: halting after camera " + c + " (-Dsgm.dense.haltAfterCamera)");
+          System.out.flush();
+          Runtime.getRuntime().halt(137);
+        }
       }
       while (!pending.isEmpty()) outputNanos += awaitOutput(pending.poll());
       } finally {

@@ -135,6 +135,7 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | `--orthomosaic` | off | Full-resolution true orthomosaic. |
 | `--orthomosaic-mode` | `true` | `classic`: smoothed, gap-free surface and no visibility test, so no holes inside the photographed area; tall objects lean. |
 | `--dense-method` | `sgm` | `mvsgm` matches several neighbouring images at once (needs `--fusion-mode image`). |
+| `--dense-checkpoint` | `auto` | mvsgm: save a checkpoint every N minutes (`auto` = 30) between fused cameras. After an interruption, run the same dense command on the same run (`dense -o PROJECT --run ID`) to continue from the last checkpoint; the result equals an uninterrupted run. Used only with the same options and earlier steps; `off` disables it. |
 | `--block-processing` | `off` | `auto` or `on` splits very large image sets into overlapping blocks. |
 | `--registration-bundle-growth` | `15` | Bundle adjustment during camera registration each time the registered set has grown by this percent; `0` turns it off. |
 | `--pair-selection` | `auto` | Which image pairs are matched. `auto` uses the nearest GPS images when every image has GPS (spread over at least 20 m), otherwise a visual search; also `overlap`, `gps`, `sequential`, `all`. |

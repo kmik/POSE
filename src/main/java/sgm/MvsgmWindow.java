@@ -126,6 +126,9 @@ final class MvsgmWindow implements AutoCloseable {
     hostMemory = o.fusionHostMemoryMb > 0 ? new FusionHostMemory(o, futureMetadata) : null;
     mvs.hostMemory = hostMemory;
     mvs.handoff.hostMemory = hostMemory;
+    mvs.handoff.checkpoint = o.checkpoint;
+    Map<String, Object> resumed = o.checkpoint == null ? null : o.checkpoint.resume("window");
+    if (resumed != null) restore(resumed);
     gpu = o.compute.equals("cpu") ? null : GpuMemoryPool.install(mvs.gpuBudget());
     preparer = Executors.newSingleThreadExecutor(r -> {
       Thread t = new Thread(r, "mvsgm-window-prepare");
@@ -137,6 +140,8 @@ final class MvsgmWindow implements AutoCloseable {
       // for every camera that may overlap c. A wrong guess costs time only (see MvsgmCameraPool).
       List<Integer> order = new ArrayList<>();
       boolean[] listed = new boolean[n];
+      // A resumed window already has the raw maps of its checkpoint (raw[]).
+      for (int c = 0; c < n; c++) listed[c] = raw[c];
       for (int c = 0; c < n; c++) {
         if (!eligible[c]) continue;
         predict(c, listed, order);
@@ -154,6 +159,88 @@ final class MvsgmWindow implements AutoCloseable {
     } else pool = null;
     stereoWork = WorkProgress.start("Multi-view stereo window", 2L * cameraCount, "camera passes");
     mvs.handoff.window = this;
+    if (resumed != null) {
+      stereoWork.update(depthCompleted + completed);
+      if (completed == cameraCount) finishStereo();
+    }
+  }
+
+  /** --dense-checkpoint: the window's bookkeeping between two fused cameras. */
+  Map<String, Object> checkpointState() {
+    List<Object> registered = new ArrayList<>();
+    for (MvsgmMaps.Camera cam : mvs.handoff.cameras())
+      registered.add(Json.object("camera", cam.camera(), "row_start", cam.rowStart()));
+    return Json.object("raw", raw.clone(), "consistent", consistent.clone(),
+        "fusion_finished", fusionFinished.clone(), "raw_readers", rawReaders.clone(),
+        "counts", counts.clone(), "source_bytes", sourceBytes.clone(),
+        "reports", Arrays.asList(reports.clone()), "registered", registered,
+        "completed", completed, "depth_completed", depthCompleted, "considered", considered, "kept", kept,
+        "depth_nanos", depthNanos, "consistency_nanos", consistencyNanos,
+        "current_source_bytes", currentSourceBytes, "peak_source_bytes", peakSourceBytes,
+        "fusion_started", fusionStarted);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void restore(Map<String, Object> s) throws IOException {
+    int n = frames.size();
+    System.arraycopy(DenseCheckpoint.booleans(s.get("raw")), 0, raw, 0, n);
+    System.arraycopy(DenseCheckpoint.booleans(s.get("consistent")), 0, consistent, 0, n);
+    System.arraycopy(DenseCheckpoint.booleans(s.get("fusion_finished")), 0, fusionFinished, 0, n);
+    System.arraycopy(DenseCheckpoint.ints(s.get("raw_readers")), 0, rawReaders, 0, n);
+    System.arraycopy(DenseCheckpoint.longs(s.get("counts")), 0, counts, 0, n);
+    System.arraycopy(DenseCheckpoint.longs(s.get("source_bytes")), 0, sourceBytes, 0, n);
+    List<Object> savedReports = (List<Object>) s.get("reports");
+    for (int c = 0; c < n; c++) reports[c] = savedReports.get(c);
+    completed = (int) s.get("completed");
+    depthCompleted = (int) s.get("depth_completed");
+    considered = (long) s.get("considered");
+    kept = (long) s.get("kept");
+    depthNanos = (long) s.get("depth_nanos");
+    consistencyNanos = (long) s.get("consistency_nanos");
+    currentSourceBytes = (long) s.get("current_source_bytes");
+    peakSourceBytes = (long) s.get("peak_source_bytes");
+    fusionStarted = (boolean) s.get("fusion_started");
+    // Maps registered at the checkpoint (raw or consistent and still read); the rest were retired.
+    Map<Integer, long[]> registered = new HashMap<>();
+    for (Object e : (List<Object>) s.get("registered")) {
+      Map<String, Object> m = (Map<String, Object>) e;
+      registered.put((int) m.get("camera"), (long[]) m.get("row_start"));
+    }
+    for (int c = 0; c < n; c++) {
+      MvsgmMaps.Camera cam = mvs.handoff.camera(c);
+      if (cam == null) continue;
+      if (!registered.containsKey(c)) mvs.handoff.forget(c);
+      else if (registered.get(c) != null)
+        mvs.handoff.add(new MvsgmMaps.Camera(c, cam.pair(), cam.width(), cam.height(), registered.get(c), cam.tiled()));
+    }
+    // Map files the checkpoint does not use: retired after it, or partly computed.
+    Path dir = mvs.handoff.dir;
+    if (Files.isDirectory(dir))
+      try (var files = Files.list(dir)) {
+        for (Path p : files.toList()) {
+          String name = p.getFileName().toString();
+          if (!name.startsWith("camera_")) continue;
+          int dot = name.indexOf('.');
+          if (dot < 0) continue;
+          int c;
+          try {
+            c = Integer.parseInt(name.substring(7, dot));
+          } catch (NumberFormatException e) {
+            continue;
+          }
+          String kind = name.substring(dot);
+          int k = Arrays.asList(MvsgmMaps.KINDS).indexOf(kind);
+          if (k < 0 || c < 0 || c >= n) continue;
+          boolean needed = registered.containsKey(c)
+              && (k >= MvsgmMaps.LR ? consistent[c] : raw[c]);
+          if (!needed) Files.deleteIfExists(p);
+        }
+      }
+    for (int c = 0; c < n; c++)
+      if (eligible[c] && registered.containsKey(c) && raw[c])
+        for (int k = 0; k < MvsgmMaps.KINDS.length; k++)
+          if ((k < MvsgmMaps.LR || consistent[c]) && !Files.isRegularFile(mvs.handoff.file(c, k)))
+            throw new IOException("Dense checkpoint: map " + mvs.handoff.file(c, k) + " is missing");
   }
 
   static void checkDisk(Path output, long need, long maps, int window, int total) throws IOException {

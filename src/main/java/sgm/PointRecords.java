@@ -77,9 +77,28 @@ final class PointRecords {
     private boolean closed;
     long nanos, bytes;
 
+    private final Path file;
+
     Writer(Path file) throws IOException {
+      this.file = file;
       out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(file), 1 << 20));
       out.writeLong(MAGIC);
+    }
+
+    /** --dense-checkpoint: continues a file cut back to {@code length} bytes ({@link #checkpoint}). */
+    Writer(Path file, long length, long recordBytes) throws IOException {
+      this.file = file;
+      DenseCheckpoint.truncate(file, length);
+      out = new DataOutputStream(new BufferedOutputStream(
+          Files.newOutputStream(file, StandardOpenOption.APPEND), 1 << 20));
+      bytes = recordBytes;
+    }
+
+    /** Length of the file with every record so far on disk. */
+    long checkpoint() throws IOException {
+      out.flush();
+      DenseCheckpoint.force(file);
+      return Files.size(file);
     }
 
     // One buffer per record (the same big-endian bytes as DataOutputStream, without a stream call

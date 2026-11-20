@@ -76,6 +76,7 @@ public final class SelfTest {
     checks += FusionHostMemoryRegression.run(root.resolve("host-memory"));
     checks += ScopedSourceMapsRegression.run(root.resolve("scoped-source-maps"));
     checks += MvsgmCameraPoolRegression.run(root.resolve("camera-pool"));
+    checks += DenseCheckpointRegression.run(root.resolve("dense-checkpoint"));
     checks += DiskAdmissionRegression.run(root.resolve("disk-admission"));
     checks += CloudOutputRegression.run(root.resolve("cloud-output"));
     checks += SpeckleFilterRegression.run();
