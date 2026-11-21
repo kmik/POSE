@@ -74,6 +74,7 @@ public final class SelfTest {
     checks += LargeFormatRegression.run();
     checks += CameraWindowRegression.run(root.resolve("camera-window"));
     checks += FusionHostMemoryRegression.run(root.resolve("host-memory"));
+    checks += MvsgmPartnerViewsRegression.run(root.resolve("partner-views"));
     checks += ScopedSourceMapsRegression.run(root.resolve("scoped-source-maps"));
     checks += MvsgmCameraPoolRegression.run(root.resolve("camera-pool"));
     checks += DenseCheckpointRegression.run(root.resolve("dense-checkpoint"));

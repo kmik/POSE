@@ -307,8 +307,12 @@ full-range solve on >= 98%; level-table mapping; option validation and copy.
 ### Known limits / next steps
 
 - Points outside Metashape's coverage (borders, under canopy) raise C2C distances; a stricter
-  consistency setting (`--mvsgm-consistent-views 2`) or a minimum-views rule for border pixels
-  would trade coverage for that.
+  consistency setting (`--mvsgm-consistent-views 2`) trades coverage for that.
+- `--min-views` counts only cameras whose own depth map confirms the point. Until 2026-11-21 the
+  neighbour each camera was paired with in fusion counted automatically, so edge bands seen by
+  two frames passed `--min-views 3`; in aerial blocks with short baselines their depth-label
+  errors showed as stacked layers about one label height apart. Since then, mvsgm clouds have
+  fewer points along block borders (city2: about 6% of the area, slightly better accuracy).
 - Pole and edges are a little fattened (about 2-3 pixels): SGM with census 5x5; a smaller census
   window or a final edge-aware check could tighten them.
 - Consistency + candidate writing (8 s) is serial file reads and per-value DataOutputStream

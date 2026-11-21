@@ -1971,9 +1971,13 @@ final class ImageFusion {
           wsum += weight[b];
           members++;
           int other = splats[from[b]].other();
-          if (m.partners.length > 0) m.partners[p * words + (other >>> 6)] |= 1L << (other & 63);
-          // Heaviest member represents the pixel; ties: lower pair id, then lower candidate index.
           int pair = splats[from[b]].data().pair;
+          // A pair partner saw this pixel when it matched. An mvsgm (single-view) pair's partner
+          // only weights the triangulation angle and may not see the pixel at all: it counts as a
+          // view only when its own map confirms the point (emission loop).
+          if (m.partners.length > 0 && !fusion.singleView(pair))
+            m.partners[p * words + (other >>> 6)] |= 1L << (other & 63);
+          // Heaviest member represents the pixel; ties: lower pair id, then lower candidate index.
           if (weight[b] > top
               || weight[b] == top && (pair < m.repPair[p] || pair == m.repPair[p] && samples[b] < m.repIndex[p])) {
             top = weight[b];

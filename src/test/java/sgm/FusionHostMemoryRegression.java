@@ -238,6 +238,9 @@ final class FusionHostMemoryRegression {
           if (strategy.equals("graph-average-tiles")) o.tiledLasOutput = .5;
           if (strategy.equals("graph-average-surface")) o.surfaceConsolidation = "normal";
           o.minViews = 2; o.compute = "cpu"; o.fusionLocalSigma = 2;
+          // 0.1 m baselines give relative sigma ~0.5: without this only unconfirmed edge rows
+          // (credited to the mvsgm partner before 2026-11-21) survived the owner strategies.
+          o.maxDepthUncertainty = 1;
           int n = 8, w = 96, h = 80;
           Camera[] cameras = new Camera[n]; int[] widths = new int[n], heights = new int[n];
           for (int c = 0; c < n; c++) {
