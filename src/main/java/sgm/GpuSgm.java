@@ -24,9 +24,30 @@ final class GpuSgm implements AutoCloseable {
   private static SymbolLookup library;
   private static final Map<String, MethodHandle> FUNCTIONS = new java.util.concurrent.ConcurrentHashMap<>();
   final Device device;
+  /**
+   * One OpenCL context per device, shared by every session on it (one per thread, plus dedicated
+   * computes), with the programs built on it. Each session has its own in-order command queue. With
+   * a context per thread, many cameras in flight kept a dozen contexts on one GPU for hours (a
+   * server run then died with native heap corruption); one context with several queues is the
+   * standard pattern. Kernels, buffers and their order per queue are unchanged, so results are too.
+   */
+  private static final class Shared {
+    final int index;
+    final MemorySegment context;
+    final LinkedHashMap<String, MemorySegment> programs = new LinkedHashMap<>(8, .75f, true);
+    int users;
+
+    Shared(int index, MemorySegment context) {
+      this.index = index;
+      this.context = context;
+    }
+  }
+
+  private static final Map<Integer, Shared> CONTEXTS = new HashMap<>();
+  private final Shared shared;
   private MemorySegment context, queue;
-  private final LinkedHashMap<String, MemorySegment> programs = new LinkedHashMap<>(8, .75f, true);
   private long programBuilds, programHits;
+  private boolean closed;
   private final int group;
 
   // Initialization is serialized; native calls (including blocking transfers) are not.
@@ -214,22 +235,10 @@ final class GpuSgm implements AutoCloseable {
     int size = 1;
     while (size * 2 <= Math.min(128, device.groupSize)) size *= 2;
     group = size;
+    shared = acquire(device, index);
+    context = shared.context;
     try (Arena a = Arena.ofConfined()) {
-      MemorySegment err = a.allocate(JAVA_INT), id = a.allocate(ADDRESS);
-      id.set(ADDRESS, 0, device.id);
-      context =
-          (MemorySegment)
-              invoke(
-                  "clCreateContext",
-                  ADDRESS,
-                  new MemoryLayout[] {ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS},
-                  MemorySegment.NULL,
-                  1,
-                  id,
-                  MemorySegment.NULL,
-                  MemorySegment.NULL,
-                  err);
-      check(err.get(JAVA_INT, 0), "Context creation");
+      MemorySegment err = a.allocate(JAVA_INT);
       queue =
           (MemorySegment)
               invoke(
@@ -416,34 +425,87 @@ final class GpuSgm implements AutoCloseable {
       invoke(function, JAVA_INT, new MemoryLayout[] {ADDRESS}, object);
   }
 
-  public synchronized void close() {
-    for (MemorySegment p : programs.values()) release("clReleaseProgram", p);
-    programs.clear();
-    release("clReleaseCommandQueue", queue);
-    release("clReleaseContext", context);
-  }
-
-  private synchronized MemorySegment cachedProgram(String source) {
-    MemorySegment p = programs.get(source);
-    if (p != null) {
-      check((int) invoke("clRetainProgram", JAVA_INT, new MemoryLayout[] {ADDRESS}, p),
-          "Retain cached OpenCL program");
-      programHits++;
+  /** The device's shared context (created by its first user). */
+  private static Shared acquire(Device device, int index) {
+    synchronized (CONTEXTS) {
+      Shared s = CONTEXTS.get(index);
+      if (s == null) {
+        try (Arena a = Arena.ofConfined()) {
+          MemorySegment err = a.allocate(JAVA_INT), id = a.allocate(ADDRESS);
+          id.set(ADDRESS, 0, device.id);
+          MemorySegment context =
+              (MemorySegment)
+                  invoke(
+                      "clCreateContext",
+                      ADDRESS,
+                      new MemoryLayout[] {ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS},
+                      MemorySegment.NULL,
+                      1,
+                      id,
+                      MemorySegment.NULL,
+                      MemorySegment.NULL,
+                      err);
+          check(err.get(JAVA_INT, 0), "Context creation");
+          s = new Shared(index, context);
+          CONTEXTS.put(index, s);
+        }
+      }
+      s.users++;
+      return s;
     }
-    return p;
   }
 
-  private synchronized void cacheProgram(String source, MemorySegment program) {
-    check((int) invoke("clRetainProgram", JAVA_INT, new MemoryLayout[] {ADDRESS}, program),
-        "Retain OpenCL program cache");
-    MemorySegment old = programs.put(source, program);
-    if (old != null) release("clReleaseProgram", old);
-    programBuilds++;
-    while (programs.size() > 8) {
-      var first = programs.entrySet().iterator();
-      var entry = first.next();
-      release("clReleaseProgram", entry.getValue());
-      first.remove();
+  /** Drops one user; the last one releases the programs and the context. */
+  private static void releaseShared(Shared s) {
+    synchronized (CONTEXTS) {
+      if (--s.users > 0) return;
+      CONTEXTS.remove(s.index);
+      for (MemorySegment p : s.programs.values()) release("clReleaseProgram", p);
+      s.programs.clear();
+      release("clReleaseContext", s.context);
+    }
+  }
+
+  /** Contexts alive now (tests). */
+  static int contexts() {
+    synchronized (CONTEXTS) {
+      return CONTEXTS.size();
+    }
+  }
+
+  public synchronized void close() {
+    if (closed) return;
+    closed = true;
+    release("clReleaseCommandQueue", queue);
+    queue = null;
+    if (shared != null) releaseShared(shared);
+  }
+
+  private MemorySegment cachedProgram(String source) {
+    synchronized (CONTEXTS) {
+      MemorySegment p = shared.programs.get(source);
+      if (p != null) {
+        check((int) invoke("clRetainProgram", JAVA_INT, new MemoryLayout[] {ADDRESS}, p),
+            "Retain cached OpenCL program");
+        programHits++;
+      }
+      return p;
+    }
+  }
+
+  private void cacheProgram(String source, MemorySegment program) {
+    synchronized (CONTEXTS) {
+      check((int) invoke("clRetainProgram", JAVA_INT, new MemoryLayout[] {ADDRESS}, program),
+          "Retain OpenCL program cache");
+      MemorySegment old = shared.programs.put(source, program);
+      if (old != null) release("clReleaseProgram", old);
+      programBuilds++;
+      while (shared.programs.size() > 8) {
+        var first = shared.programs.entrySet().iterator();
+        var entry = first.next();
+        release("clReleaseProgram", entry.getValue());
+        first.remove();
+      }
     }
   }
 

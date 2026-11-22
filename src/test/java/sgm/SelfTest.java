@@ -71,6 +71,7 @@ public final class SelfTest {
     checks += MultiViewSgmRegression.run();
     checks += OptimalMvsgmNeighborsRegression.run(root.resolve("optimal-neighbors"));
       checks += GpuMvsgmCensusRegression.run();
+      checks += GpuSharedContextRegression.run();
     checks += LargeFormatRegression.run();
     checks += CameraWindowRegression.run(root.resolve("camera-window"));
     checks += FusionHostMemoryRegression.run(root.resolve("host-memory"));
