@@ -88,7 +88,7 @@ final class AerialTiledReconstruction implements AutoCloseable {
           results[i]=result;
           decisions.merge(result.status,1L,Long::sum);
         }
-        DepthFusion.SurfaceSample[] surfaces=o.pointAttributes.equals("surface")
+        DepthFusion.SurfaceSample[] surfaces=o.surfaceAttributes()
             ? fusion.surfaceBatch(sources,results,n) : null;
         for(int i=0;i<n;i++,seen++) {
           var result=results[i];

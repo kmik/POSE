@@ -76,7 +76,9 @@ heap. The console shows the exact command first; you can copy it and run it in a
   quick calibration, tie-point cleanup (see below), ground classification, orthomosaic.
 - **Compute and memory:** compute device, GPU index and memory, GPU normals in fusion, CPU
   cores, memory budget, RAM limit.
-- **Outputs:** dense.ply, LAS tile size, point confidence file, verbose log.
+- **Outputs:** dense.ply, LAS tile size, point confidence file, per-point values in LAS/PLY
+  (checkboxes for `--point-attributes`: surface fields, views, angle, confidence, source camera,
+  depth spread, calibrated height and ray sigma), verbose log.
 
 Hover over a label for the option's help text from `photogrammetry --help`. A field left empty
 (or "(default ...)") is not passed, so the command line default applies; the default is shown in

@@ -4,7 +4,7 @@ package sgm;
 record MvsgmDiskPlan(long maps, long spoolUpper, long exportsUpper, long recordsUpper,
     long deferredUpper, long diagnosticsUpper, long headroom, long startup, long worstCase) {
   static MvsgmDiskPlan of(long pixels, int cameras, long maps, long retained, Options o) {
-    long attributes = o.pointAttributes.equals("surface") ? SurfaceAttributes.BYTES : 0;
+    long attributes = PointFields.bytes(o.pointFields());
     // The cloud is written once, straight to dense.las / dense.ply (no staging spool since
     // 14 November 2026); the field stays for the disk_plan.json layout.
     long spool = 0;

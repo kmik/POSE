@@ -52,6 +52,33 @@ final class MvsgmPartnerViewsRegression {
     check(Math.abs(span[0] - spanThin[0]) < .25 && Math.abs(span[1] - spanThin[1]) < .25,
         "--step 2 covers the same area: " + Arrays.toString(span) + " vs " + Arrays.toString(spanThin));
 
+
+    // --point-attributes all: fusion's evidence reaches the LAS. Two cameras 6 m apart see the
+    // overlap points 10 m away at 31-34 degrees; the uncertainty report is written (identical
+    // depth maps: no scatter, so the model sigma is kept with factor 1).
+    Path evidenceDir = root.resolve("evidence");
+    List<double[]> withFields = fuse(evidenceDir, 1, "all");
+    check(withFields.size() == points.size(), "point attributes do not change the points: " + withFields.size() + " vs " + points.size());
+    java.nio.ByteBuffer las = java.nio.ByteBuffer.wrap(Files.readAllBytes(evidenceDir.resolve("dense.las"))).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+    int data = las.getInt(96), len = las.getShort(105) & 0xffff;
+    var all = PointFields.parse("all");
+    int angleAt = 26, sigmaAt = 26, viewsAt = 26;
+    for (var f : all) {
+      if (f.ordinal() < PointFields.Field.ANGLE.ordinal()) angleAt += f.bytes();
+      if (f.ordinal() < PointFields.Field.HEIGHT_SIGMA.ordinal()) sigmaAt += f.bytes();
+      if (f.ordinal() < PointFields.Field.VIEWS.ordinal()) viewsAt += f.bytes();
+    }
+    check(len == 26 + PointFields.bytes(all), "record length with all fields: " + len);
+    int odd = 0;
+    for (int i = 0; i < withFields.size(); i++) {
+      int at = data + i * len;
+      float angle = las.getFloat(at + angleAt), sigma = las.getFloat(at + sigmaAt);
+      int views = las.get(at + viewsAt) & 255;
+      if (!(angle > 25 && angle < 40) || !(sigma > 0) || views < 2) odd++;
+    }
+    check(odd == 0, "angles 25-40 deg, positive height sigma, 2+ views for every point: " + odd + " not");
+    String report = Files.readString(evidenceDir.resolve("07_results/point-uncertainty.json"));
+    check(report.contains("\"factor\":1") && report.contains("\"calibrated\":false"), "identical maps: no scatter, model sigma kept: " + report);
     // --min-angle (MultiViewSgm.wideEnough): a point 10 m in front of camera 0 (centre at the
     // origin), seen by neighbours with baselines 0.5 m (2.9 deg) and 1.0 m (5.7 deg).
     Camera a = new Camera(100, 100, 47.5, 19.5), narrow = new Camera(100, 100, 47.5, 19.5), wide = new Camera(100, 100, 47.5, 19.5);
@@ -82,6 +109,10 @@ final class MvsgmPartnerViewsRegression {
 
   /** The three-camera fixture fused at --step {@code step}; the emitted points (LAS). */
   static List<double[]> fuse(Path dir, int step) throws Exception {
+    return fuse(dir, step, "surface");
+  }
+
+  static List<double[]> fuse(Path dir, int step, String attributes) throws Exception {
     Options o = new Options();
     o.output = Files.createDirectories(dir);
     o.projectDirectory = o.output;
@@ -89,6 +120,7 @@ final class MvsgmPartnerViewsRegression {
     o.fusionMode = "image";
     o.minViews = 2;
     o.step = step;
+    o.pointAttributes = attributes;
     o.compute = "cpu";
     o.cores = 2;
     int n = 3, w = 96, h = 40;

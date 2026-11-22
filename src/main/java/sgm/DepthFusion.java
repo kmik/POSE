@@ -63,6 +63,11 @@ final class DepthFusion implements AutoCloseable {
         costSharpness = Double.NaN,
         photometric = Double.NaN,
         lrError = Double.NaN;
+    /** --point-attributes evidence (image fusion): largest triangulation angle among confirming
+     * cameras (degrees), weighted residual sum of the averaged depths (dimensionless: weights are
+     * inverse variances) with its degrees of freedom, and the plain std of those depths. */
+    double angle = Double.NaN, spreadRss = Double.NaN, depthSpread = Double.NaN;
+    int spreadDof;
 
     Result(
         double[] point,

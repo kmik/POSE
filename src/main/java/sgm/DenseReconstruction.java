@@ -350,6 +350,7 @@ final class DenseReconstruction {
           fusionWork.done();
           long finishStarted = System.nanoTime();
           output.finish();
+          uncertaintyLine = output.uncertaintySummary;
           RunTelemetry.record(
               "Fusion output finish (deferred normals, consolidation, LAS/PLY)", finishStarted);
           kept = output.count();
@@ -386,7 +387,7 @@ final class DenseReconstruction {
                   options.fusionPipeline,
                   (options.fusionEmission.equals("pair")
                       && (options.surfaceConsolidation.equals("normal")
-                          || options.pointAttributes.equals("surface"))),
+                          || options.surfaceAttributes())),
                   true,
                   prepared)) {
         {
@@ -467,6 +468,7 @@ final class DenseReconstruction {
             fusionRejected);
         long finishStarted = System.nanoTime();
         output.finish();
+        uncertaintyLine = output.uncertaintySummary;
           RunTelemetry.record(
               "Fusion output finish (deferred normals, consolidation, LAS/PLY)", finishStarted);
         normalNanos += output.deferredNormalNanos();
@@ -556,6 +558,8 @@ final class DenseReconstruction {
   private MvsgmWindow mvsgmWindow;
 
   private String aerialSummary;
+  /** --point-attributes calibration line for report.txt ("" without it). */
+  private String uncertaintyLine = "";
 
   String summary() {
     if (aerialSummary != null) return aerialSummary;
@@ -612,6 +616,7 @@ final class DenseReconstruction {
         + fusion.requiredViews()
         + "\nTriangulation angle rejected="
         + angleRejected
+        + uncertaintyLine
         + "\nExported points="
         + accepted
         + "\n";

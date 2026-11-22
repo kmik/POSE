@@ -264,6 +264,9 @@ final class ImageFusion {
   // --step with --dense-method mvsgm: fusion works on the full maps (thinned maps would fall apart in
   // the 4-connected speckle filter) and each camera emits only pixels on the step grid.
   private final int emitStep;
+  // --point-attributes evidence: per-point angle and depth spread (and the camera centres they need).
+  private final boolean evidence;
+  private final double[][] centres;
   private final double sigmaK, seedMinSine, localSigma;
   // --fusion-local-sigma: per camera, the smallest merged sigma (depth units) within 4 pixels.
   private final Raster[] localBest;
@@ -419,8 +422,11 @@ final class ImageFusion {
     localSigma = o.fusionLocalSigma;
     tierCount = o.fusionSeedOrder.equals("precision") ? (seedMinSine > 0 ? 3 : 2) : 1;
     emitStep = maps != null && o.denseMethod.equals("mvsgm") ? Math.max(1, o.step) : 1;
+    evidence = o.pointEvidence();
+    centres = new double[evidence ? fusion.cameraCount() : 0][];
+    for (int c = 0; c < centres.length; c++) centres[c] = fusion.camera(c).center();
     storeWeights =
-        o.fusionStrategy.equals("graph-average") || DepthOutlierFilter.enabled(o) || o.thinSurfaceFusion();
+        o.fusionStrategy.equals("graph-average") || DepthOutlierFilter.enabled(o) || o.thinSurfaceFusion() || evidence;
     cameras = fusion.cameraCount();
     mapWindowCameras = window == null ? cameras : window.graph.peakCameras;
     words = (cameras + 63) / 64;
@@ -447,7 +453,7 @@ final class ImageFusion {
     gridCells = SurfacePatchGrid.cacheCells(o, Math.max(1, mapWindowCameras));
     if (hostMemory != null)
       gridCells = (int) Math.max(16, Math.min(gridCells, hostMemory.workBytes / 32 / Math.max(1, cameras) / SurfacePatchGrid.CELL_BYTES));
-    gpuNormals = GpuNormals.requested(o) && (o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal"));
+    gpuNormals = GpuNormals.requested(o) && (o.surfaceAttributes() || o.surfaceConsolidation.equals("normal"));
     long[] plannedMaps = new long[cameras];
     long worstCamera = 0, worstPixels = 0, speckleWork = 0, speckleLimit = Long.MAX_VALUE;
     int threads = Math.max(1, o.cores), speckleThreads = threads;
@@ -466,7 +472,7 @@ final class ImageFusion {
       worstCamera = Math.max(worstCamera, pairBytes + pixels * (34L + 8L * words + 1) + speckle);
     }
     if (window != null) allMapBytes = window.graph.peakBytes(plannedMaps, window.retainFusion);
-    boolean surfaceAttributes = o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal");
+    boolean surfaceAttributes = o.surfaceAttributes() || o.surfaceConsolidation.equals("normal");
     long normalBytes = surfaceAttributes && 24L * worstPixels <= 512L << 20 ? 24L * worstPixels : 0;
     long budget = (long) (Runtime.getRuntime().maxMemory() * .75);
     long forced = Long.getLong("sgm.fusion.mapBudgetMb", -1L);
@@ -2384,7 +2390,7 @@ final class ImageFusion {
    */
   private double[] pointCache(int c, Merged m) {
     int w = m.w, h = m.h;
-    boolean surface = o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal");
+    boolean surface = o.surfaceAttributes() || o.surfaceConsolidation.equals("normal");
     if (!surface || !normalCache || 24L * w * h > 512L << 20 || Boolean.getBoolean("sgm.noNormalCache")) return null;
     Camera cam = fusion.camera(c);
     double[] rotationT = Math3.transpose(cam.rotation);
@@ -2433,7 +2439,7 @@ final class ImageFusion {
     double[] rotationT = Math3.transpose(cam.rotation);
     double tol = o.fusionRelative;
     boolean robust = o.fusionOutliers.equals("robust");
-    boolean surface = o.pointAttributes.equals("surface") || o.surfaceConsolidation.equals("normal");
+    boolean surface = o.surfaceAttributes() || o.surfaceConsolidation.equals("normal");
     double twoView = fusion.twoViewConfidenceThreshold();
     int[] near = neighbours[c];
     int agreementRadius = agreementRadius(o);
@@ -2483,6 +2489,11 @@ final class ImageFusion {
         // direction per unit of this camera's depth; another camera's depth is linear along it.
         double sumW = average ? m.wsum[q] : 0, sumWZ = average ? m.wsum[q] * (double) mz : 0;
         double[] ray = average ? Math3.mv(rotationT, new double[] {(u - cam.cx) / cam.fx, (v - cam.cy) / cam.fy, 1}) : null;
+        // --point-attributes evidence: the averaged depths (as graph-average takes them) relative to
+        // this pixel's depth, weighted and plain, and the widest angle to a confirming camera.
+        double[] eRay = evidence ? (ray != null ? ray : Math3.mv(rotationT, new double[] {(u - cam.cx) / cam.fx, (v - cam.cy) / cam.fy, 1})) : null;
+        double eW = evidence ? m.wsum[q] : 0, eWD = 0, eWDD = 0, eD = 0, eDD = 0, bestCos = 2;
+        int eN = evidence ? 1 : 0;
         Arrays.fill(confirmed, 0);
         for (int k = 0; k < words; k++) views[k] = m.partners.length > 0 ? m.partners[q * words + k] : 0;
         views[c >>> 6] |= 1L << (c & 63);
@@ -2609,6 +2620,19 @@ final class ImageFusion {
               }
             }
           }
+          if (evidence && averageAgreement) {
+            double slope = oc.rotation[6] * eRay[0] + oc.rotation[7] * eRay[1] + oc.rotation[8] * eRay[2];
+            double zm = at(oa, ay * ow + ax), wm = hasWeights ? at(wa, ay * ow + ax) : 0;
+            if (slope > .2 && wm > 0) {
+              double d = (zm - vj[2]) / slope;
+              eW += wm;
+              eWD += wm * d;
+              eWDD += wm * d * d;
+              eD += d;
+              eDD += d * d;
+              eN++;
+            }
+          }
           if (freeSpace && (zj > 0 || agrees)) {
             // Free-space vote. Margin: three footprints (beyond depth noise, far below the 3 x
             // relative tolerance of the contradiction test). "on": cameras confirming under the
@@ -2628,6 +2652,12 @@ final class ImageFusion {
           }
           if (!agrees && zj <= 0) continue;
           if (agrees) {
+            if (evidence) {
+              double[] a = centres[c], b = centres[j];
+              double ax0 = a[0] - X[0], ay0 = a[1] - X[1], az0 = a[2] - X[2], bx = b[0] - X[0], by = b[1] - X[1], bz = b[2] - X[2];
+              double norm = Math.sqrt((ax0 * ax0 + ay0 * ay0 + az0 * az0) * (bx * bx + by * by + bz * bz));
+              if (norm > 0) bestCos = Math.min(bestCos, (ax0 * bx + ay0 * by + az0 * bz) / norm);
+            }
             if ((views[j >>> 6] & 1L << (j & 63)) == 0) outsideSupport = true;
             views[j >>> 6] |= 1L << (j & 63);
             confirmed[j >>> 6] |= 1L << (j & 63);
@@ -2717,6 +2747,14 @@ final class ImageFusion {
         DepthFusion.Result r =
             new DepthFusion.Result(X, viewCount, (int) independent, sigma, Math3.norm(Math3.sub(X, data.point(rep))), "accepted");
         r.supportingCameras = supporting;
+        if (evidence) {
+          if (bestCos <= 1) r.angle = Math.toDegrees(Math.acos(Math.max(-1, bestCos)));
+          if (eN >= 2) {
+            r.spreadRss = Math.max(0, eWDD - eWD * eWD / eW);
+            r.spreadDof = eN - 1;
+          }
+          if (eN >= 3) r.depthSpread = Math.sqrt(Math.max(0, (eDD - eD * eD / eN) / (eN - 1)));
+        }
         int e = rep * fields;
         r = TwoViewConfidence.apply(r, data.evidence[e], fields == 6 ? data.evidence[e + 5] : Double.NaN, twoView);
         r.matchingConfidence = data.evidence[e];

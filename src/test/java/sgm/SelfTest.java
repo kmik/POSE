@@ -78,6 +78,7 @@ public final class SelfTest {
     checks += CloudScoreRegression.run(root.resolve("cloud-score"));
     checks += ParamSweepRegression.run(root.resolve("param-sweep"));
     checks += PresetsRegression.run();
+    checks += PointFieldsRegression.run(root.resolve("point-fields"));
     checks += ScopedSourceMapsRegression.run(root.resolve("scoped-source-maps"));
     checks += MvsgmCameraPoolRegression.run(root.resolve("camera-pool"));
     checks += DenseCheckpointRegression.run(root.resolve("dense-checkpoint"));

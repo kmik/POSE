@@ -119,6 +119,9 @@ final class GuiOptions {
           new Field("--ply", "Write dense.ply", OUTPUT, Kind.CHOICE, List.of("", "on", "off")),
           new Field("--tiled-las-output", "LAS tile size (m)", OUTPUT, Kind.TEXT, List.of()),
           new Field("--point-confidence", "Point confidence file", OUTPUT, Kind.CHOICE, List.of("", "on", "off")),
+          new Field("--point-attributes", "Per-point values in LAS/PLY", OUTPUT, Kind.MULTI, List.of("", "surface", "uncertainty",
+              "normal", "roughness", "surface_variation", "planarity", "normal_diagnostics", "height_sigma", "ray_sigma",
+              "depth_spread", "views", "angle", "confidence", "source", "none")),
           new Field("--verbose", "Verbose log", OUTPUT, Kind.FLAG, List.of()));
 
   /**

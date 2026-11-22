@@ -47,6 +47,12 @@ public final class CloudWriter implements AutoCloseable {
     Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY
   };
   private final boolean attributes;
+  /** Generic --point-attributes layout (PointFields); null = the original surface/none layout. */
+  private final EnumSet<PointFields.Field> fields;
+  private final boolean sourceField;
+  private final ByteBuffer fieldRecord, surfaceScratch;
+  /** Factor applied to the calibrated sigma fields in one final pass (FusionOutput's variance factor). */
+  private double calibration = 1;
   private final int lasRecordBytes, plyRecordBytes;
   private final ByteBuffer extraRecord =
       ByteBuffer.allocate(SurfaceAttributes.BYTES).order(ByteOrder.LITTLE_ENDIAN);
@@ -96,13 +102,31 @@ public final class CloudWriter implements AutoCloseable {
   }
 
   CloudWriter(Path directory, double scale, Crs crs, boolean attributes) throws IOException {
+    this(directory, scale, crs, attributes, null);
+  }
+
+  /**
+   * --point-attributes: surface and none use the original layout (byte for byte); any other list
+   * the generic PointFields layout, written with {@link #point(double, double, double, int, int,
+   * int, PointFields.Values)}.
+   */
+  CloudWriter(Path directory, double scale, Crs crs, EnumSet<PointFields.Field> fields) throws IOException {
+    this(directory, scale, crs, PointFields.legacy(fields) && !fields.isEmpty(), PointFields.legacy(fields) ? null : fields);
+  }
+
+  private CloudWriter(Path directory, double scale, Crs crs, boolean attributes, EnumSet<PointFields.Field> fields)
+      throws IOException {
     this.attributes = attributes;
+    this.fields = fields;
     if (crs != null && scale != 1)
       throw new IllegalArgumentException("A CRS-tagged cloud requires scale 1");
     this.directory = directory;
     this.scale = scale;
     this.crs = crs;
-    int extra = attributes ? SurfaceAttributes.BYTES : 0;
+    int extra = fields != null ? PointFields.bytes(fields) : attributes ? SurfaceAttributes.BYTES : 0;
+    sourceField = fields != null && fields.contains(PointFields.Field.SOURCE);
+    fieldRecord = ByteBuffer.allocate(Math.max(1, extra)).order(ByteOrder.LITTLE_ENDIAN);
+    surfaceScratch = ByteBuffer.allocate(SurfaceAttributes.BYTES).order(ByteOrder.LITTLE_ENDIAN);
     lasRecordBytes = 26 + extra;
     plyRecordBytes = 27 + extra;
     lasRecord = ByteBuffer.allocate(lasRecordBytes).order(ByteOrder.LITTLE_ENDIAN);
@@ -116,11 +140,13 @@ public final class CloudWriter implements AutoCloseable {
 
   private void prepareVlrs() {
     byte[] projection = crs == null ? new byte[0] : projectionVlr(crs.epsg);
-    byte[] extras = attributes ? extraVlr() : new byte[0];
+    byte[] extras = fields != null
+        ? (PointFields.bytes(fields) > 0 ? PointFields.extraVlr(fields) : new byte[0])
+        : attributes ? extraVlr() : new byte[0];
     vlrs = new byte[projection.length + extras.length];
     System.arraycopy(projection, 0, vlrs, 0, projection.length);
     System.arraycopy(extras, 0, vlrs, projection.length, extras.length);
-    vlrCount = (crs == null ? 0 : 1) + (attributes ? 1 : 0);
+    vlrCount = (crs == null ? 0 : 1) + (extras.length > 0 ? 1 : 0);
   }
 
   // ---- --dense-checkpoint: the cloud written so far, and continuing it after an interruption
@@ -276,26 +302,53 @@ public final class CloudWriter implements AutoCloseable {
       double[] normal,
       SurfaceAttributes surface)
       throws IOException {
+    if (fields != null) throw new IllegalStateException("This writer takes PointFields.Values");
     if (closed) throw new IOException("Cloud writer is closed");
     x *= scale; y *= scale; z *= scale;
     if (!Double.isFinite(x + y + z)) throw new IOException("Non-finite cloud point");
-    if (diskSpace != null && count % OutputDiskSpace.BATCH == 0) {
-      // Records go straight to their final files: nothing is left to export at the end.
-      diskSpace.exports(0, count);
-      diskSpace.require(OutputDiskSpace.BATCH * pointBytes(), "dense cloud output");
-    }
-    if (!opened) open();
     byte[] extra = noExtra;
     if (attributes) {
       extraRecord.clear();
       surface.binary(extraRecord, normal, scale);
       extra = extraRecord.array();
     }
+    write(x, y, z, red, green, blue, extra, 0);
+  }
+
+  /** A point in the generic --point-attributes layout (writers made with a field list). */
+  void point(double x, double y, double z, int red, int green, int blue, PointFields.Values v) throws IOException {
+    if (fields == null) {
+      point(x, y, z, red, green, blue, v.normal, v.surface);
+      return;
+    }
+    if (closed) throw new IOException("Cloud writer is closed");
+    x *= scale; y *= scale; z *= scale;
+    if (!Double.isFinite(x + y + z)) throw new IOException("Non-finite cloud point");
+    fieldRecord.clear();
+    PointFields.write(fields, v, scale, fieldRecord, surfaceScratch);
+    byte[] extra = fieldRecord.position() == 0 ? noExtra : fieldRecord.array();
+    write(x, y, z, red, green, blue, extra, sourceField ? Math.max(0, Math.min(65535, v.source)) : 0);
+  }
+
+  /** Scale for the calibrated sigma fields, applied in one pass when the cloud is closed. */
+  void calibration(double factor) {
+    if (!(factor > 0) || !Double.isFinite(factor)) throw new IllegalArgumentException("Calibration factor must be positive");
+    calibration = factor;
+  }
+
+  private void write(double x, double y, double z, int red, int green, int blue, byte[] extra, int source)
+      throws IOException {
+    if (diskSpace != null && count % OutputDiskSpace.BATCH == 0) {
+      // Records go straight to their final files: nothing is left to export at the end.
+      diskSpace.exports(0, count);
+      diskSpace.require(OutputDiskSpace.BATCH * pointBytes(), "dense cloud output");
+    }
+    if (!opened) open();
     min[0] = Math.min(min[0], x); max[0] = Math.max(max[0], x);
     min[1] = Math.min(min[1], y); max[1] = Math.max(max[1], y);
     min[2] = Math.min(min[2], z); max[2] = Math.max(max[2], z);
     Las target = single != null ? single : tile(x, y);
-    target.add(x, y, z, red, green, blue, extra);
+    target.add(x, y, z, red, green, blue, extra, source);
     if (ply) {
       plyRecord.clear();
       plyRecord.putDouble(x).putDouble(y).putDouble(z).put((byte) red).put((byte) green).put((byte) blue);
@@ -380,6 +433,15 @@ public final class CloudWriter implements AutoCloseable {
         for (Las las : all) las.finish();
         work.done();
       }
+      int[] calibrated = fields == null ? new int[0] : PointFields.calibratedOffsets(fields);
+      if (calibrated.length > 0 && calibration != 1)
+        try (WorkProgress work = WorkProgress.start("Calibrating point sigmas", count, "points")) {
+          List<Las> all = new ArrayList<>(tiles.values());
+          if (single != null) all.add(single);
+          for (Las las : all) scaleFields(las.part, lasDataOffset(las.part), lasRecordBytes, 26, calibrated, las.count);
+          if (ply) scaleFields(plyPart, plyHeader(count).length, plyRecordBytes, 27, calibrated, count);
+          work.done();
+        }
       closed = true;
       for (Las las : tiles.values()) publish(las.part, las.target);
       if (tileDirectory != null) {
@@ -400,6 +462,41 @@ public final class CloudWriter implements AutoCloseable {
         abort();
       }
       if (diskSpace != null) diskSpace.exports(0, 0);
+    }
+  }
+
+  /** Offset to point data from a finished LAS header (1.2 and 1.4 alike). */
+  private static long lasDataOffset(Path las) throws IOException {
+    try (FileChannel ch = FileChannel.open(las, StandardOpenOption.READ)) {
+      ByteBuffer b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
+      while (b.hasRemaining()) if (ch.read(b, 96 + b.position()) < 0) throw new EOFException("Short LAS header: " + las);
+      return b.getInt(0) & 0xffffffffL;
+    }
+  }
+
+  /**
+   * Multiplies the float fields at {@code offsets} (within the extra bytes, which start at {@code
+   * extraStart} in each record) by the calibration factor, in place. NaN stays NaN.
+   */
+  private void scaleFields(Path file, long data, int recordBytes, int extraStart, int[] offsets, long records)
+      throws IOException {
+    int batch = Math.max(1, (1 << 22) / recordBytes);
+    ByteBuffer b = ByteBuffer.allocate(batch * recordBytes).order(ByteOrder.LITTLE_ENDIAN);
+    try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+      for (long first = 0; first < records; first += batch) {
+        int n = (int) Math.min(batch, records - first);
+        long at = data + first * recordBytes;
+        b.clear().limit(n * recordBytes);
+        while (b.hasRemaining()) if (ch.read(b, at + b.position()) < 0) throw new EOFException("Short cloud file: " + file);
+        for (int i = 0; i < n; i++)
+          for (int off : offsets) {
+            int p = i * recordBytes + extraStart + off;
+            float v = b.getFloat(p);
+            if (Float.isFinite(v)) b.putFloat(p, (float) (v * calibration));
+          }
+        b.flip();
+        write(ch, b, at);
+      }
     }
   }
 
@@ -475,7 +572,7 @@ public final class CloudWriter implements AutoCloseable {
       return out;
     }
 
-    void add(double x, double y, double z, int r, int g, int b, byte[] extra) throws IOException {
+    void add(double x, double y, double z, int r, int g, int b, byte[] extra, int source) throws IOException {
       if (count == 0) {
         if (tile) {
           offset[0] = col * tileSize;
@@ -497,7 +594,7 @@ public final class CloudWriter implements AutoCloseable {
             qy = Math.round((y - offset[1]) / QUANTIZATION),
             qz = Math.round((z - offset[2]) / QUANTIZATION);
         if (fits(qx) && fits(qy) && fits(qz)) {
-          record(lasRecord, (int) qx, (int) qy, (int) qz, r, g, b, extra);
+          record(lasRecord, (int) qx, (int) qy, (int) qz, r, g, b, extra, source);
           stream().write(lasRecord.array());
           direct++;
           count++;
@@ -514,6 +611,7 @@ public final class CloudWriter implements AutoCloseable {
       spoolOut.write(g);
       spoolOut.write(b);
       spoolOut.write(extra);
+      if (sourceField) spoolOut.writeShort(source);
       count++;
     }
 
@@ -577,8 +675,9 @@ public final class CloudWriter implements AutoCloseable {
           double x = rest.readDouble(), y = rest.readDouble(), z = rest.readDouble();
           int r = rest.readUnsignedByte(), g = rest.readUnsignedByte(), b = rest.readUnsignedByte();
           rest.readFully(extra);
+          int source = sourceField ? rest.readUnsignedShort() : 0;
           record(lasRecord, coordinate(x, centre[0], quantization), coordinate(y, centre[1], quantization),
-              coordinate(z, centre[2], quantization), r, g, b, extra);
+              coordinate(z, centre[2], quantization), r, g, b, extra, source);
           o.write(lasRecord.array());
         }
       }
@@ -608,7 +707,7 @@ public final class CloudWriter implements AutoCloseable {
   }
 
   private static void record(
-      ByteBuffer record, int x, int y, int z, int r, int g, int b, byte[] extra) {
+      ByteBuffer record, int x, int y, int z, int r, int g, int b, byte[] extra, int source) {
     record.clear();
     record.putInt(x).putInt(y).putInt(z);
     record
@@ -617,7 +716,7 @@ public final class CloudWriter implements AutoCloseable {
         .put((byte) 1)
         .put((byte) 0)
         .put((byte) 0)
-        .putShort((short) 0);
+        .putShort((short) source); // Point Source ID: 0 unless --point-attributes source
     record.putShort((short) (r * 257)).putShort((short) (g * 257)).putShort((short) (b * 257));
     record.put(extra);
   }
@@ -668,7 +767,7 @@ public final class CloudWriter implements AutoCloseable {
             + "property uchar red\n"
             + "property uchar green\n"
             + "property uchar blue\n"
-            + (attributes ? plyAttributes() : "")
+            + (fields != null ? PointFields.plyProperties(fields) : attributes ? plyAttributes() : "")
             + "end_header\n";
     return header.getBytes(StandardCharsets.US_ASCII);
   }

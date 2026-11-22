@@ -272,6 +272,23 @@ public final class Options {
   public double surfaceNormalAngle = 30;
   public int surfaceMemoryMb = 128, surfaceBatchSize = 64;
   public String surfaceValidation = "auto", pointAttributes = "surface";
+
+  /** The --point-attributes fields (empty for none). */
+  java.util.EnumSet<PointFields.Field> pointFields() {
+    return PointFields.parse(pointAttributes);
+  }
+
+  /** Whether the surface neighbourhood attributes (normals, roughness ...) are computed for output. */
+  boolean surfaceAttributes() {
+    return PointFields.needsSurface(pointFields());
+  }
+
+  /** Whether fusion records the per-point evidence for angle, depth spread and calibrated sigmas. */
+  boolean pointEvidence() {
+    var f = pointFields();
+    return f.contains(PointFields.Field.HEIGHT_SIGMA) || f.contains(PointFields.Field.RAY_SIGMA)
+        || f.contains(PointFields.Field.DEPTH_SPREAD) || f.contains(PointFields.Field.ANGLE);
+  }
   public int correlationWindow = 7, speckleSize = 50, minViews = 3;
   public String filtering = "moderate", filteringOverrides = "";
   public String quality = "custom";
@@ -2044,7 +2061,10 @@ public final class Options {
           "Invalid positive range, iteration count, or calibration board size");
     choice(o.depthRefinementMethod, "--depth-refinement", "reprojection", "weighted");
     choice(o.surfaceConsolidation, "--surface-consolidation", "normal", "none");
-    choice(o.pointAttributes, "--point-attributes", "surface", "none");
+    PointFields.parse(o.pointAttributes);
+    if (o.pointEvidence() && (!o.fusionMode.equals("image") || !o.fusionEmission.equals("pair")))
+      throw new IllegalArgumentException("--point-attributes angle, depth_spread, height_sigma and ray_sigma need --fusion-mode image"
+          + " with --fusion-emission pair");
     choice(o.surfaceValidation, "--surface-validation", "auto", "cpu", "gpu");
     if (!(o.surfaceRadius >= .5
             && o.surfaceRadius <= 8
@@ -3042,14 +3062,24 @@ Point filtering and multi-view fusion:
   --surface-memory-mb N
       Surface working-set budget in MiB (default: 128; minimum: 8), additionally
       limited by --memory-mb. Spatial partitions spill to temporary disk files.
-  --point-attributes surface|none
-      Default surface writes source-depth normals and roughness/planarity diagnostics
-      into PLY properties, LAS Extra Bytes and the point-confidence sidecar. Normals
-      point toward the producing pair's first camera; invalid estimates are NaN.
-      Neighborhood scale/support/status are recorded; normals are not recomputed
-      after consolidation. None keeps compact XYZ/RGB clouds and avoids normal
-      estimation when surface consolidation is also none. Adds 32 bytes per cloud
-      point to each LAS/PLY file, plus temporary spool/diagnostic storage.
+  --point-attributes LIST
+      Values stored per point in LAS Extra Bytes and PLY properties, comma-separated.
+      Default surface: source-depth normals and roughness/planarity diagnostics (32
+      bytes per point; normals point toward the producing pair's first camera, invalid
+      estimates are NaN, not recomputed after consolidation). none keeps compact XYZ/RGB
+      clouds and avoids normal estimation when surface consolidation is also none.
+      Single surface fields: normal, roughness, surface_variation, planarity,
+      normal_diagnostics. Per-point evidence: views (cameras confirming the point),
+      angle (largest triangulation angle, degrees), confidence (0..1), source (source
+      camera in the LAS Point Source ID), depth_spread (std of the averaged cameras'
+      depths, 3+ cameras). Uncertainty: height_sigma and ray_sigma, calibrated 1-sigma
+      local precision (vertical, along the viewing ray) in output units: the fusion
+      model's sigma scaled by the run's variance factor from the spread of the depths
+      fusion averaged (image fusion only; reported in report.txt). Local precision from the
+      images only, including disagreement between cameras (so larger than the scatter
+      around flat surfaces); orientation and absolute errors are not included. Groups:
+      uncertainty (height_sigma, ray_sigma), all. surface and none write the layout
+      above unchanged; uncertainty adds a final pass over the cloud files.
   --surface-validation auto|cpu|gpu
       Default auto reuses prepared GPU fusion evidence for batched surface checks,
       with CPU guards and audits; otherwise CPU. Cpu forces reference checks.

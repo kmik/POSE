@@ -19,6 +19,20 @@ final class FusionOutput implements AutoCloseable {
   private long staged;
   private long voxelRejected, confidenceRejected, unavailableConfidence;
   private long cloudWriteNanos;
+  // --point-attributes evidence: the run's variance factor for the calibrated sigmas. Sums of the
+  // weighted residuals of the depths fusion averaged (weights = inverse model variances) and their
+  // degrees of freedom, overall and per triangulation-angle class (report only).
+  private final boolean evidence;
+  private final EnumSet<PointFields.Field> fields;
+  /** report.txt line of the --point-attributes calibration ("" without it). */
+  String uncertaintySummary = "";
+  private double spreadRss;
+  private long spreadDof;
+  private final double[] binRss = new double[ANGLE_BINS.length + 1];
+  private final long[] binDof = new long[ANGLE_BINS.length + 1];
+  static final double[] ANGLE_BINS = {5, 10, 20, 40};
+  /** Degrees of freedom needed before the run's factor replaces the model (factor 1). */
+  static final long MIN_DOF = 1000;
   private long cameraNormalNanos;
 
   long deferredNormalNanos() {
@@ -40,6 +54,8 @@ final class FusionOutput implements AutoCloseable {
 
   FusionOutput(Options options, DepthFusion fusion, Project project, Crs crs) throws IOException {
     this.options = options;
+    evidence = options.pointEvidence();
+    fields = options.pointFields();
     this.fusion = fusion;
     this.project = project;
     Path file = options.output.resolve("07_results/point-confidence.csv.gz");
@@ -47,7 +63,7 @@ final class FusionOutput implements AutoCloseable {
     Files.createDirectories(options.output.resolve("06_fusion"));
     cloud =
         new CloudWriter(
-            options.output, options.scale, crs, options.pointAttributes.equals("surface"));
+            options.output, options.scale, crs, options.pointFields());
     cloud.writePly(options.writePly);
     if (options.tiledLasOutput > 0)
       cloud.tiles(options.tiledLasOutput, options.output.resolve("07_results/dense_tiles"));
@@ -104,6 +120,15 @@ final class FusionOutput implements AutoCloseable {
       confidenceRejected = (long) resumed.get("confidence_rejected");
       unavailableConfidence = (long) resumed.get("unavailable_confidence");
       voxelRejected = (long) resumed.get("voxel_rejected");
+      if (evidence && resumed.get("spread_rss") != null) {
+        spreadRss = ((Number) resumed.get("spread_rss")).doubleValue();
+        spreadDof = ((Number) resumed.get("spread_dof")).longValue();
+        List<?> r = (List<?>) resumed.get("bin_rss"), d = (List<?>) resumed.get("bin_dof");
+        for (int i = 0; i < binRss.length; i++) {
+          binRss[i] = ((Number) r.get(i)).doubleValue();
+          binDof[i] = ((Number) d.get(i)).longValue();
+        }
+      }
     }
   }
 
@@ -114,6 +139,12 @@ final class FusionOutput implements AutoCloseable {
     Map<String, Object> out = new LinkedHashMap<>(Json.object("staged", staged,
         "confidence_rejected", confidenceRejected, "unavailable_confidence", unavailableConfidence,
         "voxel_rejected", voxelRejected));
+    if (evidence) {
+      out.put("spread_rss", spreadRss);
+      out.put("spread_dof", spreadDof);
+      out.put("bin_rss", Arrays.stream(binRss).boxed().toList());
+      out.put("bin_dof", Arrays.stream(binDof).boxed().toList());
+    }
     if (surface != null) out.put("surface", surface.checkpoint());
     else {
       // Without consolidation the points are already in the cloud files and records.
@@ -137,6 +168,13 @@ final class FusionOutput implements AutoCloseable {
     if (geometry == null) geometry = new DepthFusion.SurfaceSample(null, 0, 0);
     SurfaceConsolidator.Sample p =
         new SurfaceConsolidator.Sample(id, source, pixel, rgb, result, geometry);
+    if (evidence && result.spreadDof > 0 && Double.isFinite(result.spreadRss)) {
+      spreadRss += result.spreadRss;
+      spreadDof += result.spreadDof;
+      int bin = angleBin(result.angle);
+      binRss[bin] += result.spreadRss;
+      binDof[bin] += result.spreadDof;
+    }
     if (options.outputDiskSpace != null && staged % OutputDiskSpace.BATCH == 0
         && (records != null || cameraEmission != null || surface != null))
       OutputDiskSpace.require(options,
@@ -196,7 +234,7 @@ final class FusionOutput implements AutoCloseable {
       cameraEmission.finish(
           batch -> {
             long normalStarted = System.nanoTime();
-            if (options.pointAttributes.equals("surface"))
+            if (options.surfaceAttributes())
               fusion.parallel(
                   batch.size(),
                   i -> {
@@ -281,9 +319,44 @@ final class FusionOutput implements AutoCloseable {
                 + " recomputed with revalidated relative sigma after surface movement",
             "scope",
             "Evidence ranking heuristic, not a probability or surveyed accuracy"));
+    if (evidence) uncertaintyReport();
     finished = true;
   }
 
+
+  /**
+   * The run's variance factor: sqrt(sum of weighted residuals / degrees of freedom) of the depths
+   * fusion averaged. 1 means the model sigma matches the scatter between cameras; with too few
+   * degrees of freedom the model is kept (factor 1, flagged). Written to
+   * 07_results/point-uncertainty.json and given to the cloud writer for the sigma fields.
+   */
+  private void uncertaintyReport() throws IOException {
+    boolean calibrated = spreadDof >= MIN_DOF && spreadRss > 0;
+    double factor = calibrated ? Math.sqrt(spreadRss / spreadDof) : 1;
+    List<Object> bins = new ArrayList<>();
+    for (int i = 0; i < binRss.length; i++) {
+      // Bins of angleBin: [0, 5), [5, 10), [10, 20), [20, 40), then 40 and above or unknown.
+      String range = i < ANGLE_BINS.length
+          ? (i == 0 ? 0 : (int) ANGLE_BINS[i - 1]) + "-" + (int) ANGLE_BINS[i] + " deg"
+          : (int) ANGLE_BINS[ANGLE_BINS.length - 1] + " deg and above, or unknown";
+      bins.add(Json.object("triangulation_angle", range, "degrees_of_freedom", binDof[i],
+          "factor", binDof[i] > 0 && binRss[i] > 0 ? Math.sqrt(binRss[i] / binDof[i]) : null));
+    }
+    Json.write(options.output.resolve("07_results/point-uncertainty.json"), Json.object(
+        "factor", factor, "calibrated", calibrated, "degrees_of_freedom", spreadDof,
+        "minimum_degrees_of_freedom", MIN_DOF, "by_triangulation_angle", bins,
+        "fields", fields.stream().map(f -> f.name).toList(),
+        "meaning", "height_sigma and ray_sigma are the fusion model's sigma (triangulation angle, footprint, averaged"
+            + " cameras) times this factor: 1-sigma local precision from the images. Orientation and absolute errors"
+            + " are not included.",
+        "factor_source", "weighted scatter of the depths fusion averaged against the model's inverse variances"));
+    System.out.printf(Locale.ROOT, "Point uncertainty: variance factor %.3f from %,d degrees of freedom%s%n",
+        factor, spreadDof, calibrated ? "" : " (too few: model sigma kept)");
+    uncertaintySummary = String.format(Locale.ROOT,
+        "%nPoint uncertainty factor=%.4f (%s, %d degrees of freedom; 07_results/point-uncertainty.json)",
+        factor, calibrated ? "calibrated" : "too few to calibrate: model sigma", spreadDof).replace("\r", "");
+    cloud.calibration(factor);
+  }
   private void publish(SurfaceConsolidator.Sample p) throws IOException {
     double score = PointConfidence.finalScore(p.matchingConfidence, p.sigma);
     if (!PointConfidence.valid(score)) unavailableConfidence++;
@@ -316,8 +389,46 @@ final class FusionOutput implements AutoCloseable {
     int r = p.rgb >>> 16, g = p.rgb >>> 8 & 255, b = p.rgb & 255;
     if (records != null) records.point(cloud.count(), p, options.scale, score);
     long cloudStarted = System.nanoTime();
-    cloud.point(p.point[0], p.point[1], p.point[2], r, g, b, p.normal, p.attributes);
+    if (PointFields.legacy(fields)) cloud.point(p.point[0], p.point[1], p.point[2], r, g, b, p.normal, p.attributes);
+    else cloud.point(p.point[0], p.point[1], p.point[2], r, g, b, values(p, score));
     cloudWriteNanos += System.nanoTime() - cloudStarted;
+  }
+
+  /**
+   * The generic --point-attributes values of a point. Sigmas are uncalibrated here (the model's
+   * relative sigma times the range from the source camera; height: its vertical part along the
+   * ray); CloudWriter scales them by the run's factor when the cloud is closed.
+   */
+  private PointFields.Values values(SurfaceConsolidator.Sample p, double score) {
+    PointFields.Values v = new PointFields.Values();
+    v.normal = p.normal;
+    v.surface = p.attributes;
+    v.views = p.views;
+    v.confidence = score;
+    v.angle = p.angle;
+    v.depthSpread = p.depthSpread;
+    int camera = p.source >= 0 && p.source < fusion.pairCount() ? fusion.pairCamera(p.source, false) : -1;
+    v.source = camera;
+    if (camera >= 0 && Double.isFinite(p.sigma)) {
+      double[] c = fusion.camera(camera).center();
+      double dx = p.point[0] - c[0], dy = p.point[1] - c[1], dz = p.point[2] - c[2];
+      double range = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (range > 0) {
+        v.raySigma = p.sigma * range;
+        v.heightSigma = v.raySigma * Math.abs(dz) / range;
+      }
+    }
+    // Output units: the writer scales coordinates; these lengths are scaled here.
+    v.raySigma *= options.scale;
+    v.heightSigma *= options.scale;
+    v.depthSpread *= options.scale;
+    return v;
+  }
+
+  static int angleBin(double angle) {
+    int bin = 0;
+    while (bin < ANGLE_BINS.length && Double.isFinite(angle) && angle >= ANGLE_BINS[bin]) bin++;
+    return Double.isFinite(angle) ? bin : ANGLE_BINS.length;
   }
 
   private static void closeOnFailure(AutoCloseable resource, Throwable failure) {
