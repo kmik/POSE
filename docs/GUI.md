@@ -69,7 +69,10 @@ heap. The console shows the exact command first; you can copy it and run it in a
   shows a "Lidar reference" line (estimated shifts and angles, stable-area RMS, whether fewer
   parameters were used) and the height datum; the report has a Lidar Reference page and the
   lidar quality flags appear with the others.
-- **Processing:** quality, maximum image dimension, dense method, filtering, minimum views,
+- **Processing:** a **Preset** menu (drone or aircraft, optionally with city or forest) that fills
+  in the tested settings of `--preset` (see the README); the fields stay editable and choosing a
+  preset changes only its own options. Then quality, maximum image dimension, dense method,
+  filtering, minimum views,
   quick calibration, tie-point cleanup (see below), ground classification, orthomosaic.
 - **Compute and memory:** compute device, GPU index and memory, GPU normals in fusion, CPU
   cores, memory budget, RAM limit.
@@ -122,11 +125,11 @@ with 32 GB and an 8 GB GPU this gives 12 cores, 16000 MB and 7700 MB. Saved sett
 have the earlier fixed sizes (12, 16000, 8000) take the computer's sizes; sizes you set
 yourself stay. The other defaults are the tested mvsgm setup: `--quality high --quick-calibration --ply off --point-confidence off
 --features 40000 --ratio 0.85 --neighbors 8 --descriptor-matcher flann --matching-algorithm sift
---descriptor-memory-mb 1600 --min-forward-overlap 50 --step 1 --filtering moderate --dense-method
-mvsgm --min-views 2 --min-angle 2 --confidence-threshold 0.0 --surface-consolidation none
+--descriptor-memory-mb 1600 --min-forward-overlap 50 --step 1 --filtering mild --dense-method
+mvsgm --min-views 2 --min-angle 4 --confidence-threshold 0.0 --surface-consolidation none
 --windowed-mode auto --fusion-gpu-evidence auto --fusion-mode image --fusion-outliers robust
 --subpixel-fit equiangular --fusion-strategy graph-average --mvsgm-optimal-neighbors
---surface-flatten 8 --depth-outlier-filter edge-aware --mvsgm-neighbors 8 --mvsgm-best-k 3
+--depth-outlier-filter edge-aware --mvsgm-neighbors 8 --mvsgm-best-k 3
 --mvsgm-census-window 5 --mvsgm-consistent-views 1 --mvsgm-consistency-labels 1` (the fields on
 New run and Advanced options are filled with these). **Reset options** returns to them, keeping
 the folders. The command line itself keeps its own defaults. The values are remembered per

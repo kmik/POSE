@@ -121,9 +121,11 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | --- | --- | --- |
 | `--quality` | `custom` | `ultra`, `high`, `medium`, `low`: images at full, 1/2, 1/4 or 1/8 size. |
 | `--max-dimension` | `1600` | Longest image side for `custom` quality. |
-| `--step` | `2` | Dense sample spacing in pixels. |
+| `--preset` | none | Tested settings from a parameter study: a platform, `drone` or `aircraft`, optionally with a scene, `city` or `forest` (`--preset drone,forest`). Sets the feature matching (SIFT with FLANN, 20000 features) and the multi-view SGM dense and fusion options; options you give yourself win. `aircraft` is a tested large-format setup that has not been searched against reference data yet. In the window: the Preset menu on New run. |
+| `--step` | `2` (`1` with `mvsgm`) | Dense sample spacing in pixels. With `mvsgm` the depth maps stay dense and each image outputs every N-th pixel (fewer points, faster fusion). |
 | `--filtering` | `moderate` | `mild`, `moderate` or `aggressive` depth filtering. |
 | `--min-views` | `3` | Images that must agree on a point. |
+| `--min-angle` | `1` | Smallest triangulation angle in degrees: a point needs at least one image pair (with `mvsgm`: one neighbouring image that sees it) at this angle. |
 | `--crs` | `EPSG:3067` | Output coordinate system. |
 | `--camera-grouping` | `auto` | Which images share one camera calibration. `auto`: camera IDs of an imported orientation, else `--camera-groups`, else EXIF make, model, serial and focal length; also `single`, `per-image`. Images of different sizes are always separate cameras; the cameras are listed in `01_calibration/cameras.json`. |
 | `--camera-groups` | none | CSV `image,camera` naming the camera of every image. |

@@ -140,15 +140,46 @@ final class GuiOptions {
       {"--quality", "high"}, {"--quick-calibration", "true"},
       {"--ply", "off"}, {"--point-confidence", "off"}, {"--features", "40000"}, {"--ratio", "0.85"}, {"--neighbors", "8"},
       {"--descriptor-matcher", "flann"}, {"--matching-algorithm", "sift"}, {"--descriptor-memory-mb", "1600"}, {"--min-forward-overlap", "50"},
-      {"--step", "1"}, {"--filtering", "moderate"}, {"--dense-method", "mvsgm"}, {"--min-views", "2"}, {"--min-angle", "2"},
+      {"--step", "1"}, {"--filtering", "mild"}, {"--dense-method", "mvsgm"}, {"--min-views", "2"}, {"--min-angle", "4"},
       {"--confidence-threshold", "0.0"}, {"--surface-consolidation", "none"}, {"--windowed-mode", "auto"}, {"--fusion-gpu-evidence", "auto"},
       {"--fusion-mode", "image"}, {"--fusion-outliers", "robust"}, {"--subpixel-fit", "equiangular"}, {"--fusion-strategy", "graph-average"},
-      {"--mvsgm-optimal-neighbors", "true"}, {"--surface-flatten", "8"}, {"--depth-outlier-filter", "edge-aware"}, {"--mvsgm-neighbors", "8"},
+      {"--mvsgm-optimal-neighbors", "true"}, {"--depth-outlier-filter", "edge-aware"}, {"--mvsgm-neighbors", "8"},
       {"--mvsgm-best-k", "3"}, {"--mvsgm-census-window", "5"}, {"--mvsgm-consistent-views", "1"}, {"--mvsgm-consistency-labels", "1"},
     };
     Map<String, String> out = new LinkedHashMap<>();
     for (String[] p : pairs) out.put(p[0], p[1]);
     return Collections.unmodifiableMap(out);
+  }
+
+  /**
+   * The window's Preset menu ({@link Presets}): platform, or platform and scene. Choosing one fills
+   * the preset's option fields, which stay editable; the menu itself adds nothing to the command.
+   */
+  static final List<String> PRESET_CHOICES =
+      List.of("drone", "drone, city", "drone, forest", "aircraft", "aircraft, city", "aircraft, forest");
+
+  /**
+   * Field values of a preset choice ("drone, forest"): flag to value ("true" for a bare flag), plus
+   * "" (the CLI default) for every option another choice sets, so switching presets leaves nothing
+   * of the previous one behind.
+   */
+  static Map<String, String> presetValues(String choice) {
+    Map<String, String> out = new LinkedHashMap<>();
+    for (String other : PRESET_CHOICES) for (String flag : presetOwnValues(other).keySet()) out.put(flag, "");
+    out.putAll(presetOwnValues(choice));
+    return out;
+  }
+
+  /** The options a preset choice sets itself. */
+  static Map<String, String> presetOwnValues(String choice) {
+    List<String> o = Presets.options(choice.replace(" ", ""));
+    Map<String, String> out = new LinkedHashMap<>();
+    for (int i = 0; i < o.size(); i++) {
+      String flag = o.get(i);
+      boolean bare = i + 1 >= o.size() || o.get(i + 1).startsWith("--");
+      out.put(flag, bare ? "true" : o.get(++i));
+    }
+    return out;
   }
 
   /** Fields that name the user's files; kept by Reset options and across a defaults change. */
@@ -166,7 +197,7 @@ final class GuiOptions {
   static final Set<String> NOT_RUN_OPTIONS =
       Set.of(
           "--run", "--branch", "--help", "--estimate-memory", "--list-gpus", "--export-confidence", "--export-report", "--report-output",
-          "--export-orthomosaic", "--export-orientations", "--gcp-port", "--analyze-run");
+          "--export-orthomosaic", "--export-orientations", "--gcp-port", "--analyze-run", "--preset");
 
   /** Second names of an option (the first name is used). */
   static final Set<String> ALIASES = Set.of("-h", "-help", "-f", "-d", "--dist", "-cores", "--ws_census", "--epsg", "-c", "--images", "--output");
@@ -360,7 +391,7 @@ final class GuiOptions {
     {"--dense-method", "mvsgm", "--subpixel-fit", "equiangular"},
     {"--dense-method", "mvsgm", "--depth-outlier-filter", "edge-aware"},
     {"--dense-method", "mvsgm", "--windowed-mode", "auto"},
-    {"--dense-method", "mvsgm", "--min-angle", "2"},
+    {"--dense-method", "mvsgm", "--min-angle", "4"},
     {"--dense-method", "mvsgm", "--mvsgm-neighbors", "8"},
     {"--dense-method", "mvsgm", "--mvsgm-optimal-neighbors", null},
   };

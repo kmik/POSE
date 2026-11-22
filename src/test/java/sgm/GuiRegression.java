@@ -372,9 +372,9 @@ final class GuiRegression {
     Files.delete(s.projectFile(dir.resolve("old")));
     // The window's defaults: the user's tested mvsgm script, without the folders.
     String script = "--cores 12 --memory-mb 16000 --gpu-memory-mb 8000 --quality high --quick-calibration --ply off --point-confidence off --features 40000 --ratio 0.85"
-        + " --neighbors 8 --descriptor-matcher flann --matching-algorithm sift --descriptor-memory-mb 1600 --min-forward-overlap 50 --step 1 --filtering moderate"
-        + " --dense-method mvsgm --min-views 2 --min-angle 2 --confidence-threshold 0.0 --surface-consolidation none --windowed-mode auto --fusion-gpu-evidence auto"
-        + " --fusion-mode image --fusion-outliers robust --subpixel-fit equiangular --fusion-strategy graph-average --mvsgm-optimal-neighbors --surface-flatten 8"
+        + " --neighbors 8 --descriptor-matcher flann --matching-algorithm sift --descriptor-memory-mb 1600 --min-forward-overlap 50 --step 1 --filtering mild"
+        + " --dense-method mvsgm --min-views 2 --min-angle 4 --confidence-threshold 0.0 --surface-consolidation none --windowed-mode auto --fusion-gpu-evidence auto"
+        + " --fusion-mode image --fusion-outliers robust --subpixel-fit equiangular --fusion-strategy graph-average --mvsgm-optimal-neighbors"
         + " --depth-outlier-filter edge-aware --mvsgm-neighbors 8 --mvsgm-best-k 3 --mvsgm-census-window 5 --mvsgm-consistent-views 1 --mvsgm-consistency-labels 1";
     Map<String, String> fromScript = new LinkedHashMap<>();
     List<String> tokens = GuiOptions.split(script);

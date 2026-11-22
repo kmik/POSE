@@ -48,7 +48,7 @@ final class MvsgmWindow implements AutoCloseable {
     this.tracks = tracks;
     this.project = project;
     if (o.step > 1)
-      System.out.println("Note: --step " + o.step + " does not thin --dense-method mvsgm depth maps; every consistent pixel goes to fusion");
+      System.out.println("Note: --step " + o.step + " with --dense-method mvsgm: the depth maps stay dense for fusion; each camera emits every " + o.step + ". pixel in x and y");
     int n = frames.size();
     headers = new MultiViewSgm.Plan[n];
     reports = new Object[n];

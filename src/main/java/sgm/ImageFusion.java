@@ -261,6 +261,9 @@ final class ImageFusion {
   // --thin-surfaces parts (all off: identical to the previous output).
   private final boolean sigmaTolerance, precisionCheck, storeWeights;
   private final int tierCount;
+  // --step with --dense-method mvsgm: fusion works on the full maps (thinned maps would fall apart in
+  // the 4-connected speckle filter) and each camera emits only pixels on the step grid.
+  private final int emitStep;
   private final double sigmaK, seedMinSine, localSigma;
   // --fusion-local-sigma: per camera, the smallest merged sigma (depth units) within 4 pixels.
   private final Raster[] localBest;
@@ -415,6 +418,7 @@ final class ImageFusion {
     seedMinSine = o.fusionSeedMinAngle > 0 ? Math.sin(Math.toRadians(o.fusionSeedMinAngle)) : 0;
     localSigma = o.fusionLocalSigma;
     tierCount = o.fusionSeedOrder.equals("precision") ? (seedMinSine > 0 ? 3 : 2) : 1;
+    emitStep = maps != null && o.denseMethod.equals("mvsgm") ? Math.max(1, o.step) : 1;
     storeWeights =
         o.fusionStrategy.equals("graph-average") || DepthOutlierFilter.enabled(o) || o.thinSurfaceFusion();
     cameras = fusion.cameraCount();
@@ -1696,8 +1700,9 @@ final class ImageFusion {
                 counters.cameraEmitted[c]++;
                 counters.viewHistogram[Math.max(0, Math.min(Counters.VIEW_BUCKETS - 1, e.result.views))]++;
                 if (e.agreements() != null && o.fusionStrategy.equals("graph-average")) {
-                  // Members were averaged into this point: exactly those pixels are used.
-                  markUsed(e, 0);
+                  // Members were averaged into this point: exactly those pixels are used (at an mvsgm
+                  // --step N, the N x N block the point stands for: radius N / 2).
+                  markUsed(e, emitStep / 2);
                   counters.members += e.agreements().length;
                 } else if (e.agreements() != null) {
                   markUsed(e, agreementRadius(o));
@@ -2461,6 +2466,7 @@ final class ImageFusion {
         int p = y * w + x, q = p - base;
         float mz = m.z[q];
         if (mz <= 0) continue;
+        if (emitStep > 1 && (x % emitStep != 0 || y % emitStep != 0)) continue;
         if (tierCount > 1 && tier(m, q, focal) != tier) continue;
         if (taken != null && taken.get(p)) {
           t[6]++;

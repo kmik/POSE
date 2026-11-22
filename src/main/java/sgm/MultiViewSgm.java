@@ -1417,6 +1417,8 @@ final class MultiViewSgm {
   }
 
   final Map<Integer, CameraInfo> info = new ConcurrentSkipListMap<>();
+  /** Depths rejected by --min-angle (no neighbour sees the point at that triangulation angle). */
+  final java.util.concurrent.atomic.AtomicLong narrowRejected = new java.util.concurrent.atomic.AtomicLong();
   final Map<String, Object> phaseTwo = new LinkedHashMap<>();
 
   /**
@@ -1439,8 +1441,8 @@ final class MultiViewSgm {
     long started = System.nanoTime();
     if (o.step > 1)
       System.out.println(
-          "Note: --step " + o.step + " does not thin --dense-method mvsgm depth maps; every consistent"
-              + " pixel goes to fusion (sparse samples of a per-camera map are removed as speckles)");
+          "Note: --step " + o.step + " with --dense-method mvsgm: the depth maps stay dense for fusion; each camera"
+              + " emits every " + o.step + ". pixel in x and y (about 1/" + (o.step * o.step) + " of the points)");
     List<Object> cameraReports;
     Path dir = o.output.resolve("05_stereo/mvsgm");
     // Own even partially written phase-1 files: DenseReconstruction closes this hand-off on
@@ -1485,16 +1487,40 @@ final class MultiViewSgm {
     RunTelemetry.record("Multi-view consistency", phase2);
     phaseTwo.putAll(Json.object(
         "consistent_views_required", minViews, "tolerance_labels", tolerance,
-        "depths", considered, "consistent", kept, "inconsistent_rejected", inconsistent, "candidates", count,
+        "depths", considered, "consistent", kept, "inconsistent_rejected", inconsistent - narrowRejected.get(),
+        "min_angle_degrees", o.minAngle, "min_angle_rejected", narrowRejected.get(), "candidates", count,
         "handoff", "maps"));
     Json.write(dir.resolve("mvsgm.json"), Json.object(
         "census_window", census, "best_k", k, "neighbours", neighbors, "label_pixels", labelPixels,
         "levels", levels(), "consistency", phaseTwo, "cameras", cameraReports));
-    System.out.printf(Locale.ROOT, "mvsgm: %,d of %,d depths consistent; %,d candidates (maps handed to fusion)%n", kept, considered, count);
+    System.out.printf(Locale.ROOT, "mvsgm: %,d of %,d depths consistent (%,d below --min-angle %.1f deg); %,d candidates (maps handed to fusion)%n",
+        kept, considered, narrowRejected.get(), o.minAngle, count);
     return count;
   }
 
   record Consistency(long considered, long kept) {}
+
+  /**
+   * Whether some neighbour sees world point X (in front, inside its image) at a triangulation
+   * angle of at least min-angle with this camera: cos(angle) <= cosLimit. {@code cams[i]}
+   * (size {@code widths[i]} x {@code heights[i]}) and {@code centres[i]} are null for neighbours without depth.
+   */
+  static boolean wideEnough(double[] X, double[] centre, Camera[] cams, int[] widths, int[] heights, double[][] centres, double cosLimit, double[] v) {
+    double ax = centre[0] - X[0], ay = centre[1] - X[1], az = centre[2] - X[2];
+    double an = Math.sqrt(ax * ax + ay * ay + az * az);
+    for (int i = 0; i < cams.length; i++) {
+      Camera oc = cams[i];
+      if (oc == null) continue;
+      oc.viewInto(X[0], X[1], X[2], v);
+      if (v[2] <= 0) continue;
+      double u = oc.fx * v[0] / v[2] + oc.cx, t = oc.fy * v[1] / v[2] + oc.cy;
+      if (u < 0 || t < 0 || u >= widths[i] || t >= heights[i]) continue;
+      double bx = centres[i][0] - X[0], by = centres[i][1] - X[1], bz = centres[i][2] - X[2];
+      double cos = (ax * bx + ay * by + az * bz) / (an * Math.sqrt(bx * bx + by * by + bz * bz));
+      if (cos <= cosLimit) return true;
+    }
+    return false;
+  }
 
   /** Reads raw neighbours only; no neighbour's consistency or fusion result is an input. */
   Consistency consistentCamera(List<ImageFrame> frames, CameraInfo ci, int pair) throws IOException {
@@ -1526,8 +1552,27 @@ final class MultiViewSgm {
       ImageFusion.Raster rgb = consistencyRaster(mapped, scopedFiles, rgbFile, bytes, true);
       Camera cam = rf.camera;
       double[] rt = Math3.transpose(cam.rotation);
+      // --min-angle: a depth needs at least one neighbour that sees its point (in front, inside
+      // the image) at a triangulation angle of at least min-angle, as a pair-SGM point needs its
+      // pair's angle. Compared as cosines: rejected when every visible neighbour's cosine is larger.
+      double cosLimit = o.minAngle > 0 ? Math.cos(Math.toRadians(o.minAngle)) : 2;
+      double[] centre = cam.center();
+      int nn = ci.neighbours().length;
+      Camera[] nCams = new Camera[nn];
+      int[] nWidths = new int[nn], nHeights = new int[nn];
+      double[][] centres = new double[nn][];
+      for (int i = 0; i < nn; i++) {
+        CameraInfo oi = info.get(ci.neighbours()[i]);
+        if (oi == null) continue;
+        ImageFrame of = frames.get(oi.camera());
+        nCams[i] = of.camera;
+        nWidths[i] = of.width;
+        nHeights[i] = of.height;
+        centres[i] = of.camera.center();
+      }
+      long[] narrow = new long[h];
       // lr = best agreement in labels; NaN = no depth or rejected (fewer than minViews agreeing
-      // neighbours). A candidate is a pixel with depth > 0 and lr not NaN.
+      // neighbours, or no neighbour at min-angle). A candidate is a pixel with depth > 0 and lr not NaN.
       long[] rows = new long[2 * h];
       parallel(h, y -> {
         double[] v = new double[3];
@@ -1540,6 +1585,11 @@ final class MultiViewSgm {
           }
           rows[2 * y]++;
           double[] X = world(cam, rt, x, y, zp);
+          if (cosLimit <= 1 && !wideEnough(X, centre, nCams, nWidths, nHeights, centres, cosLimit, v)) {
+            lr.set(p, Float.NaN);
+            narrow[y]++;
+            continue;
+          }
           int agree = 0;
           double best = Double.POSITIVE_INFINITY;
           for (int i = 0; i < others.length && minViews > 0; i++) {
@@ -1565,13 +1615,15 @@ final class MultiViewSgm {
           } else lr.set(p, Float.NaN);
         }
       });
-      long camConsidered = 0, camKept = 0;
+      long camConsidered = 0, camKept = 0, camNarrow = 0;
       long[] rowStart = new long[h + 1];
       for (int y = 0; y < h; y++) {
         camConsidered += rows[2 * y];
         camKept += rows[2 * y + 1];
+        camNarrow += narrow[y];
         rowStart[y + 1] = camKept;
       }
+      narrowRejected.addAndGet(camNarrow);
       // Packed colour r << 16 | g << 8 | b (as fusion stores it), copied in bands of rows.
       int band = Math.max(1, (1 << 22) / Math.max(1, w));
       RasterCache.prefetch(rf);
@@ -1594,8 +1646,8 @@ final class MultiViewSgm {
           else rgb.s.setAtIndex(MappedFiles.INT, base + i, value);
         }
       }
-      // Every consistent pixel goes to fusion: the maps are dense per camera, and a thinned
-      // (--step > 1) map falls apart in fusion's 4-connected speckle filter.
+      // Every consistent pixel goes to fusion: the maps are dense per camera (a thinned map would
+      // fall apart in fusion's 4-connected speckle filter); --step thins at fusion's emission.
       handoff.add(new MvsgmMaps.Camera(c, pair, w, h, rowStart, ci.tiled()));
       if (exportImages() && (ci.tiled() || hostMemory != null)) exportDepthStreamed(rf, "consistent_depth", z, lr, ci.near(), ci.far());
       else if (exportImages()) {

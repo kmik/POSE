@@ -306,6 +306,12 @@ full-range solve on >= 98%; level-table mapping; option validation and copy.
 
 ### Known limits / next steps
 
+- `--min-angle` applies to mvsgm since 2026-11-22: a depth is kept only if some neighbouring
+  image that sees the point (in front, inside the image) does so at least at that triangulation
+  angle; `--min-angle 0` gives the earlier clouds. `--step N` also applies: the depth maps stay
+  dense for fusion (thinned maps would fall apart in its speckle filter) and each image outputs
+  every N-th pixel in x and y; without an explicit `--step`, mvsgm uses 1. City at medium quality:
+  `--step 2` gave 19% of the points with unchanged accuracy and a third less fusion time.
 - Points outside Metashape's coverage (borders, under canopy) raise C2C distances; a stricter
   consistency setting (`--mvsgm-consistent-views 2`) trades coverage for that.
 - `--min-views` counts only cameras whose own depth map confirms the point. Until 2026-11-21 the

@@ -23,6 +23,27 @@ final class PoseLauncherPanel {
   final JButton run = new JButton("Run"), estimate = new JButton("Memory estimate"), reset = new JButton("Reset options"), copy = new JButton("Copy command");
   final javax.swing.Timer validateLater = new javax.swing.Timer(300, e -> validateNow());
   boolean loading;
+  /** Preset menu: fills the preset's option fields (GuiOptions.presetValues); not part of the command. */
+  final JComboBox<String> preset = presetMenu();
+
+  JComboBox<String> presetMenu() {
+    List<String> items = new ArrayList<>(List.of("(choose to fill in settings)"));
+    items.addAll(GuiOptions.PRESET_CHOICES);
+    JComboBox<String> box = new JComboBox<>(items.toArray(String[]::new));
+    box.addActionListener(e -> {
+      if (loading || box.getSelectedIndex() <= 0) return;
+      applyPreset((String) box.getSelectedItem());
+    });
+    return box;
+  }
+
+  /** Puts a preset's values into their fields; every other field keeps its value. */
+  void applyPreset(String choice) {
+    Map<String, String> v = values();
+    v.putAll(GuiOptions.presetValues(choice));
+    v.put("advanced", advanced.getText());
+    load(v);
+  }
   PoseAdvancedPanel advancedOptions;
 
   PoseLauncherPanel(PoseWindow window) {
@@ -103,6 +124,26 @@ final class PoseLauncherPanel {
     GridBagConstraints c = new GridBagConstraints();
     c.insets = new Insets(2, 4, 2, 4);
     int row = 0;
+    if (name.equals(GuiOptions.PROCESSING)) {
+      JLabel label = new JLabel("Preset");
+      String tip = "<html>Fills in the tested dense and fusion settings (multi-view SGM) for a platform and scene,<br>"
+          + "from the 2026-11-21 parameter study. The filled-in fields stay editable; choosing<br>"
+          + "a preset changes only its own options. Aircraft is a tested large-format setup<br>"
+          + "(no aerial reference data to search it yet).</html>";
+      label.setToolTipText(tip);
+      preset.setToolTipText(tip);
+      c.gridx = 0;
+      c.gridy = row;
+      c.anchor = GridBagConstraints.WEST;
+      p.add(label, c);
+      c.gridx = 1;
+      c.weightx = 1;
+      c.gridwidth = 2;
+      c.fill = GridBagConstraints.HORIZONTAL;
+      p.add(preset, c);
+      c.gridwidth = 1;
+      row++;
+    }
     for (GuiOptions.Field f : GuiOptions.FIELDS) {
       if (!f.section().equals(name) || f.flag().equals("-o")) continue; // the project folder is the bar above
       JLabel label = new JLabel(f.label());

@@ -342,13 +342,14 @@ public final class Options {
       new java.util.concurrent.atomic.AtomicLong();
 
   public static Options parse(String[] args) {
+    args = Presets.expand(args);
     Options o = new Options();
     o.quickCalibration = true; // the command-line default
     o.help = args.length == 0;
     Set<String> explicitFiltering = new TreeSet<>();
     boolean cacheDisabled = false;
     boolean storageExplicit = false;
-    boolean quickExplicit = false, pipelineExplicit = false;
+    boolean quickExplicit = false, pipelineExplicit = false, stepExplicit = false;
     for (int i = 0; i < args.length; i++) {
       String key = args[i], inline = null;
       int eq = key.indexOf('=');
@@ -1428,6 +1429,7 @@ public final class Options {
           break;
         case "--step":
           o.step = Integer.parseInt(v);
+          stepExplicit = true;
           break;
         case "--cores":
         case "-cores":
@@ -1516,6 +1518,9 @@ public final class Options {
       }
     }
     o.applyFilteringPreset(explicitFiltering);
+    // Multi-view SGM emits every consistent pixel unless --step is given: its maps are dense per
+    // camera, and the step-2 default exists for pair SGM (a default thinning would quarter mvsgm clouds).
+    if (!stepExplicit && o.denseMethod.equals("mvsgm")) o.step = 1;
     if (o.help) return o;
     choice(o.surfacePartition, "--surface-partition", "routed", "recursive");
     choice(o.processingReport, "--report", "pdf", "html", "none");
@@ -2509,6 +2514,11 @@ Block processing (large image sets; whole-run command only, -i IMAGES -o PROJECT
       0..20). More overlap: more shared cameras for aligning the blocks, more work per block.
 
 Resolution and memory planning:
+  --preset LIST
+      Tested dense and fusion settings (multi-view SGM): a platform, drone or aircraft,
+      and optionally a scene, forest or city (e.g. --preset drone,forest). A scene alone
+      uses drone. Options given explicitly win over the preset's. From the 2026-11-21
+      parameter study; aircraft is a tested large-format setup (no aerial reference yet).
   --quality NAME
       ultra, high, medium, low: original dimensions divided by 1, 2, 4, 8.
       Default custom: fit within --max-dimension. Never upsamples. Independent
@@ -3050,8 +3060,9 @@ Point filtering and multi-view fusion:
       Maximum positive rectified-camera depth before output scaling (default:
       10000; positive, in reconstruction units).
   --step N
-      Export candidate every N pixels along each image axis (default: 2;
-      minimum: 1). Does not resize images or reduce full depth-map storage.
+      Export candidate every N pixels along each image axis (default: 2; with
+      --dense-method mvsgm 1; minimum: 1). Does not resize images or reduce full depth-map
+      storage. mvsgm keeps its maps dense for fusion and emits every N-th pixel per camera.
   --voxel N
       Optional voxel edge in final output units; keep one point per voxel
       (default: 0 disables; nonnegative).

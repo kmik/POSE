@@ -32,12 +32,63 @@ final class MvsgmPartnerViewsRegression {
 
   static int run(Path root) throws Exception {
     checks = 0;
+    List<double[]> points = fuse(root.resolve("step1"), 1);
+    int inOverlap = 0, single = 0;
+    for (double[] p : points) {
+      double x = p[0];
+      // Overlaps [1.25, 4.75] and [7.25, 10.75], widened by one 0.1 m pixel.
+      if (x >= 1.15 && x <= 4.85 || x >= 7.15 && x <= 10.85) inOverlap++;
+      else single++;
+    }
+    check(inOverlap > 0, "Overlaps seen by two cameras emit points");
+    check(single == 0, "Pixels seen only by one camera (partner outside) are rejected at --min-views 2: " + single);
+
+    // --step 2 with mvsgm: fusion keeps the dense maps (nothing falls to the speckle filter) and
+    // each camera emits only its even pixels: about a quarter of the points, over the same area.
+    List<double[]> thinned = fuse(root.resolve("step2"), 2);
+    double ratio = thinned.size() / (double) points.size();
+    check(ratio > .2 && ratio < .3, "--step 2 emits about a quarter of the points: " + thinned.size() + " of " + points.size());
+    double[] span = span(points), spanThin = span(thinned);
+    check(Math.abs(span[0] - spanThin[0]) < .25 && Math.abs(span[1] - spanThin[1]) < .25,
+        "--step 2 covers the same area: " + Arrays.toString(span) + " vs " + Arrays.toString(spanThin));
+
+    // --min-angle (MultiViewSgm.wideEnough): a point 10 m in front of camera 0 (centre at the
+    // origin), seen by neighbours with baselines 0.5 m (2.9 deg) and 1.0 m (5.7 deg).
+    Camera a = new Camera(100, 100, 47.5, 19.5), narrow = new Camera(100, 100, 47.5, 19.5), wide = new Camera(100, 100, 47.5, 19.5);
+    narrow.translation[0] = -.5;
+    wide.translation[0] = -1;
+    double[] X = {0, 0, 10}, v = new double[3];
+    double cos4 = Math.cos(Math.toRadians(4));
+    check(!MultiViewSgm.wideEnough(X, a.center(), new Camera[] {narrow}, new int[] {96}, new int[] {40},
+        new double[][] {narrow.center()}, cos4, v), "A 2.9 deg neighbour does not reach --min-angle 4");
+    check(MultiViewSgm.wideEnough(X, a.center(), new Camera[] {narrow, wide}, new int[] {96, 96}, new int[] {40, 40},
+        new double[][] {narrow.center(), wide.center()}, cos4, v), "A 5.7 deg neighbour does");
+    // The wide neighbour does not count when the point falls outside its image (x = 37.5, width 30).
+    check(!MultiViewSgm.wideEnough(X, a.center(), new Camera[] {narrow, wide}, new int[] {96, 30}, new int[] {40, 40},
+        new double[][] {narrow.center(), wide.center()}, cos4, v), "A neighbour that does not see the point does not count");
+    check(!MultiViewSgm.wideEnough(X, a.center(), new Camera[] {null, null}, new int[2], new int[2], new double[2][],
+        cos4, v), "Neighbours without depth do not count");
+    return checks;
+  }
+
+  static double[] span(List<double[]> pts) {
+    double lo = Double.MAX_VALUE, hi = -Double.MAX_VALUE;
+    for (double[] p : pts) {
+      lo = Math.min(lo, p[0]);
+      hi = Math.max(hi, p[0]);
+    }
+    return new double[] {lo, hi};
+  }
+
+  /** The three-camera fixture fused at --step {@code step}; the emitted points (LAS). */
+  static List<double[]> fuse(Path dir, int step) throws Exception {
     Options o = new Options();
-    o.output = Files.createDirectories(root);
+    o.output = Files.createDirectories(dir);
     o.projectDirectory = o.output;
     o.denseMethod = "mvsgm";
     o.fusionMode = "image";
     o.minViews = 2;
+    o.step = step;
     o.compute = "cpu";
     o.cores = 2;
     int n = 3, w = 96, h = 40;
@@ -72,16 +123,6 @@ final class MvsgmPartnerViewsRegression {
         output.finish();
       }
     }
-    List<double[]> points = CloudDiagnostics.readLas(o.output.resolve("dense.las"));
-    int inOverlap = 0, single = 0;
-    for (double[] p : points) {
-      double x = p[0];
-      // Overlaps [1.25, 4.75] and [7.25, 10.75], widened by one 0.1 m pixel.
-      if (x >= 1.15 && x <= 4.85 || x >= 7.15 && x <= 10.85) inOverlap++;
-      else single++;
-    }
-    check(inOverlap > 0, "Overlaps seen by two cameras emit points");
-    check(single == 0, "Pixels seen only by one camera (partner outside) are rejected at --min-views 2: " + single);
-    return checks;
+    return CloudDiagnostics.readLas(o.output.resolve("dense.las"));
   }
 }
