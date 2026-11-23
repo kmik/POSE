@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 260" font-family="Segoe UI, Arial, sans-serif" font-size="11">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#12405f"/></marker>
+    <style>
+      .f1 { fill: #1f5f8b; fill-opacity: .14; stroke: #1f5f8b; stroke-width: 1; }
+      .f2 { fill: #19a89c; fill-opacity: .14; stroke: #19a89c; stroke-width: 1; }
+      .hl { fill: #e8a33d; fill-opacity: .35; stroke: #d0802b; stroke-width: 1.2; }
+      .line { stroke: #8aa2b3; stroke-width: 1.2; stroke-dasharray: 6 4; fill: none; }
+      .dim { stroke: #12405f; stroke-width: 1.1; marker-start: url(#a); marker-end: url(#a); }
+      .c { fill: #4a6274; } .h { fill: #12405f; font-weight: 600; }
+    </style>
+  </defs>
+  <text x="10" y="18" class="h">Flight lines and image footprints (seen from above)</text>
+  <!-- line 1 footprints: width 120, step 32 (73% forward overlap) -->
+  <g>
+    <rect class="f1" x="30"  y="40" width="120" height="80"/>
+    <rect class="f1" x="62"  y="40" width="120" height="80"/>
+    <rect class="f1" x="94"  y="40" width="120" height="80"/>
+    <rect class="f1" x="126" y="40" width="120" height="80"/>
+    <rect class="f1" x="158" y="40" width="120" height="80"/>
+    <rect class="f1" x="190" y="40" width="120" height="80"/>
+    <rect class="f1" x="222" y="40" width="120" height="80"/>
+  </g>
+  <!-- line 2: offset 52 down (35% side overlap of 80) -->
+  <g>
+    <rect class="f2" x="30"  y="92" width="120" height="80"/>
+    <rect class="f2" x="62"  y="92" width="120" height="80"/>
+    <rect class="f2" x="94"  y="92" width="120" height="80"/>
+    <rect class="f2" x="126" y="92" width="120" height="80"/>
+    <rect class="f2" x="158" y="92" width="120" height="80"/>
+    <rect class="f2" x="190" y="92" width="120" height="80"/>
+    <rect class="f2" x="222" y="92" width="120" height="80"/>
+  </g>
+  <path class="line" d="M20,80 H360"/><path class="line" d="M360,132 H20"/>
+  <text x="365" y="84" class="c">flight line 1 &#8594;</text><text x="365" y="136" class="c">&#8592; flight line 2</text>
+  <!-- annotations -->
+  <path class="dim" d="M62,190 H150"/><text x="62" y="206" class="c">forward overlap</text>
+  <path class="dim" d="M20,92 V120"/><text x="10" y="232" class="c">side overlap: the band where the two lines' footprints overlap</text>
+  <!-- right: recommendations -->
+  <g transform="translate(470,40)">
+    <text class="h" y="0">Typical overlaps</text>
+    <text class="c" y="22">Open ground, buildings:</text><text class="c" x="10" y="38">forward 70&#8211;80%, side 60&#8211;70%</text>
+    <text class="c" y="62">Forest canopy:</text><text class="c" x="10" y="78">forward 80&#8211;90%, side 70&#8211;80%</text>
+    <text class="c" y="102">Every ground point should be</text><text class="c" y="118">seen by at least 3&#8211;4 images;</text><text class="c" y="134">canopy and the block edge</text><text class="c" y="150">need more.</text>
+  </g>
+</svg>

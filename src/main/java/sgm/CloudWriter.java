@@ -139,7 +139,7 @@ public final class CloudWriter implements AutoCloseable {
   }
 
   private void prepareVlrs() {
-    byte[] projection = crs == null ? new byte[0] : projectionVlr(crs.epsg);
+    byte[] projection = crs == null ? new byte[0] : projectionVlr(crs.epsg, crs.vertical);
     byte[] extras = fields != null
         ? (PointFields.bytes(fields) > 0 ? PointFields.extraVlr(fields) : new byte[0])
         : attributes ? extraVlr() : new byte[0];
@@ -753,8 +753,10 @@ public final class CloudWriter implements AutoCloseable {
                 ? ""
                 : "comment horizontal_crs "
                     + crs.name
-                    + "; x=easting y=northing; Z=EXIF altitude, unspecified vertical datum,"
-                    + " metres\n")
+                    + (crs.vertical > 0
+                        ? "; x=easting y=northing; Z=" + Crs.verticalName(crs.vertical) + ", metres\n"
+                        : "; x=easting y=northing; Z=EXIF altitude, unspecified vertical datum,"
+                            + " metres\n"))
             // Written before the count is known and patched in place: this line keeps the
             // header length the same for any count.
             + "comment reserved" + " ".repeat(PLY_COUNT_DIGITS - number.length()) + "\n"
@@ -878,16 +880,21 @@ public final class CloudWriter implements AutoCloseable {
     return b.array();
   }
 
-  private static byte[] projectionVlr(int epsg) {
+  private static byte[] projectionVlr(int epsg, int vertical) {
     // GeoTIFF GeoKeyDirectoryTag (ASPRS specification, record 34735); LAS 1.4 allows it for the
-    // legacy point formats 0-5.
-    ByteBuffer b = ByteBuffer.allocate(54 + 40).order(ByteOrder.LITTLE_ENDIAN);
+    // legacy point formats 0-5. Keys sorted by id; VerticalCSTypeGeoKey (4096) only when labelled.
+    int[][] keys =
+        vertical > 0
+            ? new int[][] {{1024, 1}, {3072, epsg}, {3076, 9001}, {4096, vertical}, {4099, 9001}}
+            : new int[][] {{1024, 1}, {3072, epsg}, {3076, 9001}, {4099, 9001}};
+    int length = 8 + 8 * keys.length;
+    ByteBuffer b = ByteBuffer.allocate(54 + length).order(ByteOrder.LITTLE_ENDIAN);
     b.putShort((short) 0);
     ascii(b, "LASF_Projection", 16);
-    b.putShort((short) 34735).putShort((short) 40);
-    ascii(b, "Horizontal projected CRS", 32);
-    b.putShort((short) 1).putShort((short) 1).putShort((short) 0).putShort((short) 4);
-    for (int[] entry : new int[][] {{1024, 1}, {3072, epsg}, {3076, 9001}, {4099, 9001}})
+    b.putShort((short) 34735).putShort((short) length);
+    ascii(b, vertical > 0 ? "Projected and vertical CRS" : "Horizontal projected CRS", 32);
+    b.putShort((short) 1).putShort((short) 1).putShort((short) 0).putShort((short) keys.length);
+    for (int[] entry : keys)
       b.putShort((short) entry[0])
           .putShort((short) 0)
           .putShort((short) 1)

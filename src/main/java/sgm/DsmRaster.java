@@ -85,7 +85,8 @@ final class DsmRaster {
       }
     }
     writeTiff(
-        out.resolve("dsm.tif"), w, h, heights, bounds[0], bounds[4], cell, projected ? epsg : 0);
+        out.resolve("dsm.tif"), w, h, heights, bounds[0], bounds[4], cell, projected ? epsg : 0,
+        projected ? vertical(coordinates) : 0);
     int pw = Math.min(1024, w), ph = Math.max(1, (int) Math.round(h * (pw / (double) w)));
     if (ph > 1024) {
       pw = Math.max(1, (int) Math.round(pw * (1024. / ph)));
@@ -226,6 +227,13 @@ final class DsmRaster {
         "colour_scale", "logarithmic from 1 point to the 99th percentile; gray: no points");
   }
 
+  /** Vertical EPSG code of a run's coordinates.json ("vertical_crs": "EPSG:V"); 0 = none. */
+  static int vertical(Map<String, Object> coordinates) {
+    if (coordinates.get("vertical_crs") instanceof String v && v.matches("EPSG:[0-9]+"))
+      return Integer.parseInt(v.substring(5));
+    return 0;
+  }
+
   // GeoTIFF pixel-is-area, north-up; Float32 single strip and explicit NaN nodata.
   /** EPSG code of a run's coordinates.json: "epsg", else parsed from "horizontal_crs"; 0 = none. */
   static int epsg(Map<String, Object> coordinates) {
@@ -309,6 +317,13 @@ final class DsmRaster {
   static void writeTiff(
       Path path, int w, int h, float[] z, double x, double y, double cell, int epsg)
       throws IOException {
+    writeTiff(path, w, h, z, x, y, cell, epsg, 0);
+  }
+
+  /** As above; vertical > 0 adds VerticalCSTypeGeoKey (heights labelled, e.g. 3900 = N2000). */
+  static void writeTiff(
+      Path path, int w, int h, float[] z, double x, double y, double cell, int epsg, int vertical)
+      throws IOException {
     record Tag(int id, int type, int count, byte[] value) {}
     List<Tag> tags = new ArrayList<>();
     java.util.function.IntFunction<byte[]> integer =
@@ -351,7 +366,10 @@ final class DsmRaster {
                 .putDouble(0)
                 .array()));
     if (epsg > 0) {
-      int[] keys = {1, 1, 0, 4, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, epsg, 3076, 0, 1, 9001};
+      int[] keys =
+          vertical > 0
+              ? new int[] {1, 1, 0, 6, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, epsg, 3076, 0, 1, 9001, 4096, 0, 1, vertical, 4099, 0, 1, 9001}
+              : new int[] {1, 1, 0, 4, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, epsg, 3076, 0, 1, 9001};
       ByteBuffer b = ByteBuffer.allocate(keys.length * 2).order(ByteOrder.LITTLE_ENDIAN);
       for (int value : keys) b.putShort((short) value);
       tags.add(new Tag(34735, 3, keys.length, b.array()));

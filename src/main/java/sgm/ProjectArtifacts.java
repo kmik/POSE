@@ -2033,7 +2033,7 @@ final class ProjectArtifacts implements AutoCloseable {
                + " retain the original reconstruction frame; the final snapshot, candidates and"
                + " clouds use the projected frame. See 04_geometry/georeference/transform.json and"
                + " 07_results/coordinates.json. Z retains EXIF altitude with unspecified vertical"
-               + " datum; no N2000/geoid conversion.\n\n"
+               + " datum unless --source-geoid/--target-geoid converted it (see coordinates.json).\n\n"
                + "PFM files are single-channel float32, little-endian, bottom-up; invalid"
                + " disparities/depths are NaN. Rectification-map values are source"
                + " undistorted-image pixel coordinates. If epipolar lines are vertical, matching"

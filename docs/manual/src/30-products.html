@@ -1,0 +1,362 @@
+
+<!-- ============================================================ 10 -->
+<h1 id="products"><span class="num">10</span>Products</h1>
+
+<h2 id="products-cloud">10.1 Point cloud</h2>
+<p><code>07_results/dense.las</code> is a LAS 1.2 file with point format 2 (XYZ, RGB, classification), 0.1 mm coordinate resolution. Above 4,294,967,295 points it becomes LAS 1.4 automatically. When the run is georeferenced, the LAS carries the coordinate system (and the height system, Section 8.2). <code>dense.ply</code> has the same points with double-precision coordinates; <code>--ply off</code> skips it to save disk and time.</p>
+<p><code>--tiled-las-output SIZE</code> writes square LAS tiles of SIZE metres to <code>07_results/dense_tiles/</code> with a <code>tiles.csv</code> index instead of one large file. <code>--voxel SIZE</code> thins the cloud to one point per voxel.</p>
+<p><code>07_results/point-confidence.bin</code> stores, for every point in cloud order, its supporting cameras, views, evidence score and more (<code>--point-confidence off</code> skips it). <code>--export-confidence RUN</code> converts it to CSV.</p>
+
+<h2 id="products-attrs">10.2 Per-point values and uncertainty</h2>
+<p><code>--point-attributes LIST</code> chooses which values each point carries, as LAS Extra Bytes and PLY properties:</p>
+<table>
+  <tr><th>Value</th><th>Meaning</th></tr>
+  <tr><td><code>surface</code> (default)</td><td>Group: surface normal, roughness, surface variation, planarity and normal diagnostics.</td></tr>
+  <tr><td><code>none</code></td><td>XYZ and RGB only (smallest files).</td></tr>
+  <tr><td><code>views</code></td><td>Number of cameras confirming the point.</td></tr>
+  <tr><td><code>angle</code></td><td>Largest triangulation angle, degrees.</td></tr>
+  <tr><td><code>confidence</code></td><td>Evidence score 0..1 (a ranking, not a probability).</td></tr>
+  <tr><td><code>source</code></td><td>The camera that produced the point, in the LAS Point Source ID.</td></tr>
+  <tr><td><code>depth_spread</code></td><td>Standard deviation of the averaged cameras' depths (3+ cameras).</td></tr>
+  <tr><td><code>height_sigma</code>, <code>ray_sigma</code></td><td>Calibrated 1-sigma precision vertically and along the viewing ray, in metres (group <code>uncertainty</code>).</td></tr>
+  <tr><td><code>all</code></td><td>Everything.</td></tr>
+</table>
+<p>The sigmas come from the images only. The fusion model's precision estimate for each point is scaled by a factor measured in the run itself, from how much the depths of different cameras scatter where they were averaged. They describe local precision (noise and disagreement between cameras); errors of the camera orientations and of the georeferencing are not included. The calibration factor and distribution are in <code>report.txt</code> and <code>07_results/point-uncertainty.json</code>. The uncertainty values need image fusion.</p>
+<div class="example"><div class="eh">Examples: per-point values</div><div class="eb">
+<pre><code># Surface attributes plus views and calibrated sigmas
+photogrammetry -i IMAGES -o PROJECT --preset drone,forest --point-attributes surface,views,uncertainty
+
+# Smallest files: XYZ and RGB only, 1 km LAS tiles
+photogrammetry -i IMAGES -o PROJECT --point-attributes none --tiled-las-output 1000</code></pre></div></div>
+
+<h2 id="products-dsm">10.3 Surface model (DSM)</h2>
+<p>Every georeferenced run gets <code>dsm.tif</code>: the highest point per cell (<code>--report-dsm-statistic mean</code> for the mean), as a Float32 GeoTIFF with NaN for empty cells, plus a world file, a preview and a JSON description. The cell size is chosen automatically within <code>--report-dsm-max-dimension</code> (1024 cells per side) or set with <code>--report-dsm-resolution</code>. No gaps are filled.</p>
+<div class="example"><div class="eh">Example: a 0.25 m DSM of a finished run, without reprocessing</div><div class="eb">
+<pre><code>photogrammetry --export-report PROJECT/runs/RUN_ID --report-dsm-resolution 0.25 --report-dsm-max-dimension 4096</code></pre></div></div>
+
+<h2 id="products-ground">10.4 Ground, terrain and canopy height</h2>
+<p><code>--classify-ground</code> classifies the ground in the final cloud and writes the terrain model. It needs georeferenced output and uses no external terrain data. The method is a progressive morphological filter on the lowest points, limited by the camera rays (terrain cannot stand above a ray that reached its point) and by a slope envelope, with automatic tolerances from the cloud. Under closed canopy, patches of crown tops that the filter would take for ground are recognised and rejected.</p>
+<figure><img src="figures/ground.svg" alt="Ground classification"><figcaption>Figure 10.1. Ground classification: terrain from the lowest points seen through gaps, capped by the camera rays; CHM = DSM &minus; DTM.</figcaption></figure>
+<div class="two">
+  <figure><img src="shots/result-dsm.png" alt="DSM"><figcaption>Figure 10.2. Surface model (dsm.png) of the 32-image forest example.</figcaption></figure>
+  <figure><img src="shots/result-dtm.png" alt="DTM"><figcaption>Figure 10.3. Terrain model (dtm.png) of the same area; white: no data.</figcaption></figure>
+</div>
+<p>Results in <code>07_results</code>:</p>
+<ul>
+  <li>LAS classes in <code>dense.las</code>: 2 ground, 7 low noise, 1 other.</li>
+  <li><code>dtm.tif</code>: terrain; <code>chm.tif</code>: canopy height (highest point minus terrain).</li>
+  <li><code>ground_support.tif</code>: 1 observed ground, 2 interpolated, 3 blocks camera rays; <code>ground_uncertainty.tif</code>: half the difference between terrains from two halves of the data.</li>
+  <li><code>ground.json</code> with the settings and checks.</li>
+</ul>
+<p>Settings: <code>--ground-cell</code> (auto: 3 &times; point spacing, 0.25&ndash;2 m), <code>--ground-max-slope</code> (35&deg;), <code>--ground-max-object</code> (30 m, the largest non-ground object). Under closed canopy the terrain is interpolated from the nearest visible ground; <code>ground_support.tif</code> shows where.</p>
+
+<h2 id="products-ortho">10.5 Orthomosaic</h2>
+<p><code>--orthomosaic</code> writes <code>07_results/orthomosaic.tif</code> at the end of the run: the original photographs at full resolution projected onto the surface of the cloud, as a tiled RGBA GeoTIFF (BigTIFF when large) with a world file and a JSON description. <code>--export-orthomosaic RUN</code> makes one for a finished run without reprocessing.</p>
+<table>
+  <tr><th><code>--orthomosaic-mode</code></th><th>Result</th></tr>
+  <tr><td><code>true</code> (default)</td><td>True orthomosaic: every pixel from a camera that sees it, so buildings and trees do not lean. Transparent where nothing is known.</td></tr>
+  <tr><td><code>classic</code></td><td>Conventional orthophoto without holes: the surface is smoothed and filled, each pixel comes from the camera nearest its image centre, seams are feathered. Tall objects lean.</td></tr>
+</table>
+<p>Pixel size: <code>--orthomosaic-resolution</code> (auto: the median ground sample distance). Other options control the surface cell, gap filling, strict visibility and, for classic mode, smoothing and feathering. The orthomosaic needs a projected coordinate system, and the photographs must still be where the run found them.</p>
+<figure><img src="figures/ortho.svg" alt="True and classic orthomosaic"><figcaption>Figure 10.4. True orthomosaic (left) and classic orthophoto (right) of a building.</figcaption></figure>
+<figure><img src="shots/result-orthomosaic.png" alt="Orthomosaic" style="max-height: 90mm"><figcaption>Figure 10.5. Orthomosaic overview of the forest example (true mode); transparent outside the surveyed area.</figcaption></figure>
+<div class="example"><div class="eh">Examples: orthomosaic</div><div class="eb">
+<pre><code># With the run
+photogrammetry -i IMAGES -o PROJECT --orthomosaic
+
+# Classic mode, 5 cm pixels, for a finished run
+photogrammetry --export-orthomosaic PROJECT/runs/RUN_ID \
+  --orthomosaic-mode classic --orthomosaic-resolution 0.05</code></pre></div></div>
+
+<h2 id="products-report">10.6 Processing report</h2>
+<p><code>07_results/processing-report.pdf</code> documents the run: summary and quality flags, survey data (images, flying height, ground resolution, area, tie points, reprojection error), camera calibration, camera locations and their errors, ground control and check points, lidar reference, elevation models and processing parameters. <code>--report-detail full</code> adds detailed diagnostics (solver profiles, resources, OpenCL, all settings). <code>--report html</code> writes HTML instead; a JSON companion keeps every number. <code>--export-report RUN</code> regenerates the report of a finished run.</p>
+<div class="two">
+  <figure class="shot"><img src="shots/report-summary.png" alt="Report summary page"><figcaption>Figure 10.6. First page of the processing report: overview and summary.</figcaption></figure>
+  <figure class="shot"><img src="shots/report-dense.png" alt="Report dense cloud page"><figcaption>Figure 10.7. Dense point cloud page: from matches to points, fusion decisions, cameras per point.</figcaption></figure>
+</div>
+
+<h2 id="products-orient">10.7 Camera orientations</h2>
+<p>The final calibration and camera poses are in <code>04_geometry/final/</code> and <code>PROJECT/cameras.csv</code>. To use them in other software, export them during the run with <code>--orientation-output-format LIST</code> or afterwards:</p>
+<pre><code>photogrammetry --export-orientations RUN --orientation-output-format csv,colmap,metashape</code></pre>
+<p>Formats: csv, csv-opk, native, colmap, bundler, openmvg, opensfm, metashape, micmac, opencv, inpho. <code>--orientation-pixels processed</code> exports the undistorted dense images' intrinsics instead of the original photographs'.</p>
+
+<!-- ============================================================ 11 -->
+<h1 id="perf"><span class="num">11</span>Performance, memory and large projects</h1>
+
+<h2 id="perf-memory">11.1 Memory</h2>
+<p><code>--memory-mb N</code> is the processing budget in MiB, not a total RAM limit. The program restarts itself with a Java heap of about N/0.65 (for example 56000 gives an 84 GB heap); native memory for images, feature extraction and GPU buffers comes on top. A safe starting point is half the RAM; the window uses that by default.</p>
+<p><code>--ram-limit-mb N</code> is the total RAM ceiling POSE plans for (0 = detect the computer's or job's limit). It caps the heap and throttles parallel feature extraction and matching. Neither option is enforced by the operating system; use the scheduler's limit for that.</p>
+<p><code>--estimate-memory</code> prints the plan without processing. Other budgets: <code>--image-memory-mb</code> (decoded images), <code>--descriptor-memory-mb</code>, <code>--surface-memory-mb</code>, <code>--fusion-cache-mb</code>; the defaults are derived from <code>--memory-mb</code>.</p>
+<div class="note"><b>On clusters.</b> The resident memory reported by the system includes memory-mapped depth maps, which the operating system can drop at any time. A warning that host RAM is nearly exhausted is therefore not necessarily a problem; a job killed by the scheduler is.</div>
+
+<h2 id="perf-gpu">11.2 GPU</h2>
+<p>The GPU runs dense matching, depth fusion, the orthomosaic and some filters. <code>--gpu-memory-mb</code> limits the GPU working set (default 70% of the card, at most 95%). Fusion on the GPU needs double precision; without it fusion runs on the CPU. <code>--fusion-gpu-normals on</code> also computes normals on the GPU (faster, not bit-identical to the CPU). If the GPU runs out of memory, POSE falls back to smaller batches, streaming or the CPU; the fallbacks are listed in <code>06_fusion/backend.json</code>.</p>
+
+<h2 id="perf-speed">11.3 Speed</h2>
+<ul>
+  <li><b>Resolution</b> is the main factor: each step down in <code>--quality</code> divides the dense work by about four.</li>
+  <li><code>--cores</code> sets the CPU threads (default half the processors).</li>
+  <li><code>--mvsgm-cameras-in-flight auto</code> computes several cameras' depth maps at once; <code>--stereo-pairs-in-flight</code> does the same for pair SGM. Results are identical to serial processing.</li>
+  <li><code>--descriptor-matcher flann</code> speeds up matching of large sets; <code>--calibration-trial-method subset</code> or <code>joint</code> speeds up lens refinement of large blocks.</li>
+  <li><code>--step 2</code> halves the points per image side and speeds up fusion; <code>--ply off</code> and <code>--point-confidence off</code> save output time.</li>
+</ul>
+
+<h2 id="perf-disk">11.4 Disk</h2>
+<p>Depth maps and fusion data are kept on disk in the run folder while the dense step runs and removed after it. Decoded photographs are cached in the run (<code>--processed-image-cache</code>) while enough disk is free. Dense checkpoints keep up to one interval's depth maps. Plan for tens to hundreds of gigabytes for large blocks at high resolution. <code>--storage minimal</code> keeps the fewest intermediate files; <code>--diagnostics</code> keeps everything for inspection.</p>
+
+<h2 id="perf-large">11.5 Large image sets</h2>
+<p>For thousands of photographs:</p>
+<ul>
+  <li>Use <code>--pair-selection auto</code> with GPS, <code>--descriptor-matcher flann</code> and <code>--calibration-trial-method subset</code>.</li>
+  <li>Keep <code>--registration-bundle-growth</code> on to limit drift; consider <code>--registration-pose-check on</code>.</li>
+  <li>Use <code>mvsgm</code> with dense checkpoints, so an interrupted dense step can resume.</li>
+  <li><code>--block-processing auto|on</code> splits the images into overlapping blocks by GPS position, processes them one after another and merges the results into <code>PROJECT/merged/dense.las</code>. Rerunning the same command resumes after an interruption.</li>
+  <li><code>--tiled-las-output</code> keeps the output files manageable.</li>
+</ul>
+
+<!-- ============================================================ 12 -->
+<h1 id="quality"><span class="num">12</span>Checking quality</h1>
+<h3>Report and quality flags</h3>
+<p>Start with the summary page of the processing report. Quality flags point out problems: images that were not aligned, high reprojection errors, cameras flagged by screening, weak lens fits, GPS residuals, little observed ground, lidar parameters that could not be determined. The same flags are on the Project tab.</p>
+<div class="two">
+  <figure><img src="shots/result-image-overlap.png" alt="Image overlap map"><figcaption>Figure 12.1. Image overlap map from the report: how many images see each part of the area. Edges seen by few images give fewer, noisier points.</figcaption></figure>
+  <figure class="shot"><img src="shots/report-calibration.png" alt="Report calibration page"><figcaption>Figure 12.2. Camera calibration page: residuals across the image and the fitted lens parameters.</figcaption></figure>
+</div>
+<h3>Accuracy</h3>
+<ul>
+  <li><b>Reprojection error</b> (pixels) measures how well the cameras and tie points fit together; typical values are a fraction of a pixel. It does not measure absolute accuracy.</li>
+  <li><b>GPS residuals</b> show how well the block fits the image GPS; for consumer GNSS a few metres is normal.</li>
+  <li><b>Check points</b> are the only independent measure of absolute accuracy. Use <code>type=check</code> GCPs or <code>--gcp-check auto</code>.</li>
+  <li><b>Lidar reference</b> gives the distances of the tie points to the lidar surface and maps of the remaining differences.</li>
+  <li><b>Per-point uncertainty</b> (<code>--point-attributes uncertainty</code>) maps local precision across the cloud.</li>
+</ul>
+<h3>Visual checks</h3>
+<ul>
+  <li>In the <b>3D view</b>, look for doubled surfaces, misplaced cameras (red pyramids) and noise above or below the surface.</li>
+  <li>On the <b>Map</b> tab of the Images window, lower the opacity: misaligned photographs appear doubled.</li>
+  <li><code>--analyze-run RUN</code> measures local surface thickness and offsets in the cloud without changing it.</li>
+</ul>
+
+<!-- ============================================================ 13 -->
+<h1 id="trouble"><span class="num">13</span>Troubleshooting</h1>
+<table>
+  <tr><th>Problem</th><th>What to do</th></tr>
+  <tr><td>Some images are not aligned.</td><td>See Section 7.4: <code>--gps-neighbors</code>, <code>--feature-grid</code>, <code>--match-repair on</code>, <code>--registration-recovery on</code>. Check the Registration window for the reason per image.</td></tr>
+  <tr><td>The whole block is tilted or bent.</td><td>Check the GPS (Section 8.1); use <code>--registration-pose-check on</code>, GCPs or a lidar reference. Flat nadir blocks without GPS heights can dome: keep the default GPS-weighted adjustment.</td></tr>
+  <tr><td>Heights are tens of metres off.</td><td>Normal for non-RTK drones (Section 8.3). Use GCPs or a lidar reference for absolute heights.</td></tr>
+  <tr><td>Heights are off by 15&ndash;20 m (Finland).</td><td>A datum mix-up between ellipsoidal and geoid heights: use <code>--source-geoid</code>/<code>--target-geoid</code>.</td></tr>
+  <tr><td>No DSM, orthomosaic or coordinate tags.</td><td>The run is not georeferenced: too few images with GPS, or GPS turned off. Check <code>04_geometry/georeference/</code>.</td></tr>
+  <tr><td>Few points on canopy or at the block edge.</td><td>Use <code>--min-views 2</code>, <code>mvsgm</code> or a drone/forest preset; check the overlap.</td></tr>
+  <tr><td>Layered or noisy surfaces.</td><td><code>mvsgm</code> with graph-average fusion; <code>--filtering moderate</code> or <code>aggressive</code>; tie-point cleanup; check the calibration in the report.</td></tr>
+  <tr><td>GPU not used.</td><td><code>--list-gpus</code>; install the vendor OpenCL driver; choose <code>--gpu-device</code>. See <code>06_fusion/backend.json</code> for fallbacks.</td></tr>
+  <tr><td>Out of memory, or the process is killed.</td><td>Lower <code>--memory-mb</code> or the resolution; set <code>--ram-limit-mb</code> to the job limit; lower <code>--mvsgm-cameras-in-flight</code>. Resume the dense step from its checkpoint (Section 5.3).</td></tr>
+  <tr><td>Out of disk space.</td><td>Free space where the project is; <code>--processed-image-cache off</code>; <code>--storage minimal</code>.</td></tr>
+  <tr><td>The window does not start.</td><td>It needs a display; use the command line. On Windows, set <code>POSE_GUI_CONSOLE=1</code> to see errors.</td></tr>
+  <tr><td>A step failed.</td><td>Double-click the step on the Project tab, or read <code>logs/console.log</code> and <code>logs/error.txt</code> of the run. <b>Copy run details</b> collects everything for a bug report.</td></tr>
+</table>
+
+<!-- ============================================================ 14 -->
+<h1 id="examples"><span class="num">14</span>Worked examples</h1>
+<p>Each example is a complete command sequence for a common kind of survey. Commands are shown for Linux and the Windows command prompt alike; on Windows use <code>photogrammetry.bat</code> and replace the line continuation <code>\</code> with <code>^</code> (or write the command on one line). Paths are examples.</p>
+
+<h2 id="ex-drone">14.1 Drone survey of a forest stand</h2>
+<p>A consumer drone (no RTK), 30&ndash;300 photographs with 80% overlap, terrain and canopy height wanted.</p>
+<pre><code>photogrammetry -i /data/stand12/images -o /data/stand12/project \
+  --preset drone,forest --quality high \
+  --classify-ground --orthomosaic \
+  --point-attributes surface,views,uncertainty</code></pre>
+<p>What to check afterwards:</p>
+<ul>
+  <li>Report summary: all images aligned, reprojection RMS below about 1 px, no quality flags.</li>
+  <li><code>dtm.tif</code> and <code>ground_support.tif</code>: where the terrain is observed and where it is interpolated under the canopy.</li>
+  <li><code>chm.tif</code> gives tree heights; they are correct even though the absolute heights of a non-RTK drone can be tens of metres off (Section 8.3).</li>
+</ul>
+<div class="tip"><b>Tip.</b> Start with <code>--quality medium</code> for a quick check of a new dataset, then branch the dense step at high quality (Section 14.6).</div>
+
+<h2 id="ex-rtk">14.2 RTK drone with N2000 heights</h2>
+<p>A DJI RTK drone with fixed solutions (<code>RtkFlag</code> 50) over Finland. Its heights are ellipsoidal; the outputs should be in N2000 and labelled so.</p>
+<pre><code>photogrammetry -i images -o project --preset drone,city --quality high \
+  --gps-sigma 0.05 \
+  --target-geoid /data/geoid/fin2005n00.gtx --crs EPSG:3067+3900 \
+  --orthomosaic</code></pre>
+<ul>
+  <li><code>--gps-sigma 0.05</code> tells the GPS-weighted adjustment that the positions are accurate to centimetres.</li>
+  <li>Check <code>07_results/coordinates.json</code>: <code>vertical_crs</code> is <code>EPSG:3900</code> and <code>vertical_conversion</code> shows the height shift applied (about &minus;17 to &minus;20 m in Finland).</li>
+</ul>
+
+<h2 id="ex-gcp">14.3 Survey with ground control points</h2>
+<p>Ten surveyed points in ETRS-TM35FIN with N2000 heights; two held back as check points automatically.</p>
+<pre><code># 1. Process up to the gcp step; it stops as 'waiting'
+photogrammetry -i images -o project --preset drone,city --quality high \
+  --gcp gcps.csv --gcp-check auto --crs EPSG:3067+3900
+
+# 2. Pin the points in the images; Done continues the run (gcp, dense, finish)
+photogrammetry gcp-edit -o project</code></pre>
+<p>In the report, the control point residuals show how well the block fits the points, and the check point residuals give the independent accuracy. GCP heights are used as given, so the <code>+3900</code> label is correct without a geoid conversion.</p>
+<p>On a server without a display, pin the markers in the local web page instead and continue by hand:</p>
+<pre><code>photogrammetry gcp-edit -o project --browser      # open http://127.0.0.1:8765, press Done
+photogrammetry gcp dense finish -o project</code></pre>
+
+<h2 id="ex-lidar">14.4 Georeferencing to national lidar</h2>
+<p>A forest survey without GCPs, tied to national airborne laser scanning (a folder of LAZ tiles in ETRS-TM35FIN, N2000).</p>
+<pre><code>photogrammetry -i images -o project --preset drone,forest --quality high \
+  --lidar-reference /data/als/tiles --lidar-vertical-datum N2000 \
+  --crs EPSG:3067+3900 --classify-ground</code></pre>
+<ul>
+  <li>Check the coverage before processing with <b>Check lidar coverage</b> in the window; the step stops if the tiles do not cover the block plus 10 m.</li>
+  <li>The report's Lidar Reference page lists the estimated shifts and angles with their standard deviations, the parameters left at the GPS values, and maps of the differences to the lidar.</li>
+  <li>If the lidar is several years old, canopy has changed: the default canopy weight (0.1) already relies mostly on open ground and roofs.</li>
+</ul>
+
+<h2 id="ex-aerial">14.5 Aerial block with imported orientations</h2>
+<p>A large-format aerial block with exterior orientations from an INPHO project in ETRS-TM35FIN. The orientations are trusted; POSE only makes the dense products.</p>
+<pre><code>photogrammetry -i /data/block/images -o /data/block/project \
+  --orientation-input /data/block/block.prj --orientation-crs EPSG:3067 \
+  --preset aircraft --quality medium \
+  --memory-mb 50000 --mvsgm-cameras-in-flight auto</code></pre>
+<p>If the INPHO heights are ellipsoidal, add <code>--target-geoid fin2005n00.gtx --crs EPSG:3067+3900</code>; if they are already N2000, add only <code>--crs EPSG:3067+3900</code>. If the pixel size is missing from the project file, give it with <code>--orientation-pixel-size MM</code>.</p>
+
+<h2 id="ex-compare">14.6 Comparing settings with branches</h2>
+<p>Align once, then try several dense settings on the same alignment:</p>
+<pre><code># Alignment and georeferencing only
+photogrammetry inputs calibrate match align georeference -i images -o project \
+  --preset drone,forest --quality high
+
+# Three dense variants, each in its own run (RUN = the run above)
+photogrammetry dense finish -o project --run RUN --branch --min-views 2
+photogrammetry dense finish -o project --run RUN --branch --min-views 3
+photogrammetry dense finish -o project --run RUN --branch --filtering moderate
+
+# Which steps each run has done
+photogrammetry status -o project --run RUN</code></pre>
+<p>Each branch writes its own <code>07_results</code>; compare the reports, the point counts on the Project tab, or the clouds in the 3D view.</p>
+
+<h2 id="ex-server">14.7 Large block on a server</h2>
+<p>A few thousand images on a Linux server under Slurm. The job script sets a memory budget below the job's limit, keeps a log, and uses dense checkpoints so a killed job can continue.</p>
+<pre><code>#!/bin/bash
+#SBATCH --mem=180G --cpus-per-task=32 --gres=gpu:1 --time=48:00:00
+POSE=/opt/pose/pose.sh
+OUT=/scratch/$USER/block-project
+
+$POSE -i /scratch/$USER/images -o $OUT \
+  --preset aircraft --quality high \
+  --cores 32 --memory-mb 100000 --ram-limit-mb 175000 \
+  --descriptor-matcher flann --calibration-trial-method subset \
+  --mvsgm-cameras-in-flight 4 --dense-checkpoint 30 \
+  > $OUT.log 2>&1</code></pre>
+<p>If the job stops during the dense step, find the run ID in the log and continue it:</p>
+<pre><code>$POSE status -o $OUT
+$POSE dense finish -o $OUT --run RUN_ID --memory-mb 100000</code></pre>
+<p>The run continues after its last checkpoint with the same result as an uninterrupted one. With very large sets, <code>--block-processing auto</code> splits the block by GPS position instead (Section 11.5).</p>
+
+<h2 id="ex-reuse">14.8 Exports and later products</h2>
+<pre><code># Camera orientations for other software
+photogrammetry --export-orientations project/runs/RUN_ID --orientation-output-format colmap,metashape,csv
+
+# The report again, with full diagnostics
+photogrammetry --export-report project/runs/RUN_ID --report-detail full
+
+# An orthomosaic of a finished run
+photogrammetry --export-orthomosaic project/runs/RUN_ID
+
+# Per-point confidence as CSV
+photogrammetry --export-confidence project/runs/RUN_ID
+
+# Measure local surface thickness of the cloud
+photogrammetry --analyze-run project/runs/RUN_ID</code></pre>
+
+<!-- ============================================================ A -->
+<div class="ref">
+<h1 id="ref"><span class="num">A</span>Command-line reference</h1>
+<p>This appendix is generated from <code>photogrammetry -h</code> of the version this manual was made with. Defaults are given in parentheses. <code>photogrammetry --help TEXT</code> shows only the options that mention TEXT.</p>
+@REFERENCE@
+</div>
+
+<!-- ============================================================ B -->
+<h1 id="formats"><span class="num">B</span>File formats and conventions</h1>
+
+<h2>B.1 Camera convention</h2>
+<pre><code>X_camera = R * X_world + t
+C_world  = -transpose(R) * t
+camera axes: x right, y down, z forward
+pixel (0,0) = centre of the upper-left pixel</code></pre>
+<figure><img src="figures/axes.svg" alt="Camera axes"><figcaption>Figure B.1. Camera and world conventions.</figcaption></figure>
+
+<h2>B.2 Ground control points</h2>
+<pre><code>gcp_id,x,y,z,sx,sy,sz,type
+G1,605551.06,6938380.02,89.55,0.02,0.02,0.03,control
+G2,605553.10,6938371.44,88.10,,,,check</code></pre>
+<p>Header optional; separator comma, semicolon or tab. Coordinates in <code>--crs</code>, sigmas in metres (optional), type <code>control</code> or <code>check</code> (default control).</p>
+
+<h2>B.3 Camera groups</h2>
+<pre><code>image,camera
+DJI_0001.JPG,rgb
+DJI_0002.JPG,nir</code></pre>
+
+<h2>B.4 Poses (native CSV)</h2>
+<pre><code>image,r00,r01,r02,r10,r11,r12,r20,r21,r22,tx,ty,tz</code></pre>
+<p>World-to-camera rotation (row-major) and translation, as in B.1. Quaternions: <code>image,qw,qx,qy,qz,tx,ty,tz</code>. Camera centres with angles: <code>image,x,y,z,omega,phi,kappa</code> (format <code>csv-opk</code>; camera-to-world <code>Rz(kappa)&middot;Ry(phi)&middot;Rx(omega)</code>, degrees unless <code>--orientation-angle-unit radians</code>).</p>
+
+<h2>B.5 Interior orientation (CSV)</h2>
+<pre><code>image,width,height,fx,fy,cx,cy,k1,k2,p1,p2,k3</code></pre>
+
+<h2>B.6 Geoid grids</h2>
+<p>NOAA/PROJ <code>.gtx</code> (binary: big-endian south-west latitude and longitude, latitude and longitude spacing as doubles, rows and columns as integers, then rows of 32-bit floats from the south; -88.8888 marks a missing node), or text:</p>
+<pre><code># latitude longitude N
+59.00  19.00  16.3821
+59.00  19.50  16.5130
+...</code></pre>
+<p>Degrees and metres, one node per line, a regular grid, latitude first. Lines that are not numbers are skipped.</p>
+
+<h2>B.7 coordinates.json</h2>
+<p>Describes the output frame: <code>horizontal_crs</code> and <code>epsg</code>, <code>vertical_crs</code> (e.g. <code>EPSG:3900</code>, or null), <code>vertical_datum</code>, <code>height_note</code>, the GPS fit (<code>inlier_rms_metres</code>, <code>gps_inliers</code>), and with a height conversion <code>vertical_conversion</code> (source, target, height shift). GCP- and lidar-referenced runs say so in <code>datum</code>.</p>
+
+<!-- ============================================================ C -->
+<h1 id="layout"><span class="num">C</span>Project folder layout</h1>
+<pre><code>PROJECT/
+  project.json, project.properties   project metadata, latest runs
+  latest-files.csv                   outputs of the newest successful run
+  camera.txt, cameras.csv            latest calibration and cameras
+  runs/
+    &lt;UTC time&gt;_&lt;id&gt;/
+      run.json, stages.csv           arguments, status of each step
+      artifacts.csv                  every file with size and SHA-256
+      state/                         saved state for continuing and branching
+      00_inputs/                     image inventory, resolution plan, imports
+      01_calibration/                cameras, calibration and its evidence
+      02_features/                   keypoints (with --diagnostics)
+      03_matches/                    pairs, matches, pair selection
+      04_geometry/                   cameras, tie points, registration, GPS, GCP, lidar
+      05_stereo/                     depth/disparity data of the dense step
+      06_fusion/                     fusion reports and backends
+      07_results/                    clouds, rasters, orthomosaic, report
+      08_orientations/               orientation exports (on request)
+      logs/                          console.log, events.jsonl, settings, timings</code></pre>
+<p>Finished runs are not changed afterwards (except by explicit report or orthomosaic regeneration). A failed run keeps its partial results, log and error trace. A lock file prevents two processes from writing the same project.</p>
+
+<!-- ============================================================ D -->
+<h1 id="glossary"><span class="num">D</span>Glossary</h1>
+<table>
+  <tr><th>Term</th><th>Meaning</th></tr>
+  <tr><td>Alignment</td><td>Finding the camera positions, orientations and lens parameters from tie points.</td></tr>
+  <tr><td>Bundle adjustment</td><td>Least-squares refinement of all cameras and tie points together.</td></tr>
+  <tr><td>Camera group</td><td>Images that share one calibration (one physical camera and lens).</td></tr>
+  <tr><td>Check point</td><td>A surveyed point measured in the images but not used in the adjustment; gives an independent accuracy estimate.</td></tr>
+  <tr><td>CHM</td><td>Canopy height model: surface height minus terrain height.</td></tr>
+  <tr><td>Depth fusion</td><td>Combining the depth maps of many cameras into points that several cameras agree on.</td></tr>
+  <tr><td>DSM / DTM</td><td>Digital surface model (top of everything) / digital terrain model (bare ground).</td></tr>
+  <tr><td>Ellipsoid / geoid</td><td>Reference surfaces for heights: a mathematical ellipsoid (GNSS) or the equipotential surface near mean sea level (national height systems).</td></tr>
+  <tr><td>Exterior / interior orientation</td><td>Camera position and rotation / camera focal length, principal point and lens distortion.</td></tr>
+  <tr><td>GCP</td><td>Ground control point: a surveyed point used to georeference the block.</td></tr>
+  <tr><td>GSD</td><td>Ground sample distance: the size of one image pixel on the ground.</td></tr>
+  <tr><td>mvsgm</td><td>Multi-view semi-global matching: one depth map per camera from several neighbours.</td></tr>
+  <tr><td>Reprojection error</td><td>Distance in pixels between a tie point's measured and computed image position.</td></tr>
+  <tr><td>RTK / PPK</td><td>Real-time / post-processed kinematic GNSS: centimetre-level positions.</td></tr>
+  <tr><td>Run</td><td>One processing of a project, in its own folder; runs are never overwritten.</td></tr>
+  <tr><td>SGM</td><td>Semi-global matching: dense stereo matching with smoothness along several image paths.</td></tr>
+  <tr><td>Tie point</td><td>A feature matched in two or more images and triangulated in 3D.</td></tr>
+  <tr><td>True orthomosaic</td><td>An orthomosaic in which every pixel comes from a camera that sees it, so tall objects do not lean.</td></tr>
+</table>
+
+</body>
+</html>

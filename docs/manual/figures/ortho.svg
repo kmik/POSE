@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240" font-family="Segoe UI, Arial, sans-serif" font-size="11">
+  <defs><style>
+    .g { stroke: #6c8f4e; stroke-width: 1.5; } .b { fill: #c9a37a; stroke: #7a5a3a; stroke-width: 1.2; } .r { fill: #b4584a; }
+    .ray { stroke: #8aa2b3; stroke-width: 1; stroke-dasharray: 3 3; }
+    .strip { stroke-width: 9; } .c { fill: #4a6274; } .h { fill: #12405f; font-weight: 600; text-anchor: middle; }
+    .cam { fill: #1f5f8b; }
+  </style></defs>
+  <text class="h" x="180" y="18">true orthomosaic (default)</text>
+  <path class="cam" d="M52,26 h16 l-4,9 h-8 z"/><path class="cam" d="M292,26 h16 l-4,9 h-8 z"/>
+  <path class="ray" d="M60,35 L138,168"/><path class="ray" d="M300,35 L222,168"/>
+  <rect class="b" x="140" y="92" width="80" height="78"/><rect class="r" x="136" y="84" width="88" height="9"/>
+  <path class="g" d="M30,170 H330"/>
+  <path class="strip" stroke="#6c8f4e" d="M30,192 H136"/><path class="strip" stroke="#b4584a" d="M136,192 H224"/><path class="strip" stroke="#6c8f4e" d="M224,192 H330"/>
+  <text class="c" x="30" y="216">Roof where the roof is; the ground beside it comes</text>
+  <text class="c" x="30" y="229">from cameras that see the ground.</text>
+  <g transform="translate(370,0)">
+    <text class="h" x="170" y="18">classic orthophoto</text>
+    <path class="cam" d="M32,26 h16 l-4,9 h-8 z"/>
+    <path class="ray" d="M40,35 L140,170"/><path class="ray" d="M40,35 L224,170"/>
+    <rect class="b" x="140" y="92" width="80" height="78"/><rect class="r" x="136" y="84" width="88" height="9"/>
+    <path class="g" d="M20,170 H320"/>
+    <path class="strip" stroke="#6c8f4e" d="M20,192 H140"/><path class="strip" stroke="#c9a37a" d="M140,192 H190"/><path class="strip" stroke="#b4584a" d="M190,192 H262"/><path class="strip" stroke="#6c8f4e" d="M262,192 H320"/>
+    <text class="c" x="20" y="216">Nearest camera on a smoothed surface: the wall shows</text>
+    <text class="c" x="20" y="229">and the roof leans aside, but there are no holes.</text>
+  </g>
+</svg>

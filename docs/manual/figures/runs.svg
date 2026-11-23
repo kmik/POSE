@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 210" font-family="Segoe UI, Arial, sans-serif" font-size="11">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5b7a90"/></marker>
+    <style>
+      .done { fill: #1f5f8b; } .new { fill: #19a89c; } .skip { fill: #ffffff; stroke: #9db3c3; stroke-dasharray: 3 2; }
+      .lab { fill: #ffffff; font-size: 9.5px; text-anchor: middle; } .labk { fill: #7a8e9c; font-size: 9.5px; text-anchor: middle; }
+      .h { fill: #12405f; font-weight: 600; font-size: 12px; } .c { fill: #4a6274; font-size: 10.5px; }
+      .l { stroke: #19a89c; stroke-width: 1.6; fill: none; marker-end: url(#a); }
+    </style>
+  </defs>
+  <text x="10" y="18" class="h">PROJECT/runs/</text>
+  <text x="10" y="48" class="c">run A</text>
+  <g transform="translate(60,32)">
+    <rect class="done" x="0"   width="56" height="24" rx="4"/><text class="lab" x="28"  y="16">inputs</text>
+    <rect class="done" x="60"  width="56" height="24" rx="4"/><text class="lab" x="88"  y="16">calibrate</text>
+    <rect class="done" x="120" width="56" height="24" rx="4"/><text class="lab" x="148" y="16">match</text>
+    <rect class="done" x="180" width="56" height="24" rx="4"/><text class="lab" x="208" y="16">align</text>
+    <rect class="done" x="240" width="66" height="24" rx="4"/><text class="lab" x="273" y="16">georeference</text>
+    <rect class="done" x="310" width="56" height="24" rx="4"/><text class="lab" x="338" y="16">dense</text>
+    <rect class="done" x="370" width="56" height="24" rx="4"/><text class="lab" x="398" y="16">ground</text>
+    <rect class="done" x="430" width="56" height="24" rx="4"/><text class="lab" x="458" y="16">finish</text>
+  </g>
+  <text x="560" y="48" class="c">--min-views 3</text>
+  <text x="10" y="118" class="c">run B</text>
+  <g transform="translate(60,102)">
+    <rect class="skip" x="0"   width="56" height="24" rx="4"/><text class="labk" x="28"  y="16">copied</text>
+    <rect class="skip" x="60"  width="56" height="24" rx="4"/><text class="labk" x="88"  y="16">copied</text>
+    <rect class="skip" x="120" width="56" height="24" rx="4"/><text class="labk" x="148" y="16">copied</text>
+    <rect class="skip" x="180" width="56" height="24" rx="4"/><text class="labk" x="208" y="16">copied</text>
+    <rect class="skip" x="240" width="66" height="24" rx="4"/><text class="labk" x="273" y="16">copied</text>
+    <rect class="new"  x="310" width="56" height="24" rx="4"/><text class="lab" x="338" y="16">dense</text>
+    <rect class="new"  x="370" width="56" height="24" rx="4"/><text class="lab" x="398" y="16">ground</text>
+    <rect class="new"  x="430" width="56" height="24" rx="4"/><text class="lab" x="458" y="16">finish</text>
+  </g>
+  <text x="560" y="118" class="c">--min-views 2</text>
+  <path class="l" d="M370,58 V98"/>
+  <text x="378" y="82" class="c">--branch: state saved after georeference</text>
+  <text x="10" y="166" class="c">photogrammetry dense ground finish -o PROJECT --run A --branch --min-views 2</text>
+  <text x="10" y="190" class="c">Run A is not changed. Run B reuses A's saved state and redoes only dense, ground and finish.</text>
+</svg>

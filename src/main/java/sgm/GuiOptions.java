@@ -90,6 +90,8 @@ final class GuiOptions {
           new Field("--lidar-canopy-weight", "   Canopy weight", INPUT, Kind.TEXT, List.of()),
           new Field("--lidar-vertical-datum", "   Lidar height datum", INPUT, Kind.TEXT, List.of()),
           new Field("--crs", "Coordinate system (EPSG)", INPUT, Kind.TEXT, List.of()),
+          new Field("--source-geoid", "   GPS height geoid (file or ellipsoid)", INPUT, Kind.FILE, List.of()),
+          new Field("--target-geoid", "   Output height geoid (file or ellipsoid)", INPUT, Kind.FILE, List.of()),
           new Field("--camera-grouping", "Camera grouping", INPUT, Kind.CHOICE, List.of("", "auto", "single", "per-image")),
           new Field("--camera-groups", "   Camera of each image (CSV)", INPUT, Kind.FILE, List.of()),
           new Field("--quality", "Quality", PROCESSING, Kind.CHOICE, List.of("", "ultra", "high", "medium", "low")),

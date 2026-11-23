@@ -48,6 +48,8 @@ final class PoseIO {
       if (det < 0)
         throw new IllegalArgumentException("Pose rotation must be proper (determinant +1)");
       f.camera.registered = true;
+      // --source-geoid/--target-geoid: projected exteriors move to the target height datum.
+      VerticalDatum.shiftPose(f.camera, f.options);
       f.camera.fixed = true;
     }
     for (ImageFrame f : frames)

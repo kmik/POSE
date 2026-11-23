@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 200" font-family="Segoe UI, Arial, sans-serif" font-size="11">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#c0392b"/></marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#27873e"/></marker>
+    <style>.c { fill: #4a6274; } .h { fill: #12405f; font-weight: 600; } .img { fill: #f5f7f9; stroke: #8aa2b3; }</style>
+  </defs>
+  <text class="h" x="20" y="20">Camera (OpenCV convention)</text>
+  <rect class="img" x="40" y="34" width="220" height="146"/>
+  <circle cx="40" cy="34" r="3" fill="#12405f"/>
+  <text class="c" x="48" y="50">pixel (0,0) = centre of the upper-left pixel</text>
+  <path d="M150,110 H226" stroke="#c0392b" stroke-width="2" marker-end="url(#ar)"/><text class="c" x="196" y="102" fill="#c0392b">x right</text>
+  <path d="M150,110 V170" stroke="#27873e" stroke-width="2" marker-end="url(#ag)"/><text class="c" x="156" y="172" fill="#27873e">y down</text>
+  <circle cx="150" cy="110" r="7" fill="none" stroke="#1f5f8b" stroke-width="2"/><circle cx="150" cy="110" r="2" fill="#1f5f8b"/>
+  <text class="c" x="52" y="132" fill="#1f5f8b">z forward</text><text class="c" x="52" y="145" fill="#1f5f8b">(into the scene)</text>
+  <g transform="translate(320,0)">
+    <text class="h" x="0" y="20">World and camera</text>
+    <text class="c" x="0" y="46">X_camera = R &#183; X_world + t</text>
+    <text class="c" x="0" y="64">C_world = &#8722;R&#7488; &#183; t   (camera centre)</text>
+    <text class="c" x="0" y="90">World: x = easting, y = northing, z = up (metres)</text>
+    <text class="c" x="0" y="108">Intrinsics in pixels: fx, fy, cx, cy</text>
+    <text class="c" x="0" y="126">Distortion in OpenCV order: k1, k2, p1, p2, k3</text>
+    <text class="c" x="0" y="152">Omega/phi/kappa files are converted on import:</text>
+    <text class="c" x="0" y="168">camera-to-world Rz(&#954;)&#183;Ry(&#966;)&#183;Rx(&#969;), axes x right, y up, z backward.</text>
+  </g>
+</svg>

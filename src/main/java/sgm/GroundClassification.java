@@ -85,7 +85,7 @@ final class GroundClassification {
       return skipped;
     }
     try (WorkProgress work = WorkProgress.start("Ground classification", 0, "steps")) {
-      Map<String, Object> result = classify(o, frames, las, results.resolve("point-confidence.bin"), results, crs.epsg);
+      Map<String, Object> result = classify(o, frames, las, results.resolve("point-confidence.bin"), results, crs.epsg, crs.vertical);
       Json.write(report, result);
       work.done();
       return result;
@@ -94,6 +94,13 @@ final class GroundClassification {
 
   static Map<String, Object> classify(
       Options o, List<ImageFrame> frames, Path las, Path sidecar, Path results, int epsg)
+      throws IOException {
+    return classify(o, frames, las, sidecar, results, epsg, 0);
+  }
+
+  /** vertical: EPSG code labelling the DTM heights (0: none). */
+  static Map<String, Object> classify(
+      Options o, List<ImageFrame> frames, Path las, Path sidecar, Path results, int epsg, int vertical)
       throws IOException {
     threads = Math.max(1, Integer.getInteger("sgm.groundThreads", o.cores));
     long started = System.nanoTime();
@@ -194,7 +201,7 @@ final class GroundClassification {
       maxDistance = Math.max(maxDistance, distance[k] * cell);
     }
     double x0 = g.x0 + cloud.ox, y1 = g.y1 + cloud.oy;
-    DsmRaster.writeTiff(results.resolve("dtm.tif"), g.w, g.h, dtm, x0, y1, cell, epsg);
+    DsmRaster.writeTiff(results.resolve("dtm.tif"), g.w, g.h, dtm, x0, y1, cell, epsg, vertical);
     DsmRaster.writeTiff(results.resolve("chm.tif"), g.w, g.h, chm, x0, y1, cell, epsg);
     DsmRaster.writeTiff(results.resolve("ground_support.tif"), g.w, g.h, support, x0, y1, cell, epsg);
     DsmRaster.writeTiff(

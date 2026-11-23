@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 282" font-family="Segoe UI, Arial, sans-serif" font-size="11">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#12405f"/></marker>
+    <style>
+      .terrain { fill: #e3ecd9; stroke: #6c8f4e; stroke-width: 1.6; }
+      .geoid { stroke: #19a89c; stroke-width: 2; fill: none; stroke-dasharray: 8 4; }
+      .ell { stroke: #1f5f8b; stroke-width: 2; fill: none; }
+      .dim { stroke: #12405f; stroke-width: 1.2; marker-start: url(#a); marker-end: url(#a); }
+      .c { fill: #4a6274; } .h { fill: #12405f; font-weight: 600; } .b { font-weight: 600; }
+    </style>
+  </defs>
+  <g transform="translate(0,30)">
+  <path class="terrain" d="M20,150 C120,120 190,135 260,128 S420,105 520,120 S640,140 700,130 L700,240 L20,240 Z"/>
+  <path class="geoid" d="M20,175 C160,170 300,168 420,172 S620,182 700,180"/>
+  <path class="ell" d="M20,214 C200,214 500,214 700,214"/>
+  <text x="560" y="168" class="c" fill="#19a89c"><tspan class="b" fill="#19a89c">geoid</tspan> (&#8776; mean sea level)</text>
+  <text x="560" y="230" class="c"><tspan class="b" fill="#1f5f8b">ellipsoid</tspan> (GNSS reference)</text>
+  <text x="600" y="118" class="c"><tspan class="b" fill="#6c8f4e">terrain</tspan></text>
+  <!-- drone -->
+  <g transform="translate(300,30)"><rect x="-14" y="-5" width="28" height="10" rx="3" fill="#12405f"/><path d="M-22,-8 h12 M10,-8 h12" stroke="#12405f" stroke-width="2"/></g>
+  <path class="dim" d="M300,40 V212"/><text x="306" y="100" class="c"><tspan class="b">h</tspan> ellipsoidal height (RTK)</text>
+  <path class="dim" d="M240,40 V168"/><text x="120" y="70" class="c"><tspan class="b">H</tspan> height above geoid</text><text x="120" y="84" class="c">(N2000, EGM96 ...)</text>
+  <path class="dim" d="M420,172 V212"/><text x="428" y="196" class="c"><tspan class="b">N</tspan> geoid height (grid file)</text>
+  </g>
+  <text x="20" y="18" class="h">h = H + N &#8195;&#8195; --source-geoid / --target-geoid convert between them</text>
+  <text x="20" y="36" class="c">In Finland N is about 17&#8211;20 m.</text>
+</svg>

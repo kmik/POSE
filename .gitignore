@@ -25,3 +25,5 @@
 .DS_Store
 /runtime/
 /dist/
+/docs/manual/build/
+/docs/manual/*.pdf

@@ -27,7 +27,7 @@ Input cameras must describe the stored, unrotated decoded raster: the image load
 
 `--orientation-pixels source` (default) exports original distorted raster intrinsics with final poses. `processed` exports dense undistorted raster intrinsics and zero distortion. Processed calibration belongs with processed photographs, not raw originals. Resize mapping is `cx'=(cx+0.5)*sx-0.5`, similarly for y; focal lengths scale by sx/sy.
 
-`--orientation-crs EPSG:CODE` declares already-projected metre coordinates; it does **not** transform them. It suppresses GPS realignment, conflicts with `--gps`, and requires `--scale 1`. `--orientation-world-units m|ft|mm` declares units without rescaling; projected processing requires metres. CRS/units are retained in sidecars; receiving software may require separate CRS setup. No vertical-datum conversion occurs.
+`--orientation-crs EPSG:CODE` declares already-projected metre coordinates; it does **not** transform them. It suppresses GPS realignment, conflicts with `--gps`, and requires `--scale 1`. `--orientation-world-units m|ft|mm` declares units without rescaling; projected processing requires metres. CRS/units are retained in sidecars; receiving software may require separate CRS setup. Heights are converted only with `--source-geoid`/`--target-geoid` (camera centres move vertically by the datum difference at their position).
 
 ## Supported variants
 

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240" font-family="Segoe UI, Arial, sans-serif" font-size="11">
+  <defs><style>
+    .pt { fill: #6c9a4e; } .gp { fill: #a0662d; } .ray { stroke: #8aa2b3; stroke-width: 1; stroke-dasharray: 3 3; }
+    .dtm { stroke: #a0662d; stroke-width: 2.2; fill: none; } .dsm { stroke: #27873e; stroke-width: 1.4; fill: none; stroke-dasharray: 5 3; }
+    .chm { stroke: #12405f; stroke-width: 1.2; } .c { fill: #4a6274; } .h { fill: #12405f; font-weight: 600; } .cam { fill: #1f5f8b; }
+  </style></defs>
+  <text class="h" x="20" y="18">Ground classification: the lowest points, limited by camera rays and slope</text>
+  <path class="cam" d="M112,28 h16 l-4,9 h-8 z"/><path class="cam" d="M512,28 h16 l-4,9 h-8 z"/>
+  <path class="ray" d="M120,37 L300,194"/><path class="ray" d="M520,37 L340,188"/>
+  <g class="pt">
+    <circle cx="200" cy="90" r="2.5"/><circle cx="214" cy="80" r="2.5"/><circle cx="228" cy="76" r="2.5"/><circle cx="242" cy="82" r="2.5"/><circle cx="256" cy="96" r="2.5"/>
+    <circle cx="380" cy="100" r="2.5"/><circle cx="394" cy="86" r="2.5"/><circle cx="408" cy="80" r="2.5"/><circle cx="422" cy="84" r="2.5"/><circle cx="436" cy="98" r="2.5"/><circle cx="450" cy="112" r="2.5"/>
+    <circle cx="560" cy="110" r="2.5"/><circle cx="574" cy="100" r="2.5"/><circle cx="588" cy="104" r="2.5"/>
+  </g>
+  <g class="gp">
+    <circle cx="40" cy="190" r="2.5"/><circle cx="70" cy="188" r="2.5"/><circle cx="100" cy="190" r="2.5"/><circle cx="140" cy="192" r="2.5"/>
+    <circle cx="300" cy="196" r="2.5"/><circle cx="320" cy="194" r="2.5"/><circle cx="340" cy="190" r="2.5"/>
+    <circle cx="500" cy="186" r="2.5"/><circle cx="520" cy="184" r="2.5"/><circle cx="640" cy="180" r="2.5"/><circle cx="680" cy="178" r="2.5"/>
+  </g>
+  <path class="dtm" d="M30,190 C140,192 220,198 320,194 S480,186 520,184 S640,180 700,177"/>
+  <path class="dsm" d="M30,188 C120,188 170,100 228,76 S280,140 320,190 C360,140 380,90 408,80 S470,150 520,180 C540,130 560,100 588,102 S640,176 700,176"/>
+  <path class="chm" d="M228,80 V194"/><text class="c" x="234" y="150">CHM = DSM &#8722; DTM</text>
+  <text class="c" x="560" y="214"><tspan fill="#a0662d" font-weight="600">DTM</tspan> terrain (interpolated under canopy)</text>
+  <text class="c" x="560" y="230"><tspan fill="#27873e" font-weight="600">DSM</tspan> surface (dashed)</text>
+  <text class="c" x="20" y="222">Ground seen through gaps anchors the terrain;</text>
+  <text class="c" x="20" y="236">camera rays that reached the ground cap it from above.</text>
+</svg>

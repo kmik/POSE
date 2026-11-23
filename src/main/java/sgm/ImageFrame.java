@@ -75,7 +75,7 @@ final class ImageFrame implements AutoCloseable {
     color = new Mat();
     gray = new Mat();
     validMask = new Mat();
-    gps = Exif.gps(path);
+    gps = VerticalDatum.convert(Exif.gps(path), options);
     if (!managed) loadRasters();
   }
 

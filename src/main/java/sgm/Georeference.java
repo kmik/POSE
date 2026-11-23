@@ -38,8 +38,10 @@ final class Georeference {
         throw new IllegalArgumentException(
             "--gps cannot realign poses with an explicit --orientation-crs; remove the orientation"
                 + " CRS to request a GPS fit");
-      Json.write(
-          o.output.resolve("coordinates.json"),
+      // Height label: the vertical part of --orientation-crs, else of --crs.
+      int vertical = supplied.vertical > 0 ? supplied.vertical : Crs.verticalOf(o.crs);
+      supplied = supplied.withVertical(vertical);
+      Map<String, Object> coordinates =
           Json.object(
               "georeferenced",
               true,
@@ -48,12 +50,26 @@ final class Georeference {
               "reason",
               "Supplied projected camera coordinates; no transformation applied",
               "vertical_datum",
-              "unspecified"));
+              "unspecified");
+      String heights = "vertical datum unspecified";
+      if (VerticalDatum.convertsPoses(o)) {
+        coordinates.put("vertical_datum", VerticalDatum.datumName(o));
+        coordinates.put("height_note", VerticalDatum.poseHeightNote(o));
+        heights = "camera heights converted from " + VerticalDatum.label(VerticalDatum.source(o)) + " to " + VerticalDatum.label(VerticalDatum.target(o));
+      }
+      if (vertical > 0) {
+        coordinates.put("vertical_crs", "EPSG:" + vertical);
+        if (!VerticalDatum.convertsPoses(o)) coordinates.put("vertical_datum", Crs.verticalName(vertical));
+        heights += "; heights labelled " + Crs.verticalName(vertical);
+        warnUnconverted(o, vertical, "the supplied exteriors' heights");
+      }
+      Json.write(o.output.resolve("coordinates.json"), coordinates);
       return new Result(
           supplied,
           "Supplied orientations in "
               + supplied.name
-              + "; metre coordinates, no GPS similarity applied; vertical datum unspecified");
+              + "; metre coordinates, no GPS similarity applied; "
+              + heights);
     }
     List<double[]> source = new ArrayList<>(), target = new ArrayList<>(), views = new ArrayList<>();
     List<Integer> ids = new ArrayList<>();
@@ -199,7 +215,7 @@ final class Georeference {
             "units",
             "metres",
             "height_note",
-            HEIGHT_NOTE,
+            VerticalDatum.heightNote(o),
             "gps_controls",
             source.size(),
             "gps_inliers",
@@ -212,8 +228,7 @@ final class Georeference {
             "Camera GPS accuracy, scene geometry and static datum transformations limit absolute"
                 + " accuracy. This similarity has no epoch, geoid or ground control adjustment; GPS time"
                 + " offset, lever arm and lens refit: gps_bundle.json."));
-    Json.write(
-        o.output.resolve("coordinates.json"),
+    Map<String, Object> coordinates =
         Json.object(
             "georeferenced",
             true,
@@ -226,9 +241,9 @@ final class Georeference {
             "xyz_units",
             "metres",
             "vertical_crs",
-            null,
+            crs.vertical > 0 ? "EPSG:" + crs.vertical : null,
             "height_note",
-            HEIGHT_NOTE,
+            VerticalDatum.heightNote(o),
             "inlier_rms_metres",
             rms,
             "gps_inliers",
@@ -236,7 +251,17 @@ final class Georeference {
             "gps_controls",
             source.size(),
             "coordinate_multiplier",
-            1));
+            1);
+    if (VerticalDatum.active(o)) {
+      // Only with --source-geoid/--target-geoid, so default runs write the same file.
+      coordinates.put("vertical_datum", VerticalDatum.datumName(o));
+      coordinates.put("vertical_conversion", verticalConversion(frames, o));
+    }
+    if (crs.vertical > 0) {
+      if (!VerticalDatum.active(o)) coordinates.put("vertical_datum", Crs.verticalName(crs.vertical));
+      warnUnconverted(o, crs.vertical, "the EXIF GPS heights");
+    }
+    Json.write(o.output.resolve("coordinates.json"), coordinates);
     for (ImageFrame f : frames) {
       Camera c = f.camera;
       c.rotation = Math3.mul(c.rotation, Math3.transpose(transform.rotation));
@@ -272,7 +297,7 @@ final class Georeference {
             inliers,
             source.size(),
             bundled,
-            HEIGHT_NOTE);
+            VerticalDatum.heightNote(o));
     System.out.println("Georeference: " + description);
     return new Result(crs, description);
   }
@@ -505,6 +530,49 @@ final class Georeference {
       u.release();
       vt.release();
     }
+  }
+
+  /** A height label without a conversion is only right if the heights already are in that system. */
+  static void warnUnconverted(Options o, int vertical, String what) {
+    if (VerticalDatum.active(o)) return;
+    System.out.println(
+        "Warning: --crs labels heights as "
+            + Crs.verticalName(vertical)
+            + " but no --source-geoid/--target-geoid conversion was requested; the label is only"
+            + " right if "
+            + what
+            + " already are in that height system.");
+  }
+
+  /** Source/target datums and the height shift applied to the cameras (min, mean, max). */
+  static Map<String, Object> verticalConversion(List<ImageFrame> frames, Options o) throws IOException {
+    double min = Double.POSITIVE_INFINITY, max = Double.NEGATIVE_INFINITY, sum = 0;
+    int n = 0;
+    for (ImageFrame f : frames) {
+      Exif.Gps g = f.gps;
+      if (g == null || !Double.isFinite(g.latitude + g.longitude + g.altitude)) continue;
+      double s = VerticalDatum.shift(g.latitude, g.longitude, o);
+      min = Math.min(min, s);
+      max = Math.max(max, s);
+      sum += s;
+      n++;
+    }
+    Map<String, Object> m =
+        Json.object(
+            "source", VerticalDatum.source(o),
+            "target", VerticalDatum.target(o),
+            "cameras", n,
+            "height_shift_mean_metres", n == 0 ? null : sum / n,
+            "height_shift_min_metres", n == 0 ? null : min,
+            "height_shift_max_metres", n == 0 ? null : max,
+            "note", "Camera GPS heights were converted (shift added to each EXIF altitude) before"
+                + " georeferencing. GCP heights are used as given.");
+    if (n > 0)
+      System.out.printf(
+          Locale.ROOT,
+          "Vertical datum: %s -> %s, camera height shift %.3f m (%.3f..%.3f)%n",
+          VerticalDatum.label(VerticalDatum.source(o)), VerticalDatum.label(VerticalDatum.target(o)), sum / n, min, max);
+    return m;
   }
 
   static double[] ecef(Exif.Gps gps) {

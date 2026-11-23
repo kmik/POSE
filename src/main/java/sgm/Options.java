@@ -112,6 +112,8 @@ public final class Options {
   public double lidarSearchShift = 10, lidarSearchAngle = 3, lidarCell = 2, lidarCanopyWeight = .1,
       lidarOutlier = 2, lidarWeakLimit = .25, lidarMargin = 10, lidarChangeLimit = 1;
   public String lidarCrs, lidarVerticalDatum;
+  /** Vertical datums of camera GPS heights (null: ellipsoid); see VerticalDatum. */
+  public String sourceGeoid, targetGeoid;
   // Height sigma of the GPS camera prior: auto (0.2 m for DJI barometric heights, else gpsSigma).
   public String gpsHeightSigma = "auto";
   double gpsHeightSigmaValue = 2;
@@ -1182,9 +1184,17 @@ public final class Options {
           break;
         case "--lidar-crs":
           o.lidarCrs = Crs.normalize(v);
+          if (o.lidarCrs.contains("+"))
+            throw new IllegalArgumentException("--lidar-crs takes a horizontal EPSG code only; use --lidar-vertical-datum for the heights");
           break;
         case "--lidar-vertical-datum":
           o.lidarVerticalDatum = v.trim();
+          break;
+        case "--source-geoid":
+          o.sourceGeoid = VerticalDatum.normalize(v, key);
+          break;
+        case "--target-geoid":
+          o.targetGeoid = VerticalDatum.normalize(v, key);
           break;
         case "--gcp-port":
           o.gcpPort = Integer.parseInt(v);
@@ -2959,7 +2969,7 @@ Point filtering and multi-view fusion:
       its own depth; other copies are dropped (the earlier rule). owner-consume: owner
       plus, with cameras processed in order, a pixel is also a copy when an earlier
       agreeing camera emitted a point nearby or an emitted point marked it; fewer
-      stacked sheets but on forest_10 also 42% fewer interior points (strips).
+      stacked sheets, but in tests also far fewer interior points (strips).
       graph-average: every unused merged pixel seeds a point that averages, along its
       ray, all agreeing depths of the overlapping cameras, weighted by their inverse
       variance (triangulation angle); member pixels are then used and seed nothing.
@@ -2994,8 +3004,8 @@ Point filtering and multi-view fusion:
       Image fusion (default 0 = off; not part of --thin-surfaces): pixels whose merged depth
       comes only from pairs with triangulation angle below DEG may still confirm and be
       averaged, but emit a point only when at least two cameras outside their own pairs
-      confirm it. Counted as narrow_unconfirmed_rejected. On city2, 12 removed 1.1M points and
-      ~14% of vegetation/edge coverage for a marginal flatness gain.
+      confirm it. Counted as narrow_unconfirmed_rejected. In tests, 12 removed about 14% of
+      vegetation and edge coverage for a marginal flatness gain.
   --fusion-local-sigma K
       Image fusion (default 0 = off): reject a point whose final sigma exceeds K x the best
       merged sigma within 4 pixels in its camera (precise evidence nearby that it did not
@@ -3104,7 +3114,25 @@ Georeferencing and output coordinates:
       Target projected metre-based EPSG CRS (default: EPSG:3067). GPS alignment
       runs automatically with sufficient valid, non-collinear 3D camera controls;
       otherwise output remains local without a CRS tag. Z uses EXIF GPS altitude
-      with unspecified vertical datum; no geoid/N2000 conversion is applied.
+      with unspecified vertical datum unless --source-geoid/--target-geoid are given.
+      EPSG:CODE+VERTICAL (e.g. EPSG:3067+3900, ETRS-TM35FIN + N2000 heights) also
+      labels the heights in LAS, DSM/DTM GeoTIFF, PLY and coordinates.json. The
+      label converts nothing: combine it with --target-geoid, or use it when the
+      heights already are in that system (GCPs, supplied exteriors).
+  --source-geoid ellipsoid|FILE
+      Vertical datum of the camera GPS heights: ellipsoid (WGS84/ETRS89 ellipsoidal
+      heights, e.g. DJI RTK) or the geoid grid FILE they are measured from (e.g. EGM96
+      for most non-RTK drones). Default: ellipsoid when --target-geoid is given.
+  --target-geoid ellipsoid|FILE
+      Vertical datum of the outputs: ellipsoid or a geoid grid FILE (e.g. FIN2005N00
+      for N2000 heights in Finland). Default: ellipsoid when --source-geoid is given.
+      Camera heights are converted before georeferencing, so every output is in the
+      target datum. Grid files: .gtx, or text with "latitude longitude N" per line on
+      a regular grid. Without either option heights are not converted. Supplied
+      exteriors with --orientation-crs are converted too (--source-geoid then names
+      their height datum). GCP heights are read as given (in the target datum). This
+      changes the datum only: it does not fix GPS height errors (non-RTK drones are
+      often tens of metres off).
   --gps
       Require successful GPS alignment instead of allowing local output.
   --no-gps

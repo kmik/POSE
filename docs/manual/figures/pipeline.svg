@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 250" font-family="Segoe UI, Arial, sans-serif" font-size="12">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5b7a90"/></marker>
+    <style>
+      .s { fill: #e8f1f7; stroke: #1f5f8b; stroke-width: 1.6; }
+      .o { fill: #ffffff; stroke: #1f5f8b; stroke-width: 1.4; stroke-dasharray: 5 3; }
+      .t { text-anchor: middle; fill: #12405f; font-weight: 600; }
+      .d { text-anchor: middle; fill: #4a6274; font-size: 10px; }
+      .l { stroke: #5b7a90; stroke-width: 1.5; fill: none; marker-end: url(#a); }
+      .g { fill: #7a9bb3; font-size: 11px; font-weight: 600; }
+    </style>
+  </defs>
+  <text x="10" y="18" class="g">ALIGNMENT</text>
+  <g>
+    <rect class="s" x="10"  y="28" width="104" height="52" rx="6"/><text class="t" x="62"  y="50">inputs</text><text class="d" x="62" y="66">images, plan</text>
+    <rect class="s" x="150" y="28" width="104" height="52" rx="6"/><text class="t" x="202" y="50">calibrate</text><text class="d" x="202" y="66">cameras</text>
+    <rect class="s" x="290" y="28" width="104" height="52" rx="6"/><text class="t" x="342" y="50">match</text><text class="d" x="342" y="66">tie points</text>
+    <rect class="s" x="430" y="28" width="104" height="52" rx="6"/><text class="t" x="482" y="50">align</text><text class="d" x="482" y="66">poses, lens</text>
+    <rect class="o" x="570" y="28" width="104" height="52" rx="6"/><text class="t" x="622" y="50">cleanup</text><text class="d" x="622" y="66">weak tie points</text>
+    <path class="l" d="M114,54 H148"/><path class="l" d="M254,54 H288"/><path class="l" d="M394,54 H428"/><path class="l" d="M534,54 H568"/>
+  </g>
+  <text x="10" y="112" class="g">GEOREFERENCING</text>
+  <g>
+    <rect class="s" x="150" y="122" width="104" height="52" rx="6"/><text class="t" x="202" y="144">georeference</text><text class="d" x="202" y="160">GPS fit + bundle</text>
+    <rect class="o" x="290" y="122" width="104" height="52" rx="6"/><text class="t" x="342" y="144">lidar</text><text class="d" x="342" y="160">fit to ALS</text>
+    <rect class="o" x="430" y="122" width="104" height="52" rx="6"/><text class="t" x="482" y="144">gcp</text><text class="d" x="482" y="160">control points</text>
+    <path class="l" d="M674,54 H700 V100 H130 V148 H148"/>
+    <path class="l" d="M254,148 H288"/><path class="l" d="M394,148 H428"/>
+  </g>
+  <text x="10" y="206" class="g">SURFACE</text>
+  <g>
+    <rect class="s" x="290" y="190" width="104" height="52" rx="6"/><text class="t" x="342" y="212">dense</text><text class="d" x="342" y="228">point cloud</text>
+    <rect class="o" x="430" y="190" width="104" height="52" rx="6"/><text class="t" x="482" y="212">ground</text><text class="d" x="482" y="228">DTM, CHM</text>
+    <rect class="s" x="570" y="190" width="104" height="52" rx="6"/><text class="t" x="622" y="212">finish</text><text class="d" x="622" y="228">DSM, ortho, report</text>
+    <path class="l" d="M534,148 H560 V178 H270 V216 H288"/>
+    <path class="l" d="M394,216 H428"/><path class="l" d="M534,216 H568"/>
+  </g>
+  <rect class="s" x="10" y="226" width="16" height="11" rx="2"/><text x="31" y="236" font-size="10" fill="#4a6274">always run</text>
+  <rect class="o" x="100" y="226" width="16" height="11" rx="2"/><text x="121" y="236" font-size="10" fill="#4a6274">only with its options</text>
+</svg>

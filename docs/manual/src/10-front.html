@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>POSE User Manual</title>
+<style>
+  @page {
+    size: A4;
+    margin: 22mm 20mm 22mm 22mm;
+    @bottom-center { content: counter(page); font: 9pt "Segoe UI", Arial, sans-serif; color: #666; }
+    @top-right { content: "POSE User Manual"; font: 8.5pt "Segoe UI", Arial, sans-serif; color: #999; }
+  }
+  @page cover { @bottom-center { content: none; } @top-right { content: none; } }
+  :root { --accent: #1f5f8b; --soft: #eef4f8; --rule: #c9d6df; --ink: #1d2328; }
+  html { font-family: "Segoe UI", "Calibri", Arial, sans-serif; font-size: 10pt; color: var(--ink); line-height: 1.45; }
+  body { margin: 0; }
+  h1, h2, h3, h4 { font-family: "Segoe UI Semibold", "Segoe UI", Arial, sans-serif; color: var(--accent); line-height: 1.2; break-after: avoid; }
+  h1 { font-size: 22pt; margin: 0 0 6mm; padding-bottom: 2mm; border-bottom: 2px solid var(--accent); break-before: page; }
+  h1 .num { color: #7a9bb3; font-weight: normal; margin-right: 4mm; }
+  h2 { font-size: 14pt; margin: 7mm 0 2mm; }
+  h3 { font-size: 11.5pt; margin: 5mm 0 1.5mm; color: #2b4a60; }
+  h4 { font-size: 10pt; margin: 4mm 0 1mm; color: #2b4a60; }
+  p { margin: 0 0 2.4mm; text-align: left; orphans: 3; widows: 3; }
+  ul, ol { margin: 0 0 2.6mm; padding-left: 6mm; }
+  li { margin: 0 0 1mm; }
+  code, pre, kbd { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; font-size: 8.8pt; }
+  code { background: var(--soft); padding: 0 1mm; border-radius: 2px; }
+  pre { background: #f5f7f9; border: 1px solid var(--rule); border-left: 3px solid var(--accent); padding: 2.2mm 3mm; margin: 0 0 3mm; white-space: pre-wrap; word-break: break-word; break-inside: avoid; }
+  pre code { background: none; padding: 0; }
+  kbd { border: 1px solid #aab; border-bottom-width: 2px; border-radius: 3px; padding: 0 1mm; background: #fafafa; }
+  table { border-collapse: collapse; width: 100%; margin: 1mm 0 3.5mm; font-size: 9pt; break-inside: auto; }
+  th, td { border: 1px solid var(--rule); padding: 1.2mm 2mm; vertical-align: top; text-align: left; }
+  th { background: var(--soft); color: #2b4a60; font-weight: 600; }
+  tr { break-inside: avoid; }
+  td code, th code { font-size: 8.3pt; }
+  .note, .tip, .warn { border-radius: 3px; padding: 2.2mm 3mm; margin: 0 0 3mm; break-inside: avoid; }
+  .note { background: var(--soft); border-left: 3px solid var(--accent); }
+  .tip { background: #eef7ee; border-left: 3px solid #3c8a3c; }
+  .warn { background: #fdf3e7; border-left: 3px solid #d0802b; }
+  .note b:first-child, .tip b:first-child, .warn b:first-child { color: #2b4a60; }
+  figure { margin: 2mm 0 4mm; text-align: center; break-inside: avoid; }
+  figure img { max-width: 100%; }
+  figcaption { font-size: 8.8pt; color: #555; margin-top: 1.5mm; }
+  .cover { page: cover; height: 250mm; display: flex; flex-direction: column; justify-content: center; text-align: center; }
+  .cover img.logo { width: 120mm; margin: 0 auto 8mm; }
+  .cover .title { font-size: 30pt; color: var(--accent); font-weight: 600; margin-bottom: 3mm; }
+  .cover .subtitle { font-size: 13pt; color: #4a6274; margin-bottom: 18mm; }
+  .cover .meta { font-size: 10pt; color: #666; line-height: 1.7; }
+  .toc { columns: 1; }
+  .toc h1 { break-before: page; }
+  .toc ol { list-style: none; padding-left: 0; }
+  .toc > ol > li { margin: 2.2mm 0 0.6mm; font-weight: 600; }
+  .toc ol ol { padding-left: 8mm; font-weight: normal; margin: 0.6mm 0 0; }
+  .toc ol ol li { margin: 0.3mm 0; }
+  .toc a { color: var(--ink); text-decoration: none; }
+  .toc .n { display: inline-block; width: 10mm; color: #7a9bb3; }
+  a { color: var(--accent); }
+  dl.opts { margin: 0 0 3mm; }
+  dl.opts dt { font-weight: 600; margin: 2.2mm 0 0.6mm; break-after: avoid; }
+  dl.opts dt code { background: none; padding: 0; color: #12405f; font-size: 9pt; }
+  dl.opts dd { margin: 0 0 0 6mm; font-size: 9.2pt; }
+  dl.opts dd p { margin-bottom: 1.2mm; }
+  pre.help { font-size: 8pt; border-left-width: 1px; padding: 1.5mm 2mm; }
+  .ref h2 { font-size: 12.5pt; border-bottom: 1px solid var(--rule); padding-bottom: 1mm; break-before: auto; }
+  .steps td:first-child { white-space: nowrap; }
+  .nw { white-space: nowrap; }
+  figure.shot img { border: 1px solid var(--rule); box-shadow: 0 1px 4px rgba(0,0,0,.12); max-height: 150mm; }
+  figure img[src$=".svg"] { width: 100%; }
+  .two { margin-bottom: 4mm; }
+  .two figure { margin: 0; }
+  .two img { max-height: 95mm; }
+  .example { border: 1px solid var(--rule); border-radius: 3px; margin: 0 0 4mm; break-inside: avoid; }
+  .example .eh { background: var(--soft); color: #2b4a60; font-weight: 600; padding: 1.4mm 3mm; border-bottom: 1px solid var(--rule); }
+  .example .eb { padding: 2mm 3mm 0; }
+  .example pre { margin-bottom: 2mm; }
+  .small { font-size: 8.8pt; color: #555; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 4mm; }
+</style>
+</head>
+<body>
+
+<section class="cover">
+  <img class="logo" src="images/pose-logo.png" alt="POSE">
+  <div class="title">User Manual</div>
+  <div class="subtitle">Photogrammetric Orientation and Surface Estimation</div>
+  <div class="meta">
+    POSE version 0.1 &middot; Manual draft 1<br>
+    @DATE@<br>
+    Author: Mikko Kukkonen
+  </div>
+</section>
+
+<nav class="toc">
+<h1>Contents</h1>
+<ol>
+  <li><a href="#about"><span class="n"></span>About this manual</a></li>
+  <li><a href="#intro"><span class="n">1</span>Introduction</a>
+    <ol>
+      <li><a href="#intro-what">1.1 What POSE does</a></li>
+      <li><a href="#intro-flow">1.2 The processing chain</a></li>
+      <li><a href="#intro-outputs">1.3 What you get</a></li>
+      <li><a href="#intro-concepts">1.4 Projects, runs and steps</a></li>
+      <li><a href="#intro-req">1.5 Requirements</a></li>
+    </ol></li>
+  <li><a href="#install"><span class="n">2</span>Installation</a>
+    <ol>
+      <li><a href="#install-portable">2.1 Portable release</a></li>
+      <li><a href="#install-source">2.2 Building from source</a></li>
+      <li><a href="#install-gpu">2.3 GPU (OpenCL)</a></li>
+      <li><a href="#install-launch">2.4 Launchers and Java memory</a></li>
+    </ol></li>
+  <li><a href="#quick"><span class="n">3</span>Quick start</a>
+    <ol>
+      <li><a href="#quick-window">3.1 In the window</a></li>
+      <li><a href="#quick-cli">3.2 On the command line</a></li>
+      <li><a href="#quick-results">3.3 Where the results are</a></li>
+    </ol></li>
+  <li><a href="#gui"><span class="n">4</span>The POSE window</a>
+    <ol>
+      <li><a href="#gui-start">4.1 Starting and layout</a></li>
+      <li><a href="#gui-new">4.2 New run</a></li>
+      <li><a href="#gui-adv">4.3 Advanced options</a></li>
+      <li><a href="#gui-project">4.4 Project tab</a></li>
+      <li><a href="#gui-tools">4.5 3D view, Images, tie points, lidar and registration windows</a></li>
+      <li><a href="#gui-settings">4.6 Settings and help</a></li>
+    </ol></li>
+  <li><a href="#runs"><span class="n">5</span>Projects, runs and steps</a>
+    <ol>
+      <li><a href="#runs-steps">5.1 The steps</a></li>
+      <li><a href="#runs-continue">5.2 Continuing and branching runs</a></li>
+      <li><a href="#runs-interrupt">5.3 Interruptions and checkpoints</a></li>
+      <li><a href="#runs-servers">5.4 Running on a server</a></li>
+    </ol></li>
+  <li><a href="#cameras"><span class="n">6</span>Images and cameras</a>
+    <ol>
+      <li><a href="#cameras-images">6.1 Images and metadata</a></li>
+      <li><a href="#cameras-resolution">6.2 Processing resolution</a></li>
+      <li><a href="#cameras-groups">6.3 Cameras and camera groups</a></li>
+      <li><a href="#cameras-calib">6.4 Calibration</a></li>
+      <li><a href="#cameras-import">6.5 Importing orientations</a></li>
+      <li><a href="#cameras-chess">6.6 Chessboard calibration</a></li>
+    </ol></li>
+  <li><a href="#align"><span class="n">7</span>Alignment</a>
+    <ol>
+      <li><a href="#align-features">7.1 Features and matching</a></li>
+      <li><a href="#align-pairs">7.2 Choosing image pairs</a></li>
+      <li><a href="#align-register">7.3 Camera registration and bundle adjustment</a></li>
+      <li><a href="#align-missing">7.4 When images do not align</a></li>
+      <li><a href="#align-cleanup">7.5 Tie-point cleanup</a></li>
+      <li><a href="#align-screening">7.6 Camera screening</a></li>
+    </ol></li>
+  <li><a href="#geo"><span class="n">8</span>Georeferencing and coordinate systems</a>
+    <ol>
+      <li><a href="#geo-gps">8.1 GPS georeferencing</a></li>
+      <li><a href="#geo-crs">8.2 Coordinate systems</a></li>
+      <li><a href="#geo-heights">8.3 Heights and vertical datums</a></li>
+      <li><a href="#geo-gcp">8.4 Ground control points</a></li>
+      <li><a href="#geo-lidar">8.5 Lidar reference</a></li>
+      <li><a href="#geo-supplied">8.6 Supplied exterior orientations</a></li>
+    </ol></li>
+  <li><a href="#dense"><span class="n">9</span>Dense reconstruction</a>
+    <ol>
+      <li><a href="#dense-methods">9.1 Dense methods</a></li>
+      <li><a href="#dense-presets">9.2 Presets</a></li>
+      <li><a href="#dense-key">9.3 The settings that matter most</a></li>
+      <li><a href="#dense-mvsgm">9.4 Multi-view SGM in detail</a></li>
+      <li><a href="#dense-fusion">9.5 Depth fusion and filtering</a></li>
+      <li><a href="#dense-pair">9.6 Pairwise SGM settings</a></li>
+    </ol></li>
+  <li><a href="#products"><span class="n">10</span>Products</a>
+    <ol>
+      <li><a href="#products-cloud">10.1 Point cloud</a></li>
+      <li><a href="#products-attrs">10.2 Per-point values and uncertainty</a></li>
+      <li><a href="#products-dsm">10.3 Surface model (DSM)</a></li>
+      <li><a href="#products-ground">10.4 Ground, terrain and canopy height</a></li>
+      <li><a href="#products-ortho">10.5 Orthomosaic</a></li>
+      <li><a href="#products-report">10.6 Processing report</a></li>
+      <li><a href="#products-orient">10.7 Camera orientations</a></li>
+    </ol></li>
+  <li><a href="#perf"><span class="n">11</span>Performance, memory and large projects</a>
+    <ol>
+      <li><a href="#perf-memory">11.1 Memory</a></li>
+      <li><a href="#perf-gpu">11.2 GPU</a></li>
+      <li><a href="#perf-speed">11.3 Speed</a></li>
+      <li><a href="#perf-disk">11.4 Disk</a></li>
+      <li><a href="#perf-large">11.5 Large image sets</a></li>
+    </ol></li>
+  <li><a href="#quality"><span class="n">12</span>Checking quality</a></li>
+  <li><a href="#trouble"><span class="n">13</span>Troubleshooting</a></li>
+  <li><a href="#examples"><span class="n">14</span>Worked examples</a>
+    <ol>
+      <li><a href="#ex-drone">14.1 Drone survey of a forest stand</a></li>
+      <li><a href="#ex-rtk">14.2 RTK drone with N2000 heights</a></li>
+      <li><a href="#ex-gcp">14.3 Survey with ground control points</a></li>
+      <li><a href="#ex-lidar">14.4 Georeferencing to national lidar</a></li>
+      <li><a href="#ex-aerial">14.5 Aerial block with imported orientations</a></li>
+      <li><a href="#ex-compare">14.6 Comparing settings with branches</a></li>
+      <li><a href="#ex-server">14.7 Large block on a server</a></li>
+      <li><a href="#ex-reuse">14.8 Exports and later products</a></li>
+    </ol></li>
+  <li><a href="#ref"><span class="n">A</span>Command-line reference</a></li>
+  <li><a href="#formats"><span class="n">B</span>File formats and conventions</a></li>
+  <li><a href="#layout"><span class="n">C</span>Project folder layout</a></li>
+  <li><a href="#glossary"><span class="n">D</span>Glossary</a></li>
+</ol>
+</nav>
+
+<h1 id="about">About this manual</h1>
+<p>This manual describes how to use POSE: installing it, processing photographs into point clouds, surface and terrain models and orthomosaics, controlling the georeferencing and heights, and checking the quality of the results. Chapters 1 to 3 are enough to make a first point cloud. Chapters 4 to 13 explain each part of the processing in turn. Appendix A lists every command-line option, generated from the program's own help text, so it always matches the version it was made with.</p>
+<p>Conventions used here:</p>
+<ul>
+  <li><code>photogrammetry</code> stands for the launcher of your system: <code>photogrammetry.bat</code> or <code>pose.bat</code> on Windows, <code>photogrammetry.sh</code> or <code>pose.sh</code> on Linux.</li>
+  <li><code>PROJECT</code> is a project folder, <code>IMAGES</code> a folder of photographs and <code>RUN</code> the folder of one run inside a project (<code>PROJECT/runs/&lt;run-id&gt;</code>).</li>
+  <li>Options are written <code>--option VALUE</code>; <code>--option=VALUE</code> works too.</li>
+  <li>Pixel values refer to the processed images (after any resizing), unless stated otherwise.</li>
+</ul>
+<div class="note"><b>Draft.</b> This is the first draft of the manual. Sections marked with figures to come, and the details of some advanced options, will be filled in during revision.</div>
+
+<!-- ============================================================ 1 -->
+<h1 id="intro"><span class="num">1</span>Introduction</h1>
+
+<h2 id="intro-what">1.1 What POSE does</h2>
+<p>POSE (Photogrammetric Orientation and Surface Estimation) turns overlapping photographs into georeferenced 3D products. It finds the position and orientation of every camera, calibrates the lens, matches the images densely and fuses the depth maps into a point cloud. From the cloud it makes a surface model, a terrain and canopy height model, and an orthomosaic. A PDF report documents every run.</p>
+<p>POSE is written in Java and uses OpenCL to run dense matching and depth fusion on a graphics card. Without a suitable GPU everything runs on the CPU, with the same results. It runs from the command line, in a desktop window, or as part of the LAS.utils toolkit.</p>
+<figure>
+  <img src="images/city-point-cloud.png" alt="Point cloud" style="max-height: 80mm">
+  <figcaption>A dense point cloud from drone photographs, coloured by elevation.</figcaption>
+</figure>
+<p>Typical uses are drone and aircraft surveys of forests, built areas and terrain. POSE was developed with forest inventory in mind: it handles canopy, keeps thin structures, and can tie a block to existing airborne laser scanning instead of ground control points.</p>
+
+<h2 id="intro-flow">1.2 The processing chain</h2>
+<p>Processing runs as a chain of steps. Each step saves its result, so the chain can be run in one go or step by step.</p>
+<figure><img src="figures/pipeline.svg" alt="Processing chain"><figcaption>Figure 1.1. The processing steps. Dashed steps run only when their options are given.</figcaption></figure>
+<table class="steps">
+  <tr><th>Step</th><th>What it does</th><th>Main result</th></tr>
+  <tr><td><code>inputs</code></td><td>Reads the photographs and their metadata, plans the processing resolution and memory, imports supplied orientations.</td><td>Image inventory, resolution plan</td></tr>
+  <tr><td><code>calibrate</code></td><td>Sets up the cameras: supplied calibration, calibration from EXIF, or automatic estimation.</td><td>Camera groups, initial calibration</td></tr>
+  <tr><td><code>match</code></td><td>Detects features, chooses the image pairs to match, matches them and builds tie-point tracks.</td><td>Tie points</td></tr>
+  <tr><td><code>align</code></td><td>Registers the cameras one by one and refines everything with bundle adjustment, including the lens.</td><td>Camera poses, sparse cloud</td></tr>
+  <tr><td><code>cleanup</code></td><td>Optional: removes weak tie points and adjusts again.</td><td>Cleaned tie points</td></tr>
+  <tr><td><code>georeference</code></td><td>Moves the block into map coordinates using the image GPS, then a GPS-weighted adjustment.</td><td>Georeferenced cameras</td></tr>
+  <tr><td><code>lidar</code></td><td>Optional: fits the block onto an airborne lidar surface.</td><td>Lidar-referenced cameras</td></tr>
+  <tr><td><code>gcp</code></td><td>Optional: adjusts the block to ground control points pinned in the images.</td><td>GCP-referenced cameras</td></tr>
+  <tr><td><code>dense</code></td><td>Dense matching and depth fusion.</td><td>Dense point cloud</td></tr>
+  <tr><td><code>ground</code></td><td>Optional: ground classification, terrain and canopy height models.</td><td>DTM, CHM, classified cloud</td></tr>
+  <tr><td><code>finish</code></td><td>Surface model, optional orthomosaic, processing report, final files.</td><td>DSM, orthomosaic, report</td></tr>
+</table>
+
+<h2 id="intro-outputs">1.3 What you get</h2>
+<ul>
+  <li><b>Point cloud</b>: <code>dense.las</code> (LAS with RGB and optional per-point values) and <code>dense.ply</code>.</li>
+  <li><b>Surface model</b>: <code>dsm.tif</code>, a GeoTIFF of the highest point per cell.</li>
+  <li><b>Terrain and canopy</b> (with ground classification): <code>dtm.tif</code>, <code>chm.tif</code> and ground classes in the LAS.</li>
+  <li><b>Orthomosaic</b> (on request): <code>orthomosaic.tif</code>, a full-resolution tiled GeoTIFF.</li>
+  <li><b>Processing report</b>: <code>processing-report.pdf</code> with survey data, calibration, camera positions, accuracy and quality flags.</li>
+  <li><b>Camera orientations</b>: calibration and poses, exportable to other software (COLMAP, Metashape, INPHO and others).</li>
+</ul>
+
+<h2 id="intro-concepts">1.4 Projects, runs and steps</h2>
+<p>A <b>project</b> is a folder that holds everything made from one set of photographs. Each time you process, POSE creates a new <b>run</b> inside it, in <code>PROJECT/runs/&lt;run-id&gt;</code>. Runs are never overwritten: changing a setting and processing again gives a new run next to the old one, so results can be compared. A run consists of the <b>steps</b> listed above. A step can be continued later, and a run can be <b>branched</b>: a new run starts from the saved state of an earlier one and redoes the steps from a chosen point with other settings. Chapter 5 explains this in detail.</p>
+
+<h2 id="intro-req">1.5 Requirements</h2>
+<ul>
+  <li><b>Operating system:</b> Windows x64 or Linux x64 (glibc 2.28 or later for the portable Linux package).</li>
+  <li><b>Java:</b> a 64-bit Java 25 runtime. Portable packages include it; a source build needs a JDK 25.</li>
+  <li><b>GPU (optional):</b> a graphics card with a vendor OpenCL driver (NVIDIA, AMD or Intel). Double-precision support lets fusion run on the GPU too.</li>
+  <li><b>Memory:</b> 16 GB of RAM is enough for small drone projects; large blocks or high resolution need 64 GB or more. Chapter 11 explains how memory is planned.</li>
+  <li><b>Disk:</b> plan for several times the size of the photographs for temporary depth maps and caches; dense matching at full resolution of large blocks can need hundreds of gigabytes.</li>
+</ul>
+
+<!-- ============================================================ 2 -->
+<h1 id="install"><span class="num">2</span>Installation</h1>
+
+<h2 id="install-portable">2.1 Portable release</h2>
+<p>The portable release is the easiest way to run POSE. It contains the compiled program, its libraries and a private Java runtime. Nothing is installed into the system and no administrator rights are needed. Download the release archive (not the source archive generated by GitHub), check it and extract it:</p>
+<pre><code># Linux
+sha256sum -c pose-VERSION-linux-x64-glibc228.tar.gz.sha256
+tar -xzf pose-VERSION-linux-x64-glibc228.tar.gz
+cd pose-VERSION-linux-x64-glibc228
+./pose.sh -h</code></pre>
+<p>On Windows, extract the Windows package and run <code>pose.bat -h</code>. The folder can be moved and its path may contain spaces. Input and output paths are relative to the folder you start POSE from, not to the installation.</p>
+<p>The bundled runtime is used even if another Java is installed. To use a different Java 25 for a single command, set <code>POSE_JAVA_HOME</code> for that command.</p>
+
+<h2 id="install-source">2.2 Building from source</h2>
+<p>Building needs a 64-bit JDK 25. The first build downloads the libraries into <code>lib/</code>, compiles the program and runs its test suite.</p>
+<pre><code># Windows
+.\build.bat
+.\photogrammetry.bat -h
+
+# Linux
+bash build.sh
+bash photogrammetry.sh -h</code></pre>
+<p>The test suite takes a while. When it passes, the program is ready. To use POSE inside LAS.utils, copy the repository into <code>sgm_java/</code> at the LAS.utils root, copy the wrappers from <code>las-utils/</code> into that root and build the module.</p>
+
+<h2 id="install-gpu">2.3 GPU (OpenCL)</h2>
+<p>GPU processing needs a working graphics driver with OpenCL; POSE does not install it. Check what POSE sees with:</p>
+<pre><code>photogrammetry --list-gpus</code></pre>
+<p>The list numbers the devices from 0. Choose one with <code>--gpu-device N</code>. By default (<code>--compute auto</code>) POSE uses the GPU where it is worthwhile and fits in its memory, and falls back to the CPU otherwise. <code>--compute cpu</code> never touches the GPU; <code>--compute gpu</code> makes a missing GPU an error.</p>
+<div class="tip"><b>Tip.</b> On a laptop with two graphics adapters, make sure the discrete GPU is the one listed as device 0, or pick it with <code>--gpu-device</code>.</div>
+
+<h2 id="install-launch">2.4 Launchers and Java memory</h2>
+<table>
+  <tr><th>Launcher</th><th>Starts</th></tr>
+  <tr><td><code>photogrammetry.bat</code>, <code>photogrammetry.sh</code></td><td>The command-line program.</td></tr>
+  <tr><td><code>pose.bat</code>, <code>pose.sh</code></td><td>The same program (shorter name).</td></tr>
+  <tr><td><code>pose-gui.bat</code>, <code>pose-gui.sh</code></td><td>The desktop window (Chapter 4).</td></tr>
+</table>
+<p>The launcher starts Java with an initial heap of 8 GB (environment variable <code>PHOTOGRAMMETRY_HEAP</code>, e.g. <code>16g</code>). You rarely need to change it: <code>--memory-mb</code> restarts the program with a heap large enough for the requested processing budget (Chapter 11).</p>
+
+<!-- ============================================================ 3 -->
+<h1 id="quick"><span class="num">3</span>Quick start</h1>
+<p>You need a folder of overlapping photographs. For drone surveys, typical overlaps are 70&ndash;80% along the flight line and 60&ndash;70% between lines; forests need more overlap than open ground. Photographs with GPS in the EXIF are georeferenced automatically.</p>
+<figure><img src="figures/overlap.svg" alt="Image overlap"><figcaption>Figure 3.1. Forward overlap (along a flight line) and side overlap (between lines).</figcaption></figure>
+
+<h2 id="quick-window">3.1 In the window</h2>
+<ol>
+  <li>Start <code>pose-gui.bat</code> (Windows) or <code>./pose-gui.sh</code> (Linux).</li>
+  <li>Choose a <b>project folder</b> at the top. A new, empty folder is fine.</li>
+  <li>On the <b>New run</b> tab, choose the <b>image folder</b>.</li>
+  <li>Pick a <b>Preset</b>, for example <i>drone, forest</i> or <i>drone, city</i>, and if needed tick <b>Classify ground</b> and <b>Orthomosaic</b>.</li>
+  <li>Press <b>Run</b>. The console shows the steps, a progress bar and the log.</li>
+  <li>When the run completes, press <b>Open</b> to see the report or the results folder.</li>
+</ol>
+<p>The window fills in the CPU, memory and GPU settings for your computer. Its defaults are the tested multi-view setup (Chapter 9), which differs from the command-line defaults.</p>
+<figure class="shot"><img src="shots/gui-new-run.png" alt="New run tab"><figcaption>Figure 3.2. The New run tab with an image folder and the <i>drone, forest</i> preset chosen.</figcaption></figure>
+
+<h2 id="quick-cli">3.2 On the command line</h2>
+<pre><code>photogrammetry -i IMAGES -o PROJECT --preset drone,forest --classify-ground --orthomosaic</code></pre>
+<p>This runs every step in one process. A smaller and faster first test:</p>
+<pre><code>photogrammetry -i IMAGES -o PROJECT --quality medium</code></pre>
+<p>To see the memory plan without processing:</p>
+<pre><code>photogrammetry -i IMAGES -o PROJECT --quality high --estimate-memory</code></pre>
+<p>Help on all options: <code>photogrammetry -h</code>. Only the options that mention a word: <code>photogrammetry --help lidar</code>. Chapter 14 has complete command sequences for common kinds of survey.</p>
+
+<h2 id="quick-results">3.3 Where the results are</h2>
+<p>Results are in <code>PROJECT/runs/&lt;run-id&gt;/07_results/</code>:</p>
+<table>
+  <tr><th>File</th><th>Contents</th></tr>
+  <tr><td><code>dense.las</code>, <code>dense.ply</code></td><td>Dense point cloud.</td></tr>
+  <tr><td><code>dsm.tif</code> (+ <code>.tfw</code>, <code>.png</code>, <code>.json</code>)</td><td>Surface model, when the run is georeferenced.</td></tr>
+  <tr><td><code>dtm.tif</code>, <code>chm.tif</code>, <code>ground.json</code></td><td>Terrain and canopy height (with <code>--classify-ground</code>).</td></tr>
+  <tr><td><code>orthomosaic.tif</code></td><td>Orthomosaic (with <code>--orthomosaic</code>).</td></tr>
+  <tr><td><code>processing-report.pdf</code></td><td>Processing report.</td></tr>
+  <tr><td><code>coordinates.json</code></td><td>Coordinate system and height datum of the outputs.</td></tr>
+  <tr><td><code>report.txt</code></td><td>Short text summary.</td></tr>
+</table>
+<p><code>PROJECT/latest-files.csv</code> lists the outputs of the newest successful run.</p>
+
+<!-- ============================================================ 4 -->
+<h1 id="gui"><span class="num">4</span>The POSE window</h1>
+<p>The POSE window starts runs, follows them and inspects their results. It does not process anything itself: every command it starts is the normal command line, shown in the console so that it can be copied and run elsewhere, for example on a server.</p>
+
+<h2 id="gui-start">4.1 Starting and layout</h2>
+<pre><code>pose-gui.bat [PROJECT]          (Windows; no console window)
+./pose-gui.sh [PROJECT]         (Linux)
+photogrammetry gui [PROJECT]    (any launcher)</code></pre>
+<p>The window has a <b>project folder</b> bar at the top, the tabs <b>New run</b>, <b>Advanced options</b> and <b>Project</b>, and a <b>console</b> at the bottom. The window needs a display; on a machine without one, use the command line. On Windows, set <code>POSE_GUI_CONSOLE=1</code> before <code>pose-gui.bat</code> to keep a console window for error messages.</p>
+<p>The console shows the steps of the current run (pending, running, complete, skipped, waiting, failed) with their times, the current stage with its percentage, the live log, the elapsed time and a <b>Stop</b> button. Stop ends the command and every process it started; the stopped step stays marked "running" and can be run again from the Project tab. Only one command runs at a time.</p>
+
+<h2 id="gui-new">4.2 New run</h2>
+<ul>
+  <li><b>Input and project:</b> image folder; optional orientation import, GCP file and check points; optional lidar reference (one LAS/LAZ file or a folder of tiles) with its main settings; coordinate system and height datums. <b>Check lidar coverage</b> tests at once whether the lidar covers the photographs.</li>
+  <li><b>Processing:</b> the <b>Preset</b> menu, then quality, maximum image dimension, dense method, filtering, minimum views, quick calibration, tie-point cleanup, ground classification and orthomosaic.</li>
+  <li><b>Compute and memory:</b> compute device, GPU index and memory, GPU normals, CPU cores, memory budget and RAM limit.</li>
+  <li><b>Outputs:</b> PLY on/off, LAS tile size, point confidence file, the per-point values stored in LAS/PLY, verbose log.</li>
+</ul>
+<p>Hover over a label to see the option's help text. An empty field is not passed, so the default applies; the default is shown in grey. <b>Extra arguments</b> takes options typed by hand; they come last and win. The <b>Command</b> box shows the exact command and whether the option parser accepts it. <b>Memory estimate</b> runs <code>--estimate-memory</code> in a temporary project. <b>Run</b> starts the run; <b>Reset options</b> returns all options to the window's defaults.</p>
+<p>The window's own defaults are the tested multi-view setup. The compute sizes come from the computer: three quarters of the CPU cores, half the RAM for <code>--memory-mb</code>, and 95% of GPU memory. Choosing <b>mvsgm</b> as the dense method brings its required and tested settings with it. Options are remembered per project folder, and the last options used become the defaults for new projects.</p>
+
+<h2 id="gui-adv">4.3 Advanced options</h2>
+<p>Every other option (about 250) has a field on the <b>Advanced options</b> tab, grouped as in Appendix A. The fields are made from the program's help text, so they always match the program. <b>Search</b> filters by name or help text; <b>Show only the options I set</b> lists your changes, and the tab title counts them.</p>
+<figure class="shot"><img src="shots/gui-advanced.png" alt="Advanced options tab"><figcaption>Figure 4.1. The Advanced options tab: every option with its default and the first sentence of its help.</figcaption></figure>
+
+<h2 id="gui-project">4.4 Project tab</h2>
+<ul>
+  <li><b>Runs</b> of the project with start time, status, number of points and the next step.</li>
+  <li><b>Steps of the selected run</b>, with buttons to <b>Run next step</b>, <b>Run remaining steps</b> or <b>Run selected steps</b>, and <b>Redo steps in a new run...</b>, which branches the run (Section 5.2). <b>Options for these steps</b> passes options to the steps run here.</li>
+  <li><b>Edit GCPs</b> when a run waits for ground control markers; <b>Clean tie points...</b> when it waits at the cleanup step.</li>
+  <li><b>Report again</b> and <b>Orthomosaic again</b> remake these products without reprocessing.</li>
+  <li><b>Summary and quality flags</b>: the main numbers of the report and its flags. <b>Copy run details</b> copies the run's status, error and log end for a bug report; <b>Copy command</b> copies its options as one command line.</li>
+  <li>Double-click a step for its full message; a failed step shows the error and the relevant log lines.</li>
+</ul>
+<figure class="shot"><img src="shots/gui-project.png" alt="Project tab"><figcaption>Figure 4.2. The Project tab: runs, the steps of the selected run, its summary, and the console with the step strip.</figcaption></figure>
+
+<h2 id="gui-tools">4.5 3D view, Images, tie points, lidar and registration windows</h2>
+<p><b>3D view...</b> shows the dense cloud, tie points and cameras of the selected run. Colour by RGB, height, class, surface attributes or point confidence. Cameras flagged by camera screening are drawn red. Left drag orbits, right drag pans, the wheel zooms to the pointer and double-click centres. <b>Home</b>, <b>Top</b> and <b>Side</b> set standard views; <b>Shading</b> adds eye-dome lighting. For runs with a lidar reference, the lidar points can be shown in orange for direct comparison.</p>
+<figure class="shot"><img src="shots/gui-3d-view.png" alt="3D view"><figcaption>Figure 4.3. The 3D view: the dense cloud of a forest survey in RGB with eye-dome shading, and the cameras along the flight line.</figcaption></figure>
+<p><b>Images...</b> shows the photographs with their reprojection error and flags, at full resolution on the <b>Image</b> tab and projected onto the surface model on the <b>Map</b> tab. With lowered opacity, well-aligned overlapping photographs look sharp and misaligned ones look doubled.</p>
+<figure class="shot"><img src="shots/gui-images-map.png" alt="Images window, map tab"><figcaption>Figure 4.4. The Images window: previews with their reprojection error (left) and the photographs projected onto the surface model with their outlines (right).</figcaption></figure>
+<p><b>Tie-point cleanup</b> (Section 7.5) shows histograms of the tie points' error, views and angle with a 3D view of what the chosen limits remove. <b>Lidar result...</b> shows the lidar step's coverage, transformation and difference maps. <b>Registration...</b> shows how each image was registered or why it was not, with the matched pairs on a map.</p>
+<figure class="shot"><img src="shots/gui-registration.png" alt="Registration window"><figcaption>Figure 4.5. The Registration window: how the images were registered, and the images at their GPS positions with the accepted pairs.</figcaption></figure>
+<p>The GCP marker editor is described in Section 8.4.</p>
+
+<h2 id="gui-settings">4.6 Settings and help</h2>
+<p><b>Settings &gt; Preferences</b> sets the interface scale, whether new projects start with the last or the default options, whether the report opens when a run completes, and the size of the image preview cache. <b>Fit compute options to this computer</b> resets cores, memory and GPU memory from the hardware. Settings are kept in <code>%APPDATA%\POSE\gui</code> (Windows) or <code>~/.config/pose/gui</code> (Linux).</p>
+<p>The <b>Help</b> menu has the user guide (<kbd>F1</kbd>), the searchable command-line options and <b>About POSE</b> with version and system details.</p>
+
+<!-- ============================================================ 5 -->
+<h1 id="runs"><span class="num">5</span>Projects, runs and steps</h1>
+
+<h2 id="runs-steps">5.1 The steps</h2>
+<p>Without step names, POSE runs every step in one process:</p>
+<pre><code>photogrammetry -i IMAGES -o PROJECT [options]</code></pre>
+<p>With step names it runs only those steps, in order. <code>inputs</code> starts a new run and needs <code>-i</code>; the other steps continue the newest run with the options saved by <code>inputs</code>. Options given to a later step are added to the saved ones and override them.</p>
+<pre><code>photogrammetry inputs -i IMAGES -o PROJECT --quality medium
+photogrammetry calibrate match align georeference -o PROJECT
+photogrammetry dense ground finish -o PROJECT --min-views 2 --classify-ground</code></pre>
+<p>The optional steps <code>cleanup</code>, <code>lidar</code>, <code>gcp</code> and <code>ground</code> run only when their options are given; otherwise they are marked skipped and need not be named. Two steps can stop as <b>waiting</b>: <code>gcp</code> until enough markers are pinned, and <code>cleanup</code> with <code>--tie-point-cleanup pause</code> until the limits are chosen in the window.</p>
+<p>Show the state of a run:</p>
+<pre><code>photogrammetry status -o PROJECT [--run ID]</code></pre>
+
+<h2 id="runs-continue">5.2 Continuing and branching runs</h2>
+<p><code>--run ID</code> continues a given run instead of the newest one. <code>--branch</code> starts a new run from that run's saved state just before the first named step and redoes the steps from there; the source run is not changed:</p>
+<pre><code>photogrammetry dense ground finish -o PROJECT --run ID --branch --min-views 2</code></pre>
+<figure><img src="figures/runs.svg" alt="Branching a run"><figcaption>Figure 5.1. Branching: run B starts from run A's state saved after georeferencing and redoes only the later steps.</figcaption></figure>
+<p>Options only change the steps that use them. For example <code>--features</code> belongs to <code>match</code>, so to change it, branch from <code>match</code>. Options that would invalidate the saved state of earlier steps are refused; the message says which step to branch from instead.</p>
+<div class="tip"><b>Tip.</b> Branching is the quick way to compare settings: align once, then branch the <code>dense</code> step several times with different dense options.</div>
+
+<h2 id="runs-interrupt">5.3 Interruptions and checkpoints</h2>
+<p>Each step saves its state when it completes. If a run is interrupted, run the interrupted step again on the same run (<code>--run ID</code>); the completed steps are not repeated.</p>
+<p>The dense step of a multi-view run can take hours. It saves a checkpoint every 30 minutes by default (<code>--dense-checkpoint auto</code>, or a number of minutes). After a crash or a killed job, run the same dense command on the same run:</p>
+<pre><code>photogrammetry dense finish -o PROJECT --run ID</code></pre>
+<p>It continues after the last checkpoint and gives the same result as an uninterrupted run. The progress bar starts at 0% and jumps forward when the first camera after the checkpoint is done. Resource options such as <code>--cores</code>, <code>--memory-mb</code>, <code>--gpu-memory-mb</code> and <code>--mvsgm-cameras-in-flight</code> may change on resume; other options must stay the same, otherwise the dense step starts over.</p>
+
+<h2 id="runs-servers">5.4 Running on a server</h2>
+<p>On a server without a display, use the command line. A convenient workflow is to set up and test a run in the window on a desktop computer, use <b>Copy command</b> on the Project tab, and run that command on the server with its paths adjusted. Ground control markers can be pinned on the server with <code>gcp-edit --browser</code>, which serves a local web page.</p>
+<p>Under a job scheduler (for example Slurm), request somewhat more memory than <code>--memory-mb</code>: the Java heap is about <code>--memory-mb</code>/0.65 and native memory comes on top (Section 11.1). <code>--ram-limit-mb</code> tells POSE the job's memory limit when it cannot detect it. Write logs to a file and keep the run ID: an interrupted dense step resumes from its checkpoint.</p>

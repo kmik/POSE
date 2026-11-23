@@ -1438,7 +1438,11 @@ final class PdfReport implements AutoCloseable {
     if ("lidar reference".equals(c.get("datum")))
       s.append("; heights: ").append(c.getOrDefault("vertical_datum", "the lidar reference's"));
     else if (c.get("vertical_crs") == null)
-      s.append(c.get("datum") != null ? "; heights from the GCPs" : "; heights: GPS altitude, vertical datum unspecified");
+      s.append(c.get("datum") != null ? "; heights from the GCPs" : c.get("vertical_datum") != null ? "; heights: GPS altitude converted to " + c.get("vertical_datum") : "; heights: GPS altitude, vertical datum unspecified");
+    else if (c.get("vertical_crs") instanceof String v && v.startsWith("EPSG:"))
+      s.append(c.get("datum") != null ? "; heights from the GCPs, labelled " : "; heights: ")
+          .append(c.get("vertical_conversion") != null ? "GPS altitude converted to " : "")
+          .append(Crs.verticalName(Integer.parseInt(v.substring(5))));
     return s.toString();
   }
 

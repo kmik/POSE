@@ -126,7 +126,9 @@ difference maps against the lidar. Options: `photogrammetry --help lidar`.
 | `--filtering` | `moderate` | `mild`, `moderate` or `aggressive` depth filtering. |
 | `--min-views` | `3` | Images that must agree on a point. |
 | `--min-angle` | `1` | Smallest triangulation angle in degrees: a point needs at least one image pair (with `mvsgm`: one neighbouring image that sees it) at this angle. |
-| `--crs` | `EPSG:3067` | Output coordinate system. |
+| `--crs` | `EPSG:3067` | Output coordinate system. `EPSG:H+V` (e.g. `EPSG:3067+3900`, ETRS-TM35FIN + N2000) also labels the heights in LAS, DSM/DTM GeoTIFF, PLY and `coordinates.json`; the label converts nothing. |
+| `--source-geoid` | none | Vertical datum of the camera heights (EXIF GPS, or supplied exteriors with `--orientation-crs`): `ellipsoid` or a geoid grid file (`.gtx`, or text with `latitude longitude N` per line). Without `--source-geoid` and `--target-geoid` heights are not converted. |
+| `--target-geoid` | none | Vertical datum of the outputs: `ellipsoid` or a geoid grid file, e.g. FIN2005N00 for N2000. Camera heights are converted before georeferencing; GCP heights are read as given. The conversion fixes the datum, not GPS height errors. |
 | `--camera-grouping` | `auto` | Which images share one camera calibration. `auto`: camera IDs of an imported orientation, else `--camera-groups`, else EXIF make, model, serial and focal length; also `single`, `per-image`. Images of different sizes are always separate cameras; the cameras are listed in `01_calibration/cameras.json`. |
 | `--camera-groups` | none | CSV `image,camera` naming the camera of every image. |
 | `--calibration CAMERA=FILE` | none | One camera's calibration (repeatable), in any supported calibration format holding one camera (POSE `camera.txt`, `calib.result`, OpenCV, Metashape, MicMac, one-camera COLMAP/INPHO). CAMERA is a `--camera-groups` name or `camera_1`, `camera_2`, ... (EXIF grouping). `--intrinsics-mode`, `--orientation-pixel-size`, `--focal` and `--s_w` also take `CAMERA=VALUE`; `--intrinsics-mode CAMERA=free` ignores that camera's supplied calibration. A multi-camera INPHO, Metashape, COLMAP, openMVG, OpenSfM or CSV file goes to `--orientation-input`; its camera IDs name the cameras. |
@@ -166,13 +168,15 @@ into that root, and build the module. The Java entry point is `photogrammetry`.
 ## Limitations
 
 - Automatic calibration needs good overlap and camera geometry; otherwise supply a calibration.
-- With GPS only, heights follow the EXIF GPS altitude (no geoid conversion). Use GCPs or a lidar
-  reference for a surveyed height datum.
+- With GPS only, heights follow the EXIF GPS altitude; `--source-geoid`/`--target-geoid` convert
+  its datum but not its error (non-RTK drones are often tens of metres off). Use GCPs or a lidar
+  reference for surveyed heights.
 - A lidar reference corrects the block as a whole (one rigid transformation), not its bending.
 - Under closed canopy the terrain is interpolated from the nearest visible ground.
 
 ## Documentation
 
+- User manual (PDF): `bash docs/manual/build-manual.sh` builds it from [docs/manual](docs/manual) after building POSE
 - [Pipeline steps and ground control points](docs/PIPELINE_STEPS.md)
 - [Desktop window](docs/GUI.md)
 - [Project layout](docs/PROJECT_FORMAT.md)

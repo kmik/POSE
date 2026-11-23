@@ -80,6 +80,7 @@ public final class SelfTest {
     checks += ParamSweepRegression.run(root.resolve("param-sweep"));
     checks += PresetsRegression.run();
     checks += PointFieldsRegression.run(root.resolve("point-fields"));
+    checks += VerticalDatumRegression.run(root.resolve("vertical-datum"));
     checks += ScopedSourceMapsRegression.run(root.resolve("scoped-source-maps"));
     checks += MvsgmCameraPoolRegression.run(root.resolve("camera-pool"));
     checks += DenseCheckpointRegression.run(root.resolve("dense-checkpoint"));

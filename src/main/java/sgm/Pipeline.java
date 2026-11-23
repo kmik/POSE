@@ -957,7 +957,7 @@ final class Pipeline {
     String geometryQuality = GeometryQuality.write(options.output, frames, features.tracks);
     if (project != null) project.stage("04_geometry", "complete", coordinates);
     state.put("coordinates", coordinates);
-    state.put("crs", georeference.crs == null ? null : georeference.crs.name);
+    state.put("crs", georeference.crs == null ? null : georeference.crs.spec());
     state.put("georeference_description", georeference.description);
     state.put("geometry_quality", geometryQuality);
     saveFrames();
@@ -991,6 +991,12 @@ final class Pipeline {
     String coordinates = crs.name + " easting/northing, metres; heights: " + vertical + "; datum from the lidar reference. " + result.summary();
     int verticalEpsg = 0;
     for (LasFile.Header h : result.source().files()) verticalEpsg = Math.max(verticalEpsg, h.crs().vertical());
+    // The lidar's declared height system labels the outputs; else the vertical part of --crs.
+    int labelled = verticalEpsg > 0 && options.lidarVerticalDatum == null ? verticalEpsg : crs.vertical;
+    if (crs.vertical > 0 && labelled != crs.vertical)
+      System.out.println("Warning: --crs names heights " + Crs.verticalName(crs.vertical) + " but the lidar reference declares "
+          + Crs.verticalName(labelled) + "; outputs follow the lidar and are labelled " + Crs.verticalName(labelled) + ".");
+    if (labelled != crs.vertical) state.put("crs", crs.withVertical(labelled).spec());
     Json.write(
         options.output.resolve("coordinates.json"),
         Json.object(
@@ -999,7 +1005,7 @@ final class Pipeline {
             "epsg", crs.epsg,
             "xy_order", "easting,northing",
             "xyz_units", "metres",
-            "vertical_crs", verticalEpsg > 0 && options.lidarVerticalDatum == null ? "EPSG:" + verticalEpsg : null,
+            "vertical_crs", labelled > 0 ? "EPSG:" + labelled : null,
             "vertical_datum", vertical,
             "height_note", "Heights follow the lidar reference: " + vertical + ".",
             "datum", "lidar reference",
@@ -1078,7 +1084,7 @@ final class Pipeline {
             "epsg", result.crs().epsg,
             "xy_order", "easting,northing",
             "xyz_units", "metres",
-            "vertical_crs", null,
+            "vertical_crs", result.crs().vertical > 0 ? "EPSG:" + result.crs().vertical : null,
             "height_note", "Heights follow the ground control points' vertical reference.",
             "datum", "ground control points",
             "gcp_report", "04_geometry/gcp/gcp_report.json",
@@ -1088,7 +1094,7 @@ final class Pipeline {
     writeSparse(features.tracks);
     state.put("geometry_quality", GeometryQuality.write(options.output, frames, features.tracks));
     state.put("coordinates", coordinates);
-    state.put("crs", result.crs().name);
+    state.put("crs", result.crs().spec());
     state.put("gcp_summary", result.summary());
     state.json.remove("gcp_waiting");
     saveFrames();

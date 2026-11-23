@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 270" font-family="Segoe UI, Arial, sans-serif" font-size="11">
+  <defs>
+    <style>
+      .cam { fill: #ffffff; stroke: #1f5f8b; stroke-width: 1.5; }
+      .ref { fill: #1f5f8b; stroke: #12405f; stroke-width: 1.5; }
+      .occ { fill: #ffffff; stroke: #c0392b; stroke-width: 1.5; stroke-dasharray: 3 2; }
+      .ray { stroke: #19a89c; stroke-width: 1.3; }
+      .rayr { stroke: #1f5f8b; stroke-width: 2; }
+      .rayx { stroke: #c0392b; stroke-width: 1.3; stroke-dasharray: 4 3; }
+      .plane { stroke: #9db3c3; stroke-width: 1; stroke-dasharray: 2 3; }
+      .ground { fill: #e3ecd9; stroke: #6c8f4e; stroke-width: 1.5; }
+      .tree { fill: #6c9a4e; }
+      .c { fill: #4a6274; } .h { fill: #12405f; font-weight: 600; }
+    </style>
+  </defs>
+  <path class="ground" d="M20,235 C150,228 260,232 360,226 S560,236 700,230 L700,262 L20,262 Z"/>
+  <g class="plane"><path d="M220,150 H690"/><path d="M220,175 H690"/><path d="M220,200 H690"/></g>
+  <text x="610" y="146" class="c">depth planes</text>
+  <path class="tree" d="M520,228 l18,-74 l18,74 z"/>
+  <path class="rayr" d="M360,46 L360,224"/>
+  <path class="ray" d="M180,50 L358,224"/>
+  <path class="ray" d="M260,40 L359,224"/>
+  <path class="ray" d="M460,40 L361,224"/>
+  <path class="rayx" d="M590,50 L539,160"/>
+  <circle cx="360" cy="226" r="4.5" fill="#e8a33d" stroke="#12405f"/>
+  <text x="368" y="222" class="c">P</text>
+  <path class="cam" d="M168,36 h24 l-6,14 h-12 z"/><text x="148" y="28" class="c">neighbour 1</text>
+  <path class="cam" d="M248,26 h24 l-6,14 h-12 z"/><text x="236" y="18" class="c">neighbour 2</text>
+  <path class="ref" d="M346,30 h28 l-7,15 h-14 z"/><text x="318" y="20" class="h">reference camera</text>
+  <path class="cam" d="M448,26 h24 l-6,14 h-12 z"/><text x="436" y="18" class="c">neighbour 3</text>
+  <path class="occ" d="M578,36 h24 l-6,14 h-12 z"/><text x="560" y="28" class="c" fill="#c0392b">neighbour 4: view blocked</text>
+  <g transform="translate(20,80)">
+    <text class="h" y="0">For each pixel and depth plane:</text>
+    <text class="c" y="18">cost = mean of the k best</text>
+    <text class="c" y="32">neighbour costs (--mvsgm-best-k),</text>
+    <text class="c" y="46">so a neighbour that cannot</text>
+    <text class="c" y="60">see P does not spoil it.</text>
+  </g>
+  <text x="20" y="254" class="c" font-size="10">One depth map per camera, smoothed by SGM; neighbour depth maps must agree (--mvsgm-consistent-views).</text>
+</svg>
