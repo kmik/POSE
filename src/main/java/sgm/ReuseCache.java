@@ -890,6 +890,8 @@ final class ReuseCache {
     if (!o.calibrationTrialMethod.equals("full"))
       b.append("trialMethod=").append(o.calibrationTrialMethod).append(",cameras=").append(o.calibrationTrialCameras);
     if (!o.calibrationAcceptance.equals("strict")) b.append("acceptance=").append(o.calibrationAcceptance);
+    // Only non-legacy bundle solver switches enter the key (fast results differ in the last digits).
+    b.append(o.bundleSolverKey());
     if (o.poses != null) b.append(hash(o.poses));
     for (var e : o.calibrationPoses.entrySet())
       b.append(e.getKey())
@@ -951,6 +953,8 @@ final class ReuseCache {
     if (!o.calibrationTrialMethod.equals("full"))
       b.append("trialMethod=").append(o.calibrationTrialMethod).append(",cameras=").append(o.calibrationTrialCameras);
     if (!o.calibrationAcceptance.equals("strict")) b.append("acceptance=").append(o.calibrationAcceptance);
+    // Only non-legacy bundle solver switches enter the key (fast results differ in the last digits).
+    b.append(o.bundleSolverKey());
     if (o.poses != null) b.append(hash(o.poses));
     String key = key(b.toString());
     Path artifacts = o.output.resolve("01_calibration");

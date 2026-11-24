@@ -101,6 +101,7 @@ public final class SelfTest {
     checks += FilteringPresetRegression.run(root);
     checks += BundleQualityRegression.run(root);
     checks += BundleSchurRegression.run(root);
+    checks += BundleSolverRegression.run(root.resolve("bundle-solver"));
     checks += SharedCalibrationRegression.run(root);
     checks += AdaptiveCalibrationRegression.run(root.resolve("adaptive-calibration"));
     checks += MultiCameraRegression.run(root.resolve("multi-camera"));

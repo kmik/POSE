@@ -89,6 +89,40 @@ public final class Options {
   public int gpsAdjustmentRounds = 3;
   // Final bundles converge automatically; model-selection proposals have a separate hard cap.
   public boolean bundleIterationsExplicit;
+  // --bundle-solver legacy|fast and its switches (BundleAdjuster). With every switch at its
+  // legacy value (the default) bundle results are byte-identical to the previous solver; fast
+  // sets each switch that was not given explicitly to its fast value (resolved after parsing).
+  public String bundleSolver = "legacy";
+  /** Largest reduced system for the parallel dense Cholesky; -1 = legacy direct solve (768, OpenCV). */
+  public int bundleDirectLimit = -1;
+  /** Preconditioner of the iterative (PCG) bundle solve: block-jacobi (legacy) or cluster-jacobi. */
+  public String bundlePreconditioner = "block-jacobi";
+  /** Adaptive linear tolerance (forcing sequence) instead of the fixed 1e-6. */
+  public boolean bundleInexactSteps;
+  /** Local bundles of each new camera and its neighbours, global bundles at twice the growth. */
+  public boolean registrationLocalBundles;
+  /** Shared-lens fits: objective (legacy) or also stop once parameter changes are negligible. */
+  public String lensFitStop = "objective";
+
+  /** Fast-path values of the --bundle-solver switches. */
+  static final int FAST_BUNDLE_DIRECT_LIMIT = 6000;
+
+  /** Every bundle switch at its legacy value: results byte-identical to the previous solver. */
+  boolean bundleSolverLegacy() {
+    return bundleDirectLimit < 0
+        && bundlePreconditioner.equals("block-jacobi")
+        && !bundleInexactSteps
+        && !registrationLocalBundles
+        && lensFitStop.equals("objective");
+  }
+
+  /** The non-legacy bundle switches as a short key (cache keys, reports); "" when legacy. */
+  String bundleSolverKey() {
+    if (bundleSolverLegacy()) return "";
+    return "bundleSolver=direct:" + bundleDirectLimit + ",pre:" + bundlePreconditioner
+        + ",inexact:" + bundleInexactSteps + ",local:" + registrationLocalBundles
+        + ",lensStop:" + lensFitStop;
+  }
   // C1: ground classification of the final cloud (opt-in) and its tuning.
   public boolean classifyGround;
   // GS1: correct each stereo pair's vertical ground offset; GS2: merge ground copies into one sheet.
@@ -204,6 +238,8 @@ public final class Options {
   double mvsgmConsistencyLabels = 1;
   /** --mvsgm-cameras-in-flight: cameras whose depth maps are computed at once (0 = auto; 1 = serial). */
   int mvsgmCamerasInFlight = 1;
+  /** --mvsgm-tile auto|off|N: tile size for mvsgm depth maps (-1 = auto: 2048 above 16 Mpx; 0 = untiled). */
+  int mvsgmTile = -1;
   /** --dense-checkpoint off|auto|MINUTES: resumable mvsgm overlap-window dense step (DenseCheckpoint). */
   public String denseCheckpoint = "auto";
   /** The open checkpoint of the running dense step (not an option). */
@@ -369,6 +405,7 @@ public final class Options {
     boolean cacheDisabled = false;
     boolean storageExplicit = false;
     boolean quickExplicit = false, pipelineExplicit = false, stepExplicit = false;
+    Set<String> bundleExplicit = new HashSet<>();
     for (int i = 0; i < args.length; i++) {
       String key = args[i], inline = null;
       int eq = key.indexOf('=');
@@ -936,6 +973,11 @@ public final class Options {
         case "--mvsgm-cameras-in-flight":
           o.mvsgmCamerasInFlight = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
           break;
+        case "--mvsgm-tile":
+          o.mvsgmTile = v.equalsIgnoreCase("auto") ? -1 : v.equalsIgnoreCase("off") ? 0 : Integer.parseInt(v);
+          if (o.mvsgmTile != -1 && o.mvsgmTile != 0 && (o.mvsgmTile < 256 || o.mvsgmTile > 16384))
+            throw new IllegalArgumentException("--mvsgm-tile must be auto, off or 256..16384 pixels");
+          break;
         case "--dense-checkpoint":
           if (!v.equalsIgnoreCase("off") && !v.equalsIgnoreCase("auto") && !v.matches("[1-9][0-9]{0,5}"))
             throw new IllegalArgumentException("--dense-checkpoint must be off, auto or minutes (1..999999)");
@@ -1454,6 +1496,34 @@ public final class Options {
           o.iterations = Integer.parseInt(v);
           o.bundleIterationsExplicit = true;
           break;
+        case "--bundle-solver":
+          o.bundleSolver = v.toLowerCase(Locale.ROOT);
+          choice(o.bundleSolver, "--bundle-solver", "legacy", "fast");
+          break;
+        case "--bundle-direct-limit":
+          o.bundleDirectLimit = v.equalsIgnoreCase("legacy") ? -1 : Integer.parseInt(v);
+          if (o.bundleDirectLimit < -1)
+            throw new IllegalArgumentException("--bundle-direct-limit requires legacy or N >= 0");
+          bundleExplicit.add(key);
+          break;
+        case "--bundle-preconditioner":
+          o.bundlePreconditioner = v.toLowerCase(Locale.ROOT);
+          choice(o.bundlePreconditioner, "--bundle-preconditioner", "block-jacobi", "cluster-jacobi");
+          bundleExplicit.add(key);
+          break;
+        case "--bundle-inexact-steps":
+          o.bundleInexactSteps = onOff(v, "--bundle-inexact-steps");
+          bundleExplicit.add(key);
+          break;
+        case "--registration-local-bundles":
+          o.registrationLocalBundles = onOff(v, "--registration-local-bundles");
+          bundleExplicit.add(key);
+          break;
+        case "--lens-fit-stop":
+          o.lensFitStop = v.toLowerCase(Locale.ROOT);
+          choice(o.lensFitStop, "--lens-fit-stop", "objective", "parameters");
+          bundleExplicit.add(key);
+          break;
         case "--step":
           o.step = Integer.parseInt(v);
           stepExplicit = true;
@@ -1545,6 +1615,7 @@ public final class Options {
       }
     }
     o.applyFilteringPreset(explicitFiltering);
+    if (o.bundleSolver.equals("fast")) o.applyFastBundleSolver(bundleExplicit);
     // Multi-view SGM emits every consistent pixel unless --step is given: its maps are dense per
     // camera, and the step-2 default exists for pair SGM (a default thinning would quarter mvsgm clouds).
     if (!stepExplicit && o.denseMethod.equals("mvsgm")) o.step = 1;
@@ -2169,6 +2240,16 @@ public final class Options {
       throw new IllegalArgumentException("--gps-adjustment-rounds must be 1..20");
   }
 
+  /** --bundle-solver fast: the fast value of every bundle switch not given explicitly. */
+  void applyFastBundleSolver(Set<String> explicit) {
+    if (!explicit.contains("--bundle-direct-limit")) bundleDirectLimit = FAST_BUNDLE_DIRECT_LIMIT;
+    if (!explicit.contains("--bundle-preconditioner")) bundlePreconditioner = "cluster-jacobi";
+    if (!explicit.contains("--bundle-inexact-steps")) bundleInexactSteps = true;
+    // --registration-local-bundles and --lens-fit-stop parameters are not part of fast: on a
+    // 487-image block local bundles cost time and moved weak cameras without registering more,
+    // and with exact (dense) steps the lens fits converge before the parameter rule applies.
+  }
+
   private static boolean onOff(String v, String name) {
     return switch (v.toLowerCase(Locale.ROOT)) {
       case "on" -> true;
@@ -2345,6 +2426,7 @@ public final class Options {
     out.mvsgmConsistentViews = mvsgmConsistentViews;
     out.mvsgmConsistencyLabels = mvsgmConsistencyLabels;
     out.mvsgmCamerasInFlight = mvsgmCamerasInFlight;
+    out.mvsgmTile = mvsgmTile;
     try {
       for (java.lang.reflect.Field field : Options.class.getFields())
         field.set(out, field.get(this));
@@ -2606,6 +2688,40 @@ Feature matching and final bundle adjustment:
       --no-self-calibration separately disables lens refinement. The first pose
       and baseline norm anchor image-only geometry; pose priors anchor supplied
       refinement. Fixed supplied poses and rectified mode preserve their controls.
+  --bundle-solver legacy|fast
+      Linear solver of every bundle adjustment (alignment, lens fits, GPS and GCP
+      adjustments). legacy (default) keeps results identical to earlier versions:
+      direct solve up to 768 reduced variables (about 128 cameras), above that an
+      iterative solve with a fixed 1e-6 tolerance, which on large blocks often needs
+      hundreds of iterations per step. fast sets each of these switches that is not
+      given explicitly: --bundle-direct-limit 6000, --bundle-preconditioner
+      cluster-jacobi, --bundle-inexact-steps on (the last two act only above the
+      direct limit). --registration-local-bundles and --lens-fit-stop stay off unless
+      given: they brought no gain on a 487-image block, where fast aligned 17 to 18
+      times faster than legacy. The same input and options give the same result with
+      any --cores. fast reaches the same optimum within the solver tolerances (camera
+      centres about 2 cm apart there), not bit-identical to legacy.
+  --bundle-direct-limit legacy|N
+      Largest reduced camera system (6 per free camera, plus 13 per camera group in
+      lens fits) solved directly with a parallel dense Cholesky factorization (memory
+      8 N^2 bytes, also bounded by --memory-mb / 8). Larger systems use the iterative
+      solve. legacy (default): the earlier direct solve up to 768 variables.
+  --bundle-preconditioner block-jacobi|cluster-jacobi
+      Preconditioner of the iterative solve above the direct limit. block-jacobi
+      (default): each camera's 6 x 6 block. cluster-jacobi: dense blocks of up to 64
+      consecutive cameras with their mutual coupling, which needs fewer iterations.
+  --bundle-inexact-steps off|on
+      on: solve each iterative step only as accurately as its progress needs (a
+      tolerance of 0.1 far from the optimum, tightening as the gradient shrinks,
+      never below 1e-6), instead of always 1e-6 (off, default).
+  --lens-fit-stop objective|parameters
+      Stopping rule of shared-lens fits. objective (default): stop when two successive
+      iterations each improve the objective by less than the convergence threshold.
+      parameters: also stop once every free camera pose parameter and fitted lens
+      parameter moved by less than 0.1 of its standard deviation in the last step, and
+      the movement still to come (extrapolated from how fast the steps shrink) is below
+      0.1 of it too. Needs the dense direct solve (--bundle-direct-limit); iterative
+      steps use the objective rule only.
   --calibration-trial-iterations N
       Hard LM iteration cap per intrinsic-parameter proposal/focal start (default 12).
       Promising bounded proposals receive a convergence fit and repeat both holdout
@@ -2895,6 +3011,14 @@ Point filtering and multi-view fusion:
       until the per-camera heap estimate fits; 1 with --compute cpu. Up to N raw depth
       maps exist ahead of fusion (extra temporary disk: 16 bytes per pixel each). If
       a camera runs out of heap, the remaining cameras are computed one at a time.
+  --mvsgm-tile auto|off|N
+      mvsgm: solve each depth map in tiles of N x N pixels (256..16384) with a
+      64-pixel overlap on every side; images no larger than N are solved whole.
+      auto (default) = 2048-pixel tiles for images above 16 Mpx, whole images
+      otherwise. off = never tile (needs memory for the whole image). Larger tiles
+      use more GPU and host memory per camera in flight (about 256 heap bytes per
+      tile pixel) and leave fewer tile borders, where depths differ slightly from
+      an untiled solve. A dense checkpoint resumes only with the same value.
   --fusion-source-maps retained|scoped
       MVSGM image-fusion source-map lifetime (default: retained, legacy behavior).
       scoped unmaps each camera's source maps after its last active copying reader
@@ -3702,6 +3826,11 @@ Additional workflow controls:
       points) each time the number of registered cameras has grown by PCT percent since
       the previous one, then re-triangulate tracks that had failed (default: 15; 0 disables).
       Limits drift on large sets; smaller values cost more time.
+  --registration-local-bundles off|on
+      on: after each newly registered camera, adjust it with its most connected
+      registered neighbours (others held fixed, only their shared points), and run
+      the joint bundles of --registration-bundle-growth at twice that growth. Fewer
+      large bundles; the local ones keep new cameras consistent. off (default).
   --triangulation-outliers drop|reject
       When a new sparse point disagrees with some of its registered observations: drop
       those observations and keep the point supported by the most views (drop, default),

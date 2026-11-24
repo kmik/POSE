@@ -286,10 +286,12 @@ final class Geometry {
       Gate allowed)
       throws IOException {
     double growth = o.registrationBundleGrowth / 100;
+    // --registration-local-bundles: global bundles at twice the growth, local ones in between.
+    if (o.registrationLocalBundles) growth *= 2;
     int registeredCameras = 0;
     for (ImageFrame f : frames) if (f.camera.registered) registeredCameras++;
-    int lastBundle = registeredCameras, bundles = 0, added = 0;
-    long bundleNanos = 0;
+    int lastBundle = registeredCameras, bundles = 0, added = 0, localBundles = 0;
+    long bundleNanos = 0, localNanos = 0;
     while (true) {
       int best = -1, most = 0;
       for (ImageFrame f : frames)
@@ -364,6 +366,10 @@ final class Geometry {
             lastBundle = registeredCameras;
           }
         }
+      } else if (o.registrationLocalBundles) {
+        long start = System.nanoTime();
+        if (localBundle(frames, features.tracks, o, anchor, scale, newest)) localBundles++;
+        localNanos += System.nanoTime() - start;
       }
       if (project != null)
         project.data.snapshot(
@@ -376,7 +382,59 @@ final class Geometry {
           bundles,
           o.registrationBundleGrowth,
           bundleNanos / 1e9);
+    if (localBundles > 0)
+      System.out.printf(Locale.ROOT, "Registration local bundles: %d, %.1f s in total%n",
+          localBundles, localNanos / 1e9);
     return added;
+  }
+
+  /** Free cameras of a local bundle besides the new one: its most connected registered neighbours. */
+  static final int LOCAL_NEIGHBOURS = 8;
+
+  /** Accepted iterations of a local bundle at most (it stops earlier when the gain is negligible). */
+  static final int LOCAL_ITERATIONS = 10;
+
+  /**
+   * --registration-local-bundles: adjusts the new camera and its {@link #LOCAL_NEIGHBOURS}
+   * registered neighbours sharing the most triangulated tracks with it (ties by image id), with
+   * the points those cameras see; all other registered cameras stay fixed and hold the frame.
+   * Skipped (false) without at least two fixed cameras.
+   */
+  static boolean localBundle(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, Options o,
+      int anchor, int scale, int newest) throws IOException {
+    int[] shared = new int[frames.size()];
+    for (FeatureTracks.Track t : tracks) {
+      if (t.point == null) continue;
+      boolean sees = false;
+      for (FeatureTracks.Observation ob : t.observations)
+        if (ob.image == newest) {
+          sees = true;
+          break;
+        }
+      if (!sees) continue;
+      for (FeatureTracks.Observation ob : t.observations)
+        if (ob.image != newest && frames.get(ob.image).camera.registered) shared[ob.image]++;
+    }
+    List<Integer> neighbours = new ArrayList<>();
+    for (ImageFrame f : frames) if (shared[f.id] > 0) neighbours.add(f.id);
+    neighbours.sort((a, b) -> shared[a] != shared[b] ? Integer.compare(shared[b], shared[a]) : Integer.compare(a, b));
+    boolean[] variable = new boolean[frames.size()];
+    variable[newest] = true;
+    for (int i = 0; i < Math.min(LOCAL_NEIGHBOURS, neighbours.size()); i++) variable[neighbours.get(i)] = true;
+    int fixed = 0;
+    for (ImageFrame f : frames) if (f.camera.registered && !variable[f.id]) fixed++;
+    if (fixed < 2) return false;
+    List<FeatureTracks.Track> local = new ArrayList<>();
+    for (FeatureTracks.Track t : tracks) {
+      if (t.point == null) continue;
+      for (FeatureTracks.Observation ob : t.observations)
+        if (variable[ob.image]) {
+          local.add(t);
+          break;
+        }
+    }
+    BundleAdjuster.optimizeLocal(frames, local, LOCAL_ITERATIONS, o.reprojection, anchor, scale, variable);
+    return true;
   }
 
   /** Which images grow() may register, and a notice for each one it registers. */

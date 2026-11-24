@@ -1077,11 +1077,17 @@ final class MultiViewSgm {
   // ---------------------------------------------------------------------------------------------
   // Large images in tiles (STREAMED_PROCESSING.md)
 
-  /** Images above this many pixels are solved in tiles; -Dsgm.mvsgm.tile=N forces N-pixel tiles. */
+  /**
+   * Images above this many pixels are solved in tiles (--mvsgm-tile auto); --mvsgm-tile N tiles
+   * images wider or taller than N, off never tiles. Under auto, -Dsgm.mvsgm.tile=N (tests) forces
+   * N-pixel tiles on every image.
+   */
   static final long TILE_THRESHOLD = 16L << 20;
   static final int TILE_SIZE = 2048, TILE_OVERLAP = 64;
 
   int tileSize(ImageFrame f) {
+    if (o.mvsgmTile == 0) return 0;
+    if (o.mvsgmTile > 0) return f.width > o.mvsgmTile || f.height > o.mvsgmTile ? o.mvsgmTile : 0;
     Integer forced = Integer.getInteger("sgm.mvsgm.tile");
     if (forced != null) return Math.max(0, forced);
     return (long) f.width * f.height > TILE_THRESHOLD ? TILE_SIZE : 0;

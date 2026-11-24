@@ -66,7 +66,17 @@ final class AlignmentMemory {
     long batch = Math.addExact(Math.multiplyExact(slots, (33 + 2L * lensWidth) * 8 + 3 * 4 + 8),
         16384L * 16);
     long n = 6L * cameras + lensWidth, budget = Math.min(32L * MemorySafety.MIB, options.memoryMb * MemorySafety.MIB / 16);
-    long direct = n <= 768 && 4 * n * n * Double.BYTES <= budget ? 4 * n * n * Double.BYTES : 0;
+    BundleAdjuster.SolverConfig config = BundleAdjuster.SolverConfig.of(options);
+    long direct;
+    if (config.directLimit() < 0)
+      direct = n <= 768 && 4 * n * n * Double.BYTES <= budget ? 4 * n * n * Double.BYTES : 0;
+    else
+      // Parallel dense Cholesky: the reduced matrix factored in place, plus scale and
+      // refinement vectors and the per-thread tile scratch.
+      direct = config.dense(n) ? n * n * Double.BYTES + 2 * n * Double.BYTES + 64L * DenseCholesky.TILE * DenseCholesky.TILE * Double.BYTES : 0;
+    if (config.clusterJacobi() && !config.dense(n))
+      // Cluster-Jacobi: one dense block of up to CLUSTER_CAMERAS cameras per cluster.
+      direct = Math.addExact(direct, n * 6L * BundleAdjuster.CLUSTER_CAMERAS * Double.BYTES + 2 * n * Double.BYTES);
     return Math.addExact(Math.addExact(40 * L * L, batch), direct);
   }
 

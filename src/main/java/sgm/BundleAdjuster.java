@@ -83,8 +83,28 @@ final class BundleAdjuster {
       throws IOException {
     String label = lens == null ? "poses/points" : "shared " + String.join(",", lens.parameters());
     try (WorkProgress work = WorkProgress.start("Bundle fit " + label, 0, "iterations")) {
-      optimizeFit(frames, tracks, iterations, huber, project, anchor, scaleCamera, lens, work, false);
+      optimizeFit(frames, tracks, iterations, huber, project, anchor, scaleCamera, lens, work, false, null);
       work.done();
+    }
+  }
+
+  /**
+   * --registration-local-bundles: poses of the cameras with variable[id] true and the points of
+   * the given tracks (those the caller selected as seen by them); every other registered camera
+   * is held fixed and defines the frame, so no similarity normalization is applied. At most
+   * `iterations` accepted iterations, stopping early when the gain is negligible.
+   */
+  static void optimizeLocal(List<ImageFrame> frames, List<FeatureTracks.Track> tracks,
+      int iterations, double huber, int anchor, int scaleCamera, boolean[] variable)
+      throws IOException {
+    boolean[] fixed = new boolean[frames.size()];
+    for (ImageFrame f : frames) fixed[f.id] = f.camera.fixed;
+    try (WorkProgress work = WorkProgress.start("Local bundle", iterations, "iterations")) {
+      optimizeFit(frames, tracks, iterations, huber, null, anchor, scaleCamera, null, work, true, variable);
+      work.done();
+    } finally {
+      // The flags of the surrounding global fit, not the local frame.
+      for (ImageFrame f : frames) f.camera.fixed = fixed[f.id];
     }
   }
 
@@ -99,7 +119,7 @@ final class BundleAdjuster {
     }
     try (WorkProgress work = WorkProgress.start("Calibration trial " + String.join(",", lens.parameters()),
         cap, "iterations")) {
-      optimizeFit(frames, tracks, cap, huber, null, anchor, scaleCamera, lens, work, true);
+      optimizeFit(frames, tracks, cap, huber, null, anchor, scaleCamera, lens, work, true, null);
       work.done();
     }
   }
@@ -113,8 +133,10 @@ final class BundleAdjuster {
       int anchor,
       int scaleCamera,
       SharedCalibration lens,
-      WorkProgress work, boolean hardCap)
+      WorkProgress work, boolean hardCap, boolean[] local)
       throws IOException {
+    Options options = frames.get(0).options;
+    boolean legacy = options.bundleSolverLegacy();
     double[] origin = frames.get(anchor).camera.center();
     double baseline = Math3.norm(Math3.sub(frames.get(scaleCamera).camera.center(), origin));
     if (!(baseline > 1e-9) || !Double.isFinite(baseline))
@@ -130,9 +152,11 @@ final class BundleAdjuster {
     for (ImageFrame f : frames) {
       if (f.camera.registered) {
         f.camera.fixed = lens != null && lens.fixedPoses || !absolutePriors && f.id == anchor;
+        if (local != null && !local[f.id]) f.camera.fixed = true;
         if (!f.camera.fixed) index[f.id] = count++;
       }
     }
+    if (local != null && count == 0) return;
     AlignmentMemory.checkBundle(frames, tracks, index, count, lens == null ? 0 : lens.size());
     double before = error(frames, tracks, huber, lens), lambda = 1e-3;
     Path diagnostics = null;
@@ -141,9 +165,9 @@ final class BundleAdjuster {
       diagnostics = dir.resolve("linear_solver.csv");
       Files.writeString(
           diagnostics,
-          "iteration,trial,lambda,pcg_iterations,relative_linear_residual,objective_before,objective_trial,accepted,linear_method\n");
-      Json.write(
-          dir.resolve("solver.json"),
+          "iteration,trial,lambda,pcg_iterations,relative_linear_residual,objective_before,objective_trial,accepted,linear_method"
+              + (legacy ? "" : ",linear_tolerance") + "\n");
+      Map<String, Object> solverJson =
           Json.object(
               "solver",
               "joint Levenberg-Marquardt; bounded direct Schur Cholesky; matrix-free block-Jacobi"
@@ -181,7 +205,30 @@ final class BundleAdjuster {
               "All triangulated tracks and registered observations participate. Huber weights are"
                   + " recomputed each outer iteration; existing post-bundle track rejection follows"
                   + " this solve. Direct assembly is restricted to at most 768 reduced variables"
-                  + " and a bounded workspace; larger blocks retain matrix-free PCG."));
+                  + " and a bounded workspace; larger blocks retain matrix-free PCG.");
+      if (!legacy) {
+        SolverConfig config = SolverConfig.of(options);
+        long n = 6L * count + (lens == null ? 0 : lens.size());
+        solverJson.put("solver", "joint Levenberg-Marquardt; "
+            + (config.directLimit < 0 ? "bounded direct Schur Cholesky (legacy)" : "parallel dense Schur Cholesky")
+            + "; matrix-free " + options.bundlePreconditioner + " PCG fallback");
+        solverJson.put("bundle_solver", options.bundleSolver);
+        solverJson.put("direct_limit", config.directLimit < 0 ? "legacy" : config.directLimit);
+        solverJson.put("dense_memory_budget_bytes", config.directLimit < 0 ? null : config.denseBudget);
+        solverJson.put("reduced_variables", n);
+        solverJson.put("direct_eligible", config.directLimit < 0 ? n <= 768 : config.dense(n));
+        solverJson.put("preconditioner", options.bundlePreconditioner);
+        solverJson.put("inexact_steps", options.bundleInexactSteps);
+        solverJson.put("linear_relative_tolerance", options.bundleInexactSteps
+            ? "adaptive: 0.1 at the start, 0.9 (gradient ratio)^2 per iteration, at least 1e-6" : 1e-6);
+        solverJson.put("lens_fit_stop", options.lensFitStop);
+        solverJson.put("registration_local_bundles", options.registrationLocalBundles);
+        solverJson.put("note", "All triangulated tracks and registered observations participate. Huber"
+            + " weights are recomputed each outer iteration; existing post-bundle track rejection"
+            + " follows this solve. linear_solver.csv names the method of every step (dense_cholesky,"
+            + " direct_schur_cholesky, matrix_free_pcg or cluster_jacobi_pcg).");
+      }
+      Json.write(dir.resolve("solver.json"), solverJson);
       project.data.bundle(0, before, before, frames, tracks);
     }
     // Without --bundle-iterations: iterate until two successive accepted iterations each gain
@@ -201,14 +248,42 @@ final class BundleAdjuster {
     double[] gains = new double[4];
     int gainCount = 0;
     long estimate = 0;
+    // Fast path only. --bundle-inexact-steps: linear tolerance eta from the forcing sequence.
+    boolean inexact = options.bundleInexactSteps;
+    double eta = INEXACT_MAX_TOLERANCE, previousGradient = Double.NaN;
+    // --lens-fit-stop parameters: successive accepted iterations whose lens step stayed below
+    // LENS_STOP_SIGMA standard deviations; redundancy counts for the a-posteriori sigma.
+    boolean lensStop = lens != null && options.lensFitStop.equals("parameters")
+        && !options.bundleIterationsExplicit;
+    double[] previousSteps = null;
+    long lensObservations = 0, lensPoints = 0;
+    if (lensStop)
+      for (FeatureTracks.Track t : tracks)
+        if (t.point != null) {
+          lensPoints++;
+          for (FeatureTracks.Observation o : t.observations)
+            if (frames.get(o.image).camera.registered) lensObservations++;
+        }
     for (int iteration = 0; iteration < limit; iteration++) {
       boolean accepted = false;
       double after = before;
+      double[] acceptedStep = null;
       // Rejected trials restore the exact previous parameters, so one linearization serves every
       // damping trial of this iteration.
       work.detail("iteration " + (iteration + 1) + "; linearizing " + count + " cameras");
       Linear undamped = linearize(frames, tracks, index, count, huber, lens, workspace);
       Damped system = workspace.damped(undamped);
+      if (inexact) {
+        // Eisenstat-Walker choice 2 on the gradient norm, safeguarded, within [1e-6, 0.1].
+        double gradient = gradientNorm(undamped);
+        if (Double.isFinite(previousGradient) && previousGradient > 0) {
+          double next = 0.9 * Math.pow(gradient / previousGradient, 2), floor = 0.9 * eta * eta;
+          if (floor > 0.1) next = Math.max(next, floor);
+          eta = Math.max(1e-6, Math.min(INEXACT_MAX_TOLERANCE, next));
+        }
+        previousGradient = gradient;
+        system.tolerance = eta;
+      }
       for (int trial = 0; trial < 8; trial++) {
         system.refill(lambda);
         work.detail(
@@ -219,7 +294,13 @@ final class BundleAdjuster {
                 + "; solving "
                 + system.points()
                 + " point blocks");
+        long solveStart = System.nanoTime();
         Result result = system.solve();
+        if (!legacy || STATS) {
+          stats.solveNanos += System.nanoTime() - solveStart;
+          if (result != null && result.method.endsWith("cholesky")) stats.denseSolves++;
+          else if (result != null) stats.iterativeSolves++;
+        }
         stats.trials++;
         if (result == null) stats.failedSolves++;
         else {
@@ -249,7 +330,11 @@ final class BundleAdjuster {
           // (identical arithmetic per point, any order); when the scale is unusable the trial is
           // rejected and every point restored, so the points need no unscaled update.
           double newLength = Math3.norm(Math3.sub(frames.get(scaleCamera).camera.center(), origin));
-          if (newLength > 1e-12 && Double.isFinite(newLength)) {
+          if (local != null) {
+            // Local bundle: the fixed cameras hold the frame; no similarity normalization.
+            system.movePoints(result.x, origin, 1);
+            after = error(frames, tracks, huber, lens);
+          } else if (newLength > 1e-12 && Double.isFinite(newLength)) {
             double factor = absolutePriors ? 1 : baseline / newLength;
             for (ImageFrame f : frames)
               if (f.camera.registered && (absolutePriors || f.id != anchor)) {
@@ -285,13 +370,20 @@ final class BundleAdjuster {
                   + accepted
                   + ","
                   + (result == null ? "failed" : result.method)
+                  + (legacy ? "" : "," + system.tolerance)
                   + "\n",
               StandardOpenOption.APPEND);
         if (accepted) {
           // The replaced point arrays are not kept alive by the saved references.
           Arrays.fill(oldPoints, 0, pointCount, null);
           lambda = Math.max(1e-10, lambda / 3);
+          acceptedStep = result.x;
           break;
+        }
+        // A rejected step that was solved loosely: the next trial solves it more accurately.
+        if (inexact && result != null && result.relative > 1e-6) {
+          eta = Math.max(1e-6, Math.min(eta, result.relative) * .1);
+          system.tolerance = eta;
         }
         if (lens != null) lens.values = oldLens;
         for (ImageFrame f : frames) {
@@ -304,13 +396,13 @@ final class BundleAdjuster {
       if (!accepted) {
         stats.stop = "no improving step (" + stats.failedSolves + " of " + stats.trials
             + " linear solves failed)";
-        System.out.println("Bundle: no improving joint step; stopping.");
+        if (local == null) System.out.println("Bundle: no improving joint step; stopping.");
         break;
       }
       stats.acceptedIterations++;
       stats.objectiveAfter = after;
       if (project != null) project.data.bundle(iteration + 1, before, after, frames, tracks);
-      System.out.printf(
+      if (local == null) System.out.printf(
           Locale.ROOT,
           "Bundle iteration %d: robust objective %.5f -> %.5f; joint cameras=%d, points=%d%n",
           iteration + 1,
@@ -319,6 +411,34 @@ final class BundleAdjuster {
           count,
           system.points());
       work.update(iteration + 1);
+      if (lensStop) {
+        double[] steps = lensStepSigmas(system, lens, acceptedStep, count, after,
+            lensObservations, lensPoints);
+        // A converging fit's steps shrink about geometrically: the movement still to come is
+        // step r / (1 - r), r the ratio to the previous step. Settled when, for every active
+        // lens parameter, both this step and that remainder are below LENS_STOP_SIGMA.
+        double worstStep = 0, worstRemaining = 0;
+        if (steps == null || previousSteps == null) worstRemaining = Double.POSITIVE_INFINITY;
+        else
+          for (int k = 0; k < steps.length; k++) {
+            if (k >= count * 6 && !lens.active[k - count * 6]) continue;
+            double ratio = steps[k] / previousSteps[k];
+            double remaining = steps[k] == 0 ? 0
+                : ratio < 1 ? steps[k] * ratio / (1 - ratio) : Double.POSITIVE_INFINITY;
+            worstStep = Math.max(worstStep, steps[k]);
+            worstRemaining = Math.max(worstRemaining, remaining);
+          }
+        previousSteps = steps;
+        System.out.printf(Locale.ROOT, "Bundle lens step: largest %.3g sigma, still to come %.3g sigma%n",
+            worstStep, worstRemaining);
+        if (worstStep < LENS_STOP_SIGMA && worstRemaining < LENS_STOP_SIGMA) {
+          stats.stop = "lens parameters settled";
+          System.out.printf(Locale.ROOT,
+              "Bundle: lens parameters settled (step %.3g sigma, %.3g sigma still to come) after %d iterations.%n",
+              worstStep, worstRemaining, iteration + 1);
+          break;
+        }
+      }
       if (converge) {
         small = before - after < converged(frames.get(0).options) * Math.max(1, before) ? small + 1 : 0;
         if (small >= 2) {
@@ -342,6 +462,58 @@ final class BundleAdjuster {
       } else if (before - after < 1e-7 * Math.max(1, before)) break;
       before = after;
     }
+    if ((!legacy || STATS) && local == null)
+      System.out.printf(Locale.ROOT,
+          "Bundle linear solves: %d (%d direct, %d iterative, %d failed), %.1f s; %d accepted iterations, %d variables%n",
+          stats.trials, stats.denseSolves, stats.iterativeSolves, stats.failedSolves,
+          stats.solveNanos / 1e9, stats.acceptedIterations, 6 * count + (lens == null ? 0 : lens.size()));
+  }
+
+  /** -Dsgm.bundle.stats=true: per-fit linear solve summary also for the legacy solver (benchmarks). */
+  static final boolean STATS = Boolean.getBoolean("sgm.bundle.stats");
+
+  /** Largest linear tolerance of --bundle-inexact-steps (the first iteration's). */
+  static final double INEXACT_MAX_TOLERANCE = .1;
+
+  /** --lens-fit-stop parameters: a lens step below this many standard deviations is negligible. */
+  static final double LENS_STOP_SIGMA = .1;
+
+  /** Norm of the undamped gradient (camera, lens and point right-hand sides), summed in order. */
+  private static double gradientNorm(Linear s) {
+    double sum = 0;
+    for (int c = 0; c < s.count; c++) for (double v : s.cameraRhs[c]) sum += v * v;
+    if (s.shared) for (double v : s.lensRhs) sum += v * v;
+    for (int p = 0; p < s.points; p++) {
+      double[] page = s.rhs[p >>> s.shift];
+      int o = (p & s.mask) * 3;
+      for (int k = 0; k < 3; k++) sum += page[o + k] * page[o + k];
+    }
+    return Math.sqrt(sum);
+  }
+
+  /**
+   * |step| / sigma of every reduced variable (each camera's six pose parameters, then the lens;
+   * 0 for inactive lens parameters) of an accepted step. sigma: the dense factor's marginal
+   * variance scaled by the a-posteriori variance of unit weight (2 x objective / redundancy).
+   * Null when no dense factor is available (the objective rule then decides alone).
+   */
+  private static double[] lensStepSigmas(Damped system, SharedCalibration lens, double[] step,
+      int cameras, double objective, long observations, long points) {
+    if (step == null) return null;
+    double[] variance = system.marginalVariances();
+    if (variance == null) return null;
+    int active = 0;
+    for (boolean a : lens.active) if (a) active++;
+    double redundancy = Math.max(1, 2.0 * observations - 6.0 * cameras - active - 3.0 * points);
+    double unit = 2 * objective / redundancy;
+    double[] out = new double[variance.length];
+    for (int k = 0; k < out.length; k++) {
+      if (k >= cameras * 6 && !lens.active[k - cameras * 6]) continue;
+      double sigma = Math.sqrt(unit * variance[k]);
+      if (!(sigma > 0) || !Double.isFinite(sigma)) return null;
+      out[k] = Math.abs(step[k]) / sigma;
+    }
+    return out;
   }
 
   /**
@@ -590,9 +762,43 @@ final class BundleAdjuster {
   /** Result of one linear solve. x is always a new array owned by the caller (never scratch). */
   private record Result(double[] x, int iterations, double relative, String method) {}
 
+  /**
+   * Linear solver switches of one fit (--bundle-solver and its switches). LEGACY is the previous
+   * solver exactly: OpenCV direct solve up to 768 variables, block-Jacobi PCG above.
+   * directLimit >= 0: the parallel dense Cholesky up to that many reduced variables, bounded by
+   * denseBudget bytes for the n^2 matrix. clusterJacobi: dense cluster blocks precondition PCG.
+   */
+  record SolverConfig(int directLimit, long denseBudget, boolean clusterJacobi) {
+    static final SolverConfig LEGACY = new SolverConfig(-1, 0, false);
+
+    static SolverConfig of(Options o) {
+      boolean cluster = o.bundlePreconditioner.equals("cluster-jacobi");
+      if (o.bundleDirectLimit < 0 && !cluster) return LEGACY;
+      long budget = o.memoryMb * MemorySafety.MIB / 8;
+      budget = Math.max(0, Math.min(budget, Long.getLong("sgm.test.bundleDenseBytes", budget)));
+      return new SolverConfig(o.bundleDirectLimit, budget, cluster);
+    }
+
+    boolean legacy() {
+      return directLimit < 0 && !clusterJacobi;
+    }
+
+    /** The reduced system of n variables is solved by the dense Cholesky. */
+    boolean dense(long n) {
+      return directLimit >= 0 && n > 0 && n <= directLimit && n <= DenseCholesky.MAX_ORDER
+          && 8 * n * n <= denseBudget;
+    }
+  }
+
+  /** Cameras per dense block of the cluster-Jacobi preconditioner (consecutive variable cameras). */
+  static final int CLUSTER_CAMERAS = 64;
+
   /** What the last fit of this thread did (diagnostics only; never read by the solve). */
   static final class FitStats {
     int cameras, trials, failedSolves, acceptedIterations;
+    // Fast path only (never in json(), so legacy reports are unchanged).
+    int denseSolves, iterativeSolves;
+    long solveNanos;
     double objectiveBefore = Double.NaN, objectiveAfter = Double.NaN, lastRelative = Double.NaN;
     String lastMethod = "none", stop = "iteration limit or converged";
 
@@ -641,6 +847,7 @@ final class BundleAdjuster {
     final double[][] cameraNormal, cameraRhs, coupling;
     final double[] lensNormal, lensRhs;
     final long memoryBudget;
+    final SolverConfig config;
     /** Track of each point, in linearization (track) order. */
     final FeatureTracks.Track[] owners;
     /** Per point: undamped 3 x 3 normal (9), right-hand side (3), lens cross products (3 L). */
@@ -653,11 +860,12 @@ final class BundleAdjuster {
     final int[] cameraStart, cameraPoint, cameraEdge;
     int points, edges;
 
-    Linear(int n, int lensWidth, long memoryBudget, int points, int edges) {
+    Linear(int n, int lensWidth, long memoryBudget, int points, int edges, SolverConfig config) {
       L = lensWidth > 0 ? lensWidth : SharedCalibration.SIZE;
       shared = lensWidth > 0;
       count = n;
       this.memoryBudget = memoryBudget;
+      this.config = config;
       shift = pageShift();
       mask = (1 << shift) - 1;
       pointCapacity = points;
@@ -679,10 +887,10 @@ final class BundleAdjuster {
       cameraEdge = new int[edges];
     }
 
-    boolean fits(int n, int lensWidth, long memoryBudget, int points, int edges) {
+    boolean fits(int n, int lensWidth, long memoryBudget, int points, int edges, SolverConfig config) {
       return count == n && shared == lensWidth > 0 && (!shared || L == lensWidth)
           && this.memoryBudget == memoryBudget && pointCapacity == points && edgeCapacity == edges
-          && shift == pageShift();
+          && shift == pageShift() && this.config.equals(config);
     }
 
     /** The state of a new system: every accumulated sum +0.0, no points or edges. */
@@ -826,13 +1034,15 @@ final class BundleAdjuster {
       }
     int points = Math.toIntExact(pointCount), edgeCapacity = Math.toIntExact(edgeBound);
     long memoryBudget = frames.get(0).options.memoryMb * 1048576L;
-    if (workspace.undamped != null && workspace.undamped.fits(count, lensWidth, memoryBudget, points, edgeCapacity))
+    SolverConfig config = SolverConfig.of(frames.get(0).options);
+    if (workspace.undamped != null
+        && workspace.undamped.fits(count, lensWidth, memoryBudget, points, edgeCapacity, config))
       workspace.undamped.clear();
     else {
       // Drop the previous system before allocating its replacement (no overlapping copies).
       workspace.undamped = null;
       workspace.damped = null;
-      workspace.undamped = new Linear(count, lensWidth, memoryBudget, points, edgeCapacity);
+      workspace.undamped = new Linear(count, lensWidth, memoryBudget, points, edgeCapacity, config);
     }
     if (workspace.damped != null) workspace.damped.invalidate();
     final Linear s = workspace.undamped;
@@ -1344,6 +1554,16 @@ final class BundleAdjuster {
     private double[] scaled, scale, scaledRhs, lensDiag, lensInverse, lensL, lensWork;
     private double[][] diag, diagInverse;
     private final double[] l6 = new double[36], work6 = new double[6];
+    // Fast path only (SolverConfig not legacy). tolerance: relative residual each solve must
+    // reach (the legacy 1e-6 unless --bundle-inexact-steps sets it before a solve).
+    final SolverConfig config;
+    double tolerance = 1e-6;
+    /** The dense factor (in `reduced`) belongs to the current refill. */
+    private boolean factorValid;
+    private double[] factorScale, refine;
+    /** Cluster-Jacobi blocks: Jacobi scale and dense factor per cluster of consecutive cameras. */
+    private double[][] clusterFactor, clusterScale;
+    private boolean clusterReady;
 
     Damped(Linear u) {
       this.u = u;
@@ -1363,6 +1583,7 @@ final class BundleAdjuster {
       p = new double[n];
       ap = new double[n];
       pointValues = new double[3 * u.pointCapacity];
+      config = u.config;
     }
 
     int points() {
@@ -1372,6 +1593,7 @@ final class BundleAdjuster {
     /** The undamped system changed: unusable until the next refill. */
     void invalidate() {
       ready = reducedValid = false;
+      factorValid = clusterReady = false;
     }
 
     /**
@@ -1681,8 +1903,17 @@ final class BundleAdjuster {
       });
       scatter(rhs, vs);
       double[] solveRhs = suppliedRhs == null ? rhs : suppliedRhs;
-      Result direct = direct(solveRhs);
-      if (direct != null) return direct;
+      if (config.directLimit < 0) {
+        Result direct = direct(solveRhs);
+        if (direct != null) return direct;
+      } else if (config.dense(n)) {
+        Result dense = denseDirect(solveRhs);
+        if (dense != null) return dense;
+      }
+      String method = config.clusterJacobi ? "cluster_jacobi_pcg" : "matrix_free_pcg";
+      if (config.clusterJacobi) {
+        if (!clusterPreconditioner()) return null;
+      } else {
       // Block-Jacobi preconditioner: only the PCG fallback needs it.
       if (diag == null) {
         diag = new double[count][36];
@@ -1720,6 +1951,7 @@ final class BundleAdjuster {
       for (int c = 0; c < count; c++)
         if (!inverseInto(diag[c], 0, 6, diagInverse[c], 0, l6, work6)) return null;
       if (shared && !inverseInto(lensDiag, 0, L, lensInverse, 0, lensL, lensWork)) return null;
+      }
       // The right-hand side is only read from here on (the original cloned a supplied one).
       double[] b = solveRhs;
       double[] x = new double[n], r = this.r, z = this.z, p = this.p, ap = this.ap;
@@ -1727,7 +1959,7 @@ final class BundleAdjuster {
       preconditionInto(r, z);
       System.arraycopy(z, 0, p, 0, n);
       double norm = Math.sqrt(dot(b, b));
-      if (norm < 1e-15) return new Result(x, 0, 0, "matrix_free_pcg");
+      if (norm < 1e-15) return new Result(x, 0, 0, method);
       double rz = dot(r, z), relative = 1;
       int limit = Math.min(500, Math.max(30, n * 2));
       for (int iter = 0; iter < limit; iter++) {
@@ -1741,18 +1973,194 @@ final class BundleAdjuster {
         }
         relative = Math.sqrt(dot(r, r)) / norm;
         if (!Double.isFinite(relative)) return null;
-        if (relative < 1e-6) return new Result(x, iter + 1, relative, "matrix_free_pcg");
+        if (relative < tolerance) return new Result(x, iter + 1, relative, method);
         preconditionInto(r, z);
         double next = dot(r, z), beta = next / rz;
         for (int i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
         rz = next;
       }
       // An inexact step is still checked against the full robust objective before acceptance.
-      return new Result(x, limit, relative, "matrix_free_pcg");
+      return new Result(x, limit, relative, method);
     }
 
-    /** z = block-Jacobi preconditioner applied to r (z fully rewritten). */
+    /**
+     * Fast path: the reduced matrix (assembled as for the legacy direct solve), Jacobi-scaled and
+     * factored in place by the parallel dense Cholesky, kept for every solve of this refill.
+     * Each solution is certified against the matrix-free operator and refined (at most three
+     * times) until its relative residual meets the tolerance; null when the factorization fails
+     * or the tolerance is not met (the caller then uses PCG).
+     */
+    private Result denseDirect(double[] rhs) {
+      int n = rhs.length;
+      if (!factorValid) {
+        double[] h = reducedMatrix(n);
+        // The buffer holds the factor from here on, not the reduced matrix.
+        reducedValid = false;
+        if (factorScale == null || factorScale.length != n) factorScale = new double[n];
+        double[] scale = factorScale;
+        for (int i = 0; i < n; i++) {
+          if (!(h[i * n + i] > 0) || !Double.isFinite(h[i * n + i])) return null;
+          scale[i] = Math.sqrt(h[i * n + i]);
+        }
+        for (int i = 0; i < n; i++)
+          for (int j = 0, row = i * n; j <= i; j++) h[row + j] = h[row + j] / scale[i] / scale[j];
+        if (!DenseCholesky.factor(h, n, true)) return null;
+        factorValid = true;
+      }
+      double norm = Math.sqrt(dot(rhs, rhs));
+      double[] x = new double[n];
+      if (norm < 1e-15) return new Result(x, 0, 0, "dense_cholesky");
+      if (refine == null || refine.length != n) refine = new double[n];
+      double[] residual = ap, correction = refine;
+      System.arraycopy(rhs, 0, residual, 0, n);
+      double relative = Double.NaN;
+      int refinements = 0;
+      for (int pass = 0; pass <= 3; pass++) {
+        factorSolve(residual, correction);
+        for (int i = 0; i < n; i++) x[i] += correction[i];
+        // Certify against the original matrix-free operator, not the factored matrix.
+        productInto(x, residual);
+        for (int i = 0; i < n; i++) residual[i] = rhs[i] - residual[i];
+        relative = Math.sqrt(dot(residual, residual)) / norm;
+        if (!Double.isFinite(relative)) return null;
+        refinements = pass;
+        if (relative < tolerance) break;
+      }
+      return relative < tolerance ? new Result(x, refinements, relative, "dense_cholesky") : null;
+    }
+
+    /** out = (scaled factor)^-1 b in the unscaled variables. */
+    private void factorSolve(double[] b, double[] out) {
+      int n = b.length;
+      double[] scale = factorScale;
+      for (int i = 0; i < n; i++) out[i] = b[i] / scale[i];
+      DenseCholesky.solve(reduced, n, out, out);
+      for (int i = 0; i < n; i++) out[i] /= scale[i];
+    }
+
+    /**
+     * Marginal covariance diagonal of the lens variables of this refill's damped system (in the
+     * normal-equation units), from the dense factor: the lens rows are the trailing block. Null
+     * without a valid dense factor or a shared lens.
+     */
+    double[] lensMarginalVariance() {
+      if (!shared || !factorValid) return null;
+      double[] inverse = DenseCholesky.trailingInverse(reduced, n, L);
+      if (inverse == null) return null;
+      double[] variance = new double[L];
+      for (int k = 0; k < L; k++) {
+        double s = factorScale[count * 6 + k];
+        variance[k] = inverse[k * L + k] / (s * s);
+      }
+      return variance;
+    }
+
+    /**
+     * Marginal variance of every reduced variable (cameras, then lens) of this refill's damped
+     * system, in normal-equation units, from the dense factor. Null without a valid factor.
+     */
+    double[] marginalVariances() {
+      if (!factorValid) return null;
+      double[] variance = DenseCholesky.inverseDiagonal(reduced, n, true);
+      for (int i = 0; i < n; i++) variance[i] /= factorScale[i] * factorScale[i];
+      return variance;
+    }
+
+    /**
+     * Cluster-Jacobi preconditioner: the reduced matrix restricted to blocks of
+     * {@link #CLUSTER_CAMERAS} consecutive cameras (each camera's own block plus the point
+     * coupling between cameras of the same cluster), each Jacobi-scaled and Cholesky-factored;
+     * the lens block as in block-Jacobi. One task per cluster visits its cameras' (point, edge)
+     * pairs in order, so the blocks do not depend on the thread count. False when singular.
+     */
+    private boolean clusterPreconditioner() {
+      if (clusterReady) return true;
+      int clusters = (count + CLUSTER_CAMERAS - 1) / CLUSTER_CAMERAS;
+      if (clusterFactor == null || clusterFactor.length != clusters) {
+        clusterFactor = new double[clusters][];
+        clusterScale = new double[clusters][];
+        for (int g = 0; g < clusters; g++) {
+          int m = 6 * (Math.min(count, (g + 1) * CLUSTER_CAMERAS) - g * CLUSTER_CAMERAS);
+          clusterFactor[g] = new double[m * m];
+          clusterScale[g] = new double[m];
+        }
+      }
+      boolean[] failed = new boolean[clusters];
+      parallel(clusters, g -> {
+        int c0 = g * CLUSTER_CAMERAS, c1 = Math.min(count, c0 + CLUSTER_CAMERAS), m = 6 * (c1 - c0);
+        double[] block = clusterFactor[g], scale = clusterScale[g], v = new double[18];
+        Arrays.fill(block, 0);
+        for (int c = c0; c < c1; c++)
+          for (int j = 0; j < 6; j++)
+            for (int k = 0; k < 6; k++)
+              block[((c - c0) * 6 + j) * m + (c - c0) * 6 + k] = cameraNormal[c][j * 6 + k];
+        for (int c = c0; c < c1; c++)
+          for (int at = u.cameraStart[c]; at < u.cameraStart[c + 1]; at++) {
+            int e = u.cameraEdge[at], point = u.cameraPoint[at], co = (e & u.mask) * 18;
+            double[] cross = u.cross[e >>> u.shift], inv = inverse[point >>> u.shift];
+            int io = (point & u.mask) * 9;
+            for (int j = 0; j < 6; j++)
+              for (int q = 0; q < 3; q++) {
+                double s = 0;
+                for (int k = 0; k < 3; k++) s += cross[co + j * 3 + k] * inv[io + k * 3 + q];
+                v[j * 3 + q] = s;
+              }
+            for (int e2 = u.edgeStart[point]; e2 < u.edgeStart[point + 1]; e2++) {
+              int c2 = u.edgeCamera[e2];
+              if (c2 < c0 || c2 >= c1) continue;
+              double[] cross2 = u.cross[e2 >>> u.shift];
+              int o2 = (e2 & u.mask) * 18;
+              for (int j = 0; j < 6; j++) {
+                int row = ((c - c0) * 6 + j) * m + (c2 - c0) * 6;
+                for (int k = 0; k < 6; k++)
+                  block[row + k] -= v[j * 3] * cross2[o2 + k * 3] + v[j * 3 + 1] * cross2[o2 + k * 3 + 1]
+                      + v[j * 3 + 2] * cross2[o2 + k * 3 + 2];
+              }
+            }
+          }
+        for (int i = 0; i < m; i++) {
+          double d = block[i * m + i];
+          if (!(d > 0) || !Double.isFinite(d)) {
+            failed[g] = true;
+            return;
+          }
+          scale[i] = Math.sqrt(d);
+        }
+        for (int i = 0; i < m; i++)
+          for (int j = 0; j <= i; j++) block[i * m + j] = block[i * m + j] / scale[i] / scale[j];
+        if (!DenseCholesky.factor(block, m, false)) failed[g] = true;
+      });
+      for (boolean f : failed) if (f) return false;
+      if (shared) {
+        if (lensDiag == null) {
+          lensDiag = new double[L * L];
+          lensInverse = new double[L * L];
+          lensL = new double[L * L];
+          lensWork = new double[L];
+        }
+        System.arraycopy(lensNormal, 0, lensDiag, 0, lensNormal.length);
+        for (int point = 0; point < u.points; point++) {
+          int page = point >>> u.shift, local = point & u.mask;
+          double[] inv = inverse[page], lc = u.lensCross[page];
+          int io = local * 9, lo = local * 3 * L;
+          for (int j = 0; j < L; j++)
+            for (int l = 0; l < L; l++)
+              for (int k = 0; k < 3; k++)
+                for (int m = 0; m < 3; m++)
+                  lensDiag[j * L + l] -= lc[lo + j * 3 + k] * inv[io + k * 3 + m] * lc[lo + l * 3 + m];
+        }
+        if (!inverseInto(lensDiag, 0, L, lensInverse, 0, lensL, lensWork)) return false;
+      }
+      clusterReady = true;
+      return true;
+    }
+
+    /** z = preconditioner applied to r (z fully rewritten). */
     private void preconditionInto(double[] r, double[] z) {
+      if (config.clusterJacobi) {
+        clusterPreconditionInto(r, z);
+        return;
+      }
       Arrays.fill(z, 0);
       for (int c = 0; c < count; c++)
         for (int j = 0; j < 6; j++)
@@ -1761,6 +2169,33 @@ final class BundleAdjuster {
         for (int j = 0; j < L; j++)
           for (int k = 0; k < L; k++)
             z[count * 6 + j] += lensInverse[j * L + k] * r[count * 6 + k];
+    }
+
+    /** Cluster-Jacobi: z = blockdiag(clusters, lens)^-1 r, serial in cluster order. */
+    private void clusterPreconditionInto(double[] r, double[] z) {
+      for (int g = 0; g < clusterFactor.length; g++) {
+        int o = 6 * g * CLUSTER_CAMERAS;
+        double[] scale = clusterScale[g];
+        int m = scale.length;
+        double[] block = clusterFactor[g], w = work(m);
+        for (int i = 0; i < m; i++) w[i] = r[o + i] / scale[i];
+        DenseCholesky.solve(block, m, w, w);
+        for (int i = 0; i < m; i++) z[o + i] = w[i] / scale[i];
+      }
+      if (shared) {
+        int off = count * 6;
+        for (int j = 0; j < L; j++) {
+          z[off + j] = 0;
+          for (int k = 0; k < L; k++) z[off + j] += lensInverse[j * L + k] * r[off + k];
+        }
+      }
+    }
+
+    private double[] clusterWork;
+
+    private double[] work(int m) {
+      if (clusterWork == null || clusterWork.length < m) clusterWork = new double[m];
+      return clusterWork;
     }
 
     /**

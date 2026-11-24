@@ -48,6 +48,19 @@ final class LargeFormatRegression {
       rejected = true;
     }
     check(rejected, "unknown --streamed-processing value is rejected");
+    check(new Options().mvsgmTile == -1, "--mvsgm-tile defaults to auto");
+    check(Options.parse(new String[] {"-i", ".", "--mvsgm-tile", "4096"}).mvsgmTile == 4096, "--mvsgm-tile N parses");
+    check(Options.parse(new String[] {"-i", ".", "--mvsgm-tile", "off"}).mvsgmTile == 0, "--mvsgm-tile off parses");
+    check(Options.parse(new String[] {"-i", ".", "--mvsgm-tile", "4096"}).copy().mvsgmTile == 4096, "--mvsgm-tile copied");
+    for (String bad : new String[] {"100", "20000", "-5"}) {
+      rejected = false;
+      try {
+        Options.parse(new String[] {"-i", ".", "--mvsgm-tile", bad});
+      } catch (IllegalArgumentException e) {
+        rejected = true;
+      }
+      check(rejected, "--mvsgm-tile " + bad + " is rejected");
+    }
 
     Path root = Files.createTempDirectory(Files.createDirectories(Path.of("target")), "large-format ");
     try {
@@ -109,6 +122,14 @@ final class LargeFormatRegression {
       check(both > 0 && agree >= .97 * both, "tiled mvsgm depths agree with untiled: " + agree + "/" + both);
       check(onlyOne <= .05 * total, "tiled mvsgm coverage matches untiled: " + onlyOne + " of " + total + " differ");
       check(onPlanes(tiled.las) >= .95, "tiled mvsgm points lie on the true planes");
+      // --mvsgm-tile N gives the same tiles as the test property; --mvsgm-tile off with the property
+      // set still solves whole images, and a tile no smaller than the image does too.
+      Run option = dense(root, "tile-option", cams, tracks, null, null, o -> o.mvsgmTile = 96);
+      check(sameLas(tiled.las, option.las), "--mvsgm-tile 96 equals the forced 96-pixel tiles");
+      Run off = dense(root, "tile-off", cams, tracks, "96", null, o -> o.mvsgmTile = 0);
+      check(sameLas(untiled.las, off.las), "--mvsgm-tile off overrides the test property");
+      Run whole = dense(root, "tile-whole", cams, tracks, null, null, o -> o.mvsgmTile = Math.max(W, H));
+      check(sameLas(untiled.las, whole.las), "a tile covering the image solves it whole");
       Path preview;
       try (var dirs = Files.list(tiled.dir.resolve("05_stereo/mvsgm"))) {
         preview = dirs.filter(p -> p.getFileName().toString().startsWith("image_0_")).findFirst().orElseThrow();
