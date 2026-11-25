@@ -248,6 +248,32 @@ final class ReportMaps {
       }
       work.done();
     }
+    // A classic or mosaic orthomosaic of the run has no visibility holes; the overview then shows
+    // that file (sampled at the report cells) instead of the occlusion-tested report render.
+    String fromMosaic = null;
+    Path results = run.resolve("07_results");
+    Map<String, Object> full = ProcessingReport.map(results.resolve("orthomosaic.json"));
+    if ("complete".equals(full.get("status"))
+        && ("classic".equals(full.get("mode")) || "mosaic".equals(full.get("mode")))
+        && full.get("extent") instanceof List<?> extent && extent.size() == 4
+        && full.get("cell_size") instanceof Number fullCell
+        && Files.isRegularFile(results.resolve("orthomosaic.tif"))) {
+      double ex0 = ((Number) extent.get(0)).doubleValue(), eyTop = ((Number) extent.get(3)).doubleValue(), fc = fullCell.doubleValue();
+      try (TiledGeoTiff.Reader reader = new TiledGeoTiff.Reader(results.resolve("orthomosaic.tif"))) {
+        int sampled = 0;
+        for (int y = 0; y < grid.height; y++)
+          for (int x = 0; x < grid.width; x++) {
+            double wx = grid.x + (x + .5) * grid.cell, wy = grid.y - (y + .5) * grid.cell;
+            int value = reader.pixel((int) Math.floor((wx - ex0) / fc), (int) Math.floor((eyTop - wy) / fc));
+            ortho.setRGB(x, y, (value >>> 24) == 0 ? 0 : value | 0xff000000);
+            if ((value >>> 24) != 0) sampled++;
+          }
+        painted = sampled;
+        fromMosaic = (String) full.get("mode");
+      } catch (IOException unreadable) {
+        System.err.println("Report orthomosaic: " + unreadable.getMessage() + "; using the report render");
+      }
+    }
     if (painted > 0) {
       ImageIO.write(ortho, "png", out.resolve("orthomosaic.png").toFile());
       Files.writeString(
@@ -278,7 +304,10 @@ final class ReportMaps {
         supported++;
       }
     String note =
-        painted > 0
+        fromMosaic != null
+            ? "Overview of the full-resolution " + fromMosaic + " orthomosaic (07_results/orthomosaic.tif) at report"
+                + " resolution: " + grid.cell + " output units/pixel. See orthomosaic.json for its method."
+            : painted > 0
             ? "Orthorectified original Brown-calibrated photographs onto the archived "
                 + dsm.get("statistic")
                 + "-cell DSM, with DSM ray-occlusion checks and nearest-center source selection."

@@ -109,6 +109,8 @@ public final class SelfTest {
     checks += AlignmentMemoryRegression.run(root.resolve("alignment-memory"));
     checks += ConfidencePatchMatchRegression.run(root);
     checks += PatchMatchValidityRegression.run(root);
+    checks += PatchMatchScaleRegression.run(root);
+    checks += PatchMatchCheckpointRegression.run(root);
     checks += HybridSgmRegression.run(root);
     checks += ExactReuseRegression.run(root.resolve("exact-reuse"));
     checks += TwoViewConfidenceRegression.run(root.resolve("two-view-confidence"));

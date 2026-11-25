@@ -331,7 +331,9 @@ final class PoseProjectPanel {
   }
 
   List<String> extraArgs() {
-    return GuiOptions.withImplied(GuiOptions.split(extra.getText()));
+    ProjectFiles.Run r = selectedRun();
+    return GuiOptions.withImplied(
+        r == null ? List.of() : r.arguments(), GuiOptions.split(extra.getText()));
   }
 
   /** Validates the saved arguments of the run plus the extra options, as the CLI would. */
@@ -399,7 +401,7 @@ final class PoseProjectPanel {
           if (untilBox.getSelectedItem() == null) return;
           String f = (String) fromBox.getSelectedItem(), u = (String) untilBox.getSelectedItem();
           try {
-            List<String> extraArgs = GuiOptions.withImplied(GuiOptions.split(options.getText()));
+            List<String> extraArgs = GuiOptions.withImplied(r.arguments(), GuiOptions.split(options.getText()));
             command[0] = ProjectFiles.branch(window.project(), r.id(), f, u, extraArgs);
             problem[0] = extraArgs.isEmpty() ? null : GuiOptions.validateContinued(r.arguments(), extraArgs);
           } catch (IllegalArgumentException e) {

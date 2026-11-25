@@ -299,6 +299,36 @@ final class OrthomosaicRegression {
         check(whole.decoded == 18 && whole.windows == 0, "a cache for four images decodes again after eviction (" + whole.decoded + ")");
         check(windowed.decoded == 0 && windowed.windows == 18, "images above the whole-image limit are read by window");
       }
+      // Seam thumbnails from files: ceil(size / step) square, each the mean of the decoded (every
+      // second) pixels in its step x step block.
+      int[] thumb = OrthoSeams.files(files).load(4, 4, SIZE, SIZE);
+      int side = Math.ceilDiv(SIZE, 4);
+      boolean thumbOk = thumb.length == side * side;
+      for (int ty = 0; ty < side && thumbOk; ty += 13)
+        for (int tx = 0; tx < side && thumbOk; tx += 11) {
+          long r = 0, g = 0, b = 0, n = 0;
+          for (int y = 4 * ty; y < Math.min(SIZE, 4 * ty + 4); y += 2)
+            for (int x = 4 * tx; x < Math.min(SIZE, 4 * tx + 4); x += 2) {
+              int p = images.get(4)[y * SIZE + x];
+              r += (p >> 16) & 255;
+              g += (p >> 8) & 255;
+              b += p & 255;
+              n++;
+            }
+          thumbOk = thumb[ty * side + tx] == ((int) (r / n) << 16 | (int) (g / n) << 8 | (int) (b / n));
+        }
+      check(thumbOk, "seam thumbnail: block means of the subsampled decode");
+      // The tile reader returns what the JDK decoder reads, for the classic and the BigTIFF file.
+      try (TiledGeoTiff.Reader classicReader = new TiledGeoTiff.Reader(file); TiledGeoTiff.Reader bigReader = new TiledGeoTiff.Reader(bigFile)) {
+        boolean readable = classicReader.width == width && classicReader.height == height && bigReader.width == width;
+        for (int y = 0; y < height && readable; y += 97)
+          for (int x = 0; x < width && readable; x += 89) {
+            int expected = read.getRGB(x, y), alpha = expected >>> 24;
+            int a = classicReader.pixel(x, y), b = bigReader.pixel(x, y);
+            readable = a == b && (a >>> 24) == alpha && (alpha == 0 || (a & 0xffffff) == (expected & 0xffffff));
+          }
+        check(readable && classicReader.pixel(-1, 0) == 0 && classicReader.pixel(width, 0) == 0, "tile reader equals the decoded GeoTIFF");
+      }
     } finally {
       try (var walk = Files.walk(root)) {
         for (Path p : walk.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(p);
@@ -320,10 +350,143 @@ final class OrthomosaicRegression {
     }
     check(refused, "unknown --orthomosaic-mode refused");
     classic(views, memory, cloud);
+    Options mosaicOptions = Options.parse(new String[] {"-i", ".", "--orthomosaic", "--orthomosaic-mode", "mosaic", "--orthomosaic-max-angle", "30"});
+    check(mosaicOptions.orthomosaicMode.equals("mosaic") && mosaicOptions.orthomosaicMaxAngle == 30 && new Options().orthomosaicMaxAngle == 0
+        && Options.parse(new String[] {"-i", ".", "--orthomosaic-max-angle", "off"}).orthomosaicMaxAngle == 0, "mosaic options; no angle limit by default");
+    refused = false;
+    try {
+      Options.parse(new String[] {"-i", ".", "--orthomosaic-max-angle", "95"});
+    } catch (IllegalArgumentException expected) {
+      refused = true;
+    }
+    check(refused, "--orthomosaic-max-angle 95 refused");
+    graphCut();
+    mosaic(views, images, cloud);
 
     canopy();
     checkPoints();
     return checks;
+  }
+
+  /** Graph cut: the labelling it finds has the minimum energy of every assignment (random submodular problems). */
+  private static void graphCut() {
+    Random random = new Random(7);
+    boolean optimal = true;
+    for (int trial = 0; trial < 300 && optimal; trial++) {
+      int n = 2 + random.nextInt(9);
+      double[][] unary = new double[n][2];
+      List<double[]> terms = new ArrayList<>();
+      GraphCut cut = new GraphCut(n, 4);
+      for (int i = 0; i < n; i++) {
+        unary[i][0] = random.nextInt(20);
+        unary[i][1] = random.nextInt(20);
+        cut.unary(i, unary[i][0], unary[i][1]);
+      }
+      for (int e = 0; e < 2 * n; e++) {
+        int i = random.nextInt(n), j = random.nextInt(n);
+        if (i == j) continue;
+        double b = random.nextInt(15), c = random.nextInt(15), a = random.nextInt(15), d = Math.max(0, Math.min(random.nextInt(15), b + c - a));
+        if (a + d > b + c) a = b + c - d;
+        terms.add(new double[] {i, j, a, b, c, d});
+        cut.pairwise(i, j, a, b, c, d);
+      }
+      cut.maxflow();
+      double found = 0, best = Double.POSITIVE_INFINITY;
+      int[] x = new int[n];
+      for (int i = 0; i < n; i++) x[i] = cut.label(i);
+      found = energy(unary, terms, x);
+      for (int mask = 0; mask < 1 << n; mask++) {
+        for (int i = 0; i < n; i++) x[i] = mask >> i & 1;
+        best = Math.min(best, energy(unary, terms, x));
+      }
+      optimal = Math.abs(found - best) < 1e-9;
+    }
+    check(optimal, "graph cut finds the minimum energy of small random problems");
+  }
+
+  private static double energy(double[][] unary, List<double[]> terms, int[] x) {
+    double e = 0;
+    for (int i = 0; i < x.length; i++) e += unary[i][x[i]];
+    for (double[] t : terms) {
+      int a = x[(int) t[0]], b = x[(int) t[1]];
+      e += t[2 + 2 * a + b];
+    }
+    return e;
+  }
+
+  /**
+   * Mosaic mode on the nine-camera scene: no holes, ground right away from the box, each camera
+   * paints the cell at its own nadir, the same result on 1 and 8 threads, the seam energy does
+   * not rise, and a photograph that is 25% brighter is balanced by its gain.
+   */
+  private static void mosaic(List<Orthomosaic.View> views, List<int[]> images, Orthomosaic.Cloud cloud) throws Exception {
+    Orthomosaic.Surface surface = new Orthomosaic.Surface(180, 180, 3, 42, .25);
+    surface.add(cloud, "mosaic surface");
+    surface.finishClassic(4, 4);
+    double x0 = 5, yTop = 38.8, cell = .08;
+    int width = 500, height = 480;
+    double[] limit = {x0, yTop - height * cell, x0 + width * cell, yTop};
+    for (Orthomosaic.View v : views) v.reach(surface.bottom, surface.top, limit);
+    for (double bright : new double[] {1, 1.25}) {
+      List<int[]> scaled = new ArrayList<>();
+      for (int i = 0; i < images.size(); i++) {
+        int[] image = images.get(i).clone();
+        if (i == 4) for (int p = 0; p < image.length; p++) image[p] = OrthoSeams.scale(image[p], new double[] {bright, bright, bright});
+        scaled.add(image);
+      }
+      Orthomosaic.Photos photos = (view, x, y, w, h) -> {
+        int[] out = new int[w * h];
+        for (int row = 0; row < h; row++) System.arraycopy(scaled.get(view), (y + row) * SIZE + x, out, row * w, w);
+        return out;
+      };
+      OrthoSeams.Thumbnails thumbs = (v, step, w, h) -> {
+        int tw = Math.ceilDiv(w, step), th = Math.ceilDiv(h, step);
+        int[] out = new int[tw * th];
+        for (int ty = 0; ty < th; ty++)
+          for (int tx = 0; tx < tw; tx++) out[ty * tw + tx] = scaled.get(v)[Math.min(h - 1, ty * step) * SIZE + Math.min(w - 1, tx * step)];
+        return out;
+      };
+      OrthoSeams eight = OrthoSeams.build(surface, views, thumbs, x0, yTop, cell, width, height, Double.POSITIVE_INFINITY, 16, 8);
+      OrthoSeams one = OrthoSeams.build(surface, views, thumbs, x0, yTop, cell, width, height, Double.POSITIVE_INFINITY, 16, 1);
+      check(Arrays.equals(eight.label, one.label) && Arrays.equals(eight.shareWeight, one.shareWeight), "seams do not depend on the thread count");
+      check(eight.energyAfter <= eight.energyBefore + 1e-6, "graph cuts do not raise the seam energy");
+      if (bright == 1) {
+        boolean nadir = true;
+        for (int v = 0; v < views.size(); v++) {
+          double[] c = views.get(v).centre;
+          int i = (int) ((c[0] - x0) / (cell * eight.cellPixels)), j = (int) ((yTop - c[1]) / (cell * eight.cellPixels));
+          if (i >= 0 && j >= 0 && i < eight.gw && j < eight.gh) nadir &= eight.label[j * eight.gw + i] == v;
+        }
+        check(nadir, "each camera paints the cell at its nadir");
+        double spread = 0;
+        for (double[] g : eight.gain) for (double v : g) spread = Math.max(spread, Math.abs(v - 1));
+        check(spread < .02, "equal photographs: gains near 1 (" + spread + ")");
+      } else {
+        double others = 0;
+        for (int v = 0; v < views.size(); v++) if (v != 4) others += eight.gain[v][1] / (views.size() - 1);
+        check(Math.abs(eight.gain[4][1] * bright - others) < .3 * (bright - 1), "the brighter photograph is balanced (70% or more of the difference): gain " + eight.gain[4][1] + ", others " + others);
+      }
+      byte[][] tile = new byte[2][];
+      Orthomosaic.Result r8 = Orthomosaic.renderMosaic(surface, views, photos, eight, x0, yTop, cell, width, height, 8, (tx, ty, b) -> tile[0] = b);
+      Orthomosaic.Result r1 = Orthomosaic.renderMosaic(surface, views, photos, eight, x0, yTop, cell, width, height, 1, (tx, ty, b) -> tile[1] = b);
+      check(Arrays.equals(tile[0], tile[1]) && r8.painted == r1.painted, "mosaic tiles do not depend on the thread count");
+      check(r8.painted == (long) width * height && r8.unknown == 0 && r8.unseen == 0, "mosaic: no holes, every pixel painted");
+      byte[] samples = inflate(tile[0]);
+      long far = 0, right = 0;
+      for (int row = 0; row < height; row++)
+        for (int col = 0; col < width; col++) {
+          double x = x0 + (col + .5) * cell, y = yTop - (row + .5) * cell;
+          int at = 4 * (row * 512 + col);
+          int colour = (samples[at] & 255) << 16 | (samples[at + 1] & 255) << 8 | (samples[at + 2] & 255);
+          double outside = Math.max(Math.max(BX0 - x, x - BX1), Math.max(BY0 - y, y - BY1));
+          if (outside > 6) {
+            far++;
+            if (close(colour, ground(x, y), bright == 1 ? 8 : 24)) right++; // brightened colours clip at 255
+          }
+        }
+      check(far > 100000 && right >= .99 * far, "mosaic ground away from the box is right (brightness " + bright + "): " + right + " of " + far);
+    }
+    for (Orthomosaic.View v : views) v.reach = null;
   }
 
   /**

@@ -785,6 +785,8 @@ final class ReuseCache {
                 + (previous == null ? "none" : previous.width() + "x" + previous.height())
                 + ":"
                 + HexFormat.of().formatHex(hash.digest())
+                // Opt-in cost variants only: default keys are unchanged.
+                + (o.patchmatchTopViews > 1 ? ":top" + o.patchmatchTopViews : "")
                 + settings(
                     o,
                     "denseMethod",

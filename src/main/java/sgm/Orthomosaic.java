@@ -898,6 +898,173 @@ final class Orthomosaic {
   }
 
   /**
+   * Mosaic orthophoto (--orthomosaic-mode mosaic): every pixel is painted from the photographs the
+   * seams give it (OrthoSeams: contiguous regions, seams where the photographs agree, blended
+   * across a narrow band), each with its colour gains. Pixels in no photograph are transparent.
+   */
+  static Result renderMosaic(
+      Surface surface, List<View> views, Photos photos, OrthoSeams seams, double x0, double yTop, double cell, int width,
+      int height, int workers, TileSink sink) throws IOException {
+    Result result = new Result();
+    result.pixels = new long[views.size()];
+    double[] limit = {x0, yTop - height * cell, x0 + width * cell, yTop};
+    for (View v : views) if (v.reach == null) v.reach(surface.bottom, surface.top, limit);
+    int blocksAcross = Math.ceilDiv(width, BLOCK), blocksDown = Math.ceilDiv(height, BLOCK);
+    try (WorkProgress work = WorkProgress.start("Orthomosaic blocks", (long) blocksAcross * blocksDown, "blocks")) {
+      long done = 0;
+      for (int by = 0; by < height; by += BLOCK)
+        for (int bx = 0; bx < width; bx += BLOCK) {
+          blockMosaic(surface, views, photos, seams, x0, yTop, cell, bx, by, Math.min(BLOCK, width - bx), Math.min(BLOCK, height - by),
+              workers, sink, result);
+          work.update(++done);
+        }
+      work.done();
+    }
+    return result;
+  }
+
+  private static void blockMosaic(
+      Surface surface, List<View> views, Photos photos, OrthoSeams seams, double x0, double yTop, double cell, int bx, int by,
+      int bw, int bh, int workers, TileSink sink, Result result) throws IOException {
+    double left = x0 + bx * cell, upper = yTop - by * cell;
+    float[] heights = new float[bw * bh];
+    Parallel.forEach(bh, workers, row -> {
+      double y = upper - (row + .5) * cell;
+      for (int col = 0; col < bw; col++) heights[row * bw + col] = (float) surface.height(left + (col + .5) * cell, y);
+    });
+    // Weighted colour sums (R, G, B, weight) and the strongest view per pixel.
+    float[] sums = new float[4 * bw * bh], strongest = new float[bw * bh];
+    short[] primary = new short[bw * bh];
+    Arrays.fill(primary, (short) -1);
+    boolean[] used = seams.used(bx, by, bx + bw, by + bh, views.size());
+    int s = seams.cellPixels;
+    for (int i = 0; i < views.size(); i++) {
+      if (!used[i]) continue;
+      View view = views.get(i);
+      double[] gain = seams.gain[i];
+      int index = i;
+      // Pixels the view can contribute to: the cells holding a share of it, one cell around.
+      int ci0 = Integer.MAX_VALUE, cj0 = Integer.MAX_VALUE, ci1 = -1, cj1 = -1;
+      for (int j = Math.max(0, by / s - 1); j <= Math.min(seams.gh - 1, (by + bh - 1) / s + 1); j++)
+        for (int k = Math.max(0, bx / s - 1); k <= Math.min(seams.gw - 1, (bx + bw - 1) / s + 1); k++)
+          for (int a = 0; a < OrthoSeams.SHARES; a++) {
+            int v = seams.shareView[(j * seams.gw + k) * OrthoSeams.SHARES + a];
+            if (v < 0) break;
+            if (v == i) {
+              ci0 = Math.min(ci0, k);
+              ci1 = Math.max(ci1, k);
+              cj0 = Math.min(cj0, j);
+              cj1 = Math.max(cj1, j);
+            }
+          }
+      if (ci1 < 0) continue;
+      int px0 = Math.max(0, (ci0 - 1) * s - bx), px1 = Math.min(bw, (ci1 + 2) * s - bx);
+      int py0 = Math.max(0, (cj0 - 1) * s - by), py1 = Math.min(bh, (cj1 + 2) * s - by);
+      if (px0 >= px1 || py0 >= py1) continue;
+      int[][] box = new int[py1 - py0][];
+      Parallel.forEach(py1 - py0, workers, r -> {
+        int row = py0 + r;
+        double[] uv = new double[2];
+        int[] b = {Integer.MAX_VALUE, Integer.MAX_VALUE, -1, -1};
+        double y = upper - (row + .5) * cell;
+        for (int col = px0; col < px1; col++) {
+          int p = row * bw + col;
+          if (Float.isNaN(heights[p]) || seams.weight(index, bx + col, by + row) <= 0) continue;
+          if (!view.project(left + (col + .5) * cell, y, heights[p], uv) || uv[0] < 0 || uv[1] < 0 || uv[0] > view.width - 1 || uv[1] > view.height - 1) continue;
+          b[0] = Math.min(b[0], (int) uv[0]);
+          b[1] = Math.min(b[1], (int) uv[1]);
+          b[2] = Math.max(b[2], (int) uv[0] + 1);
+          b[3] = Math.max(b[3], (int) uv[1] + 1);
+        }
+        box[r] = b;
+      });
+      int u0 = Integer.MAX_VALUE, v0 = Integer.MAX_VALUE, u1 = -1, v1 = -1;
+      for (int[] b : box) {
+        u0 = Math.min(u0, b[0]);
+        v0 = Math.min(v0, b[1]);
+        u1 = Math.max(u1, b[2]);
+        v1 = Math.max(v1, b[3]);
+      }
+      if (u1 < 0) continue;
+      u1 = Math.min(u1, view.width - 1);
+      v1 = Math.min(v1, view.height - 1);
+      int ww = u1 - u0 + 1, wh = v1 - v0 + 1, ou = u0, ov = v0;
+      int[] window = photos.window(i, u0, v0, ww, wh);
+      Parallel.forEach(py1 - py0, workers, r -> {
+        int row = py0 + r;
+        double[] uv = new double[2];
+        double y = upper - (row + .5) * cell;
+        for (int col = px0; col < px1; col++) {
+          int p = row * bw + col;
+          if (Float.isNaN(heights[p])) continue;
+          double w = seams.weight(index, bx + col, by + row);
+          if (!(w > 0)) continue;
+          if (!view.project(left + (col + .5) * cell, y, heights[p], uv) || uv[0] < 0 || uv[1] < 0 || uv[0] > view.width - 1 || uv[1] > view.height - 1) continue;
+          double u = uv[0] - ou, v = uv[1] - ov;
+          int iu = Math.max(0, Math.min((int) u, ww - 2)), iv = Math.max(0, Math.min((int) v, wh - 2));
+          if (ww < 2) iu = 0;
+          if (wh < 2) iv = 0;
+          double fu = Math.max(0, Math.min(1, u - iu)), fv = Math.max(0, Math.min(1, v - iv));
+          int a = window[iv * ww + iu], b = window[iv * ww + Math.min(ww - 1, iu + 1)];
+          int c = window[Math.min(wh - 1, iv + 1) * ww + iu], d = window[Math.min(wh - 1, iv + 1) * ww + Math.min(ww - 1, iu + 1)];
+          for (int ch = 0, shift = 16; shift >= 0; ch++, shift -= 8) {
+            double upperRow = (1 - fu) * ((a >> shift) & 255) + fu * ((b >> shift) & 255);
+            double lowerRow = (1 - fu) * ((c >> shift) & 255) + fu * ((d >> shift) & 255);
+            sums[4 * p + ch] += (float) (w * gain[ch] * ((1 - fv) * upperRow + fv * lowerRow));
+          }
+          sums[4 * p + 3] += (float) w;
+          if (w > strongest[p]) {
+            strongest[p] = (float) w;
+            primary[p] = (short) index;
+          }
+        }
+      });
+    }
+    int[] rgba = new int[bw * bh];
+    long unknown = 0, unseen = 0;
+    for (int p = 0; p < rgba.length; p++) {
+      float weight = sums[4 * p + 3];
+      if (Float.isNaN(heights[p])) {
+        unknown++;
+        continue;
+      }
+      if (!(weight > 0)) {
+        unseen++;
+        continue;
+      }
+      int colour = 0xff000000;
+      for (int ch = 0, shift = 16; shift >= 0; ch++, shift -= 8)
+        colour |= Math.min(255, Math.max(0, Math.round(sums[4 * p + ch] / weight))) << shift;
+      rgba[p] = colour;
+      result.pixels[primary[p]]++;
+      result.painted++;
+    }
+    result.unknown += unknown;
+    result.unseen += unseen;
+    writeTiles(rgba, bx, by, bw, bh, workers, sink);
+  }
+
+  /** The tiles of a block's RGBA pixels, compressed in parallel, delivered in row-major order. */
+  private static void writeTiles(int[] rgba, int bx, int by, int bw, int bh, int workers, TileSink sink) throws IOException {
+    int tilesAcross = Math.ceilDiv(bw, TILE), tilesDown = Math.ceilDiv(bh, TILE);
+    byte[][] packed = new byte[tilesAcross * tilesDown][];
+    Parallel.forEach(packed.length, workers, t -> {
+      int tx = t % tilesAcross, ty = t / tilesAcross;
+      byte[] samples = new byte[TILE * TILE * 4];
+      for (int y = 0; y < TILE && ty * TILE + y < bh; y++)
+        for (int x = 0; x < TILE && tx * TILE + x < bw; x++) {
+          int value = rgba[(ty * TILE + y) * bw + tx * TILE + x], at = 4 * (y * TILE + x);
+          samples[at] = (byte) (value >> 16);
+          samples[at + 1] = (byte) (value >> 8);
+          samples[at + 2] = (byte) value;
+          samples[at + 3] = (byte) (value >>> 24);
+        }
+      packed[t] = TiledGeoTiff.compress(samples);
+    });
+    for (int t = 0; t < packed.length; t++) sink.write(bx / TILE + t % tilesAcross, by / TILE + t / tilesAcross, packed[t]);
+  }
+
+  /**
    * Photographs of a run: whole images up to wholePixels are decoded once and kept (least
    * recently used first out) within cacheBytes; larger ones are read by source window.
    */
@@ -1097,7 +1264,7 @@ final class Orthomosaic {
     surfaceCell = Math.max(surfaceCell, Math.sqrt(area / maxCells));
     Surface surface = grid(bounds, surfaceCell);
     surface.add(cloud::scan, "Orthomosaic: surface");
-    boolean classic = "classic".equals(o.orthomosaicMode);
+    boolean classic = "classic".equals(o.orthomosaicMode), mosaic = "mosaic".equals(o.orthomosaicMode);
     int fill = o.orthomosaicFill < 0 ? 64 : (int) Math.ceil(o.orthomosaicFill / surfaceCell);
     // Classic smoothing radius: auto = a tenth of the median camera height above the cloud. A
     // canopy surface smoothed less is steeper than the oblique rays at the block edge, and the
@@ -1107,7 +1274,7 @@ final class Orthomosaic {
     Arrays.sort(above);
     double smoothRadius = o.orthomosaicSmooth < 0 ? .1 * above[above.length / 2] : o.orthomosaicSmooth;
     int smooth = (int) Math.min(Math.max(surface.w, surface.h), Math.round(smoothRadius / surfaceCell));
-    if (classic) surface.finishClassic(smooth, Math.max(1, o.cores));
+    if (classic || mosaic) surface.finishClassic(smooth, Math.max(1, o.cores));
     else surface.finish(fill, Math.max(1, o.cores));
     if (surface.known == 0) return unavailable(out, "the surface is empty");
     boolean big = TiledGeoTiff.needsBig(width, height);
@@ -1124,10 +1291,29 @@ final class Orthomosaic {
     Result result;
     Path file = out.resolve("orthomosaic.tif");
     RunPhotos photos = new RunPhotos(files, widths, heights, cache);
-    GpuOrthomosaic gpu = classic ? null : GpuOrthomosaic.open(o, surface, (int) Math.min((long) BLOCK * BLOCK, (long) width * height));
+    GpuOrthomosaic gpu = classic || mosaic ? null : GpuOrthomosaic.open(o, surface, (int) Math.min((long) BLOCK * BLOCK, (long) width * height));
+    OrthoSeams seams = null;
+    long seamNanos = 0;
+    if (mosaic) {
+      long seamClock = System.nanoTime();
+      double[] limit = {x0, yTop - height * cell, x0 + width * cell, yTop};
+      for (View v : views) v.reach(surface.bottom, surface.top, limit);
+      double maxTan2 = o.orthomosaicMaxAngle > 0 ? Math.pow(Math.tan(Math.toRadians(o.orthomosaicMaxAngle)), 2) : Double.POSITIVE_INFINITY;
+      seams = OrthoSeams.build(surface, views, OrthoSeams.files(files), x0, yTop, cell, width, height, maxTan2, o.orthomosaicFeather,
+          Math.max(1, o.cores));
+      seamNanos = System.nanoTime() - seamClock;
+      String debug = System.getProperty("sgm.orthomosaic.seams");
+      if (debug != null) seams.writeDebug(Path.of(debug));
+      System.out.printf(
+          Locale.ROOT,
+          "Orthomosaic seams: %,d x %,d cells of %d pixels, %,d with photographs; seam energy %.4g -> %.4g; %.1f s%n",
+          seams.gw, seams.gh, seams.cellPixels, seams.cells, seams.energyBefore, seams.energyAfter, seamNanos / 1e9);
+    }
     try (photos; gpu; TiledGeoTiff tiff = new TiledGeoTiff(file, width, height, TILE, x0, yTop, cell, projected ? epsg : 0, big)) {
-      result = render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), !classic, !o.orthomosaicStrict, gpu,
-          classic ? o.orthomosaicFeather : -1, tiff::write);
+      result = mosaic
+          ? renderMosaic(surface, views, photos, seams, x0, yTop, cell, width, height, Math.max(1, o.cores), tiff::write)
+          : render(surface, views, photos, x0, yTop, cell, width, height, Math.max(1, o.cores), !classic, !o.orthomosaicStrict, gpu,
+              classic ? o.orthomosaicFeather : -1, tiff::write);
     } catch (IOException | RuntimeException | Error failure) {
       Files.deleteIfExists(file);
       throw failure;
@@ -1182,7 +1368,41 @@ final class Orthomosaic {
                 + " is in the way, the least obstructed camera paints the pixel unless strict; solid surfaces always"
                 + " hide. Pixels without a surface or seen by no camera are transparent. No seam blending, no"
                 + " radiometric balancing, no overviews.");
-    metadata.put("mode", classic ? "classic" : "true");
+    metadata.put("mode", classic ? "classic" : mosaic ? "mosaic" : "true");
+    if (mosaic) {
+      metadata.remove("surface_fill_cells");
+      metadata.remove("strict");
+      metadata.remove("pixels_painted_through_canopy");
+      metadata.remove("gpu_blocks");
+      metadata.remove("gpu_device_bytes");
+      metadata.put("surface_smoothing_radius", smoothRadius);
+      metadata.put("surface_smoothing_radius_basis", o.orthomosaicSmooth < 0 ? "a tenth of the median camera height above the cloud" : "--orthomosaic-smooth");
+      metadata.put("surface_smoothing_radius_cells", smooth);
+      metadata.put("seam_feather_pixels", o.orthomosaicFeather);
+      metadata.put("seam_cell_pixels", seams.cellPixels);
+      metadata.put("seam_cells", seams.cells);
+      metadata.put("seam_edges", seams.seamEdges);
+      metadata.put("seam_energy_initial", seams.energyBefore);
+      metadata.put("seam_energy", seams.energyAfter);
+      metadata.put("seam_seconds", seamNanos / 1e9);
+      metadata.put("max_angle_degrees", o.orthomosaicMaxAngle > 0 ? o.orthomosaicMaxAngle : null);
+      double[] gainRange = {Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY};
+      for (double[] g : seams.gain)
+        for (double v : g) {
+          gainRange[0] = Math.min(gainRange[0], v);
+          gainRange[1] = Math.max(gainRange[1], v);
+        }
+      metadata.put("colour_gain_range", gainRange);
+      metadata.put("pixels_outside_every_photograph", metadata.remove("pixels_seen_by_no_camera"));
+      metadata.put(
+          "method",
+          "Mosaic orthophoto: original photographs projected onto a smoothed, gap-free surface of the final cloud"
+              + " (as classic). Each photograph paints a contiguous region: on a coarse seam grid, a graph cut chooses"
+              + " one photograph per cell, preferring the most vertical view and placing the seams where neighbouring"
+              + " photographs agree in colour (not through crowns or roofs). Colour gains per photograph and channel"
+              + " equalise neighbouring photographs; the seams are blended over the feather width. Tall objects lean"
+              + " away from the nadir of their photograph. Pixels in no photograph are transparent. No overviews.");
+    }
     if (classic) {
       metadata.remove("surface_fill_cells");
       metadata.remove("strict");
@@ -1202,7 +1422,13 @@ final class Orthomosaic {
               + " radiometric balancing, no overviews.");
     }
     Json.write(out.resolve("orthomosaic.json"), metadata);
-    if (classic)
+    if (mosaic)
+      System.out.printf(
+          Locale.ROOT,
+          "Orthomosaic (mosaic): %s, %,d MiB; %.1f%% of the pixels painted from %d of %d photographs (%.1f%% in no photograph); %,d seam edges; %.1f s%n",
+          file, Files.size(file) >> 20, 100. * result.painted / total, contributing, views.size(), 100. * result.unseen / total,
+          seams.seamEdges, (System.nanoTime() - clock) / 1e9);
+    else if (classic)
       System.out.printf(
           Locale.ROOT,
           "Orthomosaic (classic): %s, %,d MiB; %.1f%% of the pixels painted from %d of %d photographs (%.1f%% in no photograph); surface %.1f%% interpolated; %.1f s%n",

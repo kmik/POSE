@@ -109,8 +109,22 @@ final class PoseLauncherPanel {
     };
   }
 
+  /** The dense method the fields were last adjusted for (see GuiOptions.followDenseMethod). */
+  private String denseMethod = "";
+
   void changedNow() {
     if (loading) return;
+    Map<String, String> now = values();
+    String method = now.getOrDefault("--dense-method", "");
+    if (!method.equals(denseMethod)) {
+      Map<String, String> follow = GuiOptions.followDenseMethod(denseMethod, method, now);
+      denseMethod = method;
+      if (!follow.isEmpty()) {
+        now.putAll(follow);
+        now.put("advanced", advanced.getText());
+        load(now);
+      }
+    }
     tiePointFields();
     lidarFields();
     updatePreview();
@@ -375,6 +389,7 @@ final class PoseLauncherPanel {
     } finally {
       loading = false;
     }
+    denseMethod = v.getOrDefault("--dense-method", "");
     tiePointFields();
     lidarFields();
     updatePreview();

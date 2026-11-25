@@ -12,6 +12,58 @@ import java.util.*;
 final class GuiRegression {
   private static int checks;
 
+  /** PatchMatch: study settings implied; image-fusion-only options adapted without image fusion. */
+  private static void patchmatchImplied(Path images) {
+    List<String> base = List.of("-i", images.toString(), "-o", "p", "--dense-method", "patchmatch");
+    List<String> plain = GuiOptions.withImplied(base);
+    for (String[] kv : new String[][] {{"--fusion-mode", "reference"}, {"--patchmatch-neighbors", "score"},
+        {"--patchmatch-view-cost", "top4"}, {"--patchmatch-smooth", "4"}, {"--patchmatch-views", "8"},
+        {"--patchmatch-consistent-views", "2"}, {"--patchmatch-speckle", "200"}})
+      check(plain.indexOf(kv[0]) > 0 && plain.get(plain.indexOf(kv[0]) + 1).equals(kv[1]), "patchmatch adds " + kv[0] + " " + kv[1] + ": " + plain);
+    check(GuiOptions.validate(plain) == null, "patchmatch settings valid: " + GuiOptions.validate(plain));
+    // The window defaults are tuned for mvsgm (image fusion, edge-aware filter): valid as they are.
+    Map<String, String> window = new HashMap<>(GuiOptions.SCRIPT_DEFAULTS);
+    window.put("-i", images.toString());
+    window.put("-o", "p");
+    window.put("--dense-method", "patchmatch");
+    List<String> defaults = GuiOptions.arguments(window, "");
+    check(GuiOptions.validate(defaults) == null, "patchmatch with the window defaults is valid: " + GuiOptions.validate(defaults));
+    // Without image fusion the image-only opt-ins are switched off so the run can go.
+    List<String> reference = GuiOptions.arguments(window,
+        "--fusion-mode reference --thin-surfaces --fusion-seed-min-angle 2 --point-attributes surface,height_sigma,views --windowed-mode on");
+    check(GuiOptions.validate(reference) == null, "patchmatch without image fusion is adapted to run: " + GuiOptions.validate(reference));
+    Options o = Options.parse(reference.toArray(String[]::new));
+    check(o.depthOutlierFilter.equals("off") && !o.thinSurfaceFusion() && !o.pointEvidence(), "image-only options off");
+    check(o.pointFields().contains(PointFields.Field.VIEWS) && o.pointFields().contains(PointFields.Field.NORMAL), "other attributes kept");
+    check(o.windowedMode.equals("auto"), "windowed mode on reset for patchmatch");
+    check(o.patchmatchTopViews == 4 && o.patchmatchSmooth == 4 && o.patchmatchNeighbors.equals("score")
+        && o.patchmatchViews == 8 && o.patchmatchConsistentViews == 2 && o.patchmatchSpeckle == 200, "study settings applied");
+    // With image fusion nothing image-only is touched.
+    List<String> image = GuiOptions.arguments(window, "--point-attributes height_sigma");
+    Options io = Options.parse(image.toArray(String[]::new));
+    check(io.fusionMode.equals("image") && io.depthOutlierFilter.equals("edge-aware") && io.pointEvidence(), "image fusion keeps its options");
+    // A user's own values win over the implied ones.
+    List<String> mine = GuiOptions.withImplied(List.of("--dense-method", "patchmatch", "--patchmatch-smooth", "0", "--patchmatch-view-cost", "best"));
+    check(Collections.frequency(mine, "--patchmatch-smooth") == 1 && Collections.frequency(mine, "--patchmatch-view-cost") == 1, "own patchmatch values kept: " + mine);
+    // Branch from a saved mvsgm-style run: the saved image-only settings are adapted as well.
+    List<String> saved = List.of("-i", images.toString(), "-o", "p", "--fusion-mode", "image", "--depth-outlier-filter", "edge-aware", "--fusion-tolerance", "sigma");
+    List<String> branch = GuiOptions.withImplied(saved, List.of("--dense-method", "patchmatch"));
+    check(GuiOptions.validateContinued(saved, branch) == null, "branch to patchmatch is adapted to run: " + GuiOptions.validateContinued(saved, branch));
+    check(GuiOptions.validateContinued(saved, GuiOptions.withImplied(List.of("--dense-method", "patchmatch"))) != null,
+        "without the saved context the conflict would remain (context is needed)");
+    // Other methods are never adapted.
+    List<String> sgm = List.of("--dense-method", "sgm", "--windowed-mode", "on", "--depth-outlier-filter", "edge-aware");
+    check(GuiOptions.withImplied(sgm).equals(sgm), "sgm arguments unchanged");
+    check(GuiOptions.tooltip("--dense-method").contains("patchmatch adds --fusion-mode reference"), "tooltip lists the patchmatch settings");
+    // Switching the dense method field: patchmatch gets reference fusion, back to mvsgm gets image.
+    check(GuiOptions.followDenseMethod("mvsgm", "patchmatch", Map.of("--fusion-mode", "image")).equals(Map.of("--fusion-mode", "reference")), "to patchmatch: reference");
+    check(GuiOptions.followDenseMethod("", "patchmatch", Map.of()).equals(Map.of("--fusion-mode", "reference")), "to patchmatch from an empty field: reference");
+    check(GuiOptions.followDenseMethod("mvsgm", "patchmatch", Map.of("--fusion-mode", "incremental")).isEmpty(), "another chosen mode stays");
+    check(GuiOptions.followDenseMethod("patchmatch", "patchmatch", Map.of("--fusion-mode", "image")).isEmpty(), "image chosen with patchmatch stays");
+    check(GuiOptions.followDenseMethod("patchmatch", "mvsgm", Map.of("--fusion-mode", "reference")).equals(Map.of("--fusion-mode", "image")), "back to mvsgm: image");
+    check(GuiOptions.followDenseMethod("patchmatch", "sgm", Map.of("--fusion-mode", "reference")).isEmpty(), "sgm keeps reference");
+  }
+
   private static void check(boolean ok, String message) {
     checks++;
     if (!ok) throw new AssertionError(message);
@@ -128,6 +180,7 @@ final class GuiRegression {
     check(!GuiOptions.withImplied(List.of("--dense-method", "mvsgm", "--dense-method", "sgm")).contains("--fusion-mode"), "the last choice counts");
     check(GuiOptions.validateContinued(List.of("-i", images.toString(), "-o", "p", "--fusion-mode", "reference"), GuiOptions.withImplied(List.of("--dense-method", "mvsgm"))) == null, "branch to mvsgm overrides a saved --fusion-mode");
     check(GuiOptions.tooltip("--dense-method").contains("mvsgm adds --fusion-mode image"), "the field's tooltip says so");
+    patchmatchImplied(images);
     // The mvsgm preset: the tested settings, a user's own value always wins.
     for (String needed : List.of("--surface-consolidation", "--fusion-outliers", "--fusion-strategy", "--subpixel-fit", "--depth-outlier-filter", "--mvsgm-neighbors", "--mvsgm-optimal-neighbors"))
       check(mvArgs.contains(needed), "mvsgm preset has " + needed + ": " + mvArgs);

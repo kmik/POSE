@@ -135,11 +135,18 @@ final class DenseReconstruction {
                       ? Files.newOutputStream(candidates)
                       : incremental.stream(),
                   4 << 20))) {
-        if (options.denseMethod.equals("patchmatch"))
-          count =
+        if (options.denseMethod.equals("patchmatch")) {
+          PatchMatchReconstruction patchmatch =
               new PatchMatchReconstruction(
-                      options, frames, tracks, fusion, project == null ? null : project.data)
-                  .run(pairs, out);
+                  options, frames, tracks, fusion, project == null ? null : project.data);
+          patchmatchRun = patchmatch;
+          try {
+            count = patchmatch.run(pairs, out, pairStarts);
+          } finally {
+            // --fusion-mode image: the per-camera maps feed image fusion like the mvsgm hand-off.
+            if (patchmatch.handoff != null) mvsgmMaps = patchmatch.handoff;
+          }
+        }
         else if (options.denseMethod.equals("mvsgm"))
         {
           MultiViewSgm mvs = new MultiViewSgm(options);
@@ -515,6 +522,8 @@ final class DenseReconstruction {
                 + " rejected by fusion geometry/uncertainty");
         project.stage("07_results", "running", "Publishing final clouds and report");
       }
+      // A patchmatch checkpoint and the maps it kept are dropped once fusion is complete.
+      if (patchmatchRun != null) patchmatchRun.complete();
       completed = true;
       return kept;
     } finally {
@@ -555,6 +564,7 @@ final class DenseReconstruction {
 
   // --dense-method mvsgm: the depth and evidence maps handed to image fusion (deleted after it).
   private MvsgmMaps mvsgmMaps;
+  private PatchMatchReconstruction patchmatchRun;
   private MvsgmWindow mvsgmWindow;
 
   private String aerialSummary;

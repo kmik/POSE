@@ -421,7 +421,8 @@ final class ImageFusion {
     seedMinSine = o.fusionSeedMinAngle > 0 ? Math.sin(Math.toRadians(o.fusionSeedMinAngle)) : 0;
     localSigma = o.fusionLocalSigma;
     tierCount = o.fusionSeedOrder.equals("precision") ? (seedMinSine > 0 ? 3 : 2) : 1;
-    emitStep = maps != null && o.denseMethod.equals("mvsgm") ? Math.max(1, o.step) : 1;
+    // Map hand-offs (mvsgm, patchmatch with image fusion) keep dense maps and thin at emission.
+    emitStep = maps != null && !o.denseMethod.equals("sgm") ? Math.max(1, o.step) : 1;
     evidence = o.pointEvidence();
     centres = new double[evidence ? fusion.cameraCount() : 0][];
     for (int c = 0; c < centres.length; c++) centres[c] = fusion.camera(c).center();
@@ -2826,7 +2827,7 @@ final class ImageFusion {
   static int agreementRadius(Options o) {
     if (o.fusionAgreementRadius >= 0) return o.fusionAgreementRadius;
     // mvsgm hands fusion every pixel of its maps (MultiViewSgm.run), as --step 1 does.
-    return o.fusionStrategy.equals("owner") ? 0 : Math.max(1, o.denseMethod.equals("mvsgm") ? 1 : o.step);
+    return o.fusionStrategy.equals("owner") ? 0 : Math.max(1, !o.denseMethod.equals("sgm") ? 1 : o.step);
   }
 
   /**

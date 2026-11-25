@@ -49,7 +49,8 @@ final class DenseCheckpoint {
   static final Set<String> RESOURCE_OPTIONS = Set.of(
       "output", "cores", "memoryMb", "denseCheckpoint", "imageFusionCacheMb", "streamedProcessing",
       "fusionSourceMaps", "surfaceMemoryMb", "estimateMemory", "processedImageCache", "cache",
-      "verbose", "mvsgmCamerasInFlight", "fusionHostCacheMb", "gpuMemoryMb", "imageMemoryMb");
+      "verbose", "mvsgmCamerasInFlight", "fusionHostCacheMb", "gpuMemoryMb", "imageMemoryMb",
+      "patchmatchReferencesInFlight");
 
   final Options o;
   final Path dir;
@@ -370,7 +371,7 @@ final class DenseCheckpoint {
     return values;
   }
 
-  private static String digest(String text) {
+  static String digest(String text) {
     try {
       return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)));
     } catch (java.security.NoSuchAlgorithmException e) {

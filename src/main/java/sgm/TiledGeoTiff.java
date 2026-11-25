@@ -49,6 +49,93 @@ final class TiledGeoTiff implements Closeable {
     put(ByteBuffer.allocate((int) position), 0);
   }
 
+  /**
+   * Reader for the files this class writes (classic TIFF or BigTIFF, RGBA Deflate tiles): pixel
+   * values 0xAARRGGBB, decoded tiles kept in a small cache. For report previews.
+   */
+  static final class Reader implements Closeable {
+    final int width, height, tile, across;
+    private final FileChannel in;
+    private final long[] offsets, counts;
+    private final LinkedHashMap<Integer, byte[]> cache = new LinkedHashMap<>(16, .75f, true);
+
+    Reader(Path path) throws IOException {
+      in = FileChannel.open(path, StandardOpenOption.READ);
+      ByteBuffer head = ByteBuffer.allocate(16);
+      in.read(head, 0);
+      ByteOrder order = head.get(0) == 'I' ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+      head.order(order);
+      boolean bigTiff = head.getShort(2) == 43;
+      long ifd = bigTiff ? head.getLong(8) : Integer.toUnsignedLong(head.getInt(4));
+      ByteBuffer count = read(ifd, bigTiff ? 8 : 2, order);
+      long entries = bigTiff ? count.getLong(0) : count.getShort(0) & 0xffff;
+      int entrySize = bigTiff ? 20 : 12;
+      ByteBuffer dir = read(ifd + (bigTiff ? 8 : 2), (int) (entries * entrySize), order);
+      int w = 0, h = 0, t = 0;
+      long[] off = null, cnt = null;
+      for (int e = 0; e < entries; e++) {
+        int at = e * entrySize, id = dir.getShort(at) & 0xffff, type = dir.getShort(at + 2) & 0xffff;
+        long n = bigTiff ? dir.getLong(at + 4) : Integer.toUnsignedLong(dir.getInt(at + 4));
+        int valueAt = at + (bigTiff ? 12 : 8);
+        long scalar = type == 3 ? dir.getShort(valueAt) & 0xffff : type == 16 ? dir.getLong(valueAt) : Integer.toUnsignedLong(dir.getInt(valueAt));
+        if (id == 256) w = (int) scalar;
+        else if (id == 257) h = (int) scalar;
+        else if (id == 322) t = (int) scalar;
+        else if (id == 324 || id == 325) {
+          int size = type == 16 ? 8 : 4;
+          long[] values = new long[(int) n];
+          ByteBuffer data = n * size <= (bigTiff ? 8 : 4) ? dir.slice(valueAt, (int) (n * size)).order(order)
+              : read(bigTiff ? dir.getLong(valueAt) : Integer.toUnsignedLong(dir.getInt(valueAt)), (int) (n * size), order);
+          for (int k = 0; k < n; k++) values[k] = size == 8 ? data.getLong(8 * k) : Integer.toUnsignedLong(data.getInt(4 * k));
+          if (id == 324) off = values;
+          else cnt = values;
+        }
+      }
+      if (w <= 0 || h <= 0 || t <= 0 || off == null || cnt == null) throw new IOException("not a tiled orthomosaic: " + path);
+      width = w;
+      height = h;
+      tile = t;
+      across = Math.ceilDiv(w, t);
+      offsets = off;
+      counts = cnt;
+    }
+
+    private ByteBuffer read(long at, int length, ByteOrder order) throws IOException {
+      ByteBuffer buffer = ByteBuffer.allocate(length);
+      while (buffer.hasRemaining() && in.read(buffer, at + buffer.position()) >= 0) {}
+      return buffer.flip().order(order);
+    }
+
+    /** Pixel (x, y) as 0xAARRGGBB (0 outside the image). */
+    int pixel(int x, int y) throws IOException {
+      if (x < 0 || y < 0 || x >= width || y >= height) return 0;
+      int index = (y / tile) * across + x / tile;
+      byte[] samples = cache.get(index);
+      if (samples == null) {
+        byte[] packed = read(offsets[index], (int) counts[index], ByteOrder.BIG_ENDIAN).array();
+        java.util.zip.Inflater inflater = new java.util.zip.Inflater();
+        samples = new byte[tile * tile * 4];
+        try {
+          inflater.setInput(packed);
+          inflater.inflate(samples);
+        } catch (java.util.zip.DataFormatException e) {
+          throw new IOException("corrupt orthomosaic tile " + index, e);
+        } finally {
+          inflater.end();
+        }
+        cache.put(index, samples);
+        if (cache.size() > 2 * across + 8) cache.remove(cache.keySet().iterator().next());
+      }
+      int at = 4 * ((y % tile) * tile + x % tile);
+      return (samples[at + 3] & 255) << 24 | (samples[at] & 255) << 16 | (samples[at + 1] & 255) << 8 | (samples[at + 2] & 255);
+    }
+
+    @Override
+    public void close() throws IOException {
+      in.close();
+    }
+  }
+
   /** Raw size above which a classic TIFF may not hold the compressed tiles. */
   static boolean needsBig(long width, long height) {
     return width * height * 4 > 3_500_000_000L;

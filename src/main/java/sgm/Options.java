@@ -302,6 +302,23 @@ public final class Options {
   public int patchmatchIterations = 4, patchmatchViews = 4, patchmatchLevels = 3;
   public double patchmatchEdgeSigma = 32;
   public double patchmatchMinDepth = 0, patchmatchMaxDepth = 0;
+  // 0 = auto. Resource option: parallel references never change a map.
+  public int patchmatchReferencesInFlight = 0;
+  // -1 auto (tile only where the untiled solve does not fit), 0 off, N = tile core size.
+  public int patchmatchTile = -1;
+  // -1 auto (the exact dependency radius, at most 256), else pixels.
+  public int patchmatchTileHalo = -1;
+  // Plane-consistent depth averaging radius of the final maps (0 = off, the original maps).
+  public int patchmatchSmooth = 0;
+  public double patchmatchSmoothTolerance = .01;
+  // --patchmatch-view-cost: 1 = best view (+ second-view term), K = mean of the K best views.
+  public int patchmatchTopViews = 1;
+  public String patchmatchNeighbors = "nearest";
+  // Source views (best one included) whose maps must confirm a depth; 1 = the best view only.
+  public int patchmatchConsistentViews = 1;
+  // Minimum depth-continuous region of a final PatchMatch map in pixels (0 = off).
+  public int patchmatchSpeckle = 0;
+  public double patchmatchSpeckleTolerance = .01;
   public boolean depthRefinement = true;
   public String depthRefinementMethod = "reprojection", surfaceConsolidation = "normal";
   public double surfaceRadius = 2, surfaceSpacing = 1, surfaceMaxShift = 2;
@@ -376,9 +393,12 @@ public final class Options {
   // Full-resolution true orthomosaic (ORTHOMOSAIC.md): off by default.
   public boolean orthomosaic, orthomosaicStrict;
   public double orthomosaicResolution = 0, orthomosaicSurfaceCell = 0, orthomosaicFill = -1;
-  // --orthomosaic-mode true|classic; classic: smoothed, fully filled surface, no visibility test.
+  // --orthomosaic-mode true|classic|mosaic; classic: smoothed, fully filled surface, no visibility test;
+  // mosaic: the same surface, contiguous photograph regions with optimised seams (OrthoSeams).
   public String orthomosaicMode = "true";
   public double orthomosaicSmooth = -1, orthomosaicFeather = 16;
+  /** --orthomosaic-max-angle DEG (mosaic): views steeper than this from the vertical are not used; 0 = no limit. */
+  public double orthomosaicMaxAngle = 0;
   public Path exportOrthomosaic, orthomosaicOutput;
   public boolean cache, listGpus;
   public int gpuDevice;
@@ -1315,6 +1335,58 @@ public final class Options {
         case "--patchmatch-max-depth":
           o.patchmatchMaxDepth = number(v);
           break;
+        case "--patchmatch-speckle":
+          o.patchmatchSpeckle = Integer.parseInt(v);
+          if (o.patchmatchSpeckle < 0 || o.patchmatchSpeckle > 1000000)
+            throw new IllegalArgumentException("--patchmatch-speckle must be 0..1000000 pixels");
+          break;
+        case "--patchmatch-speckle-tolerance":
+          o.patchmatchSpeckleTolerance = number(v);
+          if (!(o.patchmatchSpeckleTolerance > 0 && o.patchmatchSpeckleTolerance <= .2))
+            throw new IllegalArgumentException("--patchmatch-speckle-tolerance must be in (0, 0.2]");
+          break;
+        case "--patchmatch-consistent-views":
+          o.patchmatchConsistentViews = Integer.parseInt(v);
+          if (o.patchmatchConsistentViews < 1 || o.patchmatchConsistentViews > 8)
+            throw new IllegalArgumentException("--patchmatch-consistent-views must be 1..8");
+          break;
+        case "--patchmatch-neighbors":
+          o.patchmatchNeighbors = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--patchmatch-view-cost":
+          switch (v.toLowerCase(Locale.ROOT)) {
+            case "best" -> o.patchmatchTopViews = 1;
+            case "top2" -> o.patchmatchTopViews = 2;
+            case "top3" -> o.patchmatchTopViews = 3;
+            case "top4" -> o.patchmatchTopViews = 4;
+            default -> throw new IllegalArgumentException("--patchmatch-view-cost must be best, top2, top3 or top4");
+          }
+          break;
+        case "--patchmatch-smooth":
+          o.patchmatchSmooth = Integer.parseInt(v);
+          if (o.patchmatchSmooth < 0 || o.patchmatchSmooth > 8)
+            throw new IllegalArgumentException("--patchmatch-smooth must be 0..8");
+          break;
+        case "--patchmatch-smooth-tolerance":
+          o.patchmatchSmoothTolerance = number(v);
+          if (!(o.patchmatchSmoothTolerance > 0 && o.patchmatchSmoothTolerance <= .2))
+            throw new IllegalArgumentException("--patchmatch-smooth-tolerance must be in (0, 0.2]");
+          break;
+        case "--patchmatch-tile-halo":
+          o.patchmatchTileHalo = v.equalsIgnoreCase("auto") ? -1 : Integer.parseInt(v);
+          if (o.patchmatchTileHalo < -1 || o.patchmatchTileHalo > 4096)
+            throw new IllegalArgumentException("--patchmatch-tile-halo must be auto or 0..4096");
+          break;
+        case "--patchmatch-tile":
+          o.patchmatchTile =
+              v.equalsIgnoreCase("auto") ? -1 : v.equalsIgnoreCase("off") ? 0 : Integer.parseInt(v);
+          if (o.patchmatchTile > 0 && (o.patchmatchTile < 256 || o.patchmatchTile > 16384))
+            throw new IllegalArgumentException("--patchmatch-tile must be auto, off or 256..16384");
+          break;
+        case "--patchmatch-references-in-flight":
+          o.patchmatchReferencesInFlight =
+              v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
+          break;
         case "--min-views":
           o.minViews = Integer.parseInt(v);
           break;
@@ -1565,6 +1637,9 @@ public final class Options {
         case "--orthomosaic-smooth":
           o.orthomosaicSmooth = v.equalsIgnoreCase("auto") ? -1 : number(v);
           break;
+        case "--orthomosaic-max-angle":
+          o.orthomosaicMaxAngle = v.equalsIgnoreCase("off") ? 0 : number(v);
+          break;
         case "--orthomosaic-feather":
           o.orthomosaicFeather = number(v);
           break;
@@ -1647,8 +1722,10 @@ public final class Options {
         > 1) throw new IllegalArgumentException("Choose one standalone export/analysis action");
     if (!(o.orthomosaicResolution >= 0) || !(o.orthomosaicSurfaceCell >= 0))
       throw new IllegalArgumentException("--orthomosaic-resolution and --orthomosaic-surface-cell must be auto or positive");
-    if (!o.orthomosaicMode.equals("true") && !o.orthomosaicMode.equals("classic"))
-      throw new IllegalArgumentException("--orthomosaic-mode must be true or classic");
+    if (!o.orthomosaicMode.equals("true") && !o.orthomosaicMode.equals("classic") && !o.orthomosaicMode.equals("mosaic"))
+      throw new IllegalArgumentException("--orthomosaic-mode must be true, classic or mosaic");
+    if (!(o.orthomosaicMaxAngle >= 0 && o.orthomosaicMaxAngle < 90))
+      throw new IllegalArgumentException("--orthomosaic-max-angle must be off or 0..<90 degrees");
     if (!(o.orthomosaicSmooth >= 0 || o.orthomosaicSmooth == -1) || !(o.orthomosaicFeather >= 0))
       throw new IllegalArgumentException("--orthomosaic-smooth must be auto or >= 0, --orthomosaic-feather >= 0");
     if (o.exportOrthomosaic != null) {
@@ -1753,9 +1830,12 @@ public final class Options {
       throw new IllegalArgumentException(
           "Depth outlier settings require radius 2..8,"
               + " deviation >0..32 disparity pixels, edge threshold 0..255");
-    if (!o.depthOutlierFilter.equals("off") && o.denseMethod.equals("patchmatch"))
+    if (!o.depthOutlierFilter.equals("off")
+        && o.denseMethod.equals("patchmatch")
+        && !o.fusionMode.equals("image"))
       throw new IllegalArgumentException(
-          "--depth-outlier-filter edge-aware requires --dense-method sgm or mvsgm");
+          "--depth-outlier-filter edge-aware requires --dense-method sgm or mvsgm, or patchmatch"
+              + " with --fusion-mode image");
     if (o.aerialTileSize < 64 || o.aerialTileSize > 2048
         || o.aerialOverlap < 8 || o.aerialOverlap > o.aerialTileSize / 2
         || o.aerialCoarseDimension < 128 || o.aerialCoarseDimension > 2048
@@ -1812,10 +1892,9 @@ public final class Options {
     choice(o.fusionEvidence, "--fusion-evidence", "pair", "camera", "auto");
     choice(o.fusionGpuEvidence, "--fusion-gpu-evidence", "auto", "resident", "windowed");
     choice(o.fusionMode, "--fusion-mode", "reference", "incremental", "image");
-    if (o.fusionMode.equals("image")
-        && (!o.fusionEmission.equals("pair") || o.denseMethod.equals("patchmatch")))
+    if (o.fusionMode.equals("image") && !o.fusionEmission.equals("pair"))
       throw new IllegalArgumentException(
-          "--fusion-mode image requires --dense-method sgm or mvsgm and --fusion-emission pair");
+          "--fusion-mode image requires --fusion-emission pair");
     choice(o.fusionOutliers, "--fusion-outliers", "reference", "robust");
     choice(o.fusionAssociation, "--fusion-association", "pair", "camera");
     if (o.fusionAssociation.equals("camera") && !o.fusionMode.equals("incremental"))
@@ -1953,9 +2032,12 @@ public final class Options {
         || o.patchmatchMinDepth < 0
         || o.patchmatchMaxDepth < 0
         || ((o.patchmatchMinDepth == 0) != (o.patchmatchMaxDepth == 0))
+        || o.patchmatchReferencesInFlight < 0
+        || o.patchmatchReferencesInFlight > 32
         || (o.patchmatchMaxDepth > 0 && o.patchmatchMaxDepth <= o.patchmatchMinDepth))
       throw new IllegalArgumentException(
           "Invalid PatchMatch depth range or iterations/views/levels");
+    choice(o.patchmatchNeighbors, "--patchmatch-neighbors", "nearest", "score");
     choice(o.fusionCompute, "--fusion-compute", "inherit", "cpu", "auto", "gpu");
     choice(o.fusionWeightMath, "--fusion-weight-math", "direct", "reference");
     choice(o.fusionLayout, "--fusion-layout", "coalesced", "reference");
@@ -3001,6 +3083,11 @@ Point filtering and multi-view fusion:
       otherwise dense starts over. Not with --fusion-seed-order precision,
       --fusion-host-memory-mb, --voxel without surface consolidation, --fusion-emission camera
       or --diagnostics. off deletes an earlier checkpoint.
+      patchmatch: checkpoints of the solve under 05_stereo/patchmatch_checkpoint (the
+      pass and the references finished in it; the map files it needs stay until the
+      next checkpoint). auto uses them only when the PatchMatch generations do not fit
+      in memory (large blocks); MINUTES forces them. A resume after the solve reruns
+      the evidence and fusion stages from the saved maps.
   --mvsgm-cameras-in-flight N|auto
       mvsgm: compute the depth maps of N cameras at once (default 1 = one at a time;
       1..16). Each camera in flight prepares its neighbour images on the CPU and solves
@@ -3074,6 +3161,49 @@ Point filtering and multi-view fusion:
   --patchmatch-min-depth N / --patchmatch-max-depth N
       Positive camera-Z bounds in reconstruction units, specified together (default: inferred).
       Otherwise infer padded bounds from aligned tie points; fail if unavailable.
+  --patchmatch-references-in-flight N|auto
+      References solved at once within each PatchMatch pass (default auto: one per
+      3 cores, at most 4, on the GPU; one per core with --compute cpu; 1..32).
+      Lowered when the heap is short. Results are identical for any value.
+  --patchmatch-tile auto|off|N
+      Solve large references in tiles of N x N pixels plus a halo (GPU only).
+      auto (default) tiles only a level raster whose untiled working set exceeds
+      --memory-mb, the heap or the GPU budget (where an untiled solve fails); off never
+      tiles; N tiles every level raster larger than N (256..16384). Tiles agree with an
+      untiled solve (see --patchmatch-tile-halo). Tiled results are not cached.
+  --patchmatch-tile-halo auto|N
+      Halo around each PatchMatch tile in level pixels. auto (default) uses the sum of
+      the propagation strides, which makes tiles identical to an untiled solve, capped at
+      256 pixels for very large frames (then tiles agree except near tile edges).
+  --patchmatch-neighbors nearest|score
+      Source views of each PatchMatch reference (at most --patchmatch-views). nearest
+      (default): the nearest camera centres among the matched pairs. score: the
+      mvsgm view selection (shared tie points weighted by triangulation angle).
+  --patchmatch-speckle N
+      Remove small islands from the final PatchMatch depth maps (default 0 = off): regions
+      of neighbouring pixels whose depths agree within --patchmatch-speckle-tolerance that
+      have fewer than N pixels are dropped before fusion. Removes isolated patches of
+      noise (e.g. 200-1000 for 3-12 Mpx images).
+  --patchmatch-speckle-tolerance N
+      Relative depth step that still connects neighbouring pixels for --patchmatch-speckle
+      (default 0.01 = 1 %; (0, 0.2]).
+  --patchmatch-consistent-views N
+      Source views whose PatchMatch maps must confirm a depth (default 1: the best view
+      only). Each confirmation is the reciprocal check (reprojection within
+      --lr-threshold, depth agreement). 2 or more removes depths that only one other
+      view supports, such as floating clumps under tree crowns (1..8).
+  --patchmatch-view-cost best|top2|top3|top4
+      How a plane hypothesis is scored over its source views. best (default): the best
+      view plus a small second-view term. topK: the mean of the K best view costs, so a
+      depth must fit several views (averages per-pair orientation residuals).
+  --patchmatch-smooth R
+      Plane-consistent depth averaging of the final PatchMatch maps (default 0 = off):
+      each depth becomes the score-weighted mean of the depths that the planes of valid
+      pixels within R pixels predict for it, using only predictions within
+      --patchmatch-smooth-tolerance of its own depth, so other surfaces at depth edges do
+      not take part. Lowers noise on smooth surfaces.
+  --patchmatch-smooth-tolerance N
+      Relative depth agreement for --patchmatch-smooth (default 0.01 = 1 %; (0, 0.2]).
   --min-views N
       Minimum distinct supporting cameras (default: 3; minimum: 2), capped
       at registered image count. Two-image input uses stereo checks only; allowing
@@ -3677,7 +3807,8 @@ Additional workflow controls:
       experimental (provisional camera/pixel hypotheses). image fuses per camera in
       image space: per-pixel consensus over the camera's pairs, 2D speckle filter,
       reciprocal cross-checks against the other cameras' merged maps, one owner camera
-      per surface (see --fusion-strategy).
+      per surface (see --fusion-strategy). With --dense-method patchmatch, image fusion
+      takes each camera's PatchMatch map as one single-view pair (like mvsgm).
   --fusion-outliers reference|robust
       Outlier rule in fusion (default: reference). robust removes a 3+ view point only
       when independent cameras contradict it (free space or a nearer surface).
@@ -3939,20 +4070,29 @@ Orthomosaic (ORTHOMOSAIC.md):
       Leave a pixel transparent whenever no camera passes the line-of-sight test.
       Default: where only canopy (rough surface) is in the way, the least obstructed
       camera paints it, so forest is not full of holes; solid roofs always hide.
-  --orthomosaic-mode true|classic
+  --orthomosaic-mode true|classic|mosaic
       true (default): true orthomosaic as above, transparent where nothing is known.
       classic: conventional orthophoto without holes inside the photographed area: the
       surface is despiked, every gap is interpolated and the whole surface is smoothed;
       each pixel takes the camera nearest its image centre with no visibility test, and
       seams are feathered. Tall objects lean and may cover the ground beside them.
+      mosaic: conventional orthophoto on the same gap-free surface as classic, but each
+      photograph paints a contiguous region around its nadir; the seams between them are
+      placed by a graph cut where neighbouring photographs agree (not through crowns or
+      roofs), colours are balanced per photograph and the seams are blended over
+      --orthomosaic-feather pixels. Recommended for forest blocks.
   --orthomosaic-smooth auto|M
-      classic: radius of the surface smoothing in output units (default auto: a tenth
+      classic, mosaic: radius of the surface smoothing in output units (default auto: a tenth
       of the median camera height above the cloud; 0: despike and fill only). Less
       smoothing keeps crowns closer to their place but folds the photographs over
       steep canopy where the views are oblique.
   --orthomosaic-feather N
-      classic: blend two photographs over about 2N pixels across each seam (default 16;
+      classic, mosaic: blend photographs over about 2N pixels across each seam (default 16;
       0: hard seams).
+  --orthomosaic-max-angle off|DEG
+      mosaic: use only views within DEG degrees of the vertical (default off). Trims
+      the stretched edge of a block that was photographed only obliquely; those parts
+      become transparent.
   --export-orthomosaic RUN_DIRECTORY
       Make the orthomosaic of a finished run without reprocessing; written to the
       run's 07_results or to --orthomosaic-output DIRECTORY.

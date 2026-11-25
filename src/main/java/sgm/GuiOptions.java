@@ -110,7 +110,8 @@ final class GuiOptions {
           new Field("--tie-point-max-removed", "   Most removed (%)", PROCESSING, Kind.TEXT, List.of()),
           new Field("--classify-ground", "Classify ground (DTM, CHM)", PROCESSING, Kind.FLAG, List.of()),
           new Field("--orthomosaic", "Orthomosaic", PROCESSING, Kind.FLAG, List.of()),
-          new Field("--orthomosaic-mode", "   Mode", PROCESSING, Kind.CHOICE, List.of("", "true", "classic")),
+          new Field("--orthomosaic-mode", "   Mode", PROCESSING, Kind.CHOICE, List.of("", "true", "classic", "mosaic")),
+          new Field("--orthomosaic-max-angle", "   Largest view angle (degrees, mosaic)", PROCESSING, Kind.SUGGEST, List.of("", "off")),
           new Field("--compute", "Compute device", COMPUTE, Kind.CHOICE, List.of("", "auto", "gpu", "cpu")),
           new Field("--gpu-device", "GPU index", COMPUTE, Kind.TEXT, List.of()),
           new Field("--gpu-memory-mb", "GPU memory (MiB)", COMPUTE, Kind.TEXT, List.of()),
@@ -399,7 +400,128 @@ final class GuiOptions {
     {"--dense-method", "mvsgm", "--min-angle", "4"},
     {"--dense-method", "mvsgm", "--mvsgm-neighbors", "8"},
     {"--dense-method", "mvsgm", "--mvsgm-optimal-neighbors", null},
+    // PatchMatch study settings (PATCHMATCH.md): pair-provenance fusion keeps its forest coverage;
+    // mvsgm view selection, a 4-view cost and plane-consistent smoothing close most of the gap on
+    // stable surfaces.
+    {"--dense-method", "patchmatch", "--fusion-mode", "reference"},
+    {"--dense-method", "patchmatch", "--patchmatch-neighbors", "score"},
+    {"--dense-method", "patchmatch", "--patchmatch-view-cost", "top4"},
+    {"--dense-method", "patchmatch", "--patchmatch-smooth", "4"},
+    // Eight score-chosen sources average out per-pair depth offsets (city stable median below
+    // mvsgm); a second confirming view removes floating clumps under tree crowns (forest_6).
+    {"--dense-method", "patchmatch", "--patchmatch-views", "8"},
+    {"--dense-method", "patchmatch", "--patchmatch-consistent-views", "2"},
+    // Small depth islands (isolated noise patches, forest_6): drop regions under 200 pixels.
+    {"--dense-method", "patchmatch", "--patchmatch-speckle", "200"},
   };
+
+  /**
+   * Field values to change when the dense method field changes from {@code from} to {@code to}:
+   * patchmatch gets --fusion-mode reference (its forest coverage needs pair fusion; the window
+   * default is image), and leaving patchmatch for mvsgm restores image (mvsgm requires it). A
+   * value the user picks afterwards stays.
+   */
+  static Map<String, String> followDenseMethod(String from, String to, Map<String, String> values) {
+    String fusion = values.getOrDefault("--fusion-mode", "");
+    if (to.equals("patchmatch") && !from.equals("patchmatch") && (fusion.isEmpty() || fusion.equals("image")))
+      return Map.of("--fusion-mode", "reference");
+    if (to.equals("mvsgm") && from.equals("patchmatch") && fusion.equals("reference"))
+      return Map.of("--fusion-mode", "image");
+    return Map.of();
+  }
+
+  /** Point attributes computed by image fusion only (Options: pointEvidence). */
+  private static final Set<String> IMAGE_FUSION_ATTRIBUTES =
+      Set.of("height_sigma", "ray_sigma", "depth_spread", "angle");
+
+  /**
+   * --dense-method patchmatch: values that let the run go where another setting (often a window
+   * default tuned for mvsgm) cannot run with it, appended so they win (the last value counts).
+   * Without --fusion-mode image: the edge-aware outlier filter, thin-surface fusion settings and
+   * image-fusion point attributes are switched off. Always: windowed mode on, scoped source maps
+   * and the fusion host-memory bound (mvsgm only) are reset. saved = a run's saved arguments the
+   * new ones continue (empty for a new run).
+   */
+  static List<String> adaptedForPatchmatch(List<String> saved, List<String> args) {
+    List<String> all = new ArrayList<>(saved);
+    all.addAll(args);
+    if (!last(all, "--dense-method", "sgm").equalsIgnoreCase("patchmatch")) return args;
+    List<String> out = new ArrayList<>(args);
+    if (last(all, "--windowed-mode", "auto").equalsIgnoreCase("on"))
+      out.addAll(List.of("--windowed-mode", "auto"));
+    if (last(all, "--fusion-source-maps", "retained").equalsIgnoreCase("scoped"))
+      out.addAll(List.of("--fusion-source-maps", "retained"));
+    if (positive(last(all, "--fusion-host-memory-mb", "0")))
+      out.addAll(List.of("--fusion-host-memory-mb", "0"));
+    if (last(all, "--fusion-mode", "reference").equalsIgnoreCase("image")) return out;
+    if (!last(all, "--depth-outlier-filter", "off").equalsIgnoreCase("off"))
+      out.addAll(List.of("--depth-outlier-filter", "off"));
+    String attributes = last(all, "--point-attributes", null);
+    if (attributes != null) {
+      try {
+        var fields = PointFields.parse(attributes);
+        List<String> keep = new ArrayList<>();
+        boolean dropped = false;
+        for (var f : fields)
+          if (IMAGE_FUSION_ATTRIBUTES.contains(f.name)) dropped = true;
+          else keep.add(f.name);
+        if (dropped)
+          out.addAll(List.of("--point-attributes", keep.isEmpty() ? "none" : String.join(",", keep)));
+      } catch (IllegalArgumentException e) {
+        // An invalid list is reported by the parser as typed.
+      }
+    }
+    // Thin-surface fusion state as the parser would leave it (--thin-surfaces, then later values).
+    String tolerance = "relative", seedOrder = "camera";
+    boolean precision = false;
+    String minAngle = "0", localSigma = "0";
+    for (int i = 0; i < all.size(); i++) {
+      String a = all.get(i), v = i + 1 < all.size() ? all.get(i + 1) : "";
+      if (a.contains("=") && a.startsWith("--")) {
+        v = a.substring(a.indexOf('=') + 1);
+        a = a.substring(0, a.indexOf('='));
+      }
+      switch (a) {
+        case "--thin-surfaces" -> {
+          tolerance = "sigma";
+          precision = true;
+          seedOrder = "precision";
+          localSigma = "3";
+        }
+        case "--fusion-tolerance" -> tolerance = v;
+        case "--fusion-precision-check" -> precision = v.equalsIgnoreCase("on");
+        case "--fusion-seed-order" -> seedOrder = v;
+        case "--fusion-seed-min-angle" -> minAngle = v;
+        case "--fusion-local-sigma" -> localSigma = v;
+        default -> {}
+      }
+    }
+    if (tolerance.equalsIgnoreCase("sigma")) out.addAll(List.of("--fusion-tolerance", "relative"));
+    if (precision) out.addAll(List.of("--fusion-precision-check", "off"));
+    if (seedOrder.equalsIgnoreCase("precision")) out.addAll(List.of("--fusion-seed-order", "camera"));
+    if (positive(minAngle)) out.addAll(List.of("--fusion-seed-min-angle", "0"));
+    if (positive(localSigma)) out.addAll(List.of("--fusion-local-sigma", "0"));
+    return out;
+  }
+
+  /** The last value of an option (FLAG VALUE or FLAG=VALUE), or the given default. */
+  private static String last(List<String> args, String flag, String fallback) {
+    String value = fallback;
+    for (int i = 0; i < args.size(); i++) {
+      String a = args.get(i);
+      if (a.equals(flag) && i + 1 < args.size()) value = args.get(++i);
+      else if (a.startsWith(flag + "=")) value = a.substring(flag.length() + 1);
+    }
+    return value;
+  }
+
+  private static boolean positive(String number) {
+    try {
+      return Double.parseDouble(number.strip()) > 0;
+    } catch (NumberFormatException e) {
+      return false;
+    }
+  }
 
   /**
    * Adds the options a chosen value needs or is best run with, right after the choice, unless
@@ -407,6 +529,11 @@ final class GuiOptions {
    * the user always wins; a conflict is then reported by the parser, as on the command line.
    */
   static List<String> withImplied(List<String> args) {
+    return withImplied(List.of(), args);
+  }
+
+  /** As withImplied(args), continuing a run whose saved arguments are {@code saved}. */
+  static List<String> withImplied(List<String> saved, List<String> args) {
     List<String> out = new ArrayList<>(args);
     Map<String, Integer> triggers = new LinkedHashMap<>();
     for (String[] rule : IMPLIED) triggers.putIfAbsent(rule[0] + "\0" + rule[1], -1);
@@ -429,7 +556,7 @@ final class GuiOptions {
       }
       out.addAll(at, add);
     }
-    return out;
+    return adaptedForPatchmatch(saved, out);
   }
 
   private static boolean given(List<String> args, String flag) {
@@ -445,6 +572,9 @@ final class GuiOptions {
     StringBuilder s = new StringBuilder();
     for (var e : by.entrySet())
       s.append(e.getKey()).append(" adds ").append(String.join(", ", e.getValue())).append(" unless you set them yourself. ");
+    if (flag.equals("--dense-method"))
+      s.append("patchmatch without --fusion-mode image also switches off the image-fusion-only options"
+          + " (edge-aware outlier filter, thin-surface fusion settings, uncertainty point attributes). ");
     return s.toString().strip();
   }
 
