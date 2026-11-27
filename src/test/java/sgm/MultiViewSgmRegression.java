@@ -382,13 +382,24 @@ final class MultiViewSgmRegression {
     Options parsed = Options.parse(args.toArray(new String[0]));
     check(Double.isNaN(parsed.twoViewConfidenceThreshold) && parsed.mvsgmNeighbors == 5 && parsed.copy().mvsgmNeighbors == 5,
         "mvsgm options parsed, copied; two-view gate off");
-    check(parsed.mvsgmEdgeTrim == 0 && parsed.mvsgmCensusBands.equals("gray"), "edge trim off and gray census by default");
+    check(parsed.mvsgmCensusBands.equals("gray") && parsed.mvsgmCensus == 5 && parsed.mvsgmLevels == 2 && parsed.p2 == 8
+        && parsed.fusionSigmaK == 1 && parsed.mvsgmHalfPixel && parsed.mvsgmSubpixel.equals("data")
+        && parsed.mvsgmPlanarSmooth == 3 && parsed.mvsgmPlanarResidual == .5 && parsed.mvsgmEdgeTrim == 2
+        && parsed.mvsgmEdgeTrimLabels == 2 && parsed.mvsgmEdgeTrimCount == 2, "mvsgm defaults");
+    List<String> own = new ArrayList<>(args);
+    own.addAll(List.of("--p2", "20", "--mvsgm-levels", "0", "--mvsgm-half-pixel", "off", "--mvsgm-edge-trim", "off"));
+    Options ownParsed = Options.parse(own.toArray(new String[0]));
+    check(ownParsed.p2 == 20 && ownParsed.mvsgmLevels == 0 && !ownParsed.mvsgmHalfPixel && ownParsed.mvsgmEdgeTrim == 0
+        && ownParsed.mvsgmCensus == 5, "explicit options override the mvsgm defaults");
+    List<String> pair = new ArrayList<>(List.of("-i", input.toString(), "-o", input.resolve("out2").toString()));
+    Options pairParsed = Options.parse(pair.toArray(new String[0]));
+    check(pairParsed.p2 == 24 && pairParsed.fusionSigmaK == 3, "other dense methods keep the global defaults");
     List<String> trimArgs = new ArrayList<>(args);
     trimArgs.addAll(List.of("--mvsgm-edge-trim", "2,3", "--mvsgm-census-window", "3", "--mvsgm-census-bands", "color",
         "--mvsgm-half-pixel", "on", "--mvsgm-subpixel", "data", "--mvsgm-planar-smooth", "3,0.4,2", "--mvsgm-edge-trim", "2,3,4"));
     Options trimmed = Options.parse(trimArgs.toArray(new String[0]));
     check(trimmed.mvsgmEdgeTrim == 2 && trimmed.mvsgmEdgeTrimLabels == 3 && trimmed.copy().mvsgmEdgeTrim == 2
-        && trimmed.copy().mvsgmCensusBands.equals("color") && trimmed.mvsgmHalfPixel && trimmed.copy().mvsgmHalfPixel && !parsed.mvsgmHalfPixel && trimmed.copy().mvsgmSubpixel.equals("data") && trimmed.copy().mvsgmPlanarSmooth == 3 && trimmed.mvsgmPlanarResidual == .4 && trimmed.mvsgmPlanarBand == 2 && parsed.mvsgmPlanarSmooth == 0 && trimmed.copy().mvsgmEdgeTrimCount == 4 && parsed.mvsgmEdgeTrimCount == 1 && parsed.mvsgmSubpixel.equals("aggregated"), "edge trim and colour census parsed and copied");
+        && trimmed.copy().mvsgmCensusBands.equals("color") && trimmed.mvsgmHalfPixel && trimmed.copy().mvsgmHalfPixel && trimmed.copy().mvsgmSubpixel.equals("data") && trimmed.copy().mvsgmPlanarSmooth == 3 && trimmed.mvsgmPlanarResidual == .4 && trimmed.mvsgmPlanarBand == 2 && trimmed.copy().mvsgmEdgeTrimCount == 4, "edge trim and colour census parsed and copied");
     List<String> offArgs = new ArrayList<>(trimArgs);
     offArgs.addAll(List.of("--mvsgm-edge-trim", "off"));
     check(Options.parse(offArgs.toArray(new String[0])).mvsgmEdgeTrim == 0, "--mvsgm-edge-trim off");

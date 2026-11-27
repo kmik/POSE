@@ -1531,7 +1531,7 @@ final class MultiViewSgm {
       for (int p = 0; p < n; p++) if (!(label[p] == before[p]) && Float.isFinite(before[p])) median++;
     }
     long speckles = CensusSgm.removeSpeckles(label, w, h, o.speckleSize, 1.0, o.speckleConnectivity);
-    long trimmed = o.mvsgmEdgeTrim > 0 ? edgeTrim(label, w, h, o.mvsgmEdgeTrim, o.mvsgmEdgeTrimLabels, o.mvsgmEdgeTrimCount) : 0;
+    long trimmed = o.mvsgmEdgeTrim > 0 ? edgeTrim(label, w, h, o.mvsgmEdgeTrim, o.mvsgmEdgeTrimLabels, o.mvsgmEdgeTrimCount, o.mvsgmEdgeTrimMedian) : 0;
     long planar = o.mvsgmPlanarSmooth > 0
         ? planarSmooth(label, w, h, o.mvsgmPlanarSmooth, o.mvsgmPlanarResidual, o.mvsgmPlanarBand) : 0;
     float[] depth = new float[n];
@@ -1634,6 +1634,28 @@ final class MultiViewSgm {
     return n == 0 ? Double.NaN : StereoCost.subpixel(o, s0, s1, s2);
   }
 
+  /** 3x3 median of the valid labels (NaN where fewer than 5 are valid); Arrays.sort order. */
+  float[] median3(float[] src, int w, int h) {
+    float[] out = new float[src.length];
+    parallel(h, y -> {
+      float[] v = new float[9];
+      for (int x = 0; x < w; x++) {
+        int n = 0;
+        for (int yy = Math.max(0, y - 1); yy <= Math.min(h - 1, y + 1); yy++)
+          for (int xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) {
+            float u = src[yy * w + xx];
+            if (Float.isFinite(u)) v[n++] = u;
+          }
+        if (n < 5) out[y * w + x] = Float.NaN;
+        else {
+          Arrays.sort(v, 0, n);
+          out[y * w + x] = v[n / 2];
+        }
+      }
+    });
+    return out;
+  }
+
   /**
    * --mvsgm-planar-smooth R,T,J: per label, the least-squares plane l = a + b dx + c dy over the
    * labels within J of it in the (2R+1)^2 window (at least half the window); when that fit's RMS
@@ -1703,9 +1725,18 @@ final class MultiViewSgm {
     return edgeTrim(label, w, h, r, jump, 1);
   }
 
-  /** As above, removing a label only when at least {@code needed} farther labels lie in the window. */
   long edgeTrim(float[] label, int w, int h, int r, double jump, int needed) {
+    return edgeTrim(label, w, h, r, jump, needed, false);
+  }
+
+  /**
+   * As above, removing a label only when at least {@code needed} farther labels lie in the window;
+   * with {@code median} the window's labels are the 3x3 medians of the valid labels (at least 5),
+   * so isolated far outliers do not count as a background.
+   */
+  long edgeTrim(float[] label, int w, int h, int r, double jump, int needed, boolean median) {
     float[] src = label.clone();
+    float[] ref = median ? median3(src, w, h) : src;
     long[] removed = new long[h];
     parallel(h, y -> {
       long n = 0;
@@ -1717,7 +1748,7 @@ final class MultiViewSgm {
         search:
         for (int yy = Math.max(0, y - r); yy <= Math.min(h - 1, y + r); yy++)
           for (int xx = Math.max(0, x - r); xx <= Math.min(w - 1, x + r); xx++) {
-            float u = src[yy * w + xx];
+            float u = ref[yy * w + xx];
             if (Float.isFinite(u) && u < v - jump && ++farther >= needed) {
               label[p] = Float.NaN;
               n++;
@@ -2295,12 +2326,15 @@ final class MultiViewSgm {
       long side = t + 2L * TILE_OVERLAP;
       pixels = Math.max(pixels, t > 0 ? Math.min(f.width, side) * Math.min(f.height, side) : (long) f.width * f.height);
     }
-    long fit = Math.max(1, (long) (Runtime.getRuntime().maxMemory() * .35) / (pixels * CAMERA_HEAP_BYTES));
+    // --mvsgm-half-pixel: each neighbour canvas has 4x the samples (gray, validity, census: about
+    // 11 bytes each), so a camera holds about 33 more bytes per reference pixel per neighbour.
+    long perPixel = CAMERA_HEAP_BYTES + (canvasScale == 2 ? 33L * neighbors : 0);
+    long fit = Math.max(1, (long) (Runtime.getRuntime().maxMemory() * .35) / (pixels * perPixel));
     int wanted = requested > 0 ? requested : o.compute.equals("cpu") ? 1 : Math.max(1, Math.min(8, o.cores / 4));
     if (wanted > fit) {
       if (requested > 0)
         System.out.printf(Locale.ROOT, "mvsgm: --mvsgm-cameras-in-flight %d lowered to %d: about %,d MiB of heap per camera"
-            + " in flight (raise --memory-mb for more)%n", requested, fit, pixels * CAMERA_HEAP_BYTES >> 20);
+            + " in flight (raise --memory-mb for more)%n", requested, fit, pixels * perPixel >> 20);
       wanted = (int) fit;
     }
     return Math.min(wanted, cameras);

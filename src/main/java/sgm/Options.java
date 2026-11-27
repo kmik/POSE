@@ -247,6 +247,8 @@ public final class Options {
   double mvsgmEdgeTrimLabels = 2;
   // --mvsgm-edge-trim R,J,N: farther neighbours needed to trim (1 = any).
   int mvsgmEdgeTrimCount = 1;
+  // --mvsgm-edge-trim R,J,N,median: farther test against the 3x3 median of the labels (outlier-robust).
+  boolean mvsgmEdgeTrimMedian;
   // --mvsgm-planar-smooth R,T,J: plane fit over same-surface neighbours; 0 = off.
   int mvsgmPlanarSmooth = 0;
   double mvsgmPlanarResidual = .3, mvsgmPlanarBand = 1.5;
@@ -440,6 +442,8 @@ public final class Options {
     boolean storageExplicit = false;
     boolean quickExplicit = false, pipelineExplicit = false, stepExplicit = false;
     Set<String> bundleExplicit = new HashSet<>();
+    // Every option given (after preset expansion): the mvsgm defaults below apply only to absent ones.
+    Set<String> given = new HashSet<>();
     for (int i = 0; i < args.length; i++) {
       String key = args[i], inline = null;
       int eq = key.indexOf('=');
@@ -447,6 +451,7 @@ public final class Options {
         inline = key.substring(eq + 1);
         key = key.substring(0, eq);
       }
+      given.add(key);
       switch (key) {
         case "--mvsgm-optimal-neighbors":
           o.mvsgmOptimalNeighbors = true;
@@ -1039,7 +1044,9 @@ public final class Options {
             break;
           }
           String[] parts = t.split(",");
-          if (parts.length > 3) throw new IllegalArgumentException("--mvsgm-edge-trim must be off, R, R,J or R,J,N");
+          if (parts.length > 4 || parts.length == 4 && !parts[3].strip().equals("median"))
+            throw new IllegalArgumentException("--mvsgm-edge-trim must be off, R, R,J, R,J,N or R,J,N,median");
+          o.mvsgmEdgeTrimMedian = parts.length == 4;
           o.mvsgmEdgeTrim = Integer.parseInt(parts[0].strip());
           if (parts.length > 1) o.mvsgmEdgeTrimLabels = number(parts[1].strip());
           if (parts.length > 2) o.mvsgmEdgeTrimCount = Integer.parseInt(parts[2].strip());
@@ -1749,6 +1756,7 @@ public final class Options {
     // Multi-view SGM emits every consistent pixel unless --step is given: its maps are dense per
     // camera, and the step-2 default exists for pair SGM (a default thinning would quarter mvsgm clouds).
     if (!stepExplicit && o.denseMethod.equals("mvsgm")) o.step = 1;
+    if (o.denseMethod.equals("mvsgm")) o.applyMvsgmDefaults(given);
     if (o.help) return o;
     choice(o.surfacePartition, "--surface-partition", "routed", "recursive");
     choice(o.processingReport, "--report", "pdf", "html", "none");
@@ -2464,6 +2472,32 @@ public final class Options {
     return a;
   }
 
+  /**
+   * --dense-method mvsgm defaults (2026-11-28, chosen on an UltraCam forest/field/house block against
+   * Metashape at 1 m): census window 5, two coarse levels, P2 8, fusion sigma K 1,
+   * half-pixel census, data-cost subpixel, planar smoothing 3,0.5 and edge trim 2,2,2. Options given on
+   * the command line (or by a preset) keep their values; the colour census keeps window 3.
+   */
+  void applyMvsgmDefaults(Set<String> given) {
+    if (!given.contains("--mvsgm-census-window")) mvsgmCensus = mvsgmCensusBands.equals("color") ? 3 : 5;
+    if (!given.contains("--mvsgm-levels")) mvsgmLevels = 2;
+    if (!given.contains("--p2")) p2 = 8;
+    if (!given.contains("--fusion-sigma-k")) fusionSigmaK = 1;
+    if (!given.contains("--mvsgm-half-pixel")) mvsgmHalfPixel = true;
+    if (!given.contains("--mvsgm-subpixel")) mvsgmSubpixel = "data";
+    if (!given.contains("--mvsgm-planar-smooth")) {
+      mvsgmPlanarSmooth = 3;
+      mvsgmPlanarResidual = .5;
+      mvsgmPlanarBand = 1.5;
+    }
+    if (!given.contains("--mvsgm-edge-trim")) {
+      mvsgmEdgeTrim = 2;
+      mvsgmEdgeTrimLabels = 2;
+      mvsgmEdgeTrimCount = 2;
+      mvsgmEdgeTrimMedian = false;
+    }
+  }
+
   private void applyFilteringPreset(Set<String> explicit) {
     double relative, pixels, consensus, minimumCorrelation;
     int minimumSpeckle;
@@ -2581,6 +2615,7 @@ public final class Options {
     out.mvsgmEdgeTrim = mvsgmEdgeTrim;
     out.mvsgmEdgeTrimLabels = mvsgmEdgeTrimLabels;
     out.mvsgmEdgeTrimCount = mvsgmEdgeTrimCount;
+    out.mvsgmEdgeTrimMedian = mvsgmEdgeTrimMedian;
     out.mvsgmPlanarSmooth = mvsgmPlanarSmooth;
     out.mvsgmPlanarResidual = mvsgmPlanarResidual;
     out.mvsgmPlanarBand = mvsgmPlanarBand;
@@ -2994,7 +3029,7 @@ Dense stereo / SGM:
       Integer SGM penalty for a one-hypothesis disparity change (default: 4;
       nonnegative). This is a stereo penalty, not lens tangential distortion.
   --p2 N
-      Integer SGM penalty for larger disparity changes (default: 24; greater
+      Integer SGM penalty for larger disparity changes (default: 24, mvsgm 8; greater
       than p1, at most 1000000). Higher penalties favor smoother disparities.
       Both penalties are specified in 5x5-census units and scaled by
       (window*window-1)/24 for other windows, consistently across all costs.
@@ -3139,7 +3174,7 @@ Point filtering and multi-view fusion:
   --mvsgm-census-window W
       mvsgm: census window 3, 5 or 7 (default 5).
   --mvsgm-levels N
-      mvsgm: coarse-to-fine levels below full resolution, 0..5 (default -1 =
+      mvsgm: coarse-to-fine levels below full resolution, -1..5 (mvsgm default 2; -1 =
       --tsgm-levels). 0 searches every depth label at full resolution.
   --mvsgm-consistent-views N
       mvsgm: a depth is kept only if at least N neighbour depth maps agree when
@@ -3153,32 +3188,33 @@ Point filtering and multi-view fusion:
       evidence in vegetation and shadow at the same matching cost); needs
       --mvsgm-census-window 3. The census is computed on the CPU; the GPU solve still runs.
   --mvsgm-subpixel aggregated|data
-      mvsgm: the fraction within the SGM winner label (default aggregated: --subpixel-fit
-      on the SGM-aggregated costs, which favours whole labels). data fits the matching
+      mvsgm: the fraction within the SGM winner label (default data). aggregated fits
+      --subpixel-fit on the SGM-aggregated costs, which favours whole labels; data fits the matching
       cost itself at the winner and its two neighbouring labels, summed over the 3x3
       pixels around it; SGM still chooses the label. Best with --mvsgm-half-pixel on,
       whose costs carry information between whole pixels.
   --mvsgm-half-pixel on|off
-      mvsgm (default off): each neighbour is resampled at half-pixel spacing and its
+      mvsgm (default on): each neighbour is resampled at half-pixel spacing and its
       census computed there (same pattern, one pixel between compared samples), so the
       matching cost has real information between whole pixels instead of interpolating
       whole-pixel costs. Depths lock less to whole labels (crown and ground detail).
-      Same labels and SGM time; neighbour canvases take 4x the memory; the census is
-      computed on the CPU.
+      Same labels and SGM time; neighbour canvases take 4x the memory.
   --mvsgm-planar-smooth off|R[,T[,J]]
-      mvsgm (default off): fits a plane (inverse depth is linear in the image on a planar
-      surface) to the neighbours within R pixels (default 2) whose labels are within J of
-      the pixel (default 1.5; the same surface, so roof edges do not mix with the ground);
-      where the fit residual is at most T labels (default 0.3: ground, roofs, roads) the
+      mvsgm (default 3,0.5,1.5): fits a plane (inverse depth is linear in the image on a planar
+      surface) to the neighbours within R pixels whose labels are within J of the pixel
+      (1.5 when omitted; the same surface, so roof edges do not mix with the ground);
+      where the fit residual is at most T labels (0.3 when omitted: ground, roofs, roads) the
       depth becomes the plane value, elsewhere (tree crowns) it is kept. One label is
       about one pixel of image motion. A single pass per depth map.
-  --mvsgm-edge-trim off|R[,J[,N]]
-      mvsgm (default off): removes depths that have a farther depth, by more than J
+  --mvsgm-edge-trim off|R[,J[,N[,median]]]
+      mvsgm (default 2,2,2): removes depths that have a farther depth, by more than J
       labels (default 2; one label is about one pixel of image motion), within R pixels
       (1..8). This trims the near side of depth jumps, where SGM widens foreground
       surfaces over the background (wide tree crowns, building edges); it also drops
       isolated depth spikes. N (default 1) is how many farther depths are needed: a
       larger N ignores scattered far outliers (noisy shadows) and keeps the depths around
+      them. ,median compares against the 3x3 median of the depths, so scattered outliers
+      (dark shadows) do not trigger the trim while a real background still does.
       them. 2,2 suits 0.5 m aerial pixels. A single pass per depth map.
   --dense-checkpoint off|auto|MINUTES
       mvsgm with overlap-window fusion: save a checkpoint every MINUTES (auto = 30)
@@ -3352,7 +3388,8 @@ Point filtering and multi-view fusion:
       most the relative band. Precise wide-baseline depths then only confirm what agrees
       at their precision.
   --fusion-sigma-k K
-      Sigma multiplier for --fusion-tolerance sigma and --fusion-precision-check (default 3).
+      Sigma multiplier for --fusion-tolerance sigma and --fusion-precision-check (default 3,
+      mvsgm 1).
   --fusion-precision-check on|off
       Image fusion (default off): a point that cameras with at least 2x smaller sigma see
       within the relative band but not within K sigma (a near miss, not an occlusion) is
