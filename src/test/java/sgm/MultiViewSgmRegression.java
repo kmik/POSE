@@ -385,7 +385,7 @@ final class MultiViewSgmRegression {
     check(parsed.mvsgmCensusBands.equals("gray") && parsed.mvsgmCensus == 5 && parsed.mvsgmLevels == 2 && parsed.p2 == 8
         && parsed.fusionSigmaK == 1 && parsed.mvsgmHalfPixel && parsed.mvsgmSubpixel.equals("data")
         && parsed.mvsgmPlanarSmooth == 3 && parsed.mvsgmPlanarResidual == .5 && parsed.mvsgmEdgeTrim == 2
-        && parsed.mvsgmEdgeTrimLabels == 2 && parsed.mvsgmEdgeTrimCount == 2, "mvsgm defaults");
+        && parsed.mvsgmEdgeTrimLabels == 2 && parsed.mvsgmEdgeTrimCount == 2 && parsed.mvsgmEdgeTrimMedian, "mvsgm defaults");
     List<String> own = new ArrayList<>(args);
     own.addAll(List.of("--p2", "20", "--mvsgm-levels", "0", "--mvsgm-half-pixel", "off", "--mvsgm-edge-trim", "off"));
     Options ownParsed = Options.parse(own.toArray(new String[0]));

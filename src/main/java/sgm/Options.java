@@ -2475,7 +2475,7 @@ public final class Options {
   /**
    * --dense-method mvsgm defaults (2026-11-28, chosen on an UltraCam forest/field/house block against
    * Metashape at 1 m): census window 5, two coarse levels, P2 8, fusion sigma K 1,
-   * half-pixel census, data-cost subpixel, planar smoothing 3,0.5 and edge trim 2,2,2. Options given on
+   * half-pixel census, data-cost subpixel, planar smoothing 3,0.5 and edge trim 2,2,2,median. Options given on
    * the command line (or by a preset) keep their values; the colour census keeps window 3.
    */
   void applyMvsgmDefaults(Set<String> given) {
@@ -2494,7 +2494,7 @@ public final class Options {
       mvsgmEdgeTrim = 2;
       mvsgmEdgeTrimLabels = 2;
       mvsgmEdgeTrimCount = 2;
-      mvsgmEdgeTrimMedian = false;
+      mvsgmEdgeTrimMedian = true;
     }
   }
 
@@ -3207,7 +3207,7 @@ Point filtering and multi-view fusion:
       depth becomes the plane value, elsewhere (tree crowns) it is kept. One label is
       about one pixel of image motion. A single pass per depth map.
   --mvsgm-edge-trim off|R[,J[,N[,median]]]
-      mvsgm (default 2,2,2): removes depths that have a farther depth, by more than J
+      mvsgm (default 2,2,2,median): removes depths that have a farther depth, by more than J
       labels (default 2; one label is about one pixel of image motion), within R pixels
       (1..8). This trims the near side of depth jumps, where SGM widens foreground
       surfaces over the background (wide tree crowns, building edges); it also drops
