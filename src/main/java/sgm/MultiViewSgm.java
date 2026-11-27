@@ -1404,7 +1404,10 @@ final class MultiViewSgm {
   /** Phase-1 facts phase 2 needs: neighbours (best first) and the inverse-depth label step. */
   record CameraInfo(int camera, int[] neighbours, double step, double near, double far, boolean tiled) {}
 
-  /** --export-disparity-images or --diagnostics: per-camera depth previews (PFM + PNG + JSON). */
+  /**
+   * --export-disparity-images (also set by --export-full-disparity-images) or --diagnostics:
+   * per-camera depth previews (PFM + PNG + JSON; with the full option also a 16-bit _full.png).
+   */
   boolean exportImages() {
     return o.exportDisparityImages || o.diagnostics;
   }
@@ -1421,8 +1424,9 @@ final class MultiViewSgm {
     for (int p = 0; p < z.length; p++)
       values[p] = z[p] > 0 && (keep == null || !Float.isNaN(keep[p])) ? z[p] : Float.NaN;
     String stem = f.path.getFileName().toString().replaceFirst("[.][^.]*$", "").replaceAll("[^A-Za-z0-9_.-]", "_");
-    ProjectArtifacts.scalar(
-        o.output.resolve("05_stereo/mvsgm/image_" + f.id + "_" + stem), kind, values, f.width, f.height, near, far);
+    Path dir = o.output.resolve("05_stereo/mvsgm/image_" + f.id + "_" + stem);
+    ProjectArtifacts.scalar(dir, kind, values, f.width, f.height, near, far);
+    if (o.exportFullDisparityImages) ProjectArtifacts.scalarFull(dir, kind, values, f.width, f.height, near, far);
   }
 
   /**
@@ -1493,6 +1497,11 @@ final class MultiViewSgm {
         "numeric_data", kind + ".pfm", "preview_scale", scale,
         "preview", "linear grayscale, valid values clamped to 1..255; downscaled by preview_scale (block mean of"
             + " valid depths); preview clipping does not alter numeric PFM"));
+    if (o.exportFullDisparityImages)
+      ProjectArtifacts.scalarFull(dir, kind, (y, out) -> {
+        read.accept(y);
+        System.arraycopy(row, 0, out, 0, w);
+      }, w, h, near, far);
   }
 
   final Map<Integer, CameraInfo> info = new ConcurrentSkipListMap<>();

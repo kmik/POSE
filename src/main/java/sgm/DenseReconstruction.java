@@ -1193,6 +1193,15 @@ final class DenseReconstruction {
             h,
             matching.minDisparity,
             matching.minDisparity + matching.disparities - 1);
+      if (options.exportFullDisparityImages)
+        ProjectArtifacts.scalarFull(
+            rangeDirectory,
+            "disparity",
+            result.disparity,
+            w,
+            h,
+            matching.minDisparity,
+            matching.minDisparity + matching.disparities - 1);
       String qualityRow = prefix + "," + result.stats.csv();
       String warning =
           !(result.stats.lowerClipped() || result.stats.upperClipped())

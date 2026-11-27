@@ -476,6 +476,31 @@ final class LargeFormatRegression {
         png.release();
       }
       check(Files.readString(dir.resolve("depth.json")).contains("\"preview_scale\":2"), "wide preview scale recorded");
+      check(!Files.exists(dir.resolve("depth_full.png")), "no full-resolution PNG without the option");
+
+      // --export-full-disparity-images: 16-bit PNG at full size, streamed and in-memory paths alike.
+      Options parsed = Options.parse(new String[] {"-i", ".", "--export-full-disparity-images"});
+      check(parsed.exportDisparityImages && parsed.exportFullDisparityImages, "full export implies the ordinary export");
+      o.exportFullDisparityImages = true;
+      MultiViewSgm full = new MultiViewSgm(o);
+      full.exportDepthStreamed(f, "depth", mapped.map(depth, DepthMapFile.HEADER, 4L * w * h, false), null, 10, 15);
+      full.exportDepth(f, "array_depth", z, null, 10, 15);
+      for (String kind : new String[] {"depth", "array_depth"}) {
+        org.opencv.core.Mat big = org.opencv.imgcodecs.Imgcodecs.imread(
+            dir.resolve(kind + "_full.png").toString(), org.opencv.imgcodecs.Imgcodecs.IMREAD_UNCHANGED);
+        try {
+          check(big.cols() == w && big.rows() == h && big.type() == org.opencv.core.CvType.CV_16U,
+              kind + "_full.png is 16-bit at full resolution: " + big.cols() + "x" + big.rows());
+          // Column 1500 holds depth 11.5 over [10, 15]; odd columns are invalid (0).
+          long expected = Math.round(1 + 65534 * (11.5 - 10) / 5.0);
+          check(Math.abs(big.get(5, 1500)[0] - expected) <= 1, kind + " full value: " + big.get(5, 1500)[0]);
+          check(big.get(5, 1501)[0] == 0, kind + " invalid pixel is 0");
+          check(big.get(0, 0)[0] == 1, kind + " range start maps to 1: " + big.get(0, 0)[0]);
+        } finally {
+          big.release();
+        }
+        check(Files.readString(dir.resolve(kind + "_full.json")).contains("\"bits\":16"), kind + "_full.json written");
+      }
     }
   }
 

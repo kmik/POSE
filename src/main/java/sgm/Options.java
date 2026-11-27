@@ -9,7 +9,7 @@ import java.util.*;
 public final class Options {
   public Path input, output = Paths.get("photogrammetry-output"), calibration, poses;
   public boolean help, rectified, calibrate, overwrite, gps, noGps, copyInputs, verbose;
-  public boolean diagnostics, compatibilityCopies, exportDisparityImages;
+  public boolean diagnostics, compatibilityCopies, exportDisparityImages, exportFullDisparityImages;
   public String densePairSelection = "all", calibrationPipeline = "bootstrap";
   public String fusionEmission = "pair";
   public String fusionEvidence = "auto";
@@ -445,6 +445,10 @@ public final class Options {
           continue;
         case "--export-disparity-images":
           o.exportDisparityImages = true;
+          continue;
+        case "--export-full-disparity-images":
+          o.exportDisparityImages = true;
+          o.exportFullDisparityImages = true;
           continue;
         case "--compatibility-copies":
           o.compatibilityCopies = true;
@@ -3708,6 +3712,15 @@ Additional workflow controls:
       05_stereo/mvsgm/image_<id>_<name>/depth.* (the SGM depth map) and
       consistent_depth.* (what passes the multi-view check), each .pfm (depth, NaN =
       none), .png (grayscale over the image's depth range, near dark) and .json.
+      The .png of a large (tiled) mvsgm image is a preview downscaled to at most 4,096
+      pixels on its longer side; the .pfm is always full resolution.
+  --export-full-disparity-images
+      --export-disparity-images plus, next to each exported map, <name>_full.png: the
+      map at full processed resolution as a 16-bit grayscale PNG (1..65535 linear over
+      the same range as the preview, near/low dark; 0 = invalid) and <name>_full.json
+      with the conversion back to depth or disparity. 16 bits keep centimetre steps
+      over a range of hundreds of metres, so crown and roof shape stay visible. About
+      2 bytes per processed pixel per map on disk.
   --dense-pair-selection all|coverage
       Default all preserves all verified pairs. Experimental coverage ranks pairs
       by angle-qualified sparse coverage and predicted range cost; unknown coverage

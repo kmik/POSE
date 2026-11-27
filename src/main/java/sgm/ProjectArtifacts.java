@@ -1416,6 +1416,55 @@ final class ProjectArtifacts implements AutoCloseable {
         effective.minDisparity + effective.disparities - 1);
   }
 
+  /** Fills row[0..width) with row y of a scalar map (NaN or non-finite = invalid). */
+  interface Rows {
+    void read(int y, float[] row);
+  }
+
+  /**
+   * --export-full-disparity-images: dir/name_full.png, the map at full resolution as 16-bit
+   * grayscale (valid values linear 1..65535 over [low, high], clamped; 0 = invalid), and
+   * dir/name_full.json with the inverse mapping. Rows are read one at a time, so a tiled image
+   * needs no image-sized heap array (the native 16-bit image is 2 bytes per pixel).
+   */
+  static void scalarFull(Path dir, String name, Rows rows, int width, int height, double low, double high)
+      throws IOException {
+    Files.createDirectories(dir);
+    double span = Math.max(1e-12, high - low);
+    float[] row = new float[width];
+    short[] out = new short[width];
+    Mat image = new Mat(height, width, CvType.CV_16U);
+    try {
+      for (int y = 0; y < height; y++) {
+        rows.read(y, row);
+        for (int x = 0; x < width; x++)
+          out[x] = Float.isFinite(row[x])
+              ? (short) (int) Math.max(1, Math.min(65535, Math.round(1 + 65534 * (row[x] - low) / span)))
+              : 0;
+        image.put(y, 0, out);
+      }
+      image(dir.resolve(name + "_full.png"), image);
+    } finally {
+      image.release();
+    }
+    Json.write(dir.resolve(name + "_full.json"), Json.object(
+        "width", width,
+        "height", height,
+        "image", name + "_full.png",
+        "bits", 16,
+        "range", new double[] {low, high},
+        "zero", "invalid/NaN",
+        "value", "low + (v - 1) * (high - low) / 65534 for v = 1..65535 (values outside the range are clamped)",
+        "step", span / 65534,
+        "numeric_data", name + ".pfm"));
+  }
+
+  /** {@link #scalarFull} for a map held in one array. */
+  static void scalarFull(Path dir, String name, float[] values, int width, int height, double low, double high)
+      throws IOException {
+    scalarFull(dir, name, (y, row) -> System.arraycopy(values, y * width, row, 0, width), width, height, low, high);
+  }
+
   static void scalar(
       Path dir, String name, float[] values, int width, int height, double low, double high)
       throws IOException {
