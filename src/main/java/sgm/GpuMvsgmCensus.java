@@ -22,7 +22,8 @@ final class GpuMvsgmCensus {
   static long canvases, bands, grayBytes;
 
   static boolean enabled(Options o) {
-    if (disabled || o.compute.equals("cpu") || Boolean.getBoolean("sgm.cpuMvsgm")
+    // --mvsgm-census-bands color: the per-band census is computed on the CPU (the GPU kernel is grayscale).
+    if (disabled || o.compute.equals("cpu") || o.mvsgmCensusBands.equals("color") || Boolean.getBoolean("sgm.cpuMvsgm")
         || Boolean.getBoolean("sgm.cpuMvsgmCensus")) return false;
     if (o.gpuMemoryMb > 0 && o.gpuMemoryMb * 1048576L < MIN_BUDGET) {
       memoryFallback();
@@ -57,8 +58,13 @@ final class GpuMvsgmCensus {
   }
 
   static int bandRows(int w, int h, int window, long bytes) {
+    return bandRows(w, h, window, 1, bytes);
+  }
+
+  /** step: sample spacing of the census (2 on a --mvsgm-half-pixel canvas); the halo is (window / 2) step rows. */
+  static int bandRows(int w, int h, int window, int step, long bytes) {
     if (bytes >= (long) w * h) return h;
-    long rows = Math.min(h, bytes / w - 2L * (window / 2));
+    long rows = Math.min(h, bytes / w - 2L * (window / 2) * step);
     return rows < Math.min(MIN_ROWS, h) ? 0 : (int) rows;
   }
 
@@ -66,7 +72,7 @@ final class GpuMvsgmCensus {
     long largest = 0;
     for (var v : plan.views) largest = Math.max(largest, (long) v.w * v.h);
     long bytes = Math.min(Math.min(MAX_SCRATCH, largest), Math.min(available, allocation));
-    for (var v : plan.views) if (bandRows(v.w, v.h, v.window, bytes) == 0) return 0;
+    for (var v : plan.views) if (bandRows(v.w, v.h, v.window, v.scale, bytes) == 0) return 0;
     return Math.max(0, bytes);
   }
 
@@ -74,13 +80,20 @@ final class GpuMvsgmCensus {
   static void generate(GpuSgm.Compute cl, MemorySegment kernel, MemorySegment source,
       MemorySegment out, int offset, byte[] gray, int w, int h, int window,
       boolean reference, long scratchBytes, Supplier<long[]> cpu) {
-    int rows = reference ? h : bandRows(w, h, window, scratchBytes);
+    generate(cl, kernel, source, out, offset, gray, w, h, window, 1, reference, scratchBytes, cpu);
+  }
+
+  static void generate(GpuSgm.Compute cl, MemorySegment kernel, MemorySegment source,
+      MemorySegment out, int offset, byte[] gray, int w, int h, int window, int step,
+      boolean reference, long scratchBytes, Supplier<long[]> cpu) {
+    int halo = window / 2 * step;
+    int rows = reference ? h : bandRows(w, h, window, step, scratchBytes);
     if (rows == 0) throw new IllegalArgumentException("No census gray band fits");
     try (Arena arena = Arena.ofConfined()) {
       MemorySegment host = reference ? null : arena.allocate(Math.min((long) gray.length, scratchBytes));
       for (int a = 0; a < h; a += rows) {
-        int b = Math.min(h, a + rows), u0 = reference ? 0 : Math.max(0, a - window / 2);
-        int u1 = reference ? h : Math.min(h, b + window / 2);
+        int b = Math.min(h, a + rows), u0 = reference ? 0 : Math.max(0, a - halo);
+        int u1 = reference ? h : Math.min(h, b + halo);
         if (!reference) {
           long count = (long) (u1 - u0) * w;
           MemorySegment part = host.asSlice(0, count);
@@ -91,7 +104,7 @@ final class GpuMvsgmCensus {
         int pixels = (b - a) * w;
         for (int first = 0; first < pixels; first += LAUNCH_PIXELS)
           cl.run(kernel, Math.min(LAUNCH_PIXELS, pixels - first), source, out,
-              offset, w, h, window / 2, u0, a, first, pixels);
+              offset, w, h, window / 2, step, u0, a, first, pixels);
         bands++;
       }
       // The host band and device scratch may be reused/freed only after their commands finish.
@@ -124,16 +137,17 @@ final class GpuMvsgmCensus {
   static final String SOURCE = """
 #pragma OPENCL FP_CONTRACT OFF
 __kernel void mvcensus(__global const uchar *gray, __global ulong *out,
-    int offset, int w, int h, int r, int u0, int a, int first, int pixels) {
+    int offset, int w, int h, int r, int s, int u0, int a, int first, int pixels) {
   int i = first + (int)get_global_id(0); if (i >= pixels) return;
   int x = i % w, y = a + i / w;
   ulong word = 0;
-  if (x >= r && x < w-r && y >= r && y < h-r) {
+  int R = r * s;
+  if (x >= R && x < w-R && y >= R && y < h-R) {
     int p = (y-u0)*w+x, bit = 0;
     uchar center = gray[p];
     for (int yy=-r; yy<=r; yy++) for (int xx=-r; xx<=r; xx++) {
       if (xx==0 && yy==0) continue;
-      word |= ((ulong)(gray[p+yy*w+xx] < center)) << bit;
+      word |= ((ulong)(gray[p+yy*s*w+xx*s] < center)) << bit;
       bit++;
     }
   }

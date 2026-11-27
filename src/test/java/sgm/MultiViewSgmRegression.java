@@ -171,6 +171,198 @@ final class MultiViewSgmRegression {
         check(Math.abs(expected - actual) < 1e-3, "level table x mapping " + expected + " vs " + actual);
       }
 
+    // 6. --mvsgm-edge-trim: a 10x10 near box on a far background loses exactly an R-pixel ring.
+    {
+      int tw = 40, th = 30;
+      float[] lab = new float[tw * th];
+      for (int y = 10; y < 20; y++) for (int x = 10; x < 20; x++) lab[y * tw + x] = 10;
+      long removed = mv.edgeTrim(lab, tw, th, 2, 2);
+      boolean ring = true, inner = true, background = true;
+      for (int y = 0; y < th; y++)
+        for (int x = 0; x < tw; x++) {
+          float v = lab[y * tw + x];
+          boolean inBox = x >= 10 && x < 20 && y >= 10 && y < 20, core = x >= 12 && x < 18 && y >= 12 && y < 18;
+          if (core) inner &= v == 10;
+          else if (inBox) ring &= Float.isNaN(v);
+          else background &= v == 0;
+        }
+      check(ring && inner && background && removed == 64,
+          "edge trim removes the 2-pixel ring of a near box only (" + removed + " removed)");
+      float[] small = new float[tw * th];
+      for (int y = 10; y < 20; y++) for (int x = 10; x < 20; x++) small[y * tw + x] = 1.5f;
+      check(mv.edgeTrim(small, tw, th, 2, 2) == 0, "edge trim keeps jumps of at most J labels");
+      float[] spikes = new float[tw * th];
+      Arrays.fill(spikes, 10);
+      spikes[15 * tw + 15] = 0;
+      float[] spikes2 = spikes.clone();
+      long one = mv.edgeTrim(spikes, tw, th, 2, 2, 1), three = mv.edgeTrim(spikes2, tw, th, 2, 2, 3);
+      check(one == 24 && three == 0, "a single far outlier trims its 24 neighbours with N=1 but none with N=3 (" + one + ", " + three + ")");
+    }
+
+    // 7. --mvsgm-census-bands color: packed per-band census; identical bands repeat the gray bits,
+    // penalties scale with the bits, and a colour solve is as accurate as the grayscale one.
+    {
+      Options c3 = o.copy();
+      c3.mvsgmCensus = 3;
+      Options cc = c3.copy();
+      cc.mvsgmCensusBands = "color";
+      MultiViewSgm gray3 = new MultiViewSgm(c3), col = new MultiViewSgm(cc);
+      check(col.bits() == 24 && col.penalty() == 3 * gray3.penalty() && col.p2() >= 3 * gray3.p2() - 3,
+          "colour census uses 24 bits and scales penalties");
+      long[] one = CensusSgm.census(refGray, W, H, 3)[0];
+      long[] packed = MultiViewSgm.censusOf(refGray, new byte[][] {refGray, refGray, refGray}, W, H, 3);
+      boolean repeated = true;
+      for (int p = 0; p < one.length; p++) repeated &= packed[p] == (one[p] | one[p] << 8 | one[p] << 16);
+      check(repeated, "identical colour bands pack the gray census three times");
+      MultiViewSgm.Reference cref = new MultiViewSgm.Reference(W, H, refGray, ones, 3, false,
+          new byte[][] {refGray, refGray, refGray});
+      MultiViewSgm.Warped[] cviews = new MultiViewSgm.Warped[others.length];
+      for (int i = 0; i < others.length; i++) {
+        byte[] gi = render(others[i], far, near, null);
+        cviews[i] = MultiViewSgm.warp(ref, W, H, labels, i + 1, others[i], gi, ones, W, H, 3, false, new byte[][] {gi, gi, gi});
+      }
+      MultiViewSgm.Plan cplan = new MultiViewSgm.Plan(0, neighbours, labels, cref, cviews);
+      DisparityBands cfull = DisparityBands.full(W, H, labels.count(), cref.use);
+      int[] csum = col.cpuSummary(cplan, cfull);
+      MultiViewSgm.DepthMap cmap = col.select(cplan, csum);
+      int cgood = 0, cused = 0;
+      for (int y = 10; y < H - 10; y++)
+        for (int x = 10; x < W - 10; x++) {
+          int p = y * W + x;
+          if (!cref.use[p] || nearEdge(truth, x, y)) continue;
+          cused++;
+          if (cmap.depth()[p] > 0 && Math.abs(cmap.depth()[p] - truth[p]) <= .005 * truth[p]) cgood++;
+        }
+      check(cused > 0 && cgood >= .9 * cused, "colour-census depth within 0.5% for " + cgood + " of " + cused + " pixels");
+      Options gc = cc.copy();
+      gc.compute = "auto";
+      MultiViewSgm gcol = new MultiViewSgm(gc);
+      check(!GpuMvsgmCensus.enabled(gc), "colour census is computed on the CPU");
+      if (GpuMultiViewSgm.use(gc, gcol, cplan, cfull)) {
+        try (var session = new GpuMultiViewSgm.Session(gc, gcol, cplan, 0)) {
+          check(Arrays.equals(session.summary(cfull), csum), "GPU colour-census summary equals the CPU reference");
+        }
+      }
+    }
+
+    // 8. --mvsgm-half-pixel: half-pixel canvases reduce exactly to the whole-pixel ones, the solve
+    // is at least as accurate, depths lock less to whole labels, and the GPU equals the CPU.
+    {
+      Options ho = o.copy();
+      ho.mvsgmHalfPixel = true;
+      MultiViewSgm half = new MultiViewSgm(ho);
+      check(half.canvasScale == 2 && mv.canvasScale == 1, "half-pixel canvas scale");
+      MultiViewSgm.Warped[] hviews = new MultiViewSgm.Warped[others.length];
+      boolean reduces = true;
+      for (int i = 0; i < others.length; i++) {
+        byte[] gi = render(others[i], far, near, null);
+        hviews[i] = MultiViewSgm.warp(ref, W, H, labels, i + 1, others[i], gi, ones, W, H, mv.census, false, null, 2);
+        MultiViewSgm.Warped whole = hviews[i].wholePixel();
+        reduces &= hviews[i].w == 2 * views[i].w - 1 && whole.w == views[i].w && whole.h == views[i].h
+            && Arrays.equals(whole.gray, views[i].gray) && Arrays.equals(whole.cpuCensus(), views[i].cpuCensus());
+      }
+      check(reduces, "half-pixel canvases reduce to the whole-pixel canvases bit for bit");
+      long[] halfCensus = hviews[0].cpuCensus(), wholeCensus = views[0].cpuCensus();
+      boolean evenSame = true;
+      for (int y = 4; y < views[0].h - 4; y++)
+        for (int x = 4; x < views[0].w - 4; x++)
+          evenSame &= halfCensus[2 * y * hviews[0].w + 2 * x] == wholeCensus[y * views[0].w + x];
+      check(evenSame, "half-pixel census at whole-pixel samples equals the whole-pixel census");
+      MultiViewSgm.Plan hplan = new MultiViewSgm.Plan(0, neighbours, labels, reference, hviews);
+      int[] hsum = half.cpuSummary(hplan, full);
+      MultiViewSgm.DepthMap hmap = half.select(hplan, hsum);
+      int hgood = 0, hused = 0;
+      double lockedWhole = 0, lockedHalf = 0;
+      for (int y = 10; y < H - 10; y++)
+        for (int x = 10; x < W - 10; x++) {
+          int p = y * W + x;
+          if (!reference.use[p] || nearEdge(truth, x, y)) continue;
+          hused++;
+          if (hmap.depth()[p] > 0 && Math.abs(hmap.depth()[p] - truth[p]) <= .005 * truth[p]) hgood++;
+          // Distance of the fractional label from a whole label (0 = locked, 0.5 = halfway).
+          if (hmap.depth()[p] > 0) {
+            double l = (1 / hmap.depth()[p] - labels.low()) / labels.step();
+            lockedHalf += Math.abs(l - Math.rint(l));
+          }
+          if (map.depth()[p] > 0) {
+            double l = (1 / map.depth()[p] - labels.low()) / labels.step();
+            lockedWhole += Math.abs(l - Math.rint(l));
+          }
+        }
+      check(hused > 0 && hgood >= .9 * hused, "half-pixel depth within 0.5% for " + hgood + " of " + hused + " pixels");
+      Options dfo = ho.copy();
+      dfo.mvsgmSubpixel = "data";
+      MultiViewSgm dfit = new MultiViewSgm(dfo);
+      MultiViewSgm.DepthMap dmap = dfit.select(hplan, hsum);
+      int dgood = 0;
+      for (int y = 10; y < H - 10; y++)
+        for (int x = 10; x < W - 10; x++) {
+          int p = y * W + x;
+          if (!reference.use[p] || nearEdge(truth, x, y)) continue;
+          if (dmap.depth()[p] > 0 && Math.abs(dmap.depth()[p] - truth[p]) <= .005 * truth[p]) dgood++;
+        }
+      check(dgood >= .9 * hused && ((Number) dmap.report().get("data_subpixel")).longValue() > hused / 2,
+          "data-cost subpixel depth within 0.5% for " + dgood + " of " + hused + " pixels");
+      System.out.printf(Locale.ROOT, "MultiViewSgmRegression: mean distance from a whole label %.3f (whole-pixel) vs %.3f (half-pixel)%n",
+          lockedWhole / used, lockedHalf / hused);
+      Options hg = ho.copy();
+      hg.compute = "auto";
+      MultiViewSgm hgm = new MultiViewSgm(hg);
+      check(GpuMvsgmCensus.enabled(hg) == GpuMvsgmCensus.enabled(g), "half-pixel census uses the GPU census when the grayscale one does");
+      if (GpuMultiViewSgm.use(hg, hgm, hplan, full)) {
+        try (var session = new GpuMultiViewSgm.Session(hg, hgm, hplan, 0)) {
+          check(Arrays.equals(session.summary(full), hsum), "GPU half-pixel summary equals the CPU reference");
+          int[] gsums = session.dataSums();
+          MultiViewSgm dcpu = new MultiViewSgm(dfo);
+          long[] rcs = reference.cpuCensus();
+          int[] eachS = new int[hviews.length + 1];
+          long diff = 0;
+          for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+              int q = y * W + x, best = hsum[6 * q];
+              double c = dcpu.dataOffset(hplan, rcs, x, y, best, eachS), gv = dcpu.sumsOffset(gsums, q, best, hplan.count);
+              if (Double.compare(c, gv) != 0) diff++;
+            }
+          check(diff == 0, "GPU data-fit sums give the CPU offsets for every pixel (" + diff + " differ)");
+        }
+      }
+    }
+
+    // 9. --mvsgm-planar-smooth: a noisy plane becomes the plane, a cone (a crown) is kept, and a
+    // roof next to the ground is smoothed up to its edge without taking ground labels.
+    {
+      int tw = 60, th = 40;
+      Random rnd = new Random(3);
+      float[] plane = new float[tw * th], cone = new float[tw * th], step = new float[tw * th];
+      for (int y = 0; y < th; y++)
+        for (int x = 0; x < tw; x++) {
+          int p = y * tw + x;
+          plane[p] = (float) (10 + .05 * x - .03 * y + .08 * rnd.nextGaussian());
+          cone[p] = (float) (20 - 1.5 * Math.hypot(x - 30, y - 20));
+          step[p] = (float) ((x < 30 ? 5 : 15) + .08 * rnd.nextGaussian());
+        }
+      float[] coneIn = cone.clone();
+      double before = 0, after = 0;
+      float[] planeIn = plane.clone();
+      mv.planarSmooth(plane, tw, th, 2, .3, 1.5);
+      for (int y = 3; y < th - 3; y++)
+        for (int x = 3; x < tw - 3; x++) {
+          double ideal = 10 + .05 * x - .03 * y;
+          before += Math.abs(planeIn[y * tw + x] - ideal);
+          after += Math.abs(plane[y * tw + x] - ideal);
+        }
+      check(after < .5 * before, "planar smoothing reduces plane noise: " + before + " -> " + after);
+      long coneChanged = mv.planarSmooth(cone, tw, th, 2, .3, 1.5);
+      int coneTop = 20 * tw + 30;
+      check(cone[coneTop] == coneIn[coneTop], "planar smoothing keeps a cone apex (" + coneChanged + " changed)");
+      mv.planarSmooth(step, tw, th, 2, .3, 1.5);
+      boolean sides = true;
+      for (int y = 3; y < th - 3; y++) {
+        sides &= Math.abs(step[y * tw + 29] - 5) < .3 && Math.abs(step[y * tw + 30] - 15) < .3;
+      }
+      check(sides, "planar smoothing keeps both sides of a roof edge apart");
+    }
+
     // 5. Options.
     java.nio.file.Path input;
     try {
@@ -190,6 +382,27 @@ final class MultiViewSgmRegression {
     Options parsed = Options.parse(args.toArray(new String[0]));
     check(Double.isNaN(parsed.twoViewConfidenceThreshold) && parsed.mvsgmNeighbors == 5 && parsed.copy().mvsgmNeighbors == 5,
         "mvsgm options parsed, copied; two-view gate off");
+    check(parsed.mvsgmEdgeTrim == 0 && parsed.mvsgmCensusBands.equals("gray"), "edge trim off and gray census by default");
+    List<String> trimArgs = new ArrayList<>(args);
+    trimArgs.addAll(List.of("--mvsgm-edge-trim", "2,3", "--mvsgm-census-window", "3", "--mvsgm-census-bands", "color",
+        "--mvsgm-half-pixel", "on", "--mvsgm-subpixel", "data", "--mvsgm-planar-smooth", "3,0.4,2", "--mvsgm-edge-trim", "2,3,4"));
+    Options trimmed = Options.parse(trimArgs.toArray(new String[0]));
+    check(trimmed.mvsgmEdgeTrim == 2 && trimmed.mvsgmEdgeTrimLabels == 3 && trimmed.copy().mvsgmEdgeTrim == 2
+        && trimmed.copy().mvsgmCensusBands.equals("color") && trimmed.mvsgmHalfPixel && trimmed.copy().mvsgmHalfPixel && !parsed.mvsgmHalfPixel && trimmed.copy().mvsgmSubpixel.equals("data") && trimmed.copy().mvsgmPlanarSmooth == 3 && trimmed.mvsgmPlanarResidual == .4 && trimmed.mvsgmPlanarBand == 2 && parsed.mvsgmPlanarSmooth == 0 && trimmed.copy().mvsgmEdgeTrimCount == 4 && parsed.mvsgmEdgeTrimCount == 1 && parsed.mvsgmSubpixel.equals("aggregated"), "edge trim and colour census parsed and copied");
+    List<String> offArgs = new ArrayList<>(trimArgs);
+    offArgs.addAll(List.of("--mvsgm-edge-trim", "off"));
+    check(Options.parse(offArgs.toArray(new String[0])).mvsgmEdgeTrim == 0, "--mvsgm-edge-trim off");
+    for (String[] bad : new String[][] {{"--mvsgm-edge-trim", "9"}, {"--mvsgm-edge-trim", "2,0"},
+        {"--mvsgm-census-bands", "color", "--mvsgm-census-window", "5"}, {"--mvsgm-census-bands", "rgb"}, {"--mvsgm-half-pixel", "yes"}, {"--mvsgm-subpixel", "cost"}, {"--mvsgm-planar-smooth", "9"}, {"--mvsgm-planar-smooth", "2,0"}, {"--mvsgm-edge-trim", "1,2,9"}}) {
+      List<String> b = new ArrayList<>(args);
+      b.addAll(List.of(bad));
+      try {
+        Options.parse(b.toArray(new String[0]));
+        check(false, "must be rejected: " + String.join(" ", bad));
+      } catch (IllegalArgumentException expected) {
+        checks++;
+      }
+    }
     try {
       args.addAll(List.of("--mvsgm-best-k", "7"));
       Options.parse(args.toArray(new String[0]));

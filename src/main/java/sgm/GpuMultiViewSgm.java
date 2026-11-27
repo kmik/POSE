@@ -65,7 +65,7 @@ final class GpuMultiViewSgm {
     private final MemorySegment refCensus, refUse, refGray, viewCensus, viewValid, viewMeta, table;
     private final MemorySegment metadata, out, host, bandHost;
     private final MemorySegment[] cost = new MemorySegment[8], sum = new MemorySegment[8];
-    private final MemorySegment costs, paths, winners;
+    private final MemorySegment costs, paths, winners, datafit;
     private final long bank, budget, localMemory;
     private final GpuMemoryPool.Reservation reservation;
     private final List<GpuMemoryPool.Reservation> growth = new ArrayList<>();
@@ -126,6 +126,7 @@ final class GpuMultiViewSgm {
         costs = cl.kernel("mvcosts");
         paths = cl.kernel("bpaths");
         winners = cl.kernel("mvwinners");
+        datafit = cl.kernel("mvdatafit");
         boolean generated = false;
         if (GpuMvsgmCensus.enabled(o) && scratch > 0) {
           MemorySegment grayBand = null;
@@ -137,7 +138,7 @@ final class GpuMultiViewSgm {
             int offset = 0;
             for (var view : plan.views) {
               GpuMvsgmCensus.generate(cl, censusKernel, grayBand, viewCensus, offset, view.gray,
-                  view.w, view.h, view.window, false, scratch, view::cpuCensus);
+                  view.w, view.h, view.window, view.scale, false, scratch, view::cpuCensus);
               offset = Math.addExact(offset, view.gray.length);
             }
             generated = true;
@@ -249,6 +250,26 @@ final class GpuMultiViewSgm {
       return summaryBuffer;
     }
 
+    /**
+     * --mvsgm-subpixel data, after {@link #summary}: per pixel the 3x3 sums of the costs at the winner
+     * and its two neighbouring labels and the number of pixels summed (4 ints), from the winners still
+     * on the device; MultiViewSgm.dataOffset computes the same sums on the CPU.
+     */
+    int[] dataSums() {
+      MemorySegment sums = cl.buffer(16L * n);
+      try (Arena a = Arena.ofConfined()) {
+        cl.run(datafit, n, refCensus, refUse, viewCensus, viewValid, viewMeta, table, out, sums, w, h, plan.views.length,
+            mv.k, mv.penalty(), plan.count);
+        MemorySegment back = a.allocate(16L * n, 4);
+        cl.transfer(sums, 0, back, true);
+        int[] result = new int[4 * n];
+        MemorySegment.copy(back, 0, MemorySegment.ofArray(result), 0, 16L * n);
+        return result;
+      } finally {
+        cl.releaseBuffer(sums);
+      }
+    }
+
     @Override
     public void close() {
       try {
@@ -302,6 +323,45 @@ __kernel void mvcosts(__global const ulong *rc,__global const uchar *ruse,__glob
     if(valid>0){int s=0;for(int i=0;i<kk;i++)s+=i<valid?each[i]:penalty;value=(s+kk/2)/kk;}
     cset(at+j,value,CA);
   }
+}
+// --mvsgm-subpixel data: the cost of one label at pixel p, exactly as mvcosts computes it.
+int mvcostat(__global const ulong *rc,__global const ulong *vc,__global const uchar *vv,__global const int *vm,
+ __global const float *tab,int p,int x,int y,int l,int V,int k,int penalty){
+  ulong c=rc[p];float fxp=(float)x,fyp=(float)y;int each[9];int kk=min(k,V);int valid=0;
+  for(int v=0;v<V;v++){
+    int t=3*(l*V+v),cw=vm[4*v+1],ch=vm[4*v+2];float a=tab[t];
+    float sx=fxp*a+tab[t+1],sy=fyp*a+tab[t+2];
+    if(!(sx>=0.0f)||!(sy>=0.0f)||!(sx<(float)(cw-1))||!(sy<(float)(ch-1)))continue;
+    float flx=floor(sx),fly=floor(sy);int ix=(int)flx,iy=(int)fly;
+    int b=vm[4*v]+iy*cw+ix;
+    if(!vv[b]||!vv[b+1]||!vv[b+cw]||!vv[b+cw+1])continue;
+    float fx=sx-flx,fy=sy-fly;
+    float h00=(float)popcount(c^vc[b]),h10=(float)popcount(c^vc[b+1]),h01=(float)popcount(c^vc[b+cw]),h11=(float)popcount(c^vc[b+cw+1]);
+    float top=(1.0f-fx)*h00+fx*h10,bottom=(1.0f-fx)*h01+fx*h11;
+    float hv=(1.0f-fy)*top+fy*bottom;
+    int hh=(int)floor(hv*8.0f+0.5f);
+    int i=valid++;while(i>0&&each[i-1]>hh){each[i]=each[i-1];i--;}each[i]=hh;
+  }
+  int value=512;
+  if(valid>0){int s=0;for(int i=0;i<kk;i++)s+=i<valid?each[i]:penalty;value=(s+kk/2)/kk;}
+  return value;
+}
+// Per pixel: the 3x3 sums of the costs at the winner label and its two neighbours (summary[6p] = winner).
+__kernel void mvdatafit(__global const ulong *rc,__global const uchar *ruse,__global const ulong *vc,__global const uchar *vv,
+ __global const int *vm,__global const float *tab,__global const int *summary,__global int *sums,int w,int h,int V,int k,int penalty,int L){
+  int p=get_global_id(0);if(p>=w*h)return;
+  int x=p%w,y=p/w,best=summary[(size_t)p*6],s0=0,s1=0,s2=0,n=0;
+  if(best>=1&&best<=L-2){
+    for(int yy=max(0,y-1);yy<=min(h-1,y+1);yy++)for(int xx=max(0,x-1);xx<=min(w-1,x+1);xx++){
+      int q=yy*w+xx;if(!ruse[q])continue;
+      int a=mvcostat(rc,vc,vv,vm,tab,q,xx,yy,best-1,V,k,penalty);
+      int b=mvcostat(rc,vc,vv,vm,tab,q,xx,yy,best,V,k,penalty);
+      int c=mvcostat(rc,vc,vv,vm,tab,q,xx,yy,best+1,V,k,penalty);
+      if(a==512||b==512||c==512)continue;
+      s0+=a;s1+=b;s2+=c;n++;
+    }
+  }
+  size_t o=(size_t)p*4;sums[o]=s0;sums[o+1]=s1;sums[o+2]=s2;sums[o+3]=n;
 }
 __kernel void mvwinners(CP,SP,__global const int *bands,__global int *out,int w,int h,int L) {
   __global const int *low=bands,*count=bands+w*h,*offset=bands+2*w*h;

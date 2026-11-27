@@ -35,6 +35,10 @@ final class MultiViewSgm {
   final int neighbors, k, census;
   final boolean bilinear;
   final double labelPixels;
+  // --mvsgm-census-bands color: B, G and R census bits packed into one word.
+  final boolean color;
+  // --mvsgm-half-pixel: neighbour canvases at half-pixel spacing (2) or whole pixels (1).
+  final int canvasScale;
   final int maxLabels;
   final Map<Integer, Object> neighborSelectionReports = new ConcurrentHashMap<>();
 
@@ -45,6 +49,8 @@ final class MultiViewSgm {
     census = Integer.getInteger("sgm.mvsgm.census", o.mvsgmCensus);
     bilinear = true;
     labelPixels = Double.parseDouble(System.getProperty("sgm.mvsgm.labelPixels", "1.0"));
+    color = o.mvsgmCensusBands.equals("color");
+    canvasScale = o.mvsgmHalfPixel ? 2 : 1;
     maxLabels = Integer.getInteger("sgm.mvsgm.maxLabels", 1024);
     if (census < 3 || census > 7 || census % 2 == 0)
       throw new IllegalArgumentException("mvsgm census window must be 3, 5 or 7");
@@ -189,6 +195,8 @@ final class MultiViewSgm {
   static final class Reference {
     final int w, h, window;
     final byte[] gray, valid;
+    // --mvsgm-census-bands color: the colour channels (null = grayscale census).
+    final byte[][] bands;
     volatile long[] census;
     final boolean deferredCensus;
     final boolean[] use;
@@ -198,23 +206,74 @@ final class MultiViewSgm {
     }
 
     Reference(int w, int h, byte[] gray, byte[] valid, int window, boolean defer) {
+      this(w, h, gray, valid, window, defer, null);
+    }
+
+    Reference(int w, int h, byte[] gray, byte[] valid, int window, boolean defer, byte[][] bands) {
       this.w = w;
+      this.bands = bands;
       this.h = h;
       this.window = window;
       deferredCensus = defer;
       this.gray = gray;
       this.valid = valid;
-      if (!defer) census = CensusSgm.census(gray, w, h, window)[0];
+      if (!defer) census = censusOf(gray, bands, w, h, window);
       boolean[] textured = CensusSgm.textureMask(gray, w, h, window);
+      if (bands != null)
+        for (byte[] band : bands) {
+          boolean[] t = CensusSgm.textureMask(band, w, h, window);
+          for (int p = 0; p < t.length; p++) textured[p] |= t[p];
+        }
       boolean[] whole = windowValid(valid, w, h, window / 2);
       use = new boolean[w * h];
       for (int p = 0; p < use.length; p++) use[p] = textured[p] && whole[p];
     }
 
     synchronized long[] cpuCensus() {
-      if (census == null) census = CensusSgm.census(gray, w, h, window)[0];
+      if (census == null) census = censusOf(gray, bands, w, h, window);
       return census;
     }
+  }
+
+  /** Grayscale census, or with colour bands the per-band census bits packed side by side. */
+  static long[] censusOf(byte[] gray, byte[][] bands, int w, int h, int window) {
+    return censusOf(gray, bands, w, h, window, 1);
+  }
+
+  /**
+   * As above with compared samples {@code step} grid cells apart (2 on a half-pixel canvas, so the
+   * pattern still spans whole pixels); step 1 is CensusSgm.census.
+   */
+  static long[] censusOf(byte[] gray, byte[][] bands, int w, int h, int window, int step) {
+    if (bands == null) return census(gray, w, h, window, step);
+    int bits = window * window - 1;
+    long[] out = new long[w * h];
+    for (int b = 0; b < bands.length; b++) {
+      long[] c = census(bands[b], w, h, window, step);
+      for (int p = 0; p < out.length; p++) out[p] |= c[p] << (b * bits);
+    }
+    return out;
+  }
+
+  /** CensusSgm.census bits (same order: rows, then columns, "neighbour < centre") with spacing step. */
+  static long[] census(byte[] in, int w, int h, int window, int step) {
+    if (step == 1) return CensusSgm.census(in, w, h, window)[0];
+    int r = window / 2, R = r * step;
+    long[] out = new long[w * h];
+    IntStream.range(R, Math.max(R, h - R)).parallel().forEach(y -> {
+      for (int x = R; x < w - R; x++) {
+        int p = y * w + x, center = in[p] & 255, bit = 0;
+        long word = 0;
+        for (int yy = -r; yy <= r; yy++)
+          for (int xx = -r; xx <= r; xx++) {
+            if (xx == 0 && yy == 0) continue;
+            word |= (long) (((in[p + yy * step * w + xx * step] & 255) - center) >>> 31) << bit;
+            bit++;
+          }
+        out[p] = word;
+      }
+    });
+    return out;
   }
 
   /**
@@ -229,6 +288,10 @@ final class MultiViewSgm {
     final boolean[] valid;
     // Resampled gray and its validity before the census-window erosion (for coarser levels).
     final byte[] gray, raw;
+    // --mvsgm-census-bands color: resampled colour channels (null = grayscale census).
+    byte[][] bands;
+    // --mvsgm-half-pixel: 2 = one canvas sample per half virtual pixel (canvas size 2w - 1).
+    int scale = 1;
 
     Warped(int id, int x0, int y0, int w, int h, double[] shift, long[] census, boolean[] valid, byte[] gray, byte[] raw) {
       this(id, x0, y0, w, h, shift, census, valid, gray, raw, 5, false);
@@ -251,18 +314,47 @@ final class MultiViewSgm {
     }
 
     synchronized long[] cpuCensus() {
-      if (census == null) census = CensusSgm.census(gray, w, h, window)[0];
+      if (census == null) census = censusOf(gray, bands, w, h, window, scale);
       return census;
     }
 
     /** The 2x2-downsampled canvas (TsgmSearch.downsample), census recomputed once. */
     Warped coarser(int window) {
+      if (scale == 2) return wholePixel().coarser(window);
       int lw = w / 2, lh = h / 2;
       byte[] g = new byte[lw * lh], v = new byte[lw * lh];
       TsgmSearch.downsample(gray, raw, w, lw, lh, g, v);
-      return new Warped(id, x0, y0, lw, lh, shift,
-          deferredCensus ? null : CensusSgm.census(g, lw, lh, window)[0],
+      byte[][] cb = null;
+      if (bands != null) {
+        cb = new byte[bands.length][];
+        for (int b = 0; b < bands.length; b++) {
+          cb[b] = new byte[lw * lh];
+          TsgmSearch.downsample(bands[b], raw, w, lw, lh, cb[b], new byte[lw * lh]);
+        }
+      }
+      Warped out = new Warped(id, x0, y0, lw, lh, shift,
+          deferredCensus ? null : censusOf(g, cb, lw, lh, window),
           windowValid(v, lw, lh, window / 2), g, v, window, deferredCensus);
+      out.bands = cb;
+      return out;
+    }
+
+    /** A half-pixel canvas reduced to its whole-pixel samples: exactly the scale-1 canvas. */
+    Warped wholePixel() {
+      int ww = (w + 1) / 2, wh = (h + 1) / 2;
+      byte[] g = new byte[ww * wh], v = new byte[ww * wh];
+      byte[][] cb = bands == null ? null : new byte[bands.length][ww * wh];
+      for (int y = 0; y < wh; y++)
+        for (int x = 0; x < ww; x++) {
+          int q = 2 * y * w + 2 * x, p = y * ww + x;
+          g[p] = gray[q];
+          v[p] = raw[q];
+          if (cb != null) for (int b = 0; b < cb.length; b++) cb[b][p] = bands[b][q];
+        }
+      Warped out = new Warped(id, x0, y0, ww, wh, shift, deferredCensus ? null : censusOf(g, cb, ww, wh, window),
+          windowValid(v, ww, wh, window / 2), g, v, window, deferredCensus);
+      out.bands = cb;
+      return out;
     }
   }
 
@@ -280,11 +372,23 @@ final class MultiViewSgm {
   static Warped warp(
       Camera ref, int rw, int rh, Labels labels, int id, Camera other, byte[] gray, byte[] mask,
       int ow, int oh, int window, boolean defer) {
+    return warp(ref, rw, rh, labels, id, other, gray, mask, ow, oh, window, defer, null);
+  }
+
+  static Warped warp(
+      Camera ref, int rw, int rh, Labels labels, int id, Camera other, byte[] gray, byte[] mask,
+      int ow, int oh, int window, boolean defer, byte[][] bands) {
+    return warp(ref, rw, rh, labels, id, other, gray, mask, ow, oh, window, defer, bands, 1);
+  }
+
+  static Warped warp(
+      Camera ref, int rw, int rh, Labels labels, int id, Camera other, byte[] gray, byte[] mask,
+      int ow, int oh, int window, boolean defer, byte[][] bands, int scale) {
     int[] canvas = canvas(ref, other, 0, 0, rw, rh, labels, window);
     if (canvasTooLarge(canvas, rw, rh))
       throw new IllegalArgumentException("mvsgm: neighbour canvas too large: image " + id + " seen from a "
           + rw + "x" + rh + " reference needs " + canvas[2] + "x" + canvas[3] + " (misaligned camera?)");
-    return warp(ref, other, id, canvas, gray, mask, 0, 0, ow, oh, window, defer);
+    return warp(ref, other, id, canvas, gray, mask, 0, 0, ow, oh, window, defer, bands, scale);
   }
 
   /**
@@ -353,14 +457,32 @@ final class MultiViewSgm {
   static Warped warp(
       Camera ref, Camera other, int id, int[] canvas, byte[] gray, byte[] mask,
       int gx0, int gy0, int gw, int gh, int window, boolean defer) {
+    return warp(ref, other, id, canvas, gray, mask, gx0, gy0, gw, gh, window, defer, null);
+  }
+
+  /** bandsIn: colour channels laid out like gray (--mvsgm-census-bands color), or null. */
+  static Warped warp(
+      Camera ref, Camera other, int id, int[] canvas, byte[] gray, byte[] mask,
+      int gx0, int gy0, int gw, int gh, int window, boolean defer, byte[][] bandsIn) {
+    return warp(ref, other, id, canvas, gray, mask, gx0, gy0, gw, gh, window, defer, bandsIn, 1);
+  }
+
+  /**
+   * scale 2 (--mvsgm-half-pixel): one canvas sample per half virtual pixel, canvas size
+   * 2 w - 1 by 2 h - 1, census with samples two cells (one pixel) apart.
+   */
+  static Warped warp(
+      Camera ref, Camera other, int id, int[] canvas, byte[] gray, byte[] mask,
+      int gx0, int gy0, int gw, int gh, int window, boolean defer, byte[][] bandsIn, int scale) {
     double[] s = shift(ref, other);
-    int x0 = canvas[0], y0 = canvas[1], w = canvas[2], h = canvas[3];
+    int x0 = canvas[0], y0 = canvas[1], w = scale * (canvas[2] - 1) + 1, h = scale * (canvas[3] - 1) + 1;
     double[] hm = homography(ref, other);
     byte[] out = new byte[w * h], valid = new byte[w * h];
+    byte[][] bandsOut = bandsIn == null ? null : new byte[bandsIn.length][w * h];
     IntStream.range(0, h).parallel().forEach(yy -> {
-      double vy = yy + y0;
+      double vy = scale == 1 ? yy + y0 : y0 + yy / (double) scale;
       for (int xx = 0; xx < w; xx++) {
-        double vx = xx + x0;
+        double vx = scale == 1 ? xx + x0 : x0 + xx / (double) scale;
         double hz = hm[6] * vx + hm[7] * vy + hm[8];
         if (hz <= 1e-12) continue;
         double sx = (hm[0] * vx + hm[1] * vy + hm[2]) / hz - gx0, sy = (hm[3] * vx + hm[4] * vy + hm[5]) / hz - gy0;
@@ -373,12 +495,23 @@ final class MultiViewSgm {
             (1 - fy) * ((1 - fx) * (gray[p] & 255) + fx * (gray[p + 1] & 255))
                 + fy * ((1 - fx) * (gray[p + gw] & 255) + fx * (gray[p + gw + 1] & 255));
         out[yy * w + xx] = (byte) Math.min(255, (int) Math.round(g));
+        if (bandsOut != null)
+          for (int b = 0; b < bandsOut.length; b++) {
+            byte[] src = bandsIn[b];
+            double v =
+                (1 - fy) * ((1 - fx) * (src[p] & 255) + fx * (src[p + 1] & 255))
+                    + fy * ((1 - fx) * (src[p + gw] & 255) + fx * (src[p + gw + 1] & 255));
+            bandsOut[b][yy * w + xx] = (byte) Math.min(255, (int) Math.round(v));
+          }
         valid[yy * w + xx] = 1;
       }
     });
-    long[] c = defer ? null : CensusSgm.census(out, w, h, window)[0];
-    boolean[] whole = windowValid(valid, w, h, window / 2);
-    return new Warped(id, x0, y0, w, h, s, c, whole, out, valid, window, defer);
+    long[] c = defer ? null : censusOf(out, bandsOut, w, h, window, scale);
+    boolean[] whole = windowValid(valid, w, h, window / 2 * scale);
+    Warped warped = new Warped(id, x0, y0, w, h, s, c, whole, out, valid, window, defer);
+    warped.bands = bandsOut;
+    warped.scale = scale;
+    return warped;
   }
 
   /** Pixels whose whole (2r+1)^2 window is valid (separable erosion). */
@@ -450,6 +583,11 @@ final class MultiViewSgm {
           double c = .5 * a - .5 * a / f + .5 / f - .5;
           bx = bx / f + c;
           by = by / f + c;
+        } else if (views[v].scale != 1) {
+          // --mvsgm-half-pixel: canvas cell = virtual pixel x scale.
+          a *= views[v].scale;
+          bx *= views[v].scale;
+          by *= views[v].scale;
         }
         int at = 3 * (l * V + v);
         t[at] = (float) a;
@@ -460,9 +598,14 @@ final class MultiViewSgm {
     return t;
   }
 
+  /** Census bits per pixel: one band, or three with --mvsgm-census-bands color. */
+  int bits() {
+    return (color ? 3 : 1) * (census * census - 1);
+  }
+
   /** Half the census bits, the cost of a neighbour that cannot see the pixel. */
   int penalty() {
-    return COST_SCALE * (census * census - 1) / 2;
+    return COST_SCALE * bits() / 2;
   }
 
   /**
@@ -562,7 +705,15 @@ final class MultiViewSgm {
       int lw = ref.w / 2, lh = ref.h / 2, f = factor * 2;
       byte[] g = new byte[lw * lh], v = new byte[lw * lh];
       TsgmSearch.downsample(ref.gray, ref.valid, ref.w, lw, lh, g, v);
-      Reference r = new Reference(lw, lh, g, v, window, ref.deferredCensus);
+      byte[][] cb = null;
+      if (ref.bands != null) {
+        cb = new byte[ref.bands.length][];
+        for (int b = 0; b < cb.length; b++) {
+          cb[b] = new byte[lw * lh];
+          TsgmSearch.downsample(ref.bands[b], ref.valid, ref.w, lw, lh, cb[b], new byte[lw * lh]);
+        }
+      }
+      Reference r = new Reference(lw, lh, g, v, window, ref.deferredCensus, cb);
       Warped[] vs = new Warped[views.length];
       for (int i = 0; i < vs.length; i++) vs[i] = views[i].coarser(window);
       int c = (labels.count() - 1) / f + 1;
@@ -661,13 +812,14 @@ final class MultiViewSgm {
     Labels labels = header.labels;
     if (tileSize(rf) > 0) return header;
     byte[][] r = rasters(rf);
-    boolean defer = GpuMvsgmCensus.enabled(o);
-    Reference ref = new Reference(rf.width, rf.height, r[0], r[1], census, defer);
+    boolean defer = !color && GpuMvsgmCensus.enabled(o);
+    Reference ref = new Reference(rf.width, rf.height, r[0], r[1], census, defer, colorBands(rf, 0, 0, rf.width, rf.height));
     Warped[] views = new Warped[chosen.size()];
     for (int i = 0; i < views.length; i++) {
       ImageFrame of = frames.get(chosen.get(i).id());
       byte[][] g = rasters(of);
-      views[i] = warp(rf.camera, rf.width, rf.height, labels, of.id, of.camera, g[0], g[1], of.width, of.height, census, defer);
+      views[i] = warp(rf.camera, rf.width, rf.height, labels, of.id, of.camera, g[0], g[1], of.width, of.height, census, defer,
+          colorBands(of, 0, 0, of.width, of.height), canvasScale);
     }
     return new Plan(c, chosen, labels, ref, views);
   }
@@ -675,13 +827,13 @@ final class MultiViewSgm {
   /** SGM penalties in cost units: --p1/--p2 are 5x5-census units, scaled to this census. */
   int p1() {
     String forced = System.getProperty("sgm.mvsgm.p1");
-    double v = forced != null ? Double.parseDouble(forced) : o.p1 * (census * census - 1) / 24.0;
+    double v = forced != null ? Double.parseDouble(forced) : o.p1 * bits() / 24.0;
     return Math.max(1, (int) Math.round(v * COST_SCALE));
   }
 
   int p2() {
     String forced = System.getProperty("sgm.mvsgm.p2");
-    double v = forced != null ? Double.parseDouble(forced) : o.p2 * (census * census - 1) / 24.0;
+    double v = forced != null ? Double.parseDouble(forced) : o.p2 * bits() / 24.0;
     return Math.max(p1() + 1, (int) Math.round(v * COST_SCALE));
   }
 
@@ -886,7 +1038,15 @@ final class MultiViewSgm {
     return Integer.getInteger("sgm.mvsgm.levels", o.mvsgmLevels >= 0 ? o.mvsgmLevels : o.tsgmLevels);
   }
 
-  record Solved(int[] summary, DisparityBands bands, List<Object> levels, long peakDeviceBytes) {}
+  /** dataSums: --mvsgm-subpixel data sums from the GPU (4 ints per pixel), or null for the CPU fit. */
+  record Solved(int[] summary, DisparityBands bands, List<Object> levels, long peakDeviceBytes, int[] dataSums) {
+    Solved(int[] summary, DisparityBands bands, List<Object> levels, long peakDeviceBytes) {
+      this(summary, bands, levels, peakDeviceBytes, null);
+    }
+  }
+
+  // --mvsgm-subpixel data on the GPU: verified once per process against the CPU sums.
+  static volatile boolean gpuDataFitVerified, gpuDataFitDisabled;
 
   /**
    * A level's packed cost volume exceeds what int offsets can index ({@link
@@ -969,7 +1129,7 @@ final class MultiViewSgm {
     long[] peak = new long[1];
     List<Object> report = new ArrayList<>();
     float[] parent = null;
-    int[] summary = null;
+    int[] summary = null, dataSums = null;
     DisparityBands bands = null;
     for (int l = plans.size() - 1; l >= 0; l--) {
       long started = System.nanoTime();
@@ -997,6 +1157,8 @@ final class MultiViewSgm {
             summary = solveLevel(p, bands, peak, session);
           }
         }
+        if (l == 0 && session[0] != null && o.mvsgmSubpixel.equals("data") && !gpuDataFitDisabled)
+          dataSums = gpuDataSums(p, summary, session[0]);
       } finally {
         if (session[0] != null) session[0].close();
       }
@@ -1007,7 +1169,7 @@ final class MultiViewSgm {
           "backend", backend.get(), "seconds", (System.nanoTime() - started) / 1e9));
       if (l > 0) parent = parentMap(p, summary);
     }
-    return new Solved(summary, bands, report, peak[0]);
+    return new Solved(summary, bands, report, peak[0], dataSums);
   }
 
   /** A coarse level's winners usable as parents: unique, not on a range edge; NaN elsewhere. */
@@ -1231,8 +1393,8 @@ final class MultiViewSgm {
     int ex0 = Math.max(0, tx0 - O), ey0 = Math.max(0, ty0 - O), ex1 = Math.min(W, cx1 + O), ey1 = Math.min(H, cy1 + O);
     int ew = ex1 - ex0, eh = ey1 - ey0;
     byte[][] r = region(rf, ex0, ey0, ew, eh);
-    boolean defer = GpuMvsgmCensus.enabled(o);
-    Reference ref = new Reference(ew, eh, r[0], r[1], census, defer);
+    boolean defer = !color && GpuMvsgmCensus.enabled(o);
+    Reference ref = new Reference(ew, eh, r[0], r[1], census, defer, colorBands(rf, ex0, ey0, ew, eh));
     if (count(ref.use) == 0) return;
     Warped[] views = new Warped[header.neighbours.size()];
     for (int i = 0; i < views.length; i++) {
@@ -1241,7 +1403,8 @@ final class MultiViewSgm {
       int[] src = sourceRegion(homography(rf.camera, of.camera), cv, of.width, of.height);
       byte[][] g = src == null ? new byte[][] {new byte[4], new byte[4]} : region(of, src[0], src[1], src[2], src[3]);
       if (src == null) src = new int[] {0, 0, 2, 2};
-      views[i] = warp(rf.camera, of.camera, of.id, cv, g[0], g[1], src[0], src[1], src[2], src[3], census, defer);
+      views[i] = warp(rf.camera, of.camera, of.id, cv, g[0], g[1], src[0], src[1], src[2], src[3], census, defer,
+          colorBands(of, src[0], src[1], src[2], src[3]), canvasScale);
     }
     Plan p = new Plan(c, header.neighbours, header.labels, ref, views, ex0, ey0);
     double[] local = new double[seeds.length];
@@ -1271,7 +1434,7 @@ final class MultiViewSgm {
         if (q[2] > q[0] && q[3] > q[1]) tile(frames, header, dir, seeds, run, q[0], q[1], q[2], q[3]);
       return;
     }
-    DepthMap m = select(p, solved.summary());
+    DepthMap m = select(p, solved.summary(), solved.dataSums());
     float[][] maps = {m.depth(), m.margin(), m.sharpness(), m.photometric()};
     int wx0 = tx0, wy0 = ty0, cols = cx1 - tx0, rows = cy1 - ty0, sw = ew, sx0 = tx0 - ex0, sy0 = ty0 - ey0;
     finish(run.pending);
@@ -1299,6 +1462,11 @@ final class MultiViewSgm {
   record DepthMap(float[] depth, float[] margin, float[] sharpness, float[] photometric, Map<String, Object> report) {}
 
   DepthMap select(Plan plan, int[] summary) {
+    return select(plan, summary, null);
+  }
+
+  /** gpuSums: --mvsgm-subpixel data sums computed on the GPU (null: the CPU computes them). */
+  DepthMap select(Plan plan, int[] summary, int[] gpuSums) {
     Reference ref = plan.ref;
     int w = ref.w, h = ref.h, n = w * h;
     Labels labels = plan.labels;
@@ -1308,8 +1476,13 @@ final class MultiViewSgm {
     // Per-pixel and independent: row bands in parallel, counts summed per band (same values).
     int bands = Math.min(h, 64), bandRows = Math.ceilDiv(h, bands);
     long[] counts = new long[4 * bands];
+    boolean dataFit = o.mvsgmSubpixel.equals("data");
+    long[] refCensus = dataFit && gpuSums == null ? ref.cpuCensus() : null;
+    if (dataFit && gpuSums == null) for (Warped view : plan.views) view.cpuCensus();
+    long[] dataFitted = new long[bands];
     final float[] labelOut = label;
     parallel(bands, b -> {
+      int[] each = dataFit ? new int[plan.views.length + 1] : null;
       for (int p = b * bandRows * w, end = Math.min(n, (b + 1) * bandRows * w); p < end; p++) {
       int s = 6 * p, best = summary[s], value = summary[s + 1], second = summary[s + 2];
       if (!ref.use[p]) continue;
@@ -1327,6 +1500,13 @@ final class MultiViewSgm {
       }
       int before = summary[s + 3], after = summary[s + 4];
       double offset = before >= 0 && after >= 0 ? StereoCost.subpixel(o, before, value, after) : 0;
+      if (dataFit) {
+        double d = gpuSums != null ? sumsOffset(gpuSums, p, best, plan.count) : dataOffset(plan, refCensus, p % w, p / w, best, each);
+        if (!Double.isNaN(d)) {
+          offset = d;
+          dataFitted[b]++;
+        }
+      }
       labelOut[p] = (float) (best + offset);
       margin[p] = second == Integer.MAX_VALUE ? 1 : (float) ((second - value) / (double) second);
       int side = before >= 0 && after >= 0 ? Math.min(before, after) : Math.max(before, after);
@@ -1351,6 +1531,9 @@ final class MultiViewSgm {
       for (int p = 0; p < n; p++) if (!(label[p] == before[p]) && Float.isFinite(before[p])) median++;
     }
     long speckles = CensusSgm.removeSpeckles(label, w, h, o.speckleSize, 1.0, o.speckleConnectivity);
+    long trimmed = o.mvsgmEdgeTrim > 0 ? edgeTrim(label, w, h, o.mvsgmEdgeTrim, o.mvsgmEdgeTrimLabels, o.mvsgmEdgeTrimCount) : 0;
+    long planar = o.mvsgmPlanarSmooth > 0
+        ? planarSmooth(label, w, h, o.mvsgmPlanarSmooth, o.mvsgmPlanarResidual, o.mvsgmPlanarBand) : 0;
     float[] depth = new float[n];
     final float[] filtered = label;
     long[] validBands = new long[bands];
@@ -1369,7 +1552,184 @@ final class MultiViewSgm {
         "used_pixels", count(ref.use), "no_winner", none, "range_or_band_edge_rejected", boundary,
         "uniqueness_rejected", ambiguous, "selected", selected, "median_changed", median,
         "speckle_rejected", speckles, "valid", valid);
+    if (o.mvsgmEdgeTrim > 0) report.put("edge_trimmed", trimmed);
+    if (o.mvsgmPlanarSmooth > 0) report.put("planar_smoothed", planar);
+    if (dataFit) {
+      long fitted = 0;
+      for (long f : dataFitted) fitted += f;
+      report.put("data_subpixel", fitted);
+    }
     return new DepthMap(depth, margin, sharp, photo, report);
+  }
+
+  /**
+   * --mvsgm-subpixel data: the fraction within the SGM winner label from the matching cost itself
+   * (labels best - 1, best, best + 1, summed over the usable pixels of the 3x3 neighbourhood),
+   * by --subpixel-fit. NaN at the label range ends or when no neighbourhood pixel has all three
+   * costs (the caller keeps the aggregated fit).
+   */
+  /** dataOffset from GPU sums (s0, s1, s2, n per pixel); NaN under the same conditions. */
+  double sumsOffset(int[] sums, int p, int best, int count) {
+    if (best < 1 || best > count - 2 || sums[4 * p + 3] == 0) return Double.NaN;
+    return StereoCost.subpixel(o, sums[4 * p], sums[4 * p + 1], sums[4 * p + 2]);
+  }
+
+  /**
+   * The GPU data-fit sums; the first use in a process is compared with the CPU on a 64-row crop and
+   * disables the GPU data fit (CPU sums in select) when any value differs.
+   */
+  int[] gpuDataSums(Plan p, int[] summary, GpuMultiViewSgm.Session session) {
+    int[] sums;
+    try {
+      sums = session.dataSums();
+    } catch (RuntimeException e) {
+      gpuDataFitDisabled = true;
+      System.out.println("mvsgm: GPU data fit failed (" + e.getMessage() + "); using the CPU");
+      return null;
+    }
+    synchronized (MultiViewSgm.class) {
+      if (!gpuDataFitVerified && !gpuDataFitDisabled) {
+        long[] rc = p.ref.cpuCensus();
+        for (Warped v : p.views) v.cpuCensus();
+        int[] each = new int[p.views.length + 1];
+        int w = p.ref.w, y0 = Math.max(0, p.ref.h / 2 - 32), y1 = Math.min(p.ref.h, y0 + 64);
+        long differ = 0;
+        for (int y = y0; y < y1; y++)
+          for (int x = 0; x < w; x++) {
+            int q = y * w + x, best = summary[6 * q];
+            double cpu = dataOffset(p, rc, x, y, best, each), gpu = sumsOffset(sums, q, best, p.count);
+            if (!(Double.compare(cpu, gpu) == 0)) differ++;
+          }
+        if (differ == 0) {
+          gpuDataFitVerified = true;
+          System.out.printf(Locale.ROOT, "mvsgm GPU data fit: %dx%d-row check identical to the CPU%n", w, y1 - y0);
+        } else {
+          gpuDataFitDisabled = true;
+          System.out.println("WARNING: mvsgm GPU data fit differs from the CPU (" + differ + " pixels); using the CPU");
+          return null;
+        }
+      }
+    }
+    return sums;
+  }
+
+  double dataOffset(Plan plan, long[] refCensus, int x, int y, int best, int[] each) {
+    Reference ref = plan.ref;
+    if (best < 1 || best > plan.count - 2) return Double.NaN;
+    int pen = penalty();
+    long s0 = 0, s1 = 0, s2 = 0, n = 0;
+    for (int yy = Math.max(0, y - 1); yy <= Math.min(ref.h - 1, y + 1); yy++)
+      for (int xx = Math.max(0, x - 1); xx <= Math.min(ref.w - 1, x + 1); xx++) {
+        int q = yy * ref.w + xx;
+        if (!ref.use[q]) continue;
+        int a = cost(refCensus[q], plan.views, plan.table, best - 1, xx, yy, k, pen, each);
+        int c0 = cost(refCensus[q], plan.views, plan.table, best, xx, yy, k, pen, each);
+        int c = cost(refCensus[q], plan.views, plan.table, best + 1, xx, yy, k, pen, each);
+        if (a == INVALID || c0 == INVALID || c == INVALID) continue;
+        s0 += a;
+        s1 += c0;
+        s2 += c;
+        n++;
+      }
+    return n == 0 ? Double.NaN : StereoCost.subpixel(o, s0, s1, s2);
+  }
+
+  /**
+   * --mvsgm-planar-smooth R,T,J: per label, the least-squares plane l = a + b dx + c dy over the
+   * labels within J of it in the (2R+1)^2 window (at least half the window); when that fit's RMS
+   * residual is at most T the label becomes a (the plane at the pixel). Labels are inverse depth, which
+   * is linear in the image on a planar surface, so flat ground and roofs are denoised while crowns
+   * (large residual) keep their labels. Decided on the input labels (order- and thread-independent).
+   * Returns the number of labels replaced.
+   */
+  long planarSmooth(float[] label, int w, int h, int r, double residual, double band) {
+    float[] src = label.clone();
+    long[] changed = new long[h];
+    int minimum = ((2 * r + 1) * (2 * r + 1) + 1) / 2;
+    parallel(h, y -> {
+      long n0 = 0;
+      for (int x = 0; x < w; x++) {
+        int p = y * w + x;
+        float v = src[p];
+        if (!Float.isFinite(v)) continue;
+        double n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sz = 0, szx = 0, szy = 0, szz = 0;
+        for (int dy = -r; dy <= r; dy++) {
+          int yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (int dx = -r; dx <= r; dx++) {
+            int xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            float u = src[yy * w + xx];
+            if (!Float.isFinite(u) || Math.abs(u - v) > band) continue;
+            double z = u - v;
+            n++;
+            sx += dx;
+            sy += dy;
+            sxx += dx * dx;
+            syy += dy * dy;
+            sxy += dx * dy;
+            sz += z;
+            szx += z * dx;
+            szy += z * dy;
+            szz += z * z;
+          }
+        }
+        if (n < minimum) continue;
+        // Normal equations [n sx sy; sx sxx sxy; sy sxy syy] (a b c) = (sz szx szy), by Cramer.
+        double det = n * (sxx * syy - sxy * sxy) - sx * (sx * syy - sxy * sy) + sy * (sx * sxy - sxx * sy);
+        if (Math.abs(det) < 1e-9) continue;
+        double a = (sz * (sxx * syy - sxy * sxy) - sx * (szx * syy - sxy * szy) + sy * (szx * sxy - sxx * szy)) / det;
+        double b = (n * (szx * syy - sxy * szy) - sz * (sx * syy - sxy * sy) + sy * (sx * szy - szx * sy)) / det;
+        double c = (n * (sxx * szy - szx * sxy) - sx * (sx * szy - szx * sy) + sz * (sx * sxy - sxx * sy)) / det;
+        double rss = szz - (a * sz + b * szx + c * szy);
+        if (Math.sqrt(Math.max(0, rss) / n) > residual) continue;
+        label[p] = (float) (v + a);
+        n0++;
+      }
+      changed[y] = n0;
+    });
+    long total = 0;
+    for (long c : changed) total += c;
+    return total;
+  }
+
+  /**
+   * --mvsgm-edge-trim R,J: removes (sets to NaN) every label that has a valid label more than J
+   * smaller (a farther surface) within the (2R+1)^2 window: the near side of depth jumps, where SGM
+   * aggregation widens the foreground. Decided on the input labels, so the result does not depend
+   * on order or threads. Returns the number removed.
+   */
+  long edgeTrim(float[] label, int w, int h, int r, double jump) {
+    return edgeTrim(label, w, h, r, jump, 1);
+  }
+
+  /** As above, removing a label only when at least {@code needed} farther labels lie in the window. */
+  long edgeTrim(float[] label, int w, int h, int r, double jump, int needed) {
+    float[] src = label.clone();
+    long[] removed = new long[h];
+    parallel(h, y -> {
+      long n = 0;
+      for (int x = 0; x < w; x++) {
+        int p = y * w + x;
+        float v = src[p];
+        if (!Float.isFinite(v)) continue;
+        int farther = 0;
+        search:
+        for (int yy = Math.max(0, y - r); yy <= Math.min(h - 1, y + r); yy++)
+          for (int xx = Math.max(0, x - r); xx <= Math.min(w - 1, x + r); xx++) {
+            float u = src[yy * w + xx];
+            if (Float.isFinite(u) && u < v - jump && ++farther >= needed) {
+              label[p] = Float.NaN;
+              n++;
+              break search;
+            }
+          }
+      }
+      removed[y] = n;
+    });
+    long total = 0;
+    for (long n : removed) total += n;
+    return total;
   }
 
   static long count(boolean[] b) {
@@ -1801,6 +2161,31 @@ final class MultiViewSgm {
     return b;
   }
 
+  /**
+   * --mvsgm-census-bands color: the B, G and R channels of rows [y0, y0 + h) x columns [x0, x0 + w)
+   * of the processed colour image, laid out like {@link #rasters} gray; null for the grayscale census.
+   */
+  byte[][] colorBands(ImageFrame f, int x0, int y0, int w, int h) throws IOException {
+    if (!color) return null;
+    RasterCache.prefetch(f);
+    byte[] bgr;
+    synchronized (RasterCache.class) {
+      RasterCache.pair(f, f);
+      if (f.color.channels() != 3)
+        throw new IllegalArgumentException("--mvsgm-census-bands color needs a 3-channel image: " + name(f));
+      org.opencv.core.Mat sub = f.color.submat(y0, y0 + h, x0, x0 + w).clone();
+      try {
+        bgr = bytes(sub);
+      } finally {
+        sub.release();
+      }
+    }
+    byte[][] out = new byte[3][w * h];
+    for (int p = 0, i = 0; p < w * h; p++)
+      for (int b = 0; b < 3; b++) out[b][p] = bgr[i++];
+    return out;
+  }
+
   /** Gray and valid mask of a frame (undistorted, processed size). */
   static byte[][] rasters(ImageFrame f) throws IOException {
     RasterCache.prefetch(f);
@@ -1860,7 +2245,7 @@ final class MultiViewSgm {
     int[] summary = solved.summary();
     DisparityBands bands = solved.bands();
     long t2 = System.nanoTime();
-    DepthMap map = select(plan, summary);
+    DepthMap map = select(plan, summary, solved.dataSums());
     long t3 = System.nanoTime();
     ImageFrame rf = frames.get(c);
     DepthMapFile.write(dir.resolve("camera_" + c + ".depth"), rf.camera, rf.width, rf.height, map.depth());

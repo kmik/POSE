@@ -236,6 +236,20 @@ public final class Options {
   /** --dense-method mvsgm settings (MULTIVIEW_SGM.md); recorded in 05_stereo/mvsgm.json. */
   int mvsgmNeighbors = 6, mvsgmBestK = 3, mvsgmCensus = 5, mvsgmLevels = -1, mvsgmConsistentViews = 1;
   double mvsgmConsistencyLabels = 1;
+  // --mvsgm-census-bands gray|color (opt-in colour census).
+  String mvsgmCensusBands = "gray";
+  // --mvsgm-half-pixel on|off: neighbour census at half-pixel spacing (opt-in).
+  boolean mvsgmHalfPixel;
+  // --mvsgm-subpixel aggregated|data: where the fraction within the SGM winner label comes from.
+  String mvsgmSubpixel = "aggregated";
+  // --mvsgm-edge-trim R,J: drop depths within R pixels of a farther depth (more than J labels); 0 = off.
+  int mvsgmEdgeTrim = 0;
+  double mvsgmEdgeTrimLabels = 2;
+  // --mvsgm-edge-trim R,J,N: farther neighbours needed to trim (1 = any).
+  int mvsgmEdgeTrimCount = 1;
+  // --mvsgm-planar-smooth R,T,J: plane fit over same-surface neighbours; 0 = off.
+  int mvsgmPlanarSmooth = 0;
+  double mvsgmPlanarResidual = .3, mvsgmPlanarBand = 1.5;
   /** --mvsgm-cameras-in-flight: cameras whose depth maps are computed at once (0 = auto; 1 = serial). */
   int mvsgmCamerasInFlight = 1;
   /** --mvsgm-tile auto|off|N: tile size for mvsgm depth maps (-1 = auto: 2048 above 16 Mpx; 0 = untiled). */
@@ -994,6 +1008,43 @@ public final class Options {
         case "--mvsgm-consistency-labels":
           o.mvsgmConsistencyLabels = number(v);
           break;
+        case "--mvsgm-subpixel":
+          o.mvsgmSubpixel = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--mvsgm-half-pixel":
+          if (!v.equalsIgnoreCase("on") && !v.equalsIgnoreCase("off"))
+            throw new IllegalArgumentException("--mvsgm-half-pixel must be on or off");
+          o.mvsgmHalfPixel = v.equalsIgnoreCase("on");
+          break;
+        case "--mvsgm-census-bands":
+          o.mvsgmCensusBands = v.toLowerCase(Locale.ROOT);
+          break;
+        case "--mvsgm-planar-smooth": {
+          String t = v.strip().toLowerCase(Locale.ROOT);
+          if (t.equals("off")) {
+            o.mvsgmPlanarSmooth = 0;
+            break;
+          }
+          String[] parts = t.split(",");
+          if (parts.length > 3) throw new IllegalArgumentException("--mvsgm-planar-smooth must be off, R, R,T or R,T,J");
+          o.mvsgmPlanarSmooth = Integer.parseInt(parts[0].strip());
+          if (parts.length > 1) o.mvsgmPlanarResidual = number(parts[1].strip());
+          if (parts.length > 2) o.mvsgmPlanarBand = number(parts[2].strip());
+          break;
+        }
+        case "--mvsgm-edge-trim": {
+          String t = v.strip().toLowerCase(Locale.ROOT);
+          if (t.equals("off")) {
+            o.mvsgmEdgeTrim = 0;
+            break;
+          }
+          String[] parts = t.split(",");
+          if (parts.length > 3) throw new IllegalArgumentException("--mvsgm-edge-trim must be off, R, R,J or R,J,N");
+          o.mvsgmEdgeTrim = Integer.parseInt(parts[0].strip());
+          if (parts.length > 1) o.mvsgmEdgeTrimLabels = number(parts[1].strip());
+          if (parts.length > 2) o.mvsgmEdgeTrimCount = Integer.parseInt(parts[2].strip());
+          break;
+        }
         case "--mvsgm-cameras-in-flight":
           o.mvsgmCamerasInFlight = v.equalsIgnoreCase("auto") ? 0 : Integer.parseInt(v);
           break;
@@ -2005,6 +2056,19 @@ public final class Options {
                 + " 0..neighbors, --mvsgm-consistency-labels >0..64");
       if (o.mvsgmCamerasInFlight < 0 || o.mvsgmCamerasInFlight > 16)
         throw new IllegalArgumentException("--mvsgm-cameras-in-flight must be auto or 1..16");
+      choice(o.mvsgmCensusBands, "--mvsgm-census-bands", "gray", "color");
+      choice(o.mvsgmSubpixel, "--mvsgm-subpixel", "aggregated", "data");
+      if (o.mvsgmCensusBands.equals("color") && 3 * (o.mvsgmCensus * o.mvsgmCensus - 1) > 64)
+        throw new IllegalArgumentException("--mvsgm-census-bands color needs --mvsgm-census-window 3"
+            + " (three bands of a larger window do not fit the 64-bit census)");
+      if (o.mvsgmEdgeTrim < 0 || o.mvsgmEdgeTrim > 8 || !(o.mvsgmEdgeTrimLabels > 0) || o.mvsgmEdgeTrimLabels > 64
+          || o.mvsgmEdgeTrimCount < 1
+          || o.mvsgmEdgeTrim > 0 && o.mvsgmEdgeTrimCount > (2 * o.mvsgmEdgeTrim + 1) * (2 * o.mvsgmEdgeTrim + 1) - 1)
+        throw new IllegalArgumentException("--mvsgm-edge-trim must be off or R,J,N with R 0..8 pixels, J >0..64 labels"
+            + " and N 1..(2R+1)^2-1 farther neighbours");
+      if (o.mvsgmPlanarSmooth < 0 || o.mvsgmPlanarSmooth > 8 || !(o.mvsgmPlanarResidual > 0) || o.mvsgmPlanarResidual > 16
+          || !(o.mvsgmPlanarBand > 0) || o.mvsgmPlanarBand > 64)
+        throw new IllegalArgumentException("--mvsgm-planar-smooth must be off or R[,T[,J]] with R 0..8 pixels, T >0..16 and J >0..64 labels");
       if (Double.isFinite(o.twoViewConfidenceThreshold)) {
         System.out.println(
             "Note: --two-view-confidence-threshold applies to pair SGM only; ignored with"
@@ -2511,6 +2575,15 @@ public final class Options {
     out.mvsgmLevels = mvsgmLevels;
     out.mvsgmConsistentViews = mvsgmConsistentViews;
     out.mvsgmConsistencyLabels = mvsgmConsistencyLabels;
+    out.mvsgmCensusBands = mvsgmCensusBands;
+    out.mvsgmHalfPixel = mvsgmHalfPixel;
+    out.mvsgmSubpixel = mvsgmSubpixel;
+    out.mvsgmEdgeTrim = mvsgmEdgeTrim;
+    out.mvsgmEdgeTrimLabels = mvsgmEdgeTrimLabels;
+    out.mvsgmEdgeTrimCount = mvsgmEdgeTrimCount;
+    out.mvsgmPlanarSmooth = mvsgmPlanarSmooth;
+    out.mvsgmPlanarResidual = mvsgmPlanarResidual;
+    out.mvsgmPlanarBand = mvsgmPlanarBand;
     out.mvsgmCamerasInFlight = mvsgmCamerasInFlight;
     out.mvsgmTile = mvsgmTile;
     try {
@@ -3074,6 +3147,39 @@ Point filtering and multi-view fusion:
   --mvsgm-consistency-labels T
       mvsgm: agreement tolerance in the neighbour's inverse-depth label steps
       (about one pixel of image motion each; default 1).
+  --mvsgm-census-bands gray|color
+      mvsgm matching evidence (default gray: one census on the grayscale image). color
+      computes the census on the B, G and R channels and matches them together (more
+      evidence in vegetation and shadow at the same matching cost); needs
+      --mvsgm-census-window 3. The census is computed on the CPU; the GPU solve still runs.
+  --mvsgm-subpixel aggregated|data
+      mvsgm: the fraction within the SGM winner label (default aggregated: --subpixel-fit
+      on the SGM-aggregated costs, which favours whole labels). data fits the matching
+      cost itself at the winner and its two neighbouring labels, summed over the 3x3
+      pixels around it; SGM still chooses the label. Best with --mvsgm-half-pixel on,
+      whose costs carry information between whole pixels.
+  --mvsgm-half-pixel on|off
+      mvsgm (default off): each neighbour is resampled at half-pixel spacing and its
+      census computed there (same pattern, one pixel between compared samples), so the
+      matching cost has real information between whole pixels instead of interpolating
+      whole-pixel costs. Depths lock less to whole labels (crown and ground detail).
+      Same labels and SGM time; neighbour canvases take 4x the memory; the census is
+      computed on the CPU.
+  --mvsgm-planar-smooth off|R[,T[,J]]
+      mvsgm (default off): fits a plane (inverse depth is linear in the image on a planar
+      surface) to the neighbours within R pixels (default 2) whose labels are within J of
+      the pixel (default 1.5; the same surface, so roof edges do not mix with the ground);
+      where the fit residual is at most T labels (default 0.3: ground, roofs, roads) the
+      depth becomes the plane value, elsewhere (tree crowns) it is kept. One label is
+      about one pixel of image motion. A single pass per depth map.
+  --mvsgm-edge-trim off|R[,J[,N]]
+      mvsgm (default off): removes depths that have a farther depth, by more than J
+      labels (default 2; one label is about one pixel of image motion), within R pixels
+      (1..8). This trims the near side of depth jumps, where SGM widens foreground
+      surfaces over the background (wide tree crowns, building edges); it also drops
+      isolated depth spikes. N (default 1) is how many farther depths are needed: a
+      larger N ignores scattered far outliers (noisy shadows) and keeps the depths around
+      them. 2,2 suits 0.5 m aerial pixels. A single pass per depth map.
   --dense-checkpoint off|auto|MINUTES
       mvsgm with overlap-window fusion: save a checkpoint every MINUTES (auto = 30)
       between two fused cameras. If the dense step is interrupted (killed, server
