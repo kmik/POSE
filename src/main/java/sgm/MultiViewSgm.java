@@ -888,6 +888,29 @@ final class MultiViewSgm {
 
   record Solved(int[] summary, DisparityBands bands, List<Object> levels, long peakDeviceBytes) {}
 
+  /**
+   * A level's packed cost volume exceeds what int offsets can index ({@link
+   * DisparityBands#MAX_CELLS}; e.g. --mvsgm-levels 0 with a wide depth range on a large tile). The
+   * caller solves the region in smaller tiles. Volumes that fit are never affected.
+   */
+  static final class VolumeTooLarge extends RuntimeException {
+    final long cells;
+    final int labels;
+
+    VolumeTooLarge(long cells, int labels) {
+      super(String.format(Locale.ROOT, "packed cost volume %,d cells (%d labels) exceeds the cell limit", cells, labels));
+      this.cells = cells;
+      this.labels = labels;
+    }
+  }
+
+  static void requireFits(Plan p, DisparityBands bands) {
+    // -Dsgm.mvsgm.maxCells (tests): a lower limit, to exercise the split on small images.
+    long limit = Math.min(DisparityBands.MAX_CELLS, Long.getLong("sgm.mvsgm.maxCells", DisparityBands.MAX_CELLS));
+    long cells = bands.cells();
+    if (cells > limit) throw new VolumeTooLarge(cells, p.count);
+  }
+
   /** One level's solve on the GPU (own session, released afterwards) or the CPU reference. */
   int[] solveLevel(Plan plan, DisparityBands bands, long[] peak) {
     GpuMultiViewSgm.Session[] session = new GpuMultiViewSgm.Session[1];
@@ -960,6 +983,7 @@ final class MultiViewSgm {
         seeded = seed(bands, seeds, p.factor, p.ref.use);
         bands.changed();
       }
+      requireFits(p, bands);
       GpuMultiViewSgm.Session[] session = new GpuMultiViewSgm.Session[1];
       try {
         summary = solveLevel(p, bands, peak, session);
@@ -969,6 +993,7 @@ final class MultiViewSgm {
           if (widened != null) {
             retried = touched[0];
             bands = widened;
+            requireFits(p, bands);
             summary = solveLevel(p, bands, peak, session);
           }
         }
@@ -1137,67 +1162,44 @@ final class MultiViewSgm {
    */
   Map<String, Object> tiledDepth(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, Plan header, Path dir)
       throws IOException {
+    return tiledDepth(frames, tracks, header, dir, tileSize(frames.get(header.camera)));
+  }
+
+  /** Running totals of one tiled camera; tile cores go to the map files on a writer thread. */
+  private static final class TileRun {
+    final ExecutorService writer;
+    Future<?> pending;
+    long valid, cells, peak;
+    int tiles, split;
+
+    TileRun(ExecutorService writer) {
+      this.writer = writer;
+    }
+  }
+
+  static final int MIN_SPLIT_TILE = 64;
+
+  /** {@link #tiledDepth} with tile size T (tile cores T x T, TILE_OVERLAP around each). */
+  Map<String, Object> tiledDepth(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, Plan header, Path dir, int T)
+      throws IOException {
     int c = header.camera;
     ImageFrame rf = frames.get(c);
-    int W = rf.width, H = rf.height, T = tileSize(rf), O = TILE_OVERLAP;
-    String[] kinds = {".depth", ".margin", ".sharp", ".photo"};
-    for (String k : kinds) DepthMapFile.create(dir.resolve("camera_" + c + k), rf.camera, W, H);
+    int W = rf.width, H = rf.height, O = TILE_OVERLAP;
+    for (String k : TILE_KINDS) DepthMapFile.create(dir.resolve("camera_" + c + k), rf.camera, W, H);
     double[] seeds = seeds(rf, tracks, header.labels);
-    long valid = 0, cells = 0, peak = 0;
-    int tiles = 0;
-    // Tile cores go to the map files on a writer thread while the next tile is solved. At most one
-    // tile is being written (its arrays are not used again); every write ends before this returns.
+    // At most one tile is being written (its arrays are not used again); every write ends before
+    // this returns.
     ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
       Thread t = new Thread(r, "mvsgm-map-writer");
       t.setDaemon(true);
       return t;
     });
-    Future<?> pending = null;
+    TileRun run = new TileRun(writer);
     try {
-    for (int ty0 = 0; ty0 < H; ty0 += T)
-      for (int tx0 = 0; tx0 < W; tx0 += T) {
-        int cx1 = Math.min(W, tx0 + T), cy1 = Math.min(H, ty0 + T);
-        int ex0 = Math.max(0, tx0 - O), ey0 = Math.max(0, ty0 - O), ex1 = Math.min(W, cx1 + O), ey1 = Math.min(H, cy1 + O);
-        int ew = ex1 - ex0, eh = ey1 - ey0;
-        byte[][] r = region(rf, ex0, ey0, ew, eh);
-        boolean defer = GpuMvsgmCensus.enabled(o);
-        Reference ref = new Reference(ew, eh, r[0], r[1], census, defer);
-        if (count(ref.use) == 0) continue;
-        Warped[] views = new Warped[header.neighbours.size()];
-        for (int i = 0; i < views.length; i++) {
-          ImageFrame of = frames.get(header.neighbours.get(i).id());
-          int[] cv = canvas(rf.camera, of.camera, ex0, ey0, ew, eh, header.labels, census);
-          int[] src = sourceRegion(homography(rf.camera, of.camera), cv, of.width, of.height);
-          byte[][] g = src == null ? new byte[][] {new byte[4], new byte[4]} : region(of, src[0], src[1], src[2], src[3]);
-          if (src == null) src = new int[] {0, 0, 2, 2};
-          views[i] = warp(rf.camera, of.camera, of.id, cv, g[0], g[1], src[0], src[1], src[2], src[3], census, defer);
-        }
-        Plan p = new Plan(c, header.neighbours, header.labels, ref, views, ex0, ey0);
-        double[] local = new double[seeds.length];
-        int n = 0;
-        for (int s = 0; s + 2 < seeds.length; s += 3)
-          if (seeds[s] >= ex0 && seeds[s] < ex1 && seeds[s + 1] >= ey0 && seeds[s + 1] < ey1) {
-            local[n++] = seeds[s] - ex0;
-            local[n++] = seeds[s + 1] - ey0;
-            local[n++] = seeds[s + 2];
-          }
-        Solved solved = solve(p, Arrays.copyOf(local, n));
-        DepthMap m = select(p, solved.summary());
-        float[][] maps = {m.depth(), m.margin(), m.sharpness(), m.photometric()};
-        int wx0 = tx0, wy0 = ty0, cols = cx1 - tx0, rows = cy1 - ty0, sw = ew, sx0 = tx0 - ex0, sy0 = ty0 - ey0;
-        finish(pending);
-        pending = writer.submit(() -> {
-          for (int k = 0; k < kinds.length; k++)
-            DepthMapFile.writeRegion(dir.resolve("camera_" + c + kinds[k]), W, wx0, wy0, cols, rows, maps[k], sw, sx0, sy0);
-          return null;
-        });
-        for (int y = ty0; y < cy1; y++)
-          for (int x = tx0; x < cx1; x++) if (m.depth()[(y - ey0) * ew + x - ex0] > 0) valid++;
-        cells += solved.bands().total();
-        peak = Math.max(peak, solved.peakDeviceBytes());
-        tiles++;
-      }
-      finish(pending);
+      for (int ty0 = 0; ty0 < H; ty0 += T)
+        for (int tx0 = 0; tx0 < W; tx0 += T)
+          tile(frames, header, dir, seeds, run, tx0, ty0, Math.min(W, tx0 + T), Math.min(H, ty0 + T));
+      finish(run.pending);
     } finally {
       writer.shutdown();
       try {
@@ -1207,11 +1209,82 @@ final class MultiViewSgm {
       }
     }
     Map<String, Object> report = new LinkedHashMap<>(Json.object(
-        "tiled", true, "tile_size", T, "tile_overlap", O, "tiles", tiles, "packed_cells", cells,
-        "peak_device_bytes", peak, "backend", backend.get(), "valid", valid,
+        "tiled", true, "tile_size", T, "tile_overlap", O, "tiles", run.tiles, "packed_cells", run.cells,
+        "peak_device_bytes", run.peak, "backend", backend.get(), "valid", run.valid,
         "neighbours", header.neighbours.stream().map(x -> x.id()).toList()));
+    if (run.split > 0) report.put("tiles_split_for_volume", run.split);
     annotateNeighborSelection(c, report);
     return report;
+  }
+
+  static final String[] TILE_KINDS = {".depth", ".margin", ".sharp", ".photo"};
+
+  /**
+   * One tile core [tx0, cx1) x [ty0, cy1) with TILE_OVERLAP around it. A tile whose cost volume
+   * exceeds 2^31 cells (which used to abort the run) is solved as four smaller tiles instead.
+   */
+  private void tile(List<ImageFrame> frames, Plan header, Path dir, double[] seeds, TileRun run,
+      int tx0, int ty0, int cx1, int cy1) throws IOException {
+    int c = header.camera;
+    ImageFrame rf = frames.get(c);
+    int W = rf.width, H = rf.height, O = TILE_OVERLAP;
+    int ex0 = Math.max(0, tx0 - O), ey0 = Math.max(0, ty0 - O), ex1 = Math.min(W, cx1 + O), ey1 = Math.min(H, cy1 + O);
+    int ew = ex1 - ex0, eh = ey1 - ey0;
+    byte[][] r = region(rf, ex0, ey0, ew, eh);
+    boolean defer = GpuMvsgmCensus.enabled(o);
+    Reference ref = new Reference(ew, eh, r[0], r[1], census, defer);
+    if (count(ref.use) == 0) return;
+    Warped[] views = new Warped[header.neighbours.size()];
+    for (int i = 0; i < views.length; i++) {
+      ImageFrame of = frames.get(header.neighbours.get(i).id());
+      int[] cv = canvas(rf.camera, of.camera, ex0, ey0, ew, eh, header.labels, census);
+      int[] src = sourceRegion(homography(rf.camera, of.camera), cv, of.width, of.height);
+      byte[][] g = src == null ? new byte[][] {new byte[4], new byte[4]} : region(of, src[0], src[1], src[2], src[3]);
+      if (src == null) src = new int[] {0, 0, 2, 2};
+      views[i] = warp(rf.camera, of.camera, of.id, cv, g[0], g[1], src[0], src[1], src[2], src[3], census, defer);
+    }
+    Plan p = new Plan(c, header.neighbours, header.labels, ref, views, ex0, ey0);
+    double[] local = new double[seeds.length];
+    int n = 0;
+    for (int s = 0; s + 2 < seeds.length; s += 3)
+      if (seeds[s] >= ex0 && seeds[s] < ex1 && seeds[s + 1] >= ey0 && seeds[s + 1] < ey1) {
+        local[n++] = seeds[s] - ex0;
+        local[n++] = seeds[s + 1] - ey0;
+        local[n++] = seeds[s + 2];
+      }
+    Solved solved;
+    try {
+      solved = solve(p, Arrays.copyOf(local, n));
+    } catch (VolumeTooLarge e) {
+      int cw = cx1 - tx0, ch = cy1 - ty0;
+      if (Math.max(cw, ch) <= MIN_SPLIT_TILE) throw e;
+      System.out.printf(Locale.ROOT,
+          "mvsgm image %d: tile %dx%d at (%d, %d) needs %,d cost cells (%d labels, over the cell limit); solving it as 4 smaller tiles%n",
+          c, cw, ch, tx0, ty0, e.cells, e.labels);
+      run.split++;
+      p = null;
+      ref = null;
+      views = null;
+      int mx = tx0 + Math.max(1, cw / 2), my = ty0 + Math.max(1, ch / 2);
+      int[][] parts = {{tx0, ty0, mx, my}, {mx, ty0, cx1, my}, {tx0, my, mx, cy1}, {mx, my, cx1, cy1}};
+      for (int[] q : parts)
+        if (q[2] > q[0] && q[3] > q[1]) tile(frames, header, dir, seeds, run, q[0], q[1], q[2], q[3]);
+      return;
+    }
+    DepthMap m = select(p, solved.summary());
+    float[][] maps = {m.depth(), m.margin(), m.sharpness(), m.photometric()};
+    int wx0 = tx0, wy0 = ty0, cols = cx1 - tx0, rows = cy1 - ty0, sw = ew, sx0 = tx0 - ex0, sy0 = ty0 - ey0;
+    finish(run.pending);
+    run.pending = run.writer.submit(() -> {
+      for (int k = 0; k < TILE_KINDS.length; k++)
+        DepthMapFile.writeRegion(dir.resolve("camera_" + c + TILE_KINDS[k]), W, wx0, wy0, cols, rows, maps[k], sw, sx0, sy0);
+      return null;
+    });
+    for (int y = ty0; y < cy1; y++)
+      for (int x = tx0; x < cx1; x++) if (m.depth()[(y - ey0) * ew + x - ex0] > 0) run.valid++;
+    run.cells += solved.bands().total();
+    run.peak = Math.max(run.peak, solved.peakDeviceBytes());
+    run.tiles++;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1737,33 +1810,44 @@ final class MultiViewSgm {
    * Depth maps for the given cameras (all usable ones when null), written to 05_stereo/mvsgm as
    * DepthMapFile (.depth, .margin). Returns the per-camera reports.
    */
+  /** A camera solved tile by tile (T-pixel tiles), with its report entry. */
+  private Object tiledCamera(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int c, Plan plan, long t0, int T)
+      throws IOException {
+    Path dir = o.output.resolve("05_stereo/mvsgm");
+    ImageFrame rf = frames.get(c);
+    long t1 = System.nanoTime();
+    Map<String, Object> tiled = tiledDepth(frames, tracks, plan, dir, T);
+    double near = 1 / plan.labels.q(plan.labels.count() - 1), far = 1 / plan.labels.low();
+    info.put(c, new CameraInfo(c, plan.neighbours.stream().mapToInt(Neighbor::id).toArray(), plan.labels.step(), near, far, true));
+    if (exportImages())
+      try (MappedFiles mapped = new MappedFiles()) {
+        exportDepthStreamed(rf, "depth", mapped.map(dir.resolve("camera_" + c + ".depth"), DepthMapFile.HEADER,
+            4L * rf.width * rf.height, false), null, near, far);
+      }
+    tiled.put("image", c);
+    tiled.put("labels", plan.labels.count());
+    tiled.put("wait_seconds", (t1 - t0) / 1e9);
+    tiled.put("seconds", (System.nanoTime() - t1) / 1e9);
+    RunTelemetry.record("Multi-view SGM camera " + c, t0);
+    System.out.printf(Locale.ROOT, "mvsgm image %d: %dx%d in %s tiles, %d labels, %.1f s, %,d valid%n",
+        c, rf.width, rf.height, tiled.get("tiles"), plan.labels.count(), (System.nanoTime() - t1) / 1e9, tiled.get("valid"));
+    return tiled;
+  }
+
   /** One camera solve, shared by the sequential driver and the overlap-window producer. */
   Object computeCamera(List<ImageFrame> frames, List<FeatureTracks.Track> tracks, int c, Plan plan, long t0)
       throws IOException {
     Path dir = o.output.resolve("05_stereo/mvsgm");
-    if (plan.tiled()) {
-      ImageFrame rf = frames.get(c);
-      long t1 = System.nanoTime();
-      Map<String, Object> tiled = tiledDepth(frames, tracks, plan, dir);
-      double near = 1 / plan.labels.q(plan.labels.count() - 1), far = 1 / plan.labels.low();
-      info.put(c, new CameraInfo(c, plan.neighbours.stream().mapToInt(Neighbor::id).toArray(), plan.labels.step(), near, far, true));
-      if (exportImages())
-        try (MappedFiles mapped = new MappedFiles()) {
-          exportDepthStreamed(rf, "depth", mapped.map(dir.resolve("camera_" + c + ".depth"), DepthMapFile.HEADER,
-              4L * rf.width * rf.height, false), null, near, far);
-        }
-      tiled.put("image", c);
-      tiled.put("labels", plan.labels.count());
-      tiled.put("wait_seconds", (t1 - t0) / 1e9);
-      tiled.put("seconds", (System.nanoTime() - t1) / 1e9);
-
-      RunTelemetry.record("Multi-view SGM camera " + c, t0);
-      System.out.printf(Locale.ROOT, "mvsgm image %d: %dx%d in %s tiles, %d labels, %.1f s, %,d valid%n",
-          c, rf.width, rf.height, tiled.get("tiles"), plan.labels.count(), (System.nanoTime() - t1) / 1e9, tiled.get("valid"));
-      return tiled;
-    }
+    if (plan.tiled()) return tiledCamera(frames, tracks, c, plan, t0, tileSize(frames.get(c)));
     long t1 = System.nanoTime();
-    Solved solved = solve(plan, seeds(frames.get(c), tracks, plan.labels));
+    Solved solved;
+    try {
+      solved = solve(plan, seeds(frames.get(c), tracks, plan.labels));
+    } catch (VolumeTooLarge e) {
+      // Used to abort the run: the untiled image is solved in tiles instead.
+      System.out.printf(Locale.ROOT, "mvsgm image %d: %s; solving it in %d-pixel tiles%n", c, e.getMessage(), TILE_SIZE);
+      return tiledCamera(frames, tracks, c, Plan.header(c, plan.neighbours, plan.labels), t0, TILE_SIZE);
+    }
     int[] summary = solved.summary();
     DisparityBands bands = solved.bands();
     long t2 = System.nanoTime();

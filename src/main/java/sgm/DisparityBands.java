@@ -12,6 +12,9 @@ final class DisparityBands {
   private int[] offset;
   private long total = -1;
 
+  /** The largest packed volume int offsets can index. */
+  static final long MAX_CELLS = Integer.MAX_VALUE - 8;
+
   DisparityBands(int width, int height, int labels) {
     this.width = width;
     this.height = height;
@@ -29,15 +32,18 @@ final class DisparityBands {
   /** Packed start of each pixel's labels; throws if the packed volume exceeds int indexing. */
   int[] offsets() {
     if (offset == null) {
-      offset = new int[count.length];
+      // Built locally and published only when complete: a volume over the limit throws here every
+      // time instead of leaving a partial table and total = -1 behind for the next caller.
+      int[] built = new int[count.length];
       long at = 0;
       for (int p = 0; p < count.length; p++) {
-        offset[p] = (int) at;
+        built[p] = (int) at;
         at += count[p];
-        if (at > Integer.MAX_VALUE - 8)
+        if (at > MAX_CELLS)
           throw new IllegalArgumentException("Packed disparity bands exceed 2^31 cells");
       }
       total = at;
+      offset = built;
     }
     return offset;
   }

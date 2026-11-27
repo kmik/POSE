@@ -142,11 +142,61 @@ final class LargeFormatRegression {
       }
       Run tiledStrips = dense(root, "tiled-strips", cams, tracks, "96", "5");
       check(sameLas(tiled.las, tiledStrips.las), "strips on tiled mvsgm maps are byte-identical");
+      oversizedVolumes(root, cams, tracks, untiled);
       widePreview(root);
     } finally {
       delete(root);
     }
     return checks;
+  }
+
+  /**
+   * Cost volumes over the int-offset limit (lowered with -Dsgm.mvsgm.maxCells): they used to abort
+   * the run (NegativeArraySizeException on the CPU path); now an untiled image falls back to tiles
+   * and an oversized tile is split, and a limit above every volume changes nothing.
+   */
+  private static void oversizedVolumes(Path root, Camera[] cams, List<FeatureTracks.Track> tracks, Run untiled)
+      throws Exception {
+    // A failed offset build throws every time; it no longer leaves a partial table and total -1.
+    DisparityBands huge = DisparityBands.full(3000, 1000, 1000, filled(3000 * 1000));
+    for (int attempt = 0; attempt < 2; attempt++) {
+      boolean threw = false;
+      try {
+        huge.total();
+      } catch (IllegalArgumentException e) {
+        threw = true;
+      }
+      check(threw, "an over-limit band volume throws on attempt " + attempt);
+    }
+    check(huge.cells() == 3_000_000_000L, "cells() counts over-limit volumes");
+
+    long largest = 0;
+    var m = java.util.regex.Pattern.compile("\"packed_cells\":(\\d+)")
+        .matcher(Files.readString(untiled.dir.resolve("05_stereo/mvsgm/mvsgm.json")));
+    while (m.find()) largest = Math.max(largest, Long.parseLong(m.group(1)));
+    check(largest > 0, "untiled level volumes reported");
+    try {
+      System.setProperty("sgm.mvsgm.maxCells", Long.toString(largest));
+      Run same = dense(root, "volume-fits", cams, tracks, null, null);
+      check(sameLas(untiled.las, same.las), "a cell limit no smaller than every volume changes nothing");
+      System.setProperty("sgm.mvsgm.maxCells", Long.toString(largest - 1));
+      Run split = dense(root, "volume-split", cams, tracks, null, null);
+      String json = Files.readString(split.dir.resolve("05_stereo/mvsgm/mvsgm.json"));
+      check(json.contains("\"tiled\":true") && json.contains("\"tiles_split_for_volume\""),
+          "an oversized untiled image is solved in split tiles");
+      check(onPlanes(split.las) >= .95, "split-volume points lie on the true planes");
+      check(split.points > .8 * untiled.points, "split-volume coverage: " + split.points + " vs " + untiled.points);
+      System.out.printf(Locale.ROOT, "Large-format regression: cell limit %,d: split tiles -> %d points (untiled %d)%n",
+          largest - 1, split.points, untiled.points);
+    } finally {
+      System.clearProperty("sgm.mvsgm.maxCells");
+    }
+  }
+
+  private static boolean[] filled(int n) {
+    boolean[] b = new boolean[n];
+    Arrays.fill(b, true);
+    return b;
   }
 
   /** A last camera returns to the first group: raw lookahead must skip unrelated middle groups. */
