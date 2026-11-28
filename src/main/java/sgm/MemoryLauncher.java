@@ -57,7 +57,8 @@ final class MemoryLauncher {
     try {
       // A continued pipeline step uses the memory budget saved by the first step.
       String[] effective = Main.launchArguments(args);
-      if (Arrays.stream(effective).anyMatch(s -> Set.of("--help", "-h", "-help", "--list-gpus").contains(s))) {
+      if (Arrays.stream(effective).anyMatch(s -> Set.of("--help", "-h", "-help", "--list-gpus").contains(s))
+          || args.length > 0 && args[0].equals("ultracam-inpho")) {
         System.exit(Main.run(args));
         return;
       }

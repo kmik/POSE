@@ -87,6 +87,7 @@ final class PoseWindow {
     GuiSupport.brand(frame);
     frame.setJMenuBar(new JMenuBar());
     frame.getJMenuBar().add(PoseSettings.menu(this));
+    frame.getJMenuBar().add(PoseUltraCamDialog.menu(this));
     frame.getJMenuBar().add(PoseHelp.menu(frame));
     frame.addWindowListener(
         new WindowAdapter() {

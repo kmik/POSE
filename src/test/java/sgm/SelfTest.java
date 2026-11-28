@@ -125,6 +125,7 @@ public final class SelfTest {
     checks += FusionGpuRegression.run(root);
     checks += UpgradeStereoRegression.run(root);
     checks += OrientationRegression.run(root);
+    checks += UltraCamInphoRegression.run(root.resolve("ultracam-inpho"));
     checks += OverlapRegression.run(root);
     checks += PairSelectionRegression.run(root.resolve("pair-selection"));
     checks += SurfaceRegression.run(root);

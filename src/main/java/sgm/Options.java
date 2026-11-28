@@ -2697,6 +2697,12 @@ Pipeline steps (run one by one, or chained; the state is saved after each step):
       the common options as fields, follow their steps and log, manage the runs of a
       project (continue, branch, GCP markers, report again). It starts this same
       command line for the processing. Needs a display; see GUI.md.
+  photogrammetry ultracam-inpho --exteriors FILE --calibration-report PDF --output FILE.prj
+      Convert UltraCam exterior orientations (name X Y Z omega phi kappa, gon) and the
+      Vexcel calibration report PDF into an INPHO project for --orientation-input and
+      Metashape. Several cameras: repeat --exteriors and --calibration-report, one pair
+      per camera; all go into one project. More options: photogrammetry ultracam-inpho
+      --help. GUI: Tools menu.
   photogrammetry gcp-edit -o PROJECT [--run ID] [--browser] [--no-continue] [--gcp-port N]
       Open the ground control point editor in a window. Click a GCP, then click its
       exact position in an image; the other images are then refined by patch matching
